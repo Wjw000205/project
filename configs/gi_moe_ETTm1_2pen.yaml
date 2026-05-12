@@ -1,0 +1,59 @@
+exp:
+  name: GI_MoE_ETTm1_2pen
+  out_dir: outputs/gi_moe_ETTm1_2pen
+  seed: 2026
+  device: cuda:0
+data:
+  csv_path: data/ETTm1.csv
+  date_col: 0
+  max_rows: 57600
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+window:
+  input_len: 336
+  pred_len: 96
+normalize:
+  train_only: true
+  global_zscore: true
+model:
+  hidden_dim: 256
+  dropout: 0.2
+train:
+  epochs: 40
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  num_workers: 0
+
+# Only the 2 penalties with healthy directional supervision on ETTm1:
+#   amp_under  rel_gap=0.135  (base under-predicts std, room exists)
+#   delta      rel_gap=0.933  (base ≈ last-value at first diff, huge room)
+# Removed jitter / smooth (counter-directional, push toward flatter
+# predictions while truth itself is highly jittery on ETTm1).
+moe_loss:
+  enable: true
+  adapter_dim: 32
+  lambda_pen: 0.1
+  lambda_norm: 1.0e-4
+  mae_weight: 0.3
+  penalties: [amp_under, delta]
+  lambda_p: {amp_under: 1.0, delta: 1.0}
+  jump_threshold: 2.0
+
+moe_loss_v2:
+  enable: true
+  shared_dim: 128
+  private_dim: 32
+  use_penalty_gated_activation: true
+  mask_init: 0.0
+  log_alpha_init: -3.0
+  gate_init_bias: -2.0
+  lambda_pen: 0.1
+  lambda_norm: 1.0e-4
+  lambda_mask: 1.0e-4
+  mask_target: 0.5
+  mae_weight: 0.3
+  penalties: [amp_under, delta]
+  lambda_p: {amp_under: 1.0, delta: 1.0}
+  jump_threshold: 2.0

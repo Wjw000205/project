@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local IDE / assistant state
+.idea/
+.vscode/
+.claude/
+.codex_restore_zip/
+
+# Data, experiment outputs, checkpoints
+/data/
+/outputs/
+*.pt
+*.pth
+*.ckpt
+*.npy
+
+# Local archives and logs
+*.zip
+*.log

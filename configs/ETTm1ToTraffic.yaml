@@ -1,0 +1,65 @@
+﻿exp:
+  name: "ETTm1_to_Traffic"
+  out_dir: "outputs/ETTm1ToTraffic"
+  seed: 2026
+  device: "cuda:0"
+
+source:
+  memory_path: "outputs/ETTm1/cluster_memory.pt"
+  checkpoint_path: "outputs/ETTm1/best_checkpoint.pt"
+  csv_path: "data/ETTm1.csv"
+  date_col: 0
+  step_minutes: 15
+
+data:
+  csv_path: "data/traffic.csv"
+  date_col: 0
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+
+window:
+  input_len: 336
+  pred_len: 720
+
+normalize:
+  global_zscore: true
+  train_only: true   # 閬垮厤鐢ㄥ叏鏁版嵁缁熻閲忥紝鍑忓皬娉勬紡鍜屽垎甯冨亸绉诲奖鍝?
+transfer:
+  corr_mode: "cycle_template"
+  phase_bins: 48       # 姣?64 鐣ョǔ
+  phase_max_shift: 32  # 鍩烘湰淇濇寔鏁堟灉锛岃绠楁洿鐪?  period_min_hours: 12
+  period_max_hours: 168
+  corr_align: "head"
+
+  corr_threshold: 0.85
+  fallback_mode: "soft"
+  fallback_topk: 2
+  fallback_temp: 0.7
+
+  resample:
+    enable: true
+    target_step_minutes: 15
+    method: "linear"   # 杩欎釜鍦烘櫙涓嶈鏀?last/ffill
+
+  knn_hybrid:
+    enable: false
+    scope: "same_cluster"
+    bank_split: "train"
+    use_for_model_selection: false
+    k: 16
+    alpha: 0.1
+    adaptive_alpha: "confidence"
+    confidence_floor: 0.0
+    distance_sharpness: 1.0
+    shape_bins: 24
+    diff_bins: 12
+    bank_stride: 4
+    distance_weight: "inverse"
+    anchor_mode: "last"
+
+  save_corr: true
+
+eval:
+  batch_size: 64
+

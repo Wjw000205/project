@@ -1,0 +1,66 @@
+﻿exp:
+  name: "ETTm1_to_ETTm2"
+  out_dir: "outputs/ETTm1ToETTm2"
+  seed: 2026
+  device: "cuda:0"
+
+source:
+  memory_path: "outputs/ETTm1/cluster_memory.pt"
+  checkpoint_path: "outputs/ETTm1/best_checkpoint.pt"
+  csv_path: "data/ETTm1.csv"
+  date_col: 0
+  step_minutes: 15
+
+data:
+  csv_path: "data/ETTm2.csv"
+  date_col: 0
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+
+window:
+  input_len: 336
+  pred_len: 720
+
+normalize:
+  global_zscore: true
+  train_only: false
+
+transfer:
+  corr_mode: "cycle_template"
+  phase_bins: 64
+  phase_max_shift: null
+  period_min: null
+  period_max: null
+  period_min_hours: 12
+  period_max_hours: 168
+  corr_align: "head"
+  corr_max_lag: 0
+  corr_threshold: null
+  fallback_mode: "hard"
+  fallback_topk: 2
+  fallback_temp: 1.0
+  resample:
+    enable: false
+    target_step_minutes: 15
+    method: "linear"
+  knn_hybrid:
+    enable: false
+    scope: "same_cluster"
+    bank_split: "train"
+    use_for_model_selection: false
+    k: 16
+    alpha: 0.1
+    adaptive_alpha: "confidence"
+    confidence_floor: 0.0
+    distance_sharpness: 1.0
+    shape_bins: 24
+    diff_bins: 12
+    bank_stride: 4
+    distance_weight: "inverse"
+    anchor_mode: "last"
+  save_corr: true
+
+eval:
+  batch_size: 64
+

@@ -1,0 +1,73 @@
+exp:
+  name: GI_MoE_ETTm1_4pen
+  out_dir: outputs/gi_moe_ETTm1_4pen
+  seed: 2026
+  device: cuda:0
+data:
+  csv_path: data/ETTm1.csv
+  date_col: 0
+  max_rows: 57600
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+window:
+  input_len: 336
+  pred_len: 96
+normalize:
+  train_only: true
+  global_zscore: true
+cluster:
+  method: leader
+  n_clusters: 3
+  distance_threshold: 0.7
+  linkage: average
+  random_state: 2026
+  min_cluster_size: 2
+  merge_small_clusters: true
+  no_merge_if_channels_lt: 7
+model:
+  hidden_dim: 256
+  dropout: 0.2
+train:
+  epochs: 40
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  num_workers: 0
+
+# Penalty pool extended with d2_match (truth-matching second-difference).
+# Probe rel_gap on ETTm1:
+#   delta     0.89/0.98/1.00     (1st-diff pointwise match)
+#   direction 0.87/0.98/0.99     (1st-diff signed under-match)
+#   trend     0.82/0.92/0.80     (end-to-end span match)
+#   d2_match  1.02/1.00/1.00     (2nd-diff pointwise match)  *** new ***
+moe_loss:
+  enable: true
+  adapter_dim: 32
+  lambda_pen: 0.1
+  lambda_norm: 1.0e-4
+  mae_weight: 0.3
+  penalties: [delta, direction, trend, d2_match]
+  lambda_p: {delta: 1.0, direction: 1.0, trend: 1.0, d2_match: 1.0}
+  jump_threshold: 2.0
+
+moe_loss_v2:
+  enable: true
+  shared_dim: 128
+  private_dim: 32
+  use_penalty_gated_activation: true
+  mask_init: 0.0
+  log_alpha_init: -3.0
+  gate_init_bias: -2.0
+  lambda_pen: 0.1
+  lambda_norm: 1.0e-4
+  lambda_mask: 1.0e-4
+  mask_target: 0.5
+  mae_weight: 0.3
+  penalties: [delta, direction, trend, d2_match]
+  lambda_p: {delta: 1.0, direction: 1.0, trend: 1.0, d2_match: 1.0}
+  jump_threshold: 2.0
+  lambda_gate: 0.5
+  bce_tau: 0.01
+  detach_gate_from_main: false
+  lambda_gate_bimodal: 0.01
