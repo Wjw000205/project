@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import argparse
@@ -41,6 +43,7 @@ from .models.dynamic_lambda import ClusterwiseDynamicLambda
 from .models.learnable_lambda import ClusterwiseLearnableLambda
 from .models.moe_gate import ClusterwiseMoEGate, scatter_mean_bc_to_bk, scatter_mean_bcf_to_bkf
 from .models.penalties import build_penalty_bank, normalize_penalties
+from .models.residual_moe import ClusterwisePredResidualMoE
 from .utils.metrics import accumulate_channel_errors, mse_mae_from_sums
 from .utils.plotting import save_channel_plots, save_cluster_metric_curves
 from .utils.cluster_portrait import save_cluster_portraits
@@ -326,6 +329,74 @@ def _apply_skip_to_penalty_loss(
     return (1.0 - skip_bk) * penalty_loss_bk + float(skip_cost) * skip_bk
 
 
+def _pred_residual_loss_terms(
+    pred_out: Optional[Dict[str, torch.Tensor]],
+    y_base: torch.Tensor,
+    y_final: torch.Tensor,
+    y: torch.Tensor,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    cluster_id_c: torch.Tensor,
+    K: int,
+    penalty_scale: Optional[torch.Tensor] = None,
+    specialization_weight: float = 0.0,
+    norm_weight: float = 0.0,
+    intervention_weight: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    zero_bk = y_final.new_zeros((y_final.shape[0], K))
+    out = {
+        "total_bk": zero_bk,
+        "specialization_bk": zero_bk,
+        "norm_bk": zero_bk,
+        "intervention_bk": zero_bk,
+    }
+    if pred_out is None or (specialization_weight == 0.0 and norm_weight == 0.0 and intervention_weight == 0.0):
+        return out
+    residuals = pred_out.get("residuals")
+    route_bcp = pred_out.get("route_bcp")
+    effective_route_bcp = pred_out.get("effective_route_bcp", route_bcp)
+    intervention_bcp = pred_out.get("intervention_bcp")
+    alpha_cp = pred_out.get("alpha_cp")
+    if residuals is None or route_bcp is None or effective_route_bcp is None or alpha_cp is None or residuals.numel() == 0:
+        return out
+
+    spec_bk = zero_bk
+    if specialization_weight != 0.0 and len(penalty_names) > 0:
+        y_final_sg = y_final.detach()
+        for p, name in enumerate(penalty_names):
+            visible_scale = (effective_route_bcp[..., p] * alpha_cp[:, p].unsqueeze(0)).detach()
+            visible = visible_scale.unsqueeze(-1) * residuals[:, :, p, :]
+            y_view = y_final_sg + visible - visible.detach()
+            pen_bc = penalty_fns[name](y_view, y)
+            if penalty_scale is not None and penalty_scale.numel() > p:
+                scale_p = penalty_scale[p].to(device=pen_bc.device, dtype=pen_bc.dtype).clamp_min(1.0e-6)
+                pen_bc = pen_bc / scale_p
+            # Do not let unselected branches affect the scalar objective.
+            pen_bc = pen_bc * effective_route_bcp[..., p].detach()
+            spec_bk = spec_bk + scatter_mean_bc_to_bk(pen_bc, cluster_id_c, K)
+
+    norm_bk = zero_bk
+    if norm_weight != 0.0:
+        branch_mse_bc = (y_final - y_base.detach()).pow(2).mean(dim=-1)
+        norm_bk = scatter_mean_bc_to_bk(branch_mse_bc, cluster_id_c, K)
+
+    intervention_bk = zero_bk
+    if intervention_weight != 0.0 and intervention_bcp is not None:
+        intervention_bc = (route_bcp.detach() * intervention_bcp).sum(dim=-1)
+        intervention_bk = scatter_mean_bc_to_bk(intervention_bc, cluster_id_c, K)
+
+    total_bk = (
+        (float(specialization_weight) * spec_bk)
+        + (float(norm_weight) * norm_bk)
+        + (float(intervention_weight) * intervention_bk)
+    )
+    out["total_bk"] = total_bk
+    out["specialization_bk"] = spec_bk
+    out["norm_bk"] = norm_bk
+    out["intervention_bk"] = intervention_bk
+    return out
+
+
 def _mae_objective_bc_from_abs(
     abs_err_bch: torch.Tensor,
     kind: str = "l1",
@@ -398,6 +469,48 @@ def _apply_router_penalty_context(
     raise ValueError(f"Unsupported moe.router_mode='{router_mode}'. Expected learned, penalty_context, or penalty_only.")
 
 
+def _history_proxy_forecast(x_bcl: torch.Tensor, pred_len: int) -> torch.Tensor:
+    """
+    Build a target-free horizon proxy from observed history only.
+
+    Router penalty context must be available at inference time.  For penalties
+    that compare prediction to a reference series, use the latest observed
+    history segment instead of the future label.
+    """
+    pred_len = int(pred_len)
+    if pred_len <= 0:
+        raise ValueError("pred_len must be positive")
+    L = int(x_bcl.shape[-1])
+    if L <= 0:
+        raise ValueError("history length must be positive")
+    if L >= pred_len:
+        return x_bcl[..., -pred_len:]
+    pad = x_bcl[..., -1:].expand(*x_bcl.shape[:-1], pred_len - L)
+    return torch.cat([x_bcl, pad], dim=-1)
+
+
+def _router_penalty_context_from_history(
+    *,
+    x_bcl: torch.Tensor,
+    yhat_base_bch: torch.Tensor,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    penalty_scale: Optional[torch.Tensor],
+    cluster_id_c: torch.Tensor,
+    K: int,
+) -> torch.Tensor:
+    if len(penalty_names) == 0:
+        return torch.zeros((x_bcl.shape[0], K, 0), device=x_bcl.device, dtype=x_bcl.dtype)
+    y_ref = _history_proxy_forecast(x_bcl, int(yhat_base_bch.shape[-1]))
+    y_ref = y_ref.to(device=yhat_base_bch.device, dtype=yhat_base_bch.dtype)
+    route_pen_bcp = torch.stack(
+        [penalty_fns[name](yhat_base_bch, y_ref) for name in penalty_names],
+        dim=-1,
+    )
+    route_pen_bcp = normalize_penalties(route_pen_bcp, scale=penalty_scale)
+    return scatter_mean_bcf_to_bkf(route_pen_bcp, cluster_id_c, K)
+
+
 def _named_param_dict(module: Optional[nn.Module], detach: bool = False) -> Optional[Dict[str, torch.Tensor]]:
     if module is None:
         return None
@@ -433,6 +546,9 @@ def eval_loop(
     mae_objective_weight: float = 0.0,
     mae_objective_kind: str = "l1",
     mae_objective_beta: float = 1.0,
+    pred_residual: Optional[ClusterwisePredResidualMoE] = None,
+    pred_residual_gate: Optional[nn.Module] = None,
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
     residual_correction_ch: Optional[torch.Tensor] = None,
     knn_hybrid: ShapeKNNHybrid = None,
     knn_fusion_scale_ch: Optional[torch.Tensor] = None,
@@ -443,6 +559,8 @@ def eval_loop(
     gate.eval()
     if dynamic_lambda is not None:
         dynamic_lambda.eval()
+    if pred_residual is not None:
+        pred_residual.eval()
 
     moe_enable = bool(moe_cfg.get("enable", True))
     allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
@@ -472,52 +590,29 @@ def eval_loop(
         y = y.to(device, non_blocking=True)
         idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
 
-        yhat = model(x, cluster_id_c)
-        if knn_hybrid is not None:
-            yhat_base = yhat
-            query_start_abs_b = eval_start + idx
-            yhat = knn_hybrid.hybridize_batch(x, yhat, cluster_id_c, query_start_abs_b=query_start_abs_b)
-            if knn_fusion_scale_ch is not None:
-                scale = knn_fusion_scale_ch.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
-                yhat = yhat_base + scale * (yhat - yhat_base)
-            if knn_fusion_gate is not None:
-                knn_fusion_gate.eval()
-                gate_feat = _knn_gate_features(x, yhat_base, yhat)
-                scale = knn_fusion_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
-                yhat = yhat_base + scale * (yhat - yhat_base)
-        if residual_correction_ch is not None:
-            corr_ch = residual_correction_ch.to(device=yhat.device, dtype=yhat.dtype)
-            yhat = yhat + corr_ch.unsqueeze(0)
+        yhat_base = model(x, cluster_id_c)
 
-        # base error metrics per channel
-        err_bch = yhat - y
-        abs_err_bch = err_bch.abs()
-        mse_bc = err_bch.pow(2).mean(dim=-1)  # [B,C]
-        mae_bc = abs_err_bch.mean(dim=-1)  # [B,C]
-        mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)  # [B,K]
-        mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)  # [B,K]
-        mse_loss_sum += mse_bk.sum(dim=0)
-        mae_loss_sum += mae_bk.sum(dim=0)
-
-        # penalties
-        pen_bcp = []
-        for name in penalty_names:
-            pen_bc = penalty_fns[name](yhat, y)  # [B,C]
-            pen_bcp.append(pen_bc)
-        pen_bcp = torch.stack(pen_bcp, dim=-1)  # [B,C,P]
-        pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
-        pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)  # [B,K,P]
-
-        # gate
+        # Route on the base prediction. This keeps the router's penalty
+        # context independent from the residual expert it is selecting.
         feat_bcf = extract_gate_features(x)            # [B,C,F]
         feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
         series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
+        route_pen_bkp = _router_penalty_context_from_history(
+            x_bcl=x,
+            yhat_base_bch=yhat_base,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            penalty_scale=penalty_scale,
+            cluster_id_c=cluster_id_c,
+            K=K,
+        )
+
         if moe_enable and P > 0:
             straight_through = (not moe_cfg["detach_penalty_grad"])
             mask_bkp, probs_bkp, skip_bk, _ = gate(feat_bkf, straight_through=straight_through)
             probs_bkp = _apply_router_penalty_context(
                 probs_bkp,
-                pen_bkp,
+                route_pen_bkp,
                 router_mode=router_mode,
                 penalty_context_weight=router_penalty_context_weight,
                 detach_penalty_context=router_detach_penalty_context,
@@ -535,9 +630,70 @@ def eval_loop(
                 probs_sel = probs_sel * target_mass
                 mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
         else:
-            mask_bkp = torch.zeros_like(pen_bkp)
+            mask_bkp = torch.zeros_like(route_pen_bkp)
             probs_bkp = None
             skip_bk = None
+
+        if pred_residual is not None and moe_enable and P > 0:
+            pred_out = pred_residual(
+                x,
+                yhat_base,
+                cluster_id_c,
+                mask_bkp,
+                skip_bk=skip_bk if allow_skip else None,
+            )
+            yhat = pred_out["y_final"]
+            if pred_residual_gate is not None:
+                pred_residual_gate.eval()
+                gate_feat = _knn_gate_features(x, yhat_base, yhat)
+                scale = pred_residual_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
+                if pred_residual_scale_c is not None:
+                    channel_scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
+                    scale = scale * channel_scale
+                yhat = yhat_base + scale * (yhat - yhat_base)
+            elif pred_residual_scale_c is not None:
+                scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
+                yhat = yhat_base + scale * (yhat - yhat_base)
+        else:
+            yhat = yhat_base
+
+        if knn_hybrid is not None:
+            yhat_pre_knn = yhat
+            query_start_abs_b = eval_start + idx
+            yhat = knn_hybrid.hybridize_batch(x, yhat, cluster_id_c, query_start_abs_b=query_start_abs_b)
+            if knn_fusion_scale_ch is not None:
+                scale = knn_fusion_scale_ch.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
+                yhat = yhat_pre_knn + scale * (yhat - yhat_pre_knn)
+            if knn_fusion_gate is not None:
+                knn_fusion_gate.eval()
+                gate_feat = _knn_gate_features(x, yhat_pre_knn, yhat)
+                scale = knn_fusion_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
+                yhat = yhat_pre_knn + scale * (yhat - yhat_pre_knn)
+        if residual_correction_ch is not None:
+            corr_ch = residual_correction_ch.to(device=yhat.device, dtype=yhat.dtype)
+            yhat = yhat + corr_ch.unsqueeze(0)
+
+        # base error metrics per channel
+        err_bch = yhat - y
+        abs_err_bch = err_bch.abs()
+        mse_bc = err_bch.pow(2).mean(dim=-1)  # [B,C]
+        mae_bc = abs_err_bch.mean(dim=-1)  # [B,C]
+        mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)  # [B,K]
+        mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)  # [B,K]
+        mse_loss_sum += mse_bk.sum(dim=0)
+        mae_loss_sum += mae_bk.sum(dim=0)
+
+        # penalties on the final prediction.
+        if P > 0:
+            pen_bcp = []
+            for name in penalty_names:
+                pen_bc = penalty_fns[name](yhat, y)  # [B,C]
+                pen_bcp.append(pen_bc)
+            pen_bcp = torch.stack(pen_bcp, dim=-1)  # [B,C,P]
+            pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
+            pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)  # [B,K,P]
+        else:
+            pen_bkp = route_pen_bkp
         # loss per cluster
         lam = _compute_lambda_bkp(
             base_lambda_kp=lambda_kp,
@@ -782,14 +938,26 @@ class KNNResidualGate(nn.Module):
         dropout: float = 0.0,
         max_scale: float = 1.5,
         init_scale: float = 1.0,
+        scale_mode: str = "sigmoid",
     ):
         super().__init__()
         self.F = int(feat_dim)
         self.C = int(num_channels)
         self.max_scale = max(float(max_scale), 1.0e-6)
-        init_scale = max(1.0e-6, min(float(init_scale), self.max_scale - 1.0e-6))
-        init_prob = init_scale / self.max_scale
-        init_bias = math.log(init_prob / max(1.0 - init_prob, 1.0e-6))
+        self.scale_mode = str(scale_mode).lower()
+        if self.scale_mode not in {"sigmoid", "signed_tanh"}:
+            raise ValueError("Residual gate scale_mode must be 'sigmoid' or 'signed_tanh'.")
+        self.register_buffer("feature_mean", torch.zeros(1, 1, self.F), persistent=True)
+        self.register_buffer("feature_std", torch.ones(1, 1, self.F), persistent=True)
+        self.register_buffer("feature_standardize_enabled", torch.tensor(0.0), persistent=True)
+        if self.scale_mode == "signed_tanh":
+            init_scale = max(-self.max_scale + 1.0e-6, min(float(init_scale), self.max_scale - 1.0e-6))
+            init_ratio = init_scale / self.max_scale
+            init_bias = 0.5 * math.log((1.0 + init_ratio) / max(1.0 - init_ratio, 1.0e-6))
+        else:
+            init_scale = max(1.0e-6, min(float(init_scale), self.max_scale - 1.0e-6))
+            init_prob = init_scale / self.max_scale
+            init_bias = math.log(init_prob / max(1.0 - init_prob, 1.0e-6))
         self.net = nn.Sequential(
             nn.Linear(self.F, int(hidden_dim)),
             nn.GELU(),
@@ -809,8 +977,27 @@ class KNNResidualGate(nn.Module):
             nn.init.zeros_(last.weight)
             nn.init.constant_(last.bias, float(init_bias))
 
+    def set_feature_standardization(self, mean_f: torch.Tensor, std_f: torch.Tensor) -> None:
+        mean = mean_f.detach().view(1, 1, self.F).to(device=self.feature_mean.device, dtype=self.feature_mean.dtype)
+        std = std_f.detach().view(1, 1, self.F).to(device=self.feature_std.device, dtype=self.feature_std.dtype)
+        self.feature_mean.copy_(mean)
+        self.feature_std.copy_(std.clamp_min(1.0e-6))
+        self.feature_standardize_enabled.fill_(1.0)
+
+    def clear_feature_standardization(self) -> None:
+        self.feature_mean.zero_()
+        self.feature_std.fill_(1.0)
+        self.feature_standardize_enabled.zero_()
+
     def forward(self, feat_bcf: torch.Tensor) -> torch.Tensor:
+        if bool(self.feature_standardize_enabled.item() > 0.5):
+            feat_bcf = (feat_bcf - self.feature_mean.to(device=feat_bcf.device, dtype=feat_bcf.dtype)) / self.feature_std.to(
+                device=feat_bcf.device,
+                dtype=feat_bcf.dtype,
+            )
         logits_bc = self.net(feat_bcf).squeeze(-1) + self.channel_bias.view(1, -1)
+        if self.scale_mode == "signed_tanh":
+            return self.max_scale * torch.tanh(logits_bc)
         return self.max_scale * torch.sigmoid(logits_bc)
 
 
@@ -893,6 +1080,7 @@ def train_knn_residual_gate(
         dropout=float(cfg.get("dropout", 0.0)),
         max_scale=float(cfg.get("max_scale", 1.5)),
         init_scale=float(cfg.get("init_scale", 1.0)),
+        scale_mode=str(cfg.get("scale_mode", "sigmoid")),
     ).to(device)
     lr = float(cfg.get("lr", 1.0e-3))
     weight_decay = float(cfg.get("weight_decay", 1.0e-4))
@@ -985,6 +1173,277 @@ def train_knn_residual_gate(
     return gate, summary
 
 
+@torch.no_grad()
+def _collect_pred_residual_gate_tensors(
+    model: nn.Module,
+    gate: ClusterwiseMoEGate,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    penalty_scale: Optional[torch.Tensor],
+    select_ranks: Optional[List[int]] = None,
+    gate_soft_weight: float = 0.0,
+) -> Optional[Dict[str, torch.Tensor]]:
+    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
+        return None
+    moe_enable = bool(moe_cfg.get("enable", True))
+    if not moe_enable:
+        return None
+
+    model.eval()
+    gate.eval()
+    pred_residual.eval()
+    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
+    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
+    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
+    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+
+    feat_parts = []
+    base_parts = []
+    delta_parts = []
+    y_parts = []
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        y_base = model(x, cluster_id_c)
+        feat_bcf = extract_gate_features(x)
+        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        route_pen_bkp = _router_penalty_context_from_history(
+            x_bcl=x,
+            yhat_base_bch=y_base,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            penalty_scale=penalty_scale,
+            cluster_id_c=cluster_id_c,
+            K=K,
+        )
+        mask_bkp, probs_bkp, skip_bk, _ = gate(feat_bkf, straight_through=False)
+        probs_bkp = _apply_router_penalty_context(
+            probs_bkp,
+            route_pen_bkp,
+            router_mode=router_mode,
+            penalty_context_weight=router_penalty_context_weight,
+            detach_penalty_context=router_detach_penalty_context,
+        )
+        rank_mask = None
+        if select_ranks is not None:
+            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+            rank_mask = mask_bkp
+        if gate_soft_weight > 0.0:
+            probs_sel = probs_bkp
+            if rank_mask is not None:
+                probs_sel = probs_sel * rank_mask
+                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            probs_sel = probs_sel * target_mass
+            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
+
+        pred_out = pred_residual(
+            x,
+            y_base,
+            cluster_id_c,
+            mask_bkp,
+            skip_bk=skip_bk if allow_skip else None,
+        )
+        y_residual = pred_out["y_final"]
+        feat = _knn_gate_features(x, y_base, y_residual)
+        feat_parts.append(feat.detach().cpu())
+        base_parts.append(y_base.detach().cpu())
+        delta_parts.append((y_residual - y_base).detach().cpu())
+        y_parts.append(y.detach().cpu())
+
+    if len(feat_parts) == 0:
+        return None
+    return {
+        "feat": torch.cat(feat_parts, dim=0),
+        "base": torch.cat(base_parts, dim=0),
+        "delta": torch.cat(delta_parts, dim=0),
+        "y": torch.cat(y_parts, dim=0),
+    }
+
+
+def train_pred_residual_gate(
+    model: nn.Module,
+    gate: ClusterwiseMoEGate,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    penalty_scale: Optional[torch.Tensor],
+    select_ranks: Optional[List[int]],
+    gate_soft_weight: float,
+    channel_names: List[str],
+    cfg: Dict[str, object],
+) -> Tuple[Optional[KNNResidualGate], Dict[str, object]]:
+    tensors = _collect_pred_residual_gate_tensors(
+        model=model,
+        gate=gate,
+        pred_residual=pred_residual,
+        loader=loader,
+        cluster_id_c=cluster_id_c,
+        K=K,
+        moe_cfg=moe_cfg,
+        device=device,
+        penalty_names=penalty_names,
+        penalty_fns=penalty_fns,
+        penalty_scale=penalty_scale,
+        select_ranks=select_ranks,
+        gate_soft_weight=gate_soft_weight,
+    )
+    if tensors is None:
+        return None, {"enable": False, "reason": "empty_loader_or_residual_disabled"}
+
+    feat = tensors["feat"]
+    base = tensors["base"]
+    delta = tensors["delta"]
+    y = tensors["y"]
+    n = int(feat.shape[0])
+    c = int(feat.shape[1])
+    train_fraction = float(cfg.get("train_fraction", 0.7))
+    split = int(max(1, min(n - 1, round(n * train_fraction)))) if n > 1 else n
+    train_idx = torch.arange(0, split, dtype=torch.long)
+    hold_idx = torch.arange(split, n, dtype=torch.long)
+    if hold_idx.numel() == 0:
+        hold_idx = train_idx
+    standardize_features = bool(cfg.get("standardize_features", False))
+
+    residual_gate = KNNResidualGate(
+        feat_dim=int(feat.shape[-1]),
+        num_channels=c,
+        hidden_dim=int(cfg.get("hidden_dim", 32)),
+        dropout=float(cfg.get("dropout", 0.0)),
+        max_scale=float(cfg.get("max_scale", 1.0)),
+        init_scale=float(cfg.get("init_scale", 0.8)),
+        scale_mode=str(cfg.get("scale_mode", "sigmoid")),
+    ).to(device)
+    lr = float(cfg.get("lr", 1.0e-3))
+    weight_decay = float(cfg.get("weight_decay", 1.0e-4))
+    batch_size = max(1, int(cfg.get("batch_size", 256)))
+    epochs = max(1, int(cfg.get("epochs", 30)))
+    scale_reg = float(cfg.get("scale_reg", 1.0e-4))
+    init_scale = float(cfg.get("init_scale", 0.8))
+    loss_kind = str(cfg.get("loss", "mse")).lower()
+    if loss_kind not in {"mse", "mae", "smooth_l1"}:
+        raise ValueError("moe.pred_side_residual.gate_calibrator.loss must be mse, mae, or smooth_l1.")
+    selection_metric = str(cfg.get("selection_metric", loss_kind)).lower()
+    if selection_metric not in {"mse", "mae"}:
+        raise ValueError("moe.pred_side_residual.gate_calibrator.selection_metric must be mse or mae.")
+    beta = float(cfg.get("beta", 0.5))
+    opt = torch.optim.AdamW(residual_gate.parameters(), lr=lr, weight_decay=weight_decay)
+    best_state = None
+    best_hold = float("inf")
+    best_epoch = 0
+    feature_std_summary: Dict[str, object] = {
+        "standardize_features": bool(standardize_features),
+        "fit_windows": int(train_idx.numel()) if standardize_features else 0,
+        "min_std": None,
+        "max_std": None,
+    }
+    if standardize_features:
+        feat_train = feat.index_select(0, train_idx)
+        feat_flat = feat_train.reshape(-1, int(feat.shape[-1]))
+        feat_mean = feat_flat.mean(dim=0)
+        feat_std = feat_flat.std(dim=0, unbiased=False).clamp_min(1.0e-6)
+        residual_gate.set_feature_standardization(feat_mean.to(device), feat_std.to(device))
+        feature_std_summary.update(
+            {
+                "min_std": float(feat_std.min().item()),
+                "max_std": float(feat_std.max().item()),
+            }
+        )
+
+    def _loss_for(scale_bc: torch.Tensor, base_bch: torch.Tensor, delta_bch: torch.Tensor, y_bch: torch.Tensor):
+        pred = base_bch + scale_bc.unsqueeze(-1) * delta_bch
+        if loss_kind == "mse":
+            loss = (pred - y_bch).pow(2).mean()
+        elif loss_kind == "smooth_l1":
+            loss = torch.nn.functional.smooth_l1_loss(pred, y_bch, beta=beta)
+        else:
+            loss = (pred - y_bch).abs().mean()
+        if scale_reg > 0.0:
+            loss = loss + scale_reg * (scale_bc - init_scale).pow(2).mean()
+        return loss
+
+    def _eval_idx(idx: torch.Tensor) -> Tuple[float, float, torch.Tensor]:
+        residual_gate.eval()
+        ae = 0.0
+        se = 0.0
+        denom = 0
+        scale_sum = torch.zeros(c, device=device)
+        count = 0
+        with torch.no_grad():
+            for b0 in range(0, int(idx.numel()), batch_size):
+                batch_idx = idx[b0:b0 + batch_size]
+                feat_b = feat.index_select(0, batch_idx).to(device)
+                base_b = base.index_select(0, batch_idx).to(device)
+                delta_b = delta.index_select(0, batch_idx).to(device)
+                y_b = y.index_select(0, batch_idx).to(device)
+                scale_b = residual_gate(feat_b)
+                pred_b = base_b + scale_b.unsqueeze(-1) * delta_b
+                err = pred_b - y_b
+                ae += float(err.abs().sum().item())
+                se += float(err.pow(2).sum().item())
+                denom += int(err.numel())
+                scale_sum += scale_b.sum(dim=0)
+                count += int(scale_b.shape[0])
+        return ae / max(denom, 1), se / max(denom, 1), (scale_sum / max(count, 1)).detach().cpu()
+
+    for ep in range(1, epochs + 1):
+        residual_gate.train()
+        perm = train_idx[torch.randperm(train_idx.numel())]
+        for b0 in range(0, int(perm.numel()), batch_size):
+            batch_idx = perm[b0:b0 + batch_size]
+            feat_b = feat.index_select(0, batch_idx).to(device)
+            base_b = base.index_select(0, batch_idx).to(device)
+            delta_b = delta.index_select(0, batch_idx).to(device)
+            y_b = y.index_select(0, batch_idx).to(device)
+            scale_b = residual_gate(feat_b)
+            loss = _loss_for(scale_b, base_b, delta_b, y_b)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(residual_gate.parameters(), float(cfg.get("grad_clip", 1.0)))
+            opt.step()
+        hold_mae, hold_mse, _ = _eval_idx(hold_idx)
+        hold_metric = hold_mse if selection_metric == "mse" else hold_mae
+        if hold_metric < best_hold:
+            best_hold = hold_metric
+            best_epoch = ep
+            best_state = {k: v.detach().cpu().clone() for k, v in residual_gate.state_dict().items()}
+
+    if best_state is not None:
+        residual_gate.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    train_mae, train_mse, train_scale_c = _eval_idx(train_idx)
+    hold_mae, hold_mse, hold_scale_c = _eval_idx(hold_idx)
+    summary = {
+        "enable": True,
+        "loss": loss_kind,
+        "selection_metric": selection_metric,
+        "scale_mode": str(residual_gate.scale_mode),
+        "train_windows": int(train_idx.numel()),
+        "holdout_windows": int(hold_idx.numel()),
+        "best_epoch": int(best_epoch),
+        "train_mae": float(train_mae),
+        "train_mse": float(train_mse),
+        "holdout_mae": float(hold_mae),
+        "holdout_mse": float(hold_mse),
+        "channel_names": list(channel_names),
+        "train_mean_scale": [float(v) for v in train_scale_c.tolist()],
+        "holdout_mean_scale": [float(v) for v in hold_scale_c.tolist()],
+        "feature_standardization": feature_std_summary,
+    }
+    residual_gate.eval()
+    return residual_gate, summary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
@@ -1042,13 +1501,16 @@ def main():
     # 3) corr matrix (skip when using random grouping)
     cl = cfg["cluster"]
     method_norm = str(cl.get("method", "agglomerative")).lower()
+    cluster_fit_tc = data_tc[:t_train] if bool(cl.get("train_only", True)) else data_tc
+    if bool(cl.get("train_only", True)):
+        print("Cluster fit uses train split only.")
     if method_norm in {"random", "rand"}:
         C = int(data_tc.shape[1])
         corr_cc = torch.eye(C, device=data_tc.device, dtype=data_tc.dtype)
         if cfg["corr"]["compute"]:
             print("Skip corr matrix compute: cluster.method=random")
     else:
-        corr_cc = pearson_corr_matrix(data_tc)
+        corr_cc = pearson_corr_matrix(cluster_fit_tc)
         if cfg["corr"]["compute"]:
             save_path = cfg["corr"]["save_path"]
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1059,7 +1521,7 @@ def main():
     rs = cl.get("random_state", 0)
     cluster_id_c, clusters = cluster_channels_by_corr(
         corr_cc=corr_cc,
-        data_tc=data_tc,
+        data_tc=cluster_fit_tc,
         n_clusters=cl.get("n_clusters", None),
         distance_threshold=cl.get("distance_threshold", None),
         linkage=cl.get("linkage", "average"),
@@ -1085,11 +1547,13 @@ def main():
 
     # cluster memory config
     memory_cfg = cfg.get("memory", {})
-    memory_enable = bool(memory_cfg.get("enable", True))
+    memory_enable = bool(memory_cfg.get("enable", False))
     memory_path = str(memory_cfg.get("path", os.path.join(out_dir, "cluster_memory.pt")))
 
     L = int(cfg["window"]["input_len"])
     H = int(cfg["window"]["pred_len"])
+    eval_cfg = cfg.get("eval", {}) or {}
+    skip_test = bool(eval_cfg.get("skip_test", True))
 
     # Keep materialized windows on CPU.  Electricity-style datasets with many
     # channels and long horizons can expand to tens of GB; batches are moved to
@@ -1102,10 +1566,18 @@ def main():
     test_eval_start = t_val
     if past_context:
         xva, yva, val_eval_start = make_label_range_windows(data_window_tc, L, H, t_train, t_val)
-        xte, yte, test_eval_start = make_label_range_windows(data_window_tc, L, H, t_val, T)
+        if skip_test:
+            xte = torch.empty(0, C, L, dtype=data_window_tc.dtype)
+            yte = torch.empty(0, C, H, dtype=data_window_tc.dtype)
+        else:
+            xte, yte, test_eval_start = make_label_range_windows(data_window_tc, L, H, t_val, T)
     else:
         xva, yva = make_strict_windows(data_window_tc, L, H, t_train, t_val)
-        xte, yte = make_strict_windows(data_window_tc, L, H, t_val, T)
+        if skip_test:
+            xte = torch.empty(0, C, L, dtype=data_window_tc.dtype)
+            yte = torch.empty(0, C, H, dtype=data_window_tc.dtype)
+        else:
+            xte, yte = make_strict_windows(data_window_tc, L, H, t_val, T)
 
     print(
         f"Windows: train={len(xtr)}, val={len(xva)}, test={len(xte)}, "
@@ -1230,7 +1702,7 @@ def main():
     # cluster portraits (prototype + penalty metrics)
     portrait_cfg = cfg.get("portrait", {})
     gate_prior_cfg = cfg.get("moe", {}).get("gate_prior", {})
-    need_penalty_portrait = bool(portrait_cfg.get("enable", True)) or bool(gate_prior_cfg.get("enable", False))
+    need_penalty_portrait = bool(portrait_cfg.get("enable", False)) or bool(gate_prior_cfg.get("enable", False))
     penalty_portrait_kp = None
     if need_penalty_portrait and len(penalty_names) > 0:
         # Portrait generation is diagnostic; keep it from advancing the shuffled
@@ -1255,7 +1727,7 @@ def main():
         penalty_portrait_kp = compute_cluster_penalty_portrait(
             portrait_loader, penalty_names, penalty_fns, cluster_id_c, K, H, device
         )
-    if bool(portrait_cfg.get("enable", True)):
+    if bool(portrait_cfg.get("enable", False)):
         portrait_dir = portrait_cfg.get("out_dir", os.path.join(out_dir, "cluster_portraits"))
         portrait_dpi = int(portrait_cfg.get("dpi", 140))
         max_points = int(portrait_cfg.get("max_points", 2000))
@@ -1301,6 +1773,18 @@ def main():
     router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
+    pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
+    pred_residual_specialization_weight = (
+        float(pred_residual_cfg.get("specialization_weight", 0.1)) if pred_residual_enable else 0.0
+    )
+    pred_residual_norm_weight = float(pred_residual_cfg.get("norm_weight", 1.0e-4)) if pred_residual_enable else 0.0
+    pred_residual_intervention_weight = (
+        float(pred_residual_cfg.get("intervention_weight", 1.0e-3)) if pred_residual_enable else 0.0
+    )
+    pred_residual_detach_routed_penalty_pred = (
+        bool(pred_residual_cfg.get("detach_routed_penalty_pred", False)) if pred_residual_enable else False
+    )
     allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable and P > 0
     skip_cost = float(moe_cfg.get("skip_cost", 0.0)) if allow_skip else 0.0
     skip_init_bias = float(moe_cfg.get("skip_init_bias", -2.0))
@@ -1323,6 +1807,48 @@ def main():
     gate.noise_std = float(moe_cfg.get("gate_noise_std", 0.0))
     gate.logit_clip = float(moe_cfg.get("gate_logit_clip", 0.0))
     gate.prob_floor = float(moe_cfg.get("gate_prob_floor", 0.0))
+    gate_init_bias_cfg = moe_cfg.get("gate_init_bias", {}) or {}
+    if P > 0 and bool(gate_init_bias_cfg.get("enable", False)):
+        raw_bias = gate_init_bias_cfg.get("values", {}) or {}
+        default_bias = float(raw_bias.get("default", 0.0)) if isinstance(raw_bias, dict) else 0.0
+        bias_p = torch.tensor(
+            [
+                float(raw_bias.get(name, default_bias)) if isinstance(raw_bias, dict) else default_bias
+                for name in penalty_names
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        with torch.no_grad():
+            for k in range(K):
+                gate.b2[k].add_(bias_p)
+        print(f"Gate init bias applied: {dict(zip(penalty_names, [float(v) for v in bias_p.detach().cpu().tolist()]))}")
+    pred_residual = None
+    if pred_residual_enable:
+        pred_residual = ClusterwisePredResidualMoE(
+            num_clusters=K,
+            num_penalties=P,
+            input_len=L,
+            pred_len=H,
+            hidden_dim=int(pred_residual_cfg.get("corrector_hidden", 32)),
+            init_alpha=float(pred_residual_cfg.get("init_alpha", -3.0)),
+            alpha_scale=float(pred_residual_cfg.get("alpha_scale", 0.5)),
+            use_y_base_input=bool(pred_residual_cfg.get("use_y_base_input", True)),
+            feature_mode=str(pred_residual_cfg.get("feature_mode", "legacy")),
+            residual_clip=float(pred_residual_cfg.get("residual_clip", 0.0)),
+            intervention_enable=bool(pred_residual_cfg.get("intervention_enable", False)),
+            intervention_init=float(pred_residual_cfg.get("intervention_init", -2.0)),
+        ).to(device)
+        print(
+            "Prediction residual MoE enabled: "
+            f"hidden={pred_residual.hidden_dim}, feature_mode={pred_residual.feature_mode}, "
+            f"alpha_scale={pred_residual.alpha_scale:.3f}, "
+            f"residual_clip={pred_residual.residual_clip:.3f}, "
+            f"specialization_weight={pred_residual_specialization_weight:.6f}, "
+            f"norm_weight={pred_residual_norm_weight:.6f}, "
+            f"intervention_weight={pred_residual_intervention_weight:.6f}, "
+            f"detach_routed_penalty_pred={pred_residual_detach_routed_penalty_pred}"
+        )
     gate_balance_target_kp = None
     gate_prior_enable = bool(gate_prior_cfg.get("enable", False)) and penalty_portrait_kp is not None and P > 0
     if gate_prior_enable:
@@ -1605,6 +2131,8 @@ def main():
         ]
         if not (bilevel_enable and bilevel_optimize_gate):
             params_k.extend([gate.W1[k], gate.b1[k], gate.W2[k], gate.b2[k]])
+        if pred_residual is not None:
+            params_k.extend(pred_residual.get_cluster_params(k))
         if dynamic_lambda is not None and (not bilevel_enable):
             params_k.extend(dynamic_lambda.get_cluster_params(k))
         if learnable_lambda is not None and (not bilevel_enable):
@@ -1879,7 +2407,10 @@ def main():
     bad_cnt = torch.zeros((K,), dtype=torch.long, device=device)
     stopped = torch.zeros((K,), dtype=torch.bool, device=device)
 
-    best_state = [{"model": None, "gate": None, "dynamic_lambda": None, "learnable_lambda": None} for _ in range(K)]
+    best_state = [
+        {"model": None, "gate": None, "pred_residual": None, "dynamic_lambda": None, "learnable_lambda": None}
+        for _ in range(K)
+    ]
     best_epoch = torch.ones((K,), dtype=torch.long, device=device)
     train_mse_hist = []
     val_mse_hist = []
@@ -1888,6 +2419,8 @@ def main():
     def save_best(k: int, epoch_idx: int):
         best_state[k]["model"] = model.get_cluster_state(k)
         best_state[k]["gate"] = gate.get_cluster_state(k)
+        if pred_residual is not None:
+            best_state[k]["pred_residual"] = pred_residual.get_cluster_state(k)
         if dynamic_lambda is not None:
             best_state[k]["dynamic_lambda"] = dynamic_lambda.get_cluster_state(k)
         if learnable_lambda is not None:
@@ -1899,6 +2432,8 @@ def main():
             if best_state[k]["model"] is not None:
                 model.load_cluster_state(k, best_state[k]["model"])
                 gate.load_cluster_state(k, best_state[k]["gate"])
+                if pred_residual is not None and best_state[k]["pred_residual"] is not None:
+                    pred_residual.load_cluster_state(k, best_state[k]["pred_residual"])
                 if dynamic_lambda is not None and best_state[k]["dynamic_lambda"] is not None:
                     dynamic_lambda.load_cluster_state(k, best_state[k]["dynamic_lambda"])
                 if learnable_lambda is not None and best_state[k]["learnable_lambda"] is not None:
@@ -2026,12 +2561,15 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             yhat = model(x, cluster_id_c)
-            pen_bcp = []
-            for name in penalty_names:
-                pen_bcp.append(penalty_fns[name](yhat, y))
-            pen_bcp = torch.stack(pen_bcp, dim=-1)
-            pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
-            pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)
+            pen_bkp = _router_penalty_context_from_history(
+                x_bcl=x,
+                yhat_base_bch=yhat,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                cluster_id_c=cluster_id_c,
+                K=K,
+            )
             feat_bcf = extract_gate_features(x)  # [B,C,F]
             feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
             _, probs_bkp, skip_bk, skip_prob_bk = gate(feat_bkf, straight_through=False)  # [B,K,P]
@@ -2092,17 +2630,204 @@ def main():
             print(f"Saved cluster penalty probabilities to: {csv_path}")
         return avg_probs.detach()
 
+    @torch.no_grad()
+    def collect_pred_residual_summary(loader: DataLoader) -> Dict[str, object]:
+        cfg_summary = {
+            "enabled": bool(pred_residual is not None),
+            "specialization_weight": float(pred_residual_specialization_weight),
+            "norm_weight": float(pred_residual_norm_weight),
+            "intervention_weight": float(pred_residual_intervention_weight),
+            "detach_routed_penalty_pred": bool(pred_residual_detach_routed_penalty_pred),
+        }
+        if pred_residual is None or P == 0 or len(loader) == 0:
+            return cfg_summary
+        cfg_summary["feature_mode"] = str(getattr(pred_residual, "feature_mode", "legacy"))
+        cfg_summary["input_dim"] = int(getattr(pred_residual, "input_dim", 0))
+
+        model.eval()
+        gate.eval()
+        pred_residual.eval()
+        alpha_kp = pred_residual.alpha_values().detach()
+        branch_sq_sum = 0.0
+        branch_numel = 0
+        delta_sq_sum = 0.0
+        base_sq_sum = 0.0
+        spec_sum_k = torch.zeros(K, device=device)
+        norm_sum_k = torch.zeros(K, device=device)
+        intervention_sum_k = torch.zeros(K, device=device)
+        selected_intervention_sum_p = torch.zeros(P, device=device)
+        route_sum_p = torch.zeros(P, device=device)
+        effective_route_sum_p = torch.zeros(P, device=device)
+        route_numel = 0
+        cnt = 0
+
+        for x, y, _ in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            y_base = model(x, cluster_id_c)
+            route_pen_bkp = _router_penalty_context_from_history(
+                x_bcl=x,
+                yhat_base_bch=y_base,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                cluster_id_c=cluster_id_c,
+                K=K,
+            )
+            feat_bcf = extract_gate_features(x)
+            feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+            mask_bkp, probs_bkp, skip_bk, _ = gate(feat_bkf, straight_through=False)
+            probs_bkp = _apply_router_penalty_context(
+                probs_bkp,
+                route_pen_bkp,
+                router_mode=router_mode,
+                penalty_context_weight=router_penalty_context_weight,
+                detach_penalty_context=router_detach_penalty_context,
+            )
+            if select_ranks is not None:
+                mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+            pred_out = pred_residual(
+                x,
+                y_base,
+                cluster_id_c,
+                mask_bkp,
+                skip_bk=skip_bk if allow_skip else None,
+            )
+            y_final = pred_out["y_final"]
+            terms = _pred_residual_loss_terms(
+                pred_out=pred_out,
+                y_base=y_base,
+                y_final=y_final,
+                y=y,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                penalty_scale=penalty_scale,
+                specialization_weight=1.0,
+                norm_weight=1.0,
+                intervention_weight=1.0,
+            )
+            spec_sum_k += terms["specialization_bk"].sum(dim=0)
+            norm_sum_k += terms["norm_bk"].sum(dim=0)
+            intervention_sum_k += terms["intervention_bk"].sum(dim=0)
+            cnt += int(x.shape[0])
+            branches = pred_out["branches"]
+            branch_sq_sum += float(branches.pow(2).sum().item())
+            branch_numel += int(branches.numel())
+            delta = y_final - y_base
+            delta_sq_sum += float(delta.pow(2).sum().item())
+            base_sq_sum += float(y_base.pow(2).sum().item())
+            route_bcp = pred_out["route_bcp"].detach()
+            intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp)).detach()
+            effective_route_bcp = pred_out.get("effective_route_bcp", route_bcp * intervention_bcp).detach()
+            route_sum_p += route_bcp.sum(dim=(0, 1))
+            selected_intervention_sum_p += (route_bcp * intervention_bcp).sum(dim=(0, 1))
+            effective_route_sum_p += effective_route_bcp.sum(dim=(0, 1))
+            route_numel += int(route_bcp.shape[0] * route_bcp.shape[1])
+
+        spec_k = spec_sum_k / max(cnt, 1)
+        norm_k = norm_sum_k / max(cnt, 1)
+        intervention_k = intervention_sum_k / max(cnt, 1)
+        route_denom_p = route_sum_p.clamp_min(1.0e-8)
+        selected_intervention_p = selected_intervention_sum_p / route_denom_p
+        effective_route_p = effective_route_sum_p / max(route_numel, 1)
+        cfg_summary.update(
+            {
+                "alpha_mean": float(alpha_kp.mean().item()),
+                "alpha_by_penalty": {
+                    penalty_names[p]: float(alpha_kp[:, p].mean().item()) for p in range(P)
+                },
+                "intervention_mean_selected": float(
+                    (selected_intervention_sum_p.sum() / route_sum_p.sum().clamp_min(1.0e-8)).item()
+                ),
+                "intervention_by_penalty": {
+                    penalty_names[p]: float(selected_intervention_p[p].item()) for p in range(P)
+                },
+                "effective_route_by_penalty": {
+                    penalty_names[p]: float(effective_route_p[p].item()) for p in range(P)
+                },
+                "branch_rms": float((branch_sq_sum / max(branch_numel, 1)) ** 0.5),
+                "residual_base_rms_ratio": float((delta_sq_sum / max(base_sq_sum, 1.0e-12)) ** 0.5),
+                "specialization_loss": float(reduce_cluster_metric(spec_k, cluster_weight_k).item()),
+                "norm_loss": float(reduce_cluster_metric(norm_k, cluster_weight_k).item()),
+                "intervention_loss": float(reduce_cluster_metric(intervention_k, cluster_weight_k).item()),
+            }
+        )
+        return cfg_summary
+
     def compute_batch_terms(
         x: torch.Tensor,
         y: torch.Tensor,
         base_lambda_kp: torch.Tensor,
         model_params: Optional[Dict[str, torch.Tensor]] = None,
         gate_params: Optional[Dict[str, torch.Tensor]] = None,
+        pred_residual_params: Optional[Dict[str, torch.Tensor]] = None,
         dynamic_lambda_params: Optional[Dict[str, torch.Tensor]] = None,
         straight_through: bool = True,
         mae_objective_weight: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
-        yhat = _module_call(model, model_params, x, cluster_id_c)
+        yhat_base = _module_call(model, model_params, x, cluster_id_c)
+        feat_bcf = extract_gate_features(x)
+        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)
+        probs_bkp = None
+        skip_bk = None
+        skip_prob_bk = None
+        pred_out = None
+
+        route_pen_bkp = _router_penalty_context_from_history(
+            x_bcl=x,
+            yhat_base_bch=yhat_base,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            penalty_scale=penalty_scale,
+            cluster_id_c=cluster_id_c,
+            K=K,
+        )
+
+        if moe_enable and P > 0:
+            mask_bkp, probs_bkp, skip_bk, skip_prob_bk = _module_call(
+                gate,
+                gate_params,
+                feat_bkf,
+                straight_through=straight_through,
+            )
+            probs_bkp = _apply_router_penalty_context(
+                probs_bkp,
+                route_pen_bkp,
+                router_mode=router_mode,
+                penalty_context_weight=router_penalty_context_weight,
+                detach_penalty_context=router_detach_penalty_context,
+            )
+            rank_mask = None
+            if select_ranks is not None:
+                mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=straight_through)
+                rank_mask = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+            if gate_soft_weight > 0.0:
+                probs_sel = probs_bkp
+                if rank_mask is not None:
+                    probs_sel = probs_sel * rank_mask
+                    probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
+                probs_sel = probs_sel * target_mass
+                mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
+        else:
+            mask_bkp = torch.zeros_like(route_pen_bkp)
+
+        if pred_residual is not None and moe_enable and P > 0:
+            pred_out = _module_call(
+                pred_residual,
+                pred_residual_params,
+                x,
+                yhat_base,
+                cluster_id_c,
+                mask_bkp,
+                skip_bk=skip_bk if allow_skip else None,
+            )
+            yhat = pred_out["y_final"]
+        else:
+            yhat = yhat_base
 
         err_bch = yhat - y
         abs_err_bch = err_bch.abs()
@@ -2121,49 +2846,20 @@ def main():
             mae_objective_bk = torch.zeros_like(mse_bk)
 
         if P > 0:
+            if pred_out is not None:
+                yhat_for_penalty = yhat_base + (yhat - yhat_base).detach()
+                if pred_residual_detach_routed_penalty_pred:
+                    yhat_for_penalty = yhat_for_penalty.detach()
+            else:
+                yhat_for_penalty = yhat
             pen_bcp = []
             for name in penalty_names:
-                pen_bcp.append(penalty_fns[name](yhat, y))
+                pen_bcp.append(penalty_fns[name](yhat_for_penalty, y))
             pen_bcp = torch.stack(pen_bcp, dim=-1)
             pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
             pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)
         else:
-            pen_bkp = torch.zeros((x.shape[0], K, 0), device=device)
-
-        feat_bcf = extract_gate_features(x)
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
-        series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)
-        probs_bkp = None
-        skip_bk = None
-        skip_prob_bk = None
-        if moe_enable and P > 0:
-            mask_bkp, probs_bkp, skip_bk, skip_prob_bk = _module_call(
-                gate,
-                gate_params,
-                feat_bkf,
-                straight_through=straight_through,
-            )
-            probs_bkp = _apply_router_penalty_context(
-                probs_bkp,
-                pen_bkp,
-                router_mode=router_mode,
-                penalty_context_weight=router_penalty_context_weight,
-                detach_penalty_context=router_detach_penalty_context,
-            )
-            rank_mask = None
-            if select_ranks is not None:
-                mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=straight_through)
-                rank_mask = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
-            if gate_soft_weight > 0.0:
-                probs_sel = probs_bkp
-                if rank_mask is not None:
-                    probs_sel = probs_sel * rank_mask
-                    probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
-                probs_sel = probs_sel * target_mass
-                mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
-        else:
-            mask_bkp = torch.zeros_like(pen_bkp)
+            pen_bkp = route_pen_bkp
 
         if P > 0:
             lam_bkp = _compute_lambda_bkp(
@@ -2190,6 +2886,21 @@ def main():
             penalty_loss_bk = torch.zeros_like(mse_bk)
 
         objective_loss_bk = (mse_weight * mse_bk) + (float(mae_objective_weight) * mae_objective_bk) + penalty_loss_bk
+        pred_loss_terms = _pred_residual_loss_terms(
+            pred_out=pred_out,
+            y_base=yhat_base,
+            y_final=yhat,
+            y=y,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            cluster_id_c=cluster_id_c,
+            K=K,
+            penalty_scale=penalty_scale,
+            specialization_weight=pred_residual_specialization_weight,
+            norm_weight=pred_residual_norm_weight,
+            intervention_weight=pred_residual_intervention_weight,
+        )
+        objective_loss_bk = objective_loss_bk + pred_loss_terms["total_bk"]
         return {
             "mse_bk": mse_bk,
             "mae_bk": mae_bk,
@@ -2222,6 +2933,8 @@ def main():
     inner_modules = [("model", model)]
     if not (bilevel_enable and bilevel_optimize_gate):
         inner_modules.append(("gate", gate))
+    if pred_residual is not None:
+        inner_modules.append(("pred_residual", pred_residual))
     for prefix, module in inner_modules:
         for name, param in module.named_parameters():
             inner_named.append((prefix, name, param))
@@ -2266,18 +2979,24 @@ def main():
         )
         fast_model_params = {}
         fast_gate_params = {}
+        fast_pred_residual_params = {}
         for (prefix, name, param), grad in zip(inner_named, inner_grads):
             fast_param = param if grad is None else (param - bilevel_inner_lr * grad)
             if prefix == "model":
                 fast_model_params[name] = fast_param
-            else:
+            elif prefix == "gate":
                 fast_gate_params[name] = fast_param
+            else:
+                fast_pred_residual_params[name] = fast_param
 
         model_was_training = model.training
         gate_was_training = gate.training
+        pred_residual_was_training = pred_residual.training if pred_residual is not None else False
         dyn_was_training = dynamic_lambda.training if dynamic_lambda is not None else False
         model.eval()
         gate.eval()
+        if pred_residual is not None:
+            pred_residual.eval()
         if dynamic_lambda is not None:
             dynamic_lambda.eval()
         val_terms = compute_batch_terms(
@@ -2285,6 +3004,7 @@ def main():
             base_lambda_kp=base_lambda_kp,
             model_params=fast_model_params,
             gate_params=fast_gate_params if len(fast_gate_params) > 0 else None,
+            pred_residual_params=fast_pred_residual_params if len(fast_pred_residual_params) > 0 else None,
             straight_through=False,
             mae_objective_weight=mae_objective_weight_at(epoch_idx),
         )
@@ -2292,6 +3012,8 @@ def main():
             model.train()
         if gate_was_training:
             gate.train()
+        if pred_residual is not None and pred_residual_was_training:
+            pred_residual.train()
         if dynamic_lambda is not None and dyn_was_training:
             dynamic_lambda.train()
         outer_metric_bk = val_terms["mse_bk"]
@@ -2342,6 +3064,8 @@ def main():
             warmup_scale = 1.0
         model.train()
         gate.train()
+        if pred_residual is not None:
+            pred_residual.train()
         if dynamic_lambda is not None:
             dynamic_lambda.train()
         running = 0.0
@@ -2368,46 +3092,28 @@ def main():
                 train_window = torch.cat([x, y], dim=-1)
                 cluster_memory_bank.update(train_window, idx, cluster_id_c)
 
-            yhat = model(x, cluster_id_c)
-
-            err_bch = yhat - y
-            abs_err_bch = err_bch.abs()
-            mse_bc = err_bch.pow(2).mean(dim=-1)  # [B,C]
-            mae_bc = abs_err_bch.mean(dim=-1)  # [B,C]
-            mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)  # [B,K]
-            mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)  # [B,K]
-            mae_objective_weight_ep = mae_objective_weight_at(ep)
-            if mae_objective_weight_ep != 0.0:
-                mae_objective_bc = _mae_objective_bc_from_abs(
-                    abs_err_bch,
-                    kind=mae_objective_kind,
-                    beta=mae_objective_beta,
-                )
-                mae_objective_bk = scatter_mean_bc_to_bk(mae_objective_bc, cluster_id_c, K)
-            else:
-                mae_objective_bk = torch.zeros_like(mse_bk)
-
-            if P > 0:
-                pen_bcp = []
-                for name in penalty_names:
-                    pen_bc = penalty_fns[name](yhat, y)  # [B,C]
-                    pen_bcp.append(pen_bc)
-                pen_bcp = torch.stack(pen_bcp, dim=-1)  # [B,C,P]
-                pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
-                pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)  # [B,K,P]
-            else:
-                pen_bkp = torch.zeros((x.shape[0], K, 0), device=device)
-
+            yhat_base = model(x, cluster_id_c)
             feat_bcf = extract_gate_features(x)  # [B,C,F]
             feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
             series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
             skip_bk = None
+            pred_out = None
+            route_pen_bkp = _router_penalty_context_from_history(
+                x_bcl=x,
+                yhat_base_bch=yhat_base,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                cluster_id_c=cluster_id_c,
+                K=K,
+            )
+
             if moe_enable and P > 0:
                 straight_through = (not bool(moe_cfg["detach_penalty_grad"])) and (not (bilevel_enable and bilevel_optimize_gate))
                 mask_bkp, probs_bkp, skip_bk, skip_prob_bk = gate(feat_bkf, straight_through=straight_through)
                 probs_bkp = _apply_router_penalty_context(
                     probs_bkp,
-                    pen_bkp,
+                    route_pen_bkp,
                     router_mode=router_mode,
                     penalty_context_weight=router_penalty_context_weight,
                     detach_penalty_context=router_detach_penalty_context,
@@ -2439,7 +3145,53 @@ def main():
                             rank_counts[:, r] += cnt
                         rank_total += int(order.shape[0] * order.shape[1])
             else:
-                mask_bkp = torch.zeros_like(pen_bkp)
+                mask_bkp = torch.zeros_like(route_pen_bkp)
+
+            if pred_residual is not None and moe_enable and P > 0:
+                pred_out = pred_residual(
+                    x,
+                    yhat_base,
+                    cluster_id_c,
+                    mask_bkp,
+                    skip_bk=skip_bk if allow_skip else None,
+                )
+                yhat = pred_out["y_final"]
+            else:
+                yhat = yhat_base
+
+            err_bch = yhat - y
+            abs_err_bch = err_bch.abs()
+            mse_bc = err_bch.pow(2).mean(dim=-1)  # [B,C]
+            mae_bc = abs_err_bch.mean(dim=-1)  # [B,C]
+            mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)  # [B,K]
+            mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)  # [B,K]
+            mae_objective_weight_ep = mae_objective_weight_at(ep)
+            if mae_objective_weight_ep != 0.0:
+                mae_objective_bc = _mae_objective_bc_from_abs(
+                    abs_err_bch,
+                    kind=mae_objective_kind,
+                    beta=mae_objective_beta,
+                )
+                mae_objective_bk = scatter_mean_bc_to_bk(mae_objective_bc, cluster_id_c, K)
+            else:
+                mae_objective_bk = torch.zeros_like(mse_bk)
+
+            if P > 0:
+                if pred_out is not None:
+                    yhat_for_penalty = yhat_base + (yhat - yhat_base).detach()
+                    if pred_residual_detach_routed_penalty_pred:
+                        yhat_for_penalty = yhat_for_penalty.detach()
+                else:
+                    yhat_for_penalty = yhat
+                pen_bcp = []
+                for name in penalty_names:
+                    pen_bc = penalty_fns[name](yhat_for_penalty, y)  # [B,C]
+                    pen_bcp.append(pen_bc)
+                pen_bcp = torch.stack(pen_bcp, dim=-1)  # [B,C,P]
+                pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
+                pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)  # [B,K,P]
+            else:
+                pen_bkp = route_pen_bkp
 
             if P > 0:
                 base_lambda_kp = lambda_kp_at(ep, detach=bilevel_enable) * warmup_scale
@@ -2468,7 +3220,21 @@ def main():
                     + (float(mae_objective_weight_ep) * mae_objective_bk)
                     + penalty_loss_bk
                 )  # [B,K]
-                loss_bk = objective_loss_bk
+                pred_loss_terms = _pred_residual_loss_terms(
+                    pred_out=pred_out,
+                    y_base=yhat_base,
+                    y_final=yhat,
+                    y=y,
+                    penalty_names=penalty_names,
+                    penalty_fns=penalty_fns,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    penalty_scale=penalty_scale,
+                    specialization_weight=pred_residual_specialization_weight,
+                    norm_weight=pred_residual_norm_weight,
+                    intervention_weight=pred_residual_intervention_weight,
+                )
+                loss_bk = objective_loss_bk + pred_loss_terms["total_bk"]
                 if (not bilevel_enable) and learnable_lambda is not None and learnable_lambda_reg_weight > 0.0:
                     loss_bk = loss_bk + learnable_lambda_reg_weight * learnable_lambda.regularization().unsqueeze(0)
                 if (not bilevel_enable) and dynamic_lambda is not None and dynamic_lambda_reg_weight > 0.0:
@@ -2505,6 +3271,8 @@ def main():
             model.mask_cluster_grads(stopped)
             if moe_enable:
                 gate.mask_cluster_grads(stopped)
+            if pred_residual is not None:
+                pred_residual.mask_cluster_grads(stopped)
             if dynamic_lambda is not None:
                 dynamic_lambda.mask_cluster_grads(stopped)
             if learnable_lambda is not None:
@@ -2559,6 +3327,7 @@ def main():
             mae_objective_weight=mae_objective_weight_at(ep),
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
             knn_hybrid=knn_hybrid_val if knn_cfg.use_for_model_selection else None,
             eval_start=val_eval_start,
         )
@@ -2623,16 +3392,17 @@ def main():
         suffix="early stopped" if early_stopped else "done",
     )
 
-    plot_cfg = cfg["plot"]
-    loss_dir = os.path.join(out_dir, "loss_curves")
-    save_cluster_metric_curves(
-        out_dir=loss_dir,
-        train_metric_hist=train_mse_hist,
-        val_metric_hist=val_mse_hist,
-        metric_name="mse",
-        dpi=int(plot_cfg.get("dpi", 140)),
-    )
-    print(f"Saved MSE curves to: {loss_dir}")
+    plot_cfg = cfg.get("plot", {}) or {}
+    if bool(plot_cfg.get("save_loss_curves", False)):
+        loss_dir = os.path.join(out_dir, "loss_curves")
+        save_cluster_metric_curves(
+            out_dir=loss_dir,
+            train_metric_hist=train_mse_hist,
+            val_metric_hist=val_mse_hist,
+            metric_name="mse",
+            dpi=int(plot_cfg.get("dpi", 140)),
+        )
+        print(f"Saved MSE curves to: {loss_dir}")
 
     load_best_all()
     if knn_cfg.enable and knn_requires_base_bank:
@@ -2662,7 +3432,7 @@ def main():
         save_cluster_memory(memory_path, prototypes_kt, cluster_id_c, channel_names, meta=memory_meta)
         print(f"Saved cluster memory to: {memory_path}")
 
-    if bool(memory_cfg.get("save_checkpoint", True)):
+    if bool(memory_cfg.get("save_checkpoint", False)):
         ckpt_path = str(memory_cfg.get("checkpoint_path", os.path.join(out_dir, "best_checkpoint.pt")))
         meta = {
             "K": K,
@@ -2677,6 +3447,7 @@ def main():
             "penalty_names": list(penalty_names),
             "best_epoch": best_epoch.detach().cpu(),
         }
+        pred_residual_state = None if pred_residual is None else pred_residual.state_dict()
         dynamic_lambda_state = None if dynamic_lambda is None else dynamic_lambda.state_dict()
         learnable_lambda_state = None if learnable_lambda is None else learnable_lambda.state_dict()
         save_cluster_checkpoint(
@@ -2684,6 +3455,7 @@ def main():
             model.state_dict(),
             gate.state_dict(),
             meta,
+            pred_residual_state=pred_residual_state,
             dynamic_lambda_state=dynamic_lambda_state,
             learnable_lambda_state=learnable_lambda_state,
         )
@@ -2718,7 +3490,8 @@ def main():
     avg_probs_summary = print_cluster_penalty_summary(summary_loader, title=summary_name, lam_kp=lam_kp_summary, csv_path=summary_csv_path)
     lambda_stats_csv_path = os.path.join(out_dir, "cluster_lambda_stats.csv")
     print_dynamic_lambda_summary(summary_name, lambda_stats, csv_path=lambda_stats_csv_path)
-    if bool(portrait_cfg.get("enable", True)) and (avg_probs_summary is not None) and len(penalty_names) > 0:
+    moe_residual_summary = collect_pred_residual_summary(summary_loader)
+    if bool(portrait_cfg.get("enable", False)) and (avg_probs_summary is not None) and len(penalty_names) > 0:
         portrait_dir = portrait_cfg.get("out_dir", os.path.join(out_dir, "cluster_portraits"))
         portrait_dpi = int(portrait_cfg.get("dpi", 140))
         max_points = int(portrait_cfg.get("max_points", 2000))
@@ -2736,9 +3509,9 @@ def main():
             metric_scale_mode="raw_0_1",
         )
         print(f"Updated cluster portraits with expert selection radar: {paths['dir']}")
-    plot_cfg = cfg["plot"]
-    plot_enable = bool(plot_cfg["enable"])
-    random_n = int(plot_cfg["random_n"])
+    plot_cfg = cfg.get("plot", {}) or {}
+    plot_enable = bool(plot_cfg.get("enable", False))
+    random_n = int(plot_cfg.get("random_n", 0))
     plot_idx = None
     if plot_enable and len(dte) > 0 and random_n > 0:
         rng = np.random.default_rng(int(cfg["exp"]["seed"]))
@@ -2758,6 +3531,10 @@ def main():
     knn_gate_summary = None
     residual_correction_base_ch = None
     residual_correction_hybrid_ch = None
+    pred_residual_channel_scale_c = None
+    pred_residual_gate_model = None
+    pred_residual_gate_summary = None
+    pred_residual_selection_summary = None
     calibration_summary = {
         "enable": bool(calibration_enable),
         "method": str(calibration_method),
@@ -2767,6 +3544,8 @@ def main():
         "hybrid_mean_abs": None,
     }
     mae_eval_weight = mae_objective_weight_final if mae_objective_enable else 0.0
+    if skip_test:
+        print("eval.skip_test=true: test split windows, evaluation, and metrics are disabled.")
     if len(dva) > 0:
         val_loader_summary = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
         if calibration_enable:
@@ -2816,6 +3595,7 @@ def main():
             mae_objective_weight=mae_eval_weight,
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
             residual_correction_ch=residual_correction_base_ch,
             knn_hybrid=None,
             eval_start=val_eval_start,
@@ -2828,6 +3608,272 @@ def main():
             "per_cluster_mse": [float(v) for v in val_mse_best_k.detach().cpu().tolist()],
             "per_cluster_mae": [float(v) for v in val_mae_best_k.detach().cpu().tolist()],
         }
+        residual_selection_policy = str(pred_residual_cfg.get("selection_policy", "none")).lower()
+        if residual_selection_policy in {"false", "off", "disable", "disabled"}:
+            residual_selection_policy = "none"
+        if residual_selection_policy not in {"none", "val_mse_channel", "val_mse_scale", "val_mse_gate", "val_mse_gate_guarded"}:
+            raise ValueError(
+                "Unsupported moe.pred_side_residual.selection_policy="
+                f"'{residual_selection_policy}'. Expected none, val_mse_channel, val_mse_scale, "
+                "val_mse_gate, or val_mse_gate_guarded."
+            )
+        if pred_residual is not None and residual_selection_policy in {"val_mse_channel", "val_mse_scale", "val_mse_gate", "val_mse_gate_guarded"}:
+            zero_residual_scale_c = torch.zeros(C, device=device, dtype=torch.float32)
+            residual_scale_mean_value = 0.0
+            (
+                val_loss_pred_base_k,
+                val_mse_pred_base_k,
+                val_mae_pred_base_k,
+                val_mse_c_pred_base,
+                val_mae_c_pred_base,
+                _,
+                _,
+                _,
+            ) = eval_loop(
+                model, gate, lam_kp_best,
+                penalty_names, penalty_fns,
+                val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                select_ranks=select_ranks,
+                collect_plot=False, channel_count=C,
+                mse_weight=mse_weight,
+                gate_entropy_weight=gate_entropy_weight,
+                gate_balance_weight=gate_balance_weight,
+                gate_soft_weight=gate_soft_weight,
+                gate_entropy_target_frac=gate_entropy_target_frac,
+                penalty_scale=penalty_scale,
+                dynamic_lambda=dynamic_lambda,
+                lambda_min_kp=lambda_min_kp,
+                mae_objective_weight=mae_eval_weight,
+                mae_objective_kind=mae_objective_kind,
+                mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
+                pred_residual_scale_c=zero_residual_scale_c,
+                residual_correction_ch=residual_correction_base_ch,
+                knn_hybrid=None,
+                eval_start=val_eval_start,
+            )
+            val_scaled_mse_c = val_mse_c_base
+            val_scaled_mae_c = val_mae_c_base
+            if residual_selection_policy == "val_mse_scale":
+                scale_min = float(pred_residual_cfg.get("selection_scale_min", 0.0))
+                scale_max = float(pred_residual_cfg.get("selection_scale_max", 1.0))
+                scale_steps = int(pred_residual_cfg.get("selection_scale_steps", 21))
+                if scale_steps < 2:
+                    raise ValueError("moe.pred_side_residual.selection_scale_steps must be >= 2")
+                scale_grid = torch.linspace(scale_min, scale_max, scale_steps, device=device, dtype=torch.float32)
+                best_mse_c = torch.full((C,), float("inf"), dtype=val_mse_c_pred_base.dtype)
+                best_mae_c = torch.full((C,), float("inf"), dtype=val_mae_c_pred_base.dtype)
+                best_scale_c = torch.zeros((C,), dtype=torch.float32)
+                for scale_value in scale_grid.tolist():
+                    scale_c = torch.full((C,), float(scale_value), device=device, dtype=torch.float32)
+                    (
+                        _,
+                        _,
+                        _,
+                        cand_mse_c,
+                        cand_mae_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        pred_residual_scale_c=scale_c,
+                        residual_correction_ch=residual_correction_base_ch,
+                        knn_hybrid=None,
+                        eval_start=val_eval_start,
+                    )
+                    better = cand_mse_c < best_mse_c
+                    best_mse_c = torch.where(better, cand_mse_c, best_mse_c)
+                    best_mae_c = torch.where(better, cand_mae_c, best_mae_c)
+                    best_scale_c = torch.where(
+                        better,
+                        torch.full_like(best_scale_c, float(scale_value)),
+                        best_scale_c,
+                    )
+                pred_residual_channel_scale_c = best_scale_c.to(device=device, dtype=torch.float32)
+                val_scaled_mse_c = best_mse_c
+                val_scaled_mae_c = best_mae_c
+                use_residual_c = pred_residual_channel_scale_c.detach().cpu() > 1.0e-8
+                scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
+                residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
+            elif residual_selection_policy in {"val_mse_gate", "val_mse_gate_guarded"}:
+                gate_calib_cfg = pred_residual_cfg.get("gate_calibrator", {}) or {}
+                pred_residual_gate_model, pred_residual_gate_summary = train_pred_residual_gate(
+                    model=model,
+                    gate=gate,
+                    pred_residual=pred_residual,
+                    loader=val_loader_summary,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_names=penalty_names,
+                    penalty_fns=penalty_fns,
+                    penalty_scale=penalty_scale,
+                    select_ranks=select_ranks,
+                    gate_soft_weight=gate_soft_weight,
+                    channel_names=channel_names,
+                    cfg=gate_calib_cfg,
+                )
+                if pred_residual_gate_model is None:
+                    pred_residual_channel_scale_c = zero_residual_scale_c
+                    val_scaled_mse_c = val_mse_c_pred_base
+                    val_scaled_mae_c = val_mae_c_pred_base
+                    use_residual_c = torch.zeros(C, dtype=torch.bool)
+                    pred_residual_channel_scale_c = zero_residual_scale_c
+                    scale_values = [0.0 for _ in range(C)]
+                    residual_scale_mean_value = 0.0
+                else:
+                    (
+                        _,
+                        _,
+                        _,
+                        val_gate_mse_c,
+                        val_gate_mae_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        pred_residual_gate=pred_residual_gate_model,
+                        residual_correction_ch=residual_correction_base_ch,
+                        knn_hybrid=None,
+                        eval_start=val_eval_start,
+                    )
+                    val_scaled_mse_c = val_gate_mse_c
+                    val_scaled_mae_c = val_gate_mae_c
+                    hold_scales = pred_residual_gate_summary.get("holdout_mean_scale", [])
+                    min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
+                    min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
+                    required = torch.maximum(
+                        torch.full_like(val_mse_c_pred_base, min_abs),
+                        min_rel * val_mse_c_pred_base.abs().clamp_min(1.0e-12),
+                    )
+                    use_residual_c = (val_mse_c_pred_base - val_scaled_mse_c) > required
+                    if residual_selection_policy == "val_mse_gate_guarded":
+                        pred_residual_channel_scale_c = use_residual_c.to(device=device, dtype=torch.float32)
+                        (
+                            _,
+                            _,
+                            _,
+                            val_guarded_mse_c,
+                            val_guarded_mae_c,
+                            _,
+                            _,
+                            _,
+                        ) = eval_loop(
+                            model, gate, lam_kp_best,
+                            penalty_names, penalty_fns,
+                            val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                            select_ranks=select_ranks,
+                            collect_plot=False, channel_count=C,
+                            mse_weight=mse_weight,
+                            gate_entropy_weight=gate_entropy_weight,
+                            gate_balance_weight=gate_balance_weight,
+                            gate_soft_weight=gate_soft_weight,
+                            gate_entropy_target_frac=gate_entropy_target_frac,
+                            penalty_scale=penalty_scale,
+                            dynamic_lambda=dynamic_lambda,
+                            lambda_min_kp=lambda_min_kp,
+                            mae_objective_weight=mae_eval_weight,
+                            mae_objective_kind=mae_objective_kind,
+                            mae_objective_beta=mae_objective_beta,
+                            pred_residual=pred_residual,
+                            pred_residual_gate=pred_residual_gate_model,
+                            pred_residual_scale_c=pred_residual_channel_scale_c,
+                            residual_correction_ch=residual_correction_base_ch,
+                            knn_hybrid=None,
+                            eval_start=val_eval_start,
+                        )
+                        val_scaled_mse_c = val_guarded_mse_c
+                        val_scaled_mae_c = val_guarded_mae_c
+                        scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
+                        residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
+                    else:
+                        pred_residual_channel_scale_c = None
+                        scale_values = [float(v) for v in hold_scales] if len(hold_scales) == C else []
+                        residual_scale_mean_value = (
+                            float(sum(scale_values) / max(len(scale_values), 1)) if len(scale_values) > 0 else 1.0
+                        )
+            else:
+                min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
+                min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
+                required = torch.maximum(
+                    torch.full_like(val_mse_c_pred_base, min_abs),
+                    min_rel * val_mse_c_pred_base.abs().clamp_min(1.0e-12),
+                )
+                use_residual_c = (val_mse_c_pred_base - val_mse_c_base) > required
+                pred_residual_channel_scale_c = use_residual_c.to(device=device, dtype=torch.float32)
+                scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
+                residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
+            pred_residual_selection_summary = {
+                "policy": residual_selection_policy,
+                "min_abs_improvement": float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0)),
+                "min_rel_improvement": float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0)),
+                "scale_values": scale_values,
+                "mean_scale": float(residual_scale_mean_value),
+                "num_residual_channels": int(use_residual_c.sum().item()),
+                "residual_channels": [
+                    channel_names[i] for i, use_residual in enumerate(use_residual_c.tolist()) if bool(use_residual)
+                ],
+                "base_channels": [
+                    channel_names[i] for i, use_residual in enumerate(use_residual_c.tolist()) if not bool(use_residual)
+                ],
+                "val_pred_base_avg_mse": float(reduce_cluster_metric(val_mse_pred_base_k, cluster_weight_k).item()),
+                "val_pred_base_avg_mae": float(reduce_cluster_metric(val_mae_pred_base_k, cluster_weight_k).item()),
+                "val_residual_avg_mse": float(reduce_cluster_metric(val_mse_best_k, cluster_weight_k).item()),
+                "val_residual_avg_mae": float(reduce_cluster_metric(val_mae_best_k, cluster_weight_k).item()),
+                "val_scaled_avg_mse": float(val_scaled_mse_c.mean().item()),
+                "val_scaled_avg_mae": float(val_scaled_mae_c.mean().item()),
+                "val_pred_base_mse_per_channel": [float(v) for v in val_mse_c_pred_base.detach().cpu().tolist()],
+                "val_residual_mse_per_channel": [float(v) for v in val_mse_c_base.detach().cpu().tolist()],
+                "val_scaled_mse_per_channel": [float(v) for v in val_scaled_mse_c.detach().cpu().tolist()],
+                "val_pred_base_mae_per_channel": [float(v) for v in val_mae_c_pred_base.detach().cpu().tolist()],
+                "val_residual_mae_per_channel": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
+                "val_scaled_mae_per_channel": [float(v) for v in val_scaled_mae_c.detach().cpu().tolist()],
+                "gate_calibrator": pred_residual_gate_summary,
+            }
+            print(
+                "Prediction residual selection: "
+                f"policy={residual_selection_policy}, "
+                f"residual_channels={pred_residual_selection_summary['num_residual_channels']}/{C}, "
+                f"val_base_MSE={pred_residual_selection_summary['val_pred_base_avg_mse']:.6f}, "
+                f"val_residual_MSE={pred_residual_selection_summary['val_residual_avg_mse']:.6f}, "
+                f"val_scaled_MSE={pred_residual_selection_summary['val_scaled_avg_mse']:.6f}, "
+                f"mean_scale={pred_residual_selection_summary['mean_scale']:.3f}"
+            )
         if knn_hybrid_val is not None:
             knn_hybrid_val.reset_confidence_stats()
             val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop(
@@ -2847,6 +3893,7 @@ def main():
                 mae_objective_weight=mae_eval_weight,
                 mae_objective_kind=mae_objective_kind,
                 mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
                 residual_correction_ch=residual_correction_hybrid_ch,
                 knn_hybrid=knn_hybrid_val,
                 eval_start=val_eval_start,
@@ -2862,34 +3909,43 @@ def main():
             val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
 
     lam_kp_test = lam_kp_best
-    test_loss_k, test_mse_k, test_mae_k, mse_c, mae_c, plot_cache, best_sample, worst_sample = eval_loop(
-        model, gate, lam_kp_test,
-        penalty_names, penalty_fns,
-        dl_te, cluster_id_c, K, moe_cfg, device,
-        select_ranks=select_ranks,
-        collect_plot=plot_enable, plot_idx=plot_idx, channel_count=C,
-        mse_weight=mse_weight,
-        gate_entropy_weight=gate_entropy_weight,
-        gate_balance_weight=gate_balance_weight,
-        gate_soft_weight=gate_soft_weight,
-        gate_entropy_target_frac=gate_entropy_target_frac,
-        penalty_scale=penalty_scale,
-        dynamic_lambda=dynamic_lambda,
-        lambda_min_kp=lambda_min_kp,
-        mae_objective_weight=mae_eval_weight,
-        mae_objective_kind=mae_objective_kind,
-        mae_objective_beta=mae_objective_beta,
-        residual_correction_ch=residual_correction_base_ch,
-        knn_hybrid=None,
-        eval_start=test_eval_start,
-    )
+    test_loss_k = test_mse_k = test_mae_k = None
+    mse_c = mae_c = None
+    plot_cache = {}
+    best_sample = {}
+    worst_sample = {}
+    if not skip_test:
+        test_loss_k, test_mse_k, test_mae_k, mse_c, mae_c, plot_cache, best_sample, worst_sample = eval_loop(
+            model, gate, lam_kp_test,
+            penalty_names, penalty_fns,
+            dl_te, cluster_id_c, K, moe_cfg, device,
+            select_ranks=select_ranks,
+            collect_plot=plot_enable, plot_idx=plot_idx, channel_count=C,
+            mse_weight=mse_weight,
+            gate_entropy_weight=gate_entropy_weight,
+            gate_balance_weight=gate_balance_weight,
+            gate_soft_weight=gate_soft_weight,
+            gate_entropy_target_frac=gate_entropy_target_frac,
+            penalty_scale=penalty_scale,
+            dynamic_lambda=dynamic_lambda,
+            lambda_min_kp=lambda_min_kp,
+            mae_objective_weight=mae_eval_weight,
+            mae_objective_kind=mae_objective_kind,
+            mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
+            pred_residual_gate=pred_residual_gate_model,
+            pred_residual_scale_c=pred_residual_channel_scale_c,
+            residual_correction_ch=residual_correction_base_ch,
+            knn_hybrid=None,
+            eval_start=test_eval_start,
+        )
     test_loss_hybrid_k = None
     test_mse_hybrid_k = None
     test_mae_hybrid_k = None
     mse_c_hybrid = None
     mae_c_hybrid = None
     test_hybrid_confidence = None
-    if knn_hybrid_test is not None:
+    if knn_hybrid_test is not None and not skip_test:
         knn_hybrid_test.reset_confidence_stats()
         test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
             model, gate, lam_kp_test,
@@ -2908,6 +3964,7 @@ def main():
             mae_objective_weight=mae_eval_weight,
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
             residual_correction_ch=residual_correction_hybrid_ch,
             knn_hybrid=knn_hybrid_test,
             eval_start=test_eval_start,
@@ -2916,7 +3973,7 @@ def main():
 
     knn_sweep_results = []
     knn_sweep_cfgs = cfg.get("knn_hybrid", {}).get("sweep", []) or []
-    if knn_cfg.enable and len(knn_sweep_cfgs) > 0 and len(dva) > 0 and val_summary is not None:
+    if (not skip_test) and knn_cfg.enable and len(knn_sweep_cfgs) > 0 and len(dva) > 0 and val_summary is not None:
         base_knn_dict = dict(cfg.get("knn_hybrid", {}))
         base_knn_dict.pop("sweep", None)
         base_knn_dict.pop("path", None)
@@ -2954,6 +4011,7 @@ def main():
                 mae_objective_weight=mae_eval_weight,
                 mae_objective_kind=mae_objective_kind,
                 mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
                 residual_correction_ch=residual_correction_hybrid_ch,
                 knn_hybrid=cand_val_hybrid,
                 eval_start=val_eval_start,
@@ -2978,6 +4036,7 @@ def main():
                 mae_objective_weight=mae_eval_weight,
                 mae_objective_kind=mae_objective_kind,
                 mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
                 residual_correction_ch=residual_correction_hybrid_ch,
                 knn_hybrid=cand_test_hybrid,
                 eval_start=test_eval_start,
@@ -3095,6 +4154,7 @@ def main():
                 mae_objective_weight=mae_eval_weight,
                 mae_objective_kind=mae_objective_kind,
                 mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
                 residual_correction_ch=residual_correction_hybrid_ch,
                 knn_hybrid=knn_hybrid_val,
                 knn_fusion_scale_ch=knn_fusion_scale_ch,
@@ -3110,30 +4170,32 @@ def main():
             }
             val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
 
-            knn_hybrid_test.reset_confidence_stats()
-            test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
-                model, gate, lam_kp_test,
-                penalty_names, penalty_fns,
-                dl_te, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, plot_idx=None, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=knn_hybrid_test,
-                knn_fusion_scale_ch=knn_fusion_scale_ch,
-                eval_start=test_eval_start,
-            )
-            test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
+            if knn_hybrid_test is not None and not skip_test:
+                knn_hybrid_test.reset_confidence_stats()
+                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
+                    model, gate, lam_kp_test,
+                    penalty_names, penalty_fns,
+                    dl_te, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, plot_idx=None, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    residual_correction_ch=residual_correction_hybrid_ch,
+                    knn_hybrid=knn_hybrid_test,
+                    knn_fusion_scale_ch=knn_fusion_scale_ch,
+                    eval_start=test_eval_start,
+                )
+                test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
 
     gate_calib_cfg = cfg.get("knn_hybrid", {}).get("gate_calibrator", {}) or {}
     if bool(dict(gate_calib_cfg).get("enable", False)) and knn_hybrid_val is not None and len(dva) > 0:
@@ -3175,6 +4237,7 @@ def main():
                 mae_objective_weight=mae_eval_weight,
                 mae_objective_kind=mae_objective_kind,
                 mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
                 residual_correction_ch=residual_correction_hybrid_ch,
                 knn_hybrid=knn_hybrid_val,
                 knn_fusion_gate=knn_gate_model,
@@ -3190,47 +4253,53 @@ def main():
             }
             val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
 
-            knn_hybrid_test.reset_confidence_stats()
-            test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
-                model, gate, lam_kp_test,
-                penalty_names, penalty_fns,
-                dl_te, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, plot_idx=None, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=knn_hybrid_test,
-                knn_fusion_gate=knn_gate_model,
-                eval_start=test_eval_start,
-            )
-            test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
+            if knn_hybrid_test is not None and not skip_test:
+                knn_hybrid_test.reset_confidence_stats()
+                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
+                    model, gate, lam_kp_test,
+                    penalty_names, penalty_fns,
+                    dl_te, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, plot_idx=None, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    residual_correction_ch=residual_correction_hybrid_ch,
+                    knn_hybrid=knn_hybrid_test,
+                    knn_fusion_gate=knn_gate_model,
+                    eval_start=test_eval_start,
+                )
+                test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
 
-    df = pd.DataFrame({
-        "channel": channel_names,
-        "MAE": mae_c.numpy(),
-        "MSE": mse_c.numpy(),
-        "cluster_id": cluster_id_c.detach().cpu().numpy()
-    })
-    if mse_c_hybrid is not None and mae_c_hybrid is not None:
-        df["MAE_hybrid"] = mae_c_hybrid.numpy()
-        df["MSE_hybrid"] = mse_c_hybrid.numpy()
-    avg_mae = float(df["MAE"].mean())
-    avg_mse = float(reduce_cluster_metric(test_mse_k, cluster_weight_k).item())
+    df = None
+    avg_mae = None
+    avg_mse = None
     avg_mae_hybrid = None
     avg_mse_hybrid = None
-    if mse_c_hybrid is not None and mae_c_hybrid is not None and test_mse_hybrid_k is not None:
-        avg_mae_hybrid = float(df["MAE_hybrid"].mean())
-        avg_mse_hybrid = float(reduce_cluster_metric(test_mse_hybrid_k, cluster_weight_k).item())
+    if not skip_test:
+        df = pd.DataFrame({
+            "channel": channel_names,
+            "MAE": mae_c.numpy(),
+            "MSE": mse_c.numpy(),
+            "cluster_id": cluster_id_c.detach().cpu().numpy()
+        })
+        if mse_c_hybrid is not None and mae_c_hybrid is not None:
+            df["MAE_hybrid"] = mae_c_hybrid.numpy()
+            df["MSE_hybrid"] = mse_c_hybrid.numpy()
+        avg_mae = float(df["MAE"].mean())
+        avg_mse = float(reduce_cluster_metric(test_mse_k, cluster_weight_k).item())
+        if mse_c_hybrid is not None and mae_c_hybrid is not None and test_mse_hybrid_k is not None:
+            avg_mae_hybrid = float(df["MAE_hybrid"].mean())
+            avg_mse_hybrid = float(reduce_cluster_metric(test_mse_hybrid_k, cluster_weight_k).item())
 
     channel_selection_summary = None
     channel_selected_avg_mae = None
@@ -3249,6 +4318,7 @@ def main():
         and val_mae_c_base is not None
         and val_mae_c_hybrid is not None
         and val_mse_c_base is not None
+        and not skip_test
         and val_mse_c_hybrid is not None
         and mae_c_hybrid is not None
         and mse_c_hybrid is not None
@@ -3348,6 +4418,8 @@ def main():
             knn_selection_min_rel_improvement * max(abs(float(selected_base_val_mae)), 1.0e-12),
         )
     selected_criterion = knn_selection_policy
+    selected_selection_policy = knn_selection_policy
+    moe_residual_variant = "none"
     if knn_selection_policy == "hybrid":
         if avg_mae_hybrid is not None and avg_mse_hybrid is not None:
             selected_variant = "hybrid"
@@ -3387,33 +4459,86 @@ def main():
         selected_avg_mae = avg_mae_hybrid
         selected_avg_mse = avg_mse_hybrid
 
+    if pred_residual_selection_summary is not None:
+        moe_residual_variant = (
+            "moe_residual_gate"
+            if str(pred_residual_selection_summary.get("policy", "")) == "val_mse_gate"
+            else "moe_residual_channel"
+        )
+
     if channel_selection_summary is not None:
         selected_variant = "channel_hybrid" if int(channel_selection_summary["num_hybrid_channels"]) > 0 else "base"
         selected_avg_mae = float(channel_selected_avg_mae)
         selected_avg_mse = float(channel_selected_avg_mse)
         selected_criterion = channel_selection_policy
+        selected_selection_policy = channel_selection_policy
 
-    if avg_mae_hybrid is not None and avg_mse_hybrid is not None:
-        print(f"\nOverall(base): avg_MAE={avg_mae:.6f}, avg_MSE={avg_mse:.6f}")
-        print(f"Overall(hybrid): avg_MAE={avg_mae_hybrid:.6f}, avg_MSE={avg_mse_hybrid:.6f}")
+    if skip_test:
+        val_mse_print = None if val_summary is None else val_summary.get("avg_mse")
+        val_mae_print = None if val_summary is None else val_summary.get("avg_mae")
+        if pred_residual_selection_summary is not None:
+            val_mse_print = pred_residual_selection_summary.get("val_scaled_avg_mse", val_mse_print)
+            val_mae_print = pred_residual_selection_summary.get("val_scaled_avg_mae", val_mae_print)
+        if val_mse_print is not None and val_mae_print is not None:
+            print(f"\nValidation-only: avg_MAE={val_mae_print:.6f}, avg_MSE={val_mse_print:.6f}")
+            final_print(
+                "FINAL_VALIDATION "
+                f"selected={selected_variant} "
+                f"moe_residual={moe_residual_variant} "
+                f"val_MAE={val_mae_print:.6f} "
+                f"val_MSE={val_mse_print:.6f} "
+                "test_MAE=skipped test_MSE=skipped",
+                flush=True,
+            )
+        else:
+            print("\nValidation-only: validation metrics unavailable")
+            final_print(
+                "FINAL_VALIDATION "
+                f"selected={selected_variant} "
+                f"moe_residual={moe_residual_variant} "
+                "val_MAE=nan val_MSE=nan test_MAE=skipped test_MSE=skipped",
+                flush=True,
+            )
+    elif avg_mae_hybrid is not None and avg_mse_hybrid is not None:
+        print(f"\nOverall(base): test_MAE={avg_mae:.6f}, test_MSE={avg_mse:.6f}")
+        print(f"Overall(hybrid): test_MAE={avg_mae_hybrid:.6f}, test_MSE={avg_mse_hybrid:.6f}")
         if channel_selection_summary is not None:
             print(
-                f"Overall(channel_hybrid): avg_MAE={channel_selected_avg_mae:.6f}, "
-                f"avg_MSE={channel_selected_avg_mse:.6f}, "
+                f"Overall(channel_hybrid): test_MAE={channel_selected_avg_mae:.6f}, "
+                f"test_MSE={channel_selected_avg_mse:.6f}, "
                 f"hybrid_channels={channel_selection_summary['num_hybrid_channels']}/{C}"
             )
-        print(f"Overall(selected={selected_variant}): avg_MAE={selected_avg_mae:.6f}, avg_MSE={selected_avg_mse:.6f}")
+        print(
+            f"Overall(selected={selected_variant}, moe_residual={moe_residual_variant}): "
+            f"test_MAE={selected_avg_mae:.6f}, test_MSE={selected_avg_mse:.6f}"
+        )
+        final_print(
+            "FINAL_TEST "
+            f"selected={selected_variant} "
+            f"moe_residual={moe_residual_variant} "
+            f"test_MAE={selected_avg_mae:.6f} "
+            f"test_MSE={selected_avg_mse:.6f}",
+            flush=True,
+        )
     else:
-        print(f"\nOverall: avg_MAE={avg_mae:.6f}, avg_MSE={avg_mse:.6f}")
-    final_print(
-        f"FINAL_METRICS selected={selected_variant} MAE={selected_avg_mae:.6f} MSE={selected_avg_mse:.6f}",
-        flush=True,
-    )
+        print(
+            f"\nOverall(selected={selected_variant}, moe_residual={moe_residual_variant}): "
+            f"test_MAE={selected_avg_mae:.6f}, test_MSE={selected_avg_mse:.6f}"
+        )
+        final_print(
+            "FINAL_TEST "
+            f"selected={selected_variant} "
+            f"moe_residual={moe_residual_variant} "
+            f"test_MAE={selected_avg_mae:.6f} "
+            f"test_MSE={selected_avg_mse:.6f}",
+            flush=True,
+        )
 
-    df.to_csv(os.path.join(out_dir, "test_metrics.csv"), index=False)
-    np.save(os.path.join(out_dir, "test_loss_per_cluster.npy"), test_loss_k.detach().cpu().numpy())
+    if not skip_test and df is not None:
+        df.to_csv(os.path.join(out_dir, "test_metrics.csv"), index=False)
+        np.save(os.path.join(out_dir, "test_loss_per_cluster.npy"), test_loss_k.detach().cpu().numpy())
 
-    if plot_enable and (plot_idx is not None):
+    if (not skip_test) and plot_enable and (plot_idx is not None):
         plot_dir = os.path.join(out_dir, "plots")
         save_channel_plots(
             out_dir=plot_dir,
@@ -3449,6 +4574,9 @@ def main():
             "test_eval_start": int(test_eval_start),
             "val_label_start": int(t_train),
             "test_label_start": int(t_val),
+            "num_train_windows": int(len(dtr)),
+            "num_val_windows": int(len(dva)),
+            "num_test_windows": int(len(dte)),
             "normalize_train_only": bool(norm_cfg.get("train_only", False)),
             "data_max_rows": int(max_rows),
         },
@@ -3459,9 +4587,15 @@ def main():
             "warmup_epochs": int(mae_objective_warmup_epochs),
             "beta": float(mae_objective_beta),
         },
+        "eval": {
+            "skip_test": bool(skip_test),
+        },
         "calibration": calibration_summary,
+        "moe_residual": moe_residual_summary,
+        "moe_residual_selection": pred_residual_selection_summary,
+        "moe_residual_gate_calibrator": pred_residual_gate_summary,
         "val": val_summary,
-        "test": {
+        "test": None if skip_test else {
             "avg_mae": avg_mae,
             "avg_mse": avg_mse,
             "per_cluster_loss": [float(v) for v in test_loss_k.detach().cpu().tolist()],
@@ -3470,8 +4604,9 @@ def main():
         },
         "selected": {
             "variant": selected_variant,
+            "moe_residual_variant": moe_residual_variant,
             "criterion": selected_criterion,
-            "selection_policy": knn_selection_policy,
+            "selection_policy": selected_selection_policy,
             "avg_mae": selected_avg_mae,
             "avg_mse": selected_avg_mse,
             "base_val_mse": selected_base_val_mse,
@@ -3505,7 +4640,7 @@ def main():
             "out_dir_size_mb": float(out_dir_mb),
         },
     }
-    if knn_hybrid_test is not None:
+    if knn_hybrid_test is not None and not skip_test:
         summary["knn_hybrid"] = knn_hybrid_test.describe()
     if len(knn_sweep_results) > 0:
         summary["knn_sweep"] = knn_sweep_results
