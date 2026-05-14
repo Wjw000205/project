@@ -1,29 +1,26 @@
 exp:
-  name: ETTm2_pred_192
-  out_dir: outputs/ETTm2
+  name: ETTm2_pred_96_moe_td_lam1p575_wd0p001
+  out_dir: outputs/ETTm2_96_moe_best
   seed: 2026
   deterministic: true
   device: cuda:0
 data:
-  csv_path: "data/ETTm2.csv"
+  csv_path: data/ETTm2.csv
   date_col: 0
-  # ETTm* benchmark standard: 12/4/4 months at 15-min freq = 34560/11520/11520 rows.
-  # Keep first 57600 rows so 60/20/20 split matches iTransformer/PatchTST protocol.
   max_rows: 57600
   train_ratio: 0.6
   val_ratio: 0.2
   test_ratio: 0.2
-
 window:
   input_len: 336
-  pred_len: 192
+  pred_len: 96
   past_context: true
 normalize:
   global_zscore: true
-  train_only: false
+  train_only: true
 corr:
   compute: true
-  save_path: outputs/ETTm2/corr.npy
+  save_path: outputs/ETTm2_96_moe_best/corr.npy
 cluster:
   method: leader
   n_clusters: 3
@@ -39,31 +36,57 @@ cluster:
   min_cluster_size: 2
   merge_small_clusters: true
   no_merge_if_channels_lt: 7
+  train_only: true
 model:
   predictor: mlp
   hidden_dim: 256
   dropout: 0.2
 moe:
-  topk: 1
   enable: true
+  topk: 1
   freeze_lambda: false
-  gate_hidden_dim: 128
+  gate_hidden_dim: 32
   select_ranks:
   - 1
   detach_penalty_grad: false
   lambda_init:
-    jump: 0.1
-    amp_under: 0.1
-    level: 0.1
-    delta: 0.1
+    trend: 0.07875
+    direction: 0.1575
+  lambda_min:
+    trend: 0.0
+    direction: 0.0
+  lambda_schedule:
+    trend: none
+    direction: none
   pred_side_residual:
     enable: true
+    feature_mode: legacy
+    residual_clip: 0.0
     corrector_hidden: 32
     init_alpha: -3.0
-    alpha_scale: 0.5
+    alpha_scale: 1.1
     specialization_weight: 0.1
-    norm_weight: 1.0e-4
+    norm_weight: 0.0
     use_y_base_input: true
+    intervention_enable: false
+    intervention_init: -2.0
+    intervention_weight: 0.001
+    detach_routed_penalty_pred: false
+    selection_policy: val_mse_gate
+    selection_min_abs_improvement: 0.0
+    selection_min_rel_improvement: 0.0
+    gate_calibrator:
+      loss: mse
+      selection_metric: mse
+      epochs: 30
+      train_fraction: 0.7
+      hidden_dim: 32
+      batch_size: 256
+      max_scale: 1.0
+      init_scale: 0.4
+      scale_reg: 0.0005
+      scale_mode: sigmoid
+      standardize_features: true
   dynamic_lambda:
     enable: true
     mode: multiscale
@@ -77,50 +100,29 @@ moe:
     reg_weight: 0.0001
   learnable_lambda:
     enable: false
-    reg_weight: 0.01
-    share_floor: 0.05
-    bilevel:
-      enable: true
-      optimize_gate: false
-      outer_lr: 0.005
-      inner_lr: 0.001
-      val_metric: val_mse
-      steps_per_epoch: 10
-  gate_entropy_weight: 0.02
-  gate_balance_weight: 0.01
+  gate_entropy_weight: 0.0
+  gate_balance_weight: 0.0
   gate_route_on_penalty_only: true
-  router_mode: penalty_context
-  router_penalty_context_weight: 1.1
+  router_mode: learned
+  router_penalty_context_weight: 0.0
   router_detach_penalty_context: true
   allow_skip: true
   skip_cost: 0.15
   skip_init_bias: -2.0
-  gate_temperature: 1.2
+  gate_temperature: 1.0
   gate_noise_std: 0.2
+  gate_init_bias:
+    enable: true
+    values:
+      default: 0.0
   gate_soft_weight: 0.0
   gate_prob_floor: 0.0
   gate_entropy_target_frac: 0.7
-  lambda_min:
-    amp: 0.0
-    jitter: 0.0
-    jump: 0.0
-    amp_under: 0.0
-    level: 0.0
-    delta: 0.0
-  lambda_schedule:
-    amp: none
-    jitter: none
-    jump: none
-    amp_under: none
-    level: none
-    delta: none
   gate_logit_clip: 5.0
 penalties:
   enabled:
-  - jump
-  - amp_under
-  - level
-  - delta
+  - trend
+  - direction
   jump_threshold: 0.6
 train:
   epochs: 100
@@ -132,8 +134,8 @@ train:
     kind: l1
     weight: 0.6
     warmup_epochs: 5
-  selection_metric: val_mae
-  weight_decay: 0.0001
+  selection_metric: val_mse
+  weight_decay: 0.001
   grad_clip: 1.0
   lr_scheduler:
     name: plateau
@@ -145,17 +147,17 @@ early_stop:
   patience: 10
   min_delta: 1.0e-06
 plot:
-  enable: true
+  enable: false
   random_n: 3
   dpi: 140
 portrait:
-  enable: true
-  out_dir: outputs/ETTm2/cluster_portraits
+  enable: false
+  out_dir: outputs/ETTm2_96_moe_best/cluster_portraits
   dpi: 140
   max_points: 2000
   jump_threshold: 0.6
 knn_hybrid:
-  enable: true
+  enable: false
   mode: rolling
   scope: same_channel
   bank_split: history
@@ -178,4 +180,13 @@ knn_hybrid:
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/ETTm2/knn_shape_bank.pt
+  path: outputs/ETTm2_96_moe_best/knn_shape_bank.pt
+eval:
+  skip_test: false
+calibration:
+  enable: false
+memory:
+  enable: false
+  save_checkpoint: false
+  path: outputs/ETTm2_96_moe_best/cluster_memory.pt
+  checkpoint_path: outputs/ETTm2_96_moe_best/best_checkpoint.pt

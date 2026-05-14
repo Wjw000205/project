@@ -15,7 +15,7 @@ data:
 
 window:
   input_len: 336
-  pred_len: 96
+  pred_len: 720
 
 normalize:
   train_only: true
