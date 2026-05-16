@@ -1,6 +1,6 @@
 exp:
-  name: ETTh2_pred_192_moe_current_pool_lam0p15
-  out_dir: outputs/ETTh2_192_moe_best
+  name: ETTh2_96_mlp_moe_best
+  out_dir: outputs/ETTh2_96_mlp_moe_best
   seed: 2026
   deterministic: true
   device: cuda:0
@@ -20,7 +20,7 @@ normalize:
   train_only: true
 corr:
   compute: true
-  save_path: outputs/ETTh2_192_moe_best/corr.npy
+  save_path: outputs/ETTh2_96_mlp_moe_best/corr.npy
 cluster:
   method: leader
   n_clusters: 3
@@ -39,8 +39,8 @@ cluster:
   train_only: true
 model:
   predictor: mlp
-  hidden_dim: 128
-  dropout: 0.3
+  hidden_dim: 256
+  dropout: 0.2
 moe:
   topk: 1
   enable: true
@@ -58,7 +58,7 @@ moe:
     enable: true
     corrector_hidden: 32
     init_alpha: -3.0
-    alpha_scale: 1.1
+    alpha_scale: 1.6
     specialization_weight: 0.1
     norm_weight: 0.0
     use_y_base_input: true
@@ -79,7 +79,7 @@ moe:
       hidden_dim: 32
       batch_size: 256
       max_scale: 1.0
-      init_scale: 0.4
+      init_scale: 0.78
       scale_reg: 0.0005
       scale_mode: sigmoid
       standardize_features: true
@@ -160,7 +160,7 @@ plot:
   dpi: 140
 portrait:
   enable: false
-  out_dir: outputs/ETTh2_192_moe_best/cluster_portraits
+  out_dir: outputs/ETTh2_96_mlp_moe_best/cluster_portraits
   dpi: 140
   max_points: 2000
   jump_threshold: 0.6
@@ -190,7 +190,7 @@ knn_hybrid:
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/ETTh2_192_moe_best/knn_shape_bank.pt
+  path: outputs/ETTh2_96_mlp_moe_best/knn_shape_bank.pt
 eval:
   skip_test: false
 calibration:
@@ -198,5 +198,5 @@ calibration:
 memory:
   enable: false
   save_checkpoint: false
-  path: outputs/ETTh2_192_moe_best/cluster_memory.pt
-  checkpoint_path: outputs/ETTh2_192_moe_best/best_checkpoint.pt
+  path: outputs/ETTh2_96_mlp_moe_best/cluster_memory.pt
+  checkpoint_path: outputs/ETTh2_96_mlp_moe_best/best_checkpoint.pt
