@@ -25,6 +25,7 @@ from src.models.dynamic_lambda import ClusterwiseDynamicLambda
 from src.models.learnable_lambda import ClusterwiseLearnableLambda
 from src.models.moe_gate import ClusterwiseMoEGate, scatter_mean_bcf_to_bkf
 from src.models.penalties import build_penalty_bank, normalize_penalties
+from src.models.residual_moe import ClusterwisePredResidualMoE
 from src.train import _compute_lambda_bkp, _select_rank_mask, extract_gate_features
 from src.utils.cluster_memory import load_cluster_checkpoint, scatter_mean_bcl_to_bkl
 from src.utils.clustering import cluster_channels_by_corr
@@ -169,6 +170,9 @@ def prepare_data_context(cfg: dict) -> DataContext:
     csv_path = str(cfg["data"]["csv_path"])
     date_col = int(cfg["data"]["date_col"])
     raw_df = pd.read_csv(csv_path)
+    max_rows = int(cfg.get("data", {}).get("max_rows", 0) or 0)
+    if max_rows > 0:
+        raw_df = raw_df.iloc[:max_rows].copy()
     date_col_name = raw_df.columns[date_col]
     date_values = pd.to_datetime(raw_df[date_col_name], errors="coerce")
     value_cols = [c for i, c in enumerate(raw_df.columns) if i != date_col]
@@ -199,10 +203,11 @@ def prepare_data_context(cfg: dict) -> DataContext:
 
     cl = cfg["cluster"]
     method_norm = str(cl.get("method", "agglomerative")).lower()
+    cluster_fit_tc = norm_data_tc[:t_train] if bool(cl.get("train_only", True)) else norm_data_tc
     if method_norm in {"random", "rand"}:
         corr_cc = torch.eye(norm_data_tc.shape[1], dtype=norm_data_tc.dtype)
     else:
-        corr_cc = pearson_corr_matrix(norm_data_tc)
+        corr_cc = pearson_corr_matrix(cluster_fit_tc)
     cluster_id_c, _ = cluster_channels_by_corr(
         corr_cc=corr_cc,
         data_tc=norm_data_tc,
@@ -430,6 +435,27 @@ def load_eval_modules(
         learnable_lambda.load_state_dict(learn_state)
         learnable_lambda.eval()
 
+    pred_residual = None
+    pred_residual_state = ckpt.get("pred_residual_state", None)
+    pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
+    if pred_residual_state is not None and P > 0:
+        pred_residual = ClusterwisePredResidualMoE(
+            num_clusters=K,
+            num_penalties=P,
+            input_len=input_len,
+            pred_len=pred_len,
+            hidden_dim=int(pred_residual_cfg.get("corrector_hidden", 32)),
+            init_alpha=float(pred_residual_cfg.get("init_alpha", -3.0)),
+            alpha_scale=float(pred_residual_cfg.get("alpha_scale", 0.5)),
+            use_y_base_input=bool(pred_residual_cfg.get("use_y_base_input", True)),
+            feature_mode=str(pred_residual_cfg.get("feature_mode", "legacy")),
+            residual_clip=float(pred_residual_cfg.get("residual_clip", 0.0)),
+            intervention_enable=bool(pred_residual_cfg.get("intervention_enable", False)),
+            intervention_init=float(pred_residual_cfg.get("intervention_init", -2.0)),
+        ).to(device)
+        pred_residual.load_state_dict(pred_residual_state)
+        pred_residual.eval()
+
     base_lambda_kp = build_base_lambda_kp(run_cfg, meta, penalty_names, K, device, learnable_lambda)
 
     return {
@@ -439,6 +465,7 @@ def load_eval_modules(
         "gate": gate,
         "dynamic_lambda": dynamic_lambda,
         "learnable_lambda": learnable_lambda,
+        "pred_residual": pred_residual,
         "base_lambda_kp": base_lambda_kp,
         "lambda_min_kp": lambda_min_kp,
         "penalty_names": penalty_names,

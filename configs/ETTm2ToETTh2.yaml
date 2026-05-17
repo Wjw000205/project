@@ -1,19 +1,19 @@
-﻿exp:
-  name: "ETTm1_to_ETTh1"
-  out_dir: "outputs/ETTm1ToETTh1"
+exp:
+  name: "ETTm2_to_ETTh2"
+  out_dir: "outputs/ETTm2ToETTh2"
   seed: 2026
   device: "cuda:0"
 
 source:
-  memory_path: "outputs/ettm1_h96_transfer_no_leak/source/cluster_memory.pt"
-  checkpoint_path: "outputs/ettm1_val_refinement_base/runs/ETTm1/pred_96/best_checkpoint.pt"
-  summary_path: "outputs/ettm1_val_refinement_base/runs/ETTm1/pred_96/run_summary.json"
-  csv_path: "data/ETTm1.csv"
+  memory_path: "outputs/ettm2_h96_src_transfer_no_leak/source/cluster_memory.pt"
+  checkpoint_path: "outputs/ett_global_h96_param_base/runs/ETTm2/pred_96/best_checkpoint.pt"
+  summary_path: "outputs/ett_global_h96_param_base/runs/ETTm2/pred_96/run_summary.json"
+  csv_path: "data/ETTm2.csv"
   date_col: 0
   step_minutes: 15
 
 data:
-  csv_path: "data/ETTh1.csv"
+  csv_path: "data/ETTh2.csv"
   date_col: 0
   train_ratio: 0.7
   val_ratio: 0.1
@@ -65,4 +65,3 @@ transfer:
 
 eval:
   batch_size: 64
-

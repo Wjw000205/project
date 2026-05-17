@@ -127,10 +127,14 @@ def run_eval(
     dynamic_lambda,
     lambda_min_kp: torch.Tensor,
     cluster_weight_k: torch.Tensor,
+    pred_residual=None,
+    pred_residual_gate=None,
+    pred_residual_scale_c=None,
+    residual_correction_ch=None,
 ) -> Dict[str, Any]:
     if hybrid is not None:
         hybrid.reset_confidence_stats()
-    loss_k, mse_k, _, mae_c, *_ = eval_loop(
+    loss_k, mse_k, _, _, mae_c, *_ = eval_loop(
         model,
         gate,
         lambda_kp,
@@ -152,6 +156,10 @@ def run_eval(
         penalty_scale=penalty_scale,
         dynamic_lambda=dynamic_lambda,
         lambda_min_kp=lambda_min_kp,
+        pred_residual=pred_residual,
+        pred_residual_gate=pred_residual_gate,
+        pred_residual_scale_c=pred_residual_scale_c,
+        residual_correction_ch=residual_correction_ch,
         knn_hybrid=hybrid,
         eval_start=eval_start,
     )
@@ -204,6 +212,7 @@ def main() -> None:
     model = bundle["model"]
     gate = bundle["gate"]
     dynamic_lambda = bundle["dynamic_lambda"]
+    pred_residual = bundle.get("pred_residual")
     lambda_kp = bundle["base_lambda_kp"]
     lambda_min_kp = bundle["lambda_min_kp"]
     penalty_names = bundle["penalty_names"]
@@ -253,6 +262,7 @@ def main() -> None:
         "dynamic_lambda": dynamic_lambda,
         "lambda_min_kp": lambda_min_kp,
         "cluster_weight_k": cluster_weight_k,
+        "pred_residual": pred_residual,
     }
 
     rows: List[Dict[str, Any]] = []

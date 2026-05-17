@@ -5,8 +5,9 @@
   device: "cuda:0"
 
 source:
-  memory_path: "outputs/ETTm1/cluster_memory.pt"
-  checkpoint_path: "outputs/ETTm1/best_checkpoint.pt"
+  memory_path: "outputs/ettm1_h96_transfer_no_leak/source/cluster_memory.pt"
+  checkpoint_path: "outputs/ettm1_val_refinement_base/runs/ETTm1/pred_96/best_checkpoint.pt"
+  summary_path: "outputs/ettm1_val_refinement_base/runs/ETTm1/pred_96/run_summary.json"
   csv_path: "data/ETTm1.csv"
   date_col: 0
   step_minutes: 15
@@ -20,14 +21,16 @@ data:
 
 window:
   input_len: 336
-  pred_len: 720
+  pred_len: 96
 
 normalize:
   global_zscore: true
-  train_only: false
+  train_only: true
 
 transfer:
   corr_mode: "cycle_template"
+  route_fit_scope: "train"
+  use_pred_residual: true
   phase_bins: 64
   phase_max_shift: null
   period_min: null

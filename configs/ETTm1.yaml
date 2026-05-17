@@ -1,9 +1,10 @@
 exp:
   name: ETTm1_pred_96
-  out_dir: outputs/ETTm1
+  out_dir: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11
   seed: 2026
   deterministic: true
   device: cuda:0
+
 data:
   csv_path: data/ETTm1.csv
   date_col: 0
@@ -11,20 +12,19 @@ data:
   train_ratio: 0.6
   val_ratio: 0.2
   test_ratio: 0.2
+
 window:
   input_len: 336
-  pred_len: 96
+  pred_len: 720
+
 normalize:
   train_only: true
   global_zscore: true
-calibration:
-  enable: false
-  method: median
-  shrink: 1.0
-  max_abs: 0.0
+
 corr:
   compute: true
-  save_path: outputs/ETTm1/corr.npy
+  save_path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/corr.npy
+
 cluster:
   method: leader
   n_clusters: 3
@@ -40,43 +40,48 @@ cluster:
   min_cluster_size: 2
   merge_small_clusters: true
   no_merge_if_channels_lt: 7
+  train_only: true
+
 model:
   predictor: mlp
   hidden_dim: 256
   dropout: 0.2
-# ============================================================
-# MoE Penalty Module — Penalty-Supervised Expert MoE
-# ETTm1 H=96 最佳配置 (合规协议下 base test_mse = 0.26087, multi-seed mean)
-#   vs PatchTST 0.290: -10.0% 真实突破
-#   vs v12 baseline 0.295: -11.7%
-# 三层核心创新：
-#   1. 参数物理隔离 (K×P 独立 expert head)
-#   2. Specialization Loss (expert 被对应 penalty 单独监督)
-#   3. 数据驱动 penalty 池 (按 ETTm1 平稳+周期特征筛选)
-# ============================================================
+
 moe:
-  topk: 1
   enable: true
+  topk: 1
   freeze_lambda: false
   gate_hidden_dim: 32
-  min_k_for_extensions: 3      # K-aware safeguard
+  min_k_for_extensions: 3
   safeguard_hidden_dim: 64
-  select_ranks:
-  - 1
+  select_ranks: [1]
   detach_penalty_grad: false
-  # Lambda 配置：仅对应启用的 4 个 penalty
+
   lambda_init:
     level: 0.1
-  # ★★ 核心创新：Penalty-Supervised Expert MoE
-  # mask 直接参与预测：yhat = yhat_base + Σ_p (mask_p × expert_p(x))
-  # 每个 expert_p 由对应 penalty_p 单独监督，强制 specialization
+    delta: 0.1
+    d2_match: 0.1
+    diff_amp: 0.1
+  lambda_min:
+    level: 0.0
+    delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_schedule:
+    level: none
+    delta: none
+    d2_match: none
+    diff_amp: none
+
   pred_side_residual:
     enable: true
+    feature_mode: legacy
+    residual_clip: 0.0
     corrector_hidden: 32
     init_alpha: -3.0
-    alpha_scale: 0.5
+    alpha_scale: 1.1
     specialization_weight: 0.1
-    norm_weight: 1.0e-4
+    norm_weight: 0.0
     use_y_base_input: true
     intervention_enable: false
     intervention_init: -2.0
@@ -95,17 +100,17 @@ moe:
       max_scale: 1.0
       init_scale: 0.8
       scale_reg: 1.0e-4
+
   dynamic_lambda:
     enable: true
     mode: multiscale
     hidden_dim: 32
-    segment_bins:
-    - 4
-    - 8
+    segment_bins: [4, 8]
     max_factor: 1.5
     mix: 0.6
     dropout: 0.0
-    reg_weight: 0.0001
+    reg_weight: 1.0e-4
+
   learnable_lambda:
     enable: false
     reg_weight: 0.01
@@ -117,8 +122,9 @@ moe:
       inner_lr: 0.001
       val_metric: val_mse
       steps_per_epoch: 10
-  gate_entropy_weight: 0.008
-  gate_balance_weight: 0.02
+
+  gate_entropy_weight: 0.0
+  gate_balance_weight: 0.0
   gate_route_on_penalty_only: true
   router_mode: learned
   router_penalty_context_weight: 0.0
@@ -128,6 +134,11 @@ moe:
   skip_init_bias: -2.0
   gate_temperature: 1.0
   gate_noise_std: 0.2
+  gate_init_bias:
+    enable: true
+    values:
+      level: 2.0
+      default: 0.0
   gate_soft_weight: 0.0
   gate_prob_floor: 0.0
   gate_entropy_target_frac: 0.7
@@ -145,59 +156,36 @@ moe:
     enable: true
     gamma: 0.2
     init_bias: -2.0
-  lambda_min:
-    level: 0.0
-  lambda_schedule:
-    level: none
   gate_logit_clip: 5.0
-# ============================================================
-# Data-driven Penalty Pool: 按 ETTm1 平稳+周期数据特征筛选
-#   ❌ 已移除（实证无效或冲突）：
-#     - jump      : ETTm1 几乎不触发跳变 (>0.6 std 仅 ~2%)
-#     - level     : 与 MSE 完全重叠（mean 偏移已被 MSE 覆盖）
-#     - corr/direction/trend : 与 MSE 方向冲突，实测退化 +6.55%
-#   ✅ 保留（与 ETTm1 数据特征匹配）：
-#     - amp_under : 防止预测幅度收缩，平稳数据中关键
-#     - delta     : 一阶差分匹配，符合 ETTm1 渐变特征
-#     - jitter    : 二阶差分平滑，匹配 ETTm1 周期性
-#     - smooth    : 一阶差分平方，匹配能源数据稳态
-# ============================================================
+
 penalties:
-  enabled:
-  - level
+  enabled: [level, delta, d2_match, diff_amp]
   jump_threshold: 0.6
+
 train:
   epochs: 100
   batch_size: 64
   lr: 0.001
   mse_weight: 0.9
+  selection_metric: val_mse
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  penalty_warmup_epochs: 10
   mae_objective:
     enable: true
     kind: l1
     weight: 0.6
     warmup_epochs: 5
-  selection_metric: val_mse
-  weight_decay: 0.0001
-  grad_clip: 1.0
   lr_scheduler:
     name: plateau
     factor: 0.5
     patience: 3
-    min_lr: 1.0e-06
-  penalty_warmup_epochs: 10
+    min_lr: 1.0e-6
+
 early_stop:
   patience: 10
-  min_delta: 1.0e-06
-plot:
-  enable: true
-  random_n: 3
-  dpi: 140
-portrait:
-  enable: true
-  out_dir: outputs/ETTm1/cluster_portraits
-  dpi: 140
-  max_points: 2000
-  jump_threshold: 0.6
+  min_delta: 1.0e-6
+
 knn_hybrid:
   enable: false
   mode: rolling
@@ -222,9 +210,7 @@ knn_hybrid:
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/ETTm1/knn_shape_bank.pt
-memory:
-  path: outputs/ETTm1/cluster_memory.pt
-  checkpoint_path: outputs/ETTm1/best_checkpoint.pt
-  enable: false
-  save_checkpoint: false
+  path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/knn_shape_bank.pt
+
+eval:
+  skip_test: false

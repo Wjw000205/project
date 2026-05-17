@@ -1,6 +1,6 @@
-﻿exp:
-  name: "ETTm1_to_ETTh1"
-  out_dir: "outputs/ETTm1ToETTh1"
+exp:
+  name: "ETTm1_to_ETTh2"
+  out_dir: "outputs/ETTm1ToETTh2"
   seed: 2026
   device: "cuda:0"
 
@@ -13,7 +13,7 @@ source:
   step_minutes: 15
 
 data:
-  csv_path: "data/ETTh1.csv"
+  csv_path: "data/ETTh2.csv"
   date_col: 0
   train_ratio: 0.7
   val_ratio: 0.1
@@ -65,4 +65,3 @@ transfer:
 
 eval:
   batch_size: 64
-
