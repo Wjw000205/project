@@ -14,13 +14,14 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2"]
+DEFAULT_DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2", "weather"]
 DEFAULT_HORIZONS = [96, 192, 336, 720]
 DEFAULT_CONFIGS = {
     "ETTh1": "configs/ETTh1.yaml",
     "ETTh2": "configs/ETTh2.yaml",
     "ETTm1": "configs/ETTm1.yaml",
     "ETTm2": "configs/ETTm2.yaml",
+    "weather": "configs/weather.yaml",
 }
 
 CSV_FIELDS = [
@@ -418,7 +419,7 @@ def summary_reusable(summary_path: Path, config_path: Path) -> bool:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Run ETTh1/ETTh2/ETTm1/ETTm2 over 96/192/336/720 and write base+hybrid metrics to CSV."
+        description="Run datasets over 96/192/336/720 and write base+hybrid metrics to CSV."
     )
     ap.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS, choices=DEFAULT_DATASETS)
     ap.add_argument("--horizons", nargs="+", type=int, default=DEFAULT_HORIZONS)
