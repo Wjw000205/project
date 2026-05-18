@@ -90,6 +90,21 @@ moe:
     selection_policy: val_mse_gate
     selection_min_abs_improvement: 0.0
     selection_min_rel_improvement: 0.0
+    penalty_guard:
+      enable: false
+      metric: mse
+      allow_multi: true
+      min_abs_improvement: 0.0
+      min_rel_improvement: 0.0
+    channel_guard:
+      enable: false
+    validation_guard:
+      enable: false
+      select_fraction: 0.5
+      min_abs_improvement: 0.0
+      min_rel_improvement: 0.002
+    diagnostics:
+      enable: true
     gate_calibrator:
       loss: mse
       selection_metric: mse

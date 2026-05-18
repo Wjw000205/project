@@ -567,6 +567,7 @@ def eval_loop(
     router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
 
     P = len(penalty_names)
     total_loss_sum = torch.zeros(K, device=device)
@@ -609,13 +610,14 @@ def eval_loop(
 
         if moe_enable and P > 0:
             straight_through = (not moe_cfg["detach_penalty_grad"])
-            mask_bkp, probs_bkp, skip_bk, _ = gate(feat_bkf, straight_through=straight_through)
-            probs_bkp = _apply_router_penalty_context(
-                probs_bkp,
-                route_pen_bkp,
-                router_mode=router_mode,
+            mask_bkp, probs_bkp, skip_bk, _ = gate(
+                feat_bkf,
+                straight_through=straight_through,
+                penalty_context_bkp=route_pen_bkp,
+                penalty_context_mode=router_mode,
                 penalty_context_weight=router_penalty_context_weight,
-                detach_penalty_context=router_detach_penalty_context,
+                penalty_context_detach=router_detach_penalty_context,
+                penalty_context_score=router_penalty_context_score,
             )
             rank_mask = None
             if select_ranks is not None:
@@ -647,6 +649,32 @@ def eval_loop(
                 pred_residual_gate.eval()
                 gate_feat = _knn_gate_features(x, yhat_base, yhat)
                 scale = pred_residual_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
+                if bool(getattr(pred_residual_gate, "apply_activation_threshold", False)):
+                    threshold_raw = getattr(
+                        pred_residual_gate,
+                        "activation_threshold_c",
+                        getattr(pred_residual_gate, "activation_threshold", 0.0),
+                    )
+                    threshold = torch.as_tensor(threshold_raw, device=scale.device, dtype=scale.dtype)
+                    if threshold.numel() == 1:
+                        threshold = threshold.reshape(1, 1, 1)
+                    elif threshold.numel() == scale.shape[1]:
+                        threshold = threshold.reshape(1, scale.shape[1], 1)
+                    else:
+                        raise ValueError(
+                            f"Residual gate activation threshold must be scalar or length {scale.shape[1]}, "
+                            f"got {int(threshold.numel())}."
+                        )
+                    if bool(getattr(pred_residual_gate, "activation_head_enable", False)):
+                        active_score = pred_residual_gate.activation_prob(gate_feat).to(
+                            device=scale.device,
+                            dtype=scale.dtype,
+                        ).unsqueeze(-1)
+                        active = active_score > threshold
+                    else:
+                        by_abs = bool(getattr(pred_residual_gate, "activation_by_abs_scale", False))
+                        active = scale.abs() > threshold if by_abs else scale > threshold
+                    scale = scale * active.to(dtype=scale.dtype)
                 if pred_residual_scale_c is not None:
                     channel_scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
                     scale = scale * channel_scale
@@ -929,6 +957,33 @@ def _knn_gate_features(
     )
 
 
+def _activation_feature_mask_for_mode(mode: str, feat_dim: int) -> torch.Tensor:
+    mode_l = str(mode).lower()
+    mask = torch.zeros(int(feat_dim), dtype=torch.float32)
+    if mode_l in {"full", "all"}:
+        mask.fill_(1.0)
+    elif mode_l in {"input", "history", "history_only", "input_only"}:
+        mask[: min(5, int(feat_dim))] = 1.0
+    elif mode_l in {"input_base", "history_base", "input_and_base"}:
+        keep = [0, 1, 2, 3, 4, 9, 11]
+        for idx in keep:
+            if idx < int(feat_dim):
+                mask[idx] = 1.0
+    elif mode_l in {"no_delta", "no_residual_delta"}:
+        keep = [0, 1, 2, 3, 4, 9, 10, 11, 12]
+        for idx in keep:
+            if idx < int(feat_dim):
+                mask[idx] = 1.0
+    else:
+        raise ValueError(
+            "activation_feature_mode must be full, input_only, input_base, or no_delta "
+            f"(got {mode!r})."
+        )
+    if float(mask.sum().item()) <= 0.0:
+        mask.fill_(1.0)
+    return mask
+
+
 class KNNResidualGate(nn.Module):
     def __init__(
         self,
@@ -939,17 +994,33 @@ class KNNResidualGate(nn.Module):
         max_scale: float = 1.5,
         init_scale: float = 1.0,
         scale_mode: str = "sigmoid",
+        activation_head: bool = False,
+        activation_init_prob: float = 0.5,
+        activation_cluster_ids: Optional[torch.Tensor] = None,
+        activation_cluster_bias: bool = False,
     ):
         super().__init__()
         self.F = int(feat_dim)
         self.C = int(num_channels)
         self.max_scale = max(float(max_scale), 1.0e-6)
         self.scale_mode = str(scale_mode).lower()
+        self.activation_head_enable = bool(activation_head)
+        self.activation_cluster_bias_enable = bool(activation_cluster_bias)
         if self.scale_mode not in {"sigmoid", "signed_tanh"}:
             raise ValueError("Residual gate scale_mode must be 'sigmoid' or 'signed_tanh'.")
         self.register_buffer("feature_mean", torch.zeros(1, 1, self.F), persistent=True)
         self.register_buffer("feature_std", torch.ones(1, 1, self.F), persistent=True)
         self.register_buffer("feature_standardize_enabled", torch.tensor(0.0), persistent=True)
+        self.register_buffer("activation_feature_mask", torch.ones(1, 1, self.F), persistent=True)
+        if activation_cluster_ids is None:
+            cluster_id = torch.zeros(self.C, dtype=torch.long)
+        else:
+            cluster_id = activation_cluster_ids.detach().cpu().to(dtype=torch.long).reshape(-1)
+            if int(cluster_id.numel()) != self.C:
+                raise ValueError(f"activation_cluster_ids must have {self.C} entries, got {int(cluster_id.numel())}.")
+            cluster_id = cluster_id.clamp_min(0)
+        self.register_buffer("activation_cluster_id_c", cluster_id, persistent=True)
+        activation_num_clusters = int(cluster_id.max().item()) + 1 if self.C > 0 else 1
         if self.scale_mode == "signed_tanh":
             init_scale = max(-self.max_scale + 1.0e-6, min(float(init_scale), self.max_scale - 1.0e-6))
             init_ratio = init_scale / self.max_scale
@@ -965,7 +1036,28 @@ class KNNResidualGate(nn.Module):
             nn.Linear(int(hidden_dim), 1),
         )
         self.channel_bias = nn.Parameter(torch.zeros(self.C))
+        if self.activation_head_enable:
+            activation_init_prob = min(max(float(activation_init_prob), 1.0e-6), 1.0 - 1.0e-6)
+            activation_init_bias = math.log(activation_init_prob / max(1.0 - activation_init_prob, 1.0e-6))
+            self.activation_net = nn.Sequential(
+                nn.Linear(self.F, int(hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
+                nn.Linear(int(hidden_dim), 1),
+            )
+            self.activation_channel_bias = nn.Parameter(torch.zeros(self.C))
+            if self.activation_cluster_bias_enable:
+                self.activation_cluster_bias = nn.Parameter(torch.zeros(activation_num_clusters))
+            else:
+                self.activation_cluster_bias = None
+        else:
+            activation_init_bias = 0.0
+            self.activation_net = None
+            self.activation_channel_bias = None
+            self.activation_cluster_bias = None
         self.reset_parameters(init_bias)
+        if self.activation_head_enable:
+            self.reset_activation_parameters(activation_init_bias)
 
     def reset_parameters(self, init_bias: float):
         for module in self.net:
@@ -973,6 +1065,18 @@ class KNNResidualGate(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
         last = self.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.constant_(last.bias, float(init_bias))
+
+    def reset_activation_parameters(self, init_bias: float):
+        if self.activation_net is None:
+            return
+        for module in self.activation_net:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        last = self.activation_net[-1]
         if isinstance(last, nn.Linear):
             nn.init.zeros_(last.weight)
             nn.init.constant_(last.bias, float(init_bias))
@@ -989,16 +1093,44 @@ class KNNResidualGate(nn.Module):
         self.feature_std.fill_(1.0)
         self.feature_standardize_enabled.zero_()
 
-    def forward(self, feat_bcf: torch.Tensor) -> torch.Tensor:
+    def set_activation_feature_mask(self, mask_f: torch.Tensor) -> None:
+        mask = mask_f.detach().view(1, 1, self.F).to(
+            device=self.activation_feature_mask.device,
+            dtype=self.activation_feature_mask.dtype,
+        )
+        self.activation_feature_mask.copy_(mask.clamp(0.0, 1.0))
+
+    def _standardize_feat(self, feat_bcf: torch.Tensor) -> torch.Tensor:
         if bool(self.feature_standardize_enabled.item() > 0.5):
             feat_bcf = (feat_bcf - self.feature_mean.to(device=feat_bcf.device, dtype=feat_bcf.dtype)) / self.feature_std.to(
                 device=feat_bcf.device,
                 dtype=feat_bcf.dtype,
             )
+        return feat_bcf
+
+    def forward(self, feat_bcf: torch.Tensor) -> torch.Tensor:
+        feat_bcf = self._standardize_feat(feat_bcf)
         logits_bc = self.net(feat_bcf).squeeze(-1) + self.channel_bias.view(1, -1)
         if self.scale_mode == "signed_tanh":
             return self.max_scale * torch.tanh(logits_bc)
         return self.max_scale * torch.sigmoid(logits_bc)
+
+    def activation_prob(self, feat_bcf: torch.Tensor) -> torch.Tensor:
+        if self.activation_net is None or self.activation_channel_bias is None:
+            scale = self.forward(feat_bcf)
+            if self.scale_mode == "signed_tanh":
+                return ((scale / self.max_scale) + 1.0).mul(0.5).clamp(1.0e-6, 1.0 - 1.0e-6)
+            return (scale / self.max_scale).clamp(1.0e-6, 1.0 - 1.0e-6)
+        feat_bcf = self._standardize_feat(feat_bcf)
+        feat_bcf = feat_bcf * self.activation_feature_mask.to(device=feat_bcf.device, dtype=feat_bcf.dtype)
+        logits_bc = self.activation_net(feat_bcf).squeeze(-1) + self.activation_channel_bias.view(1, -1)
+        if self.activation_cluster_bias is not None:
+            cluster_bias_c = self.activation_cluster_bias.index_select(
+                0,
+                self.activation_cluster_id_c.to(device=self.activation_cluster_bias.device),
+            )
+            logits_bc = logits_bc + cluster_bias_c.to(device=logits_bc.device, dtype=logits_bc.dtype).view(1, -1)
+        return torch.sigmoid(logits_bc).clamp(1.0e-6, 1.0 - 1.0e-6)
 
 
 @torch.no_grad()
@@ -1141,7 +1273,7 @@ def train_knn_residual_gate(
             delta_b = delta.index_select(0, batch_idx).to(device)
             y_b = y.index_select(0, batch_idx).to(device)
             scale_b = gate(feat_b)
-            loss = _loss_for(scale_b, base_b, delta_b, y_b)
+            loss = _loss_for(scale_b, base_b, delta_b, y_b, feat_bcf=feat_b)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(gate.parameters(), float(cfg.get("grad_clip", 1.0)))
@@ -1202,6 +1334,7 @@ def _collect_pred_residual_gate_tensors(
     router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
 
     feat_parts = []
     base_parts = []
@@ -1222,13 +1355,14 @@ def _collect_pred_residual_gate_tensors(
             cluster_id_c=cluster_id_c,
             K=K,
         )
-        mask_bkp, probs_bkp, skip_bk, _ = gate(feat_bkf, straight_through=False)
-        probs_bkp = _apply_router_penalty_context(
-            probs_bkp,
-            route_pen_bkp,
-            router_mode=router_mode,
+        mask_bkp, probs_bkp, skip_bk, _ = gate(
+            feat_bkf,
+            straight_through=False,
+            penalty_context_bkp=route_pen_bkp,
+            penalty_context_mode=router_mode,
             penalty_context_weight=router_penalty_context_weight,
-            detach_penalty_context=router_detach_penalty_context,
+            penalty_context_detach=router_detach_penalty_context,
+            penalty_context_score=router_penalty_context_score,
         )
         rank_mask = None
         if select_ranks is not None:
@@ -1264,6 +1398,578 @@ def _collect_pred_residual_gate_tensors(
         "base": torch.cat(base_parts, dim=0),
         "delta": torch.cat(delta_parts, dim=0),
         "y": torch.cat(y_parts, dim=0),
+    }
+
+
+@torch.no_grad()
+def _pred_residual_gate_activation_metrics_from_tensors(
+    tensors: Optional[Dict[str, torch.Tensor]],
+    residual_gate: Optional[KNNResidualGate],
+    device: torch.device,
+    batch_size: int,
+    activation_threshold: float,
+    label_min_improvement: float = 0.0,
+    activation_by_abs_scale: bool = False,
+    apply_activation_threshold: bool = False,
+    channel_scale_c: Optional[torch.Tensor] = None,
+    indices: Optional[torch.Tensor] = None,
+    channel_names: Optional[List[str]] = None,
+    cluster_id_c: Optional[torch.Tensor] = None,
+) -> Optional[Dict[str, object]]:
+    if tensors is None or residual_gate is None:
+        return None
+    feat = tensors["feat"]
+    base = tensors["base"]
+    delta = tensors["delta"]
+    y = tensors["y"]
+    n = int(feat.shape[0])
+    if n == 0:
+        return None
+    if indices is None:
+        indices = torch.arange(0, n, dtype=torch.long)
+    else:
+        indices = indices.detach().cpu().to(dtype=torch.long)
+    if indices.numel() == 0:
+        return None
+
+    residual_gate.eval()
+    c = int(feat.shape[1])
+    threshold_t = torch.as_tensor(activation_threshold, dtype=torch.float32)
+    if threshold_t.numel() == 1:
+        threshold_summary = float(max(0.0, float(threshold_t.reshape(-1)[0].item())))
+        threshold_bc_cpu = torch.full((1, c), threshold_summary, dtype=torch.float32)
+    elif threshold_t.numel() == c:
+        threshold_bc_cpu = threshold_t.reshape(1, c).clamp_min(0.0)
+        threshold_summary = [float(v) for v in threshold_bc_cpu.reshape(-1).tolist()]
+    else:
+        raise ValueError(f"activation_threshold must be scalar or length {c}, got {int(threshold_t.numel())}")
+    min_improvement = max(0.0, float(label_min_improvement))
+    batch_size = max(1, int(batch_size))
+
+    tp = fp = tn = fn = 0
+    tp_c = torch.zeros(c, dtype=torch.long)
+    fp_c = torch.zeros(c, dtype=torch.long)
+    tn_c = torch.zeros(c, dtype=torch.long)
+    fn_c = torch.zeros(c, dtype=torch.long)
+    base_se = raw_se = scaled_se = 0.0
+    denom = 0
+    scale_sum = 0.0
+    scale_abs_sum = 0.0
+    scale_count = 0
+    channel_scale = None
+    if channel_scale_c is not None:
+        channel_scale = channel_scale_c.detach().to(device=device, dtype=torch.float32).view(1, -1)
+
+    for b0 in range(0, int(indices.numel()), batch_size):
+        batch_idx = indices[b0:b0 + batch_size]
+        feat_b = feat.index_select(0, batch_idx).to(device)
+        base_b = base.index_select(0, batch_idx).to(device)
+        delta_b = delta.index_select(0, batch_idx).to(device)
+        y_b = y.index_select(0, batch_idx).to(device)
+
+        scale_b = residual_gate(feat_b)
+        if channel_scale is not None:
+            scale_b = scale_b * channel_scale.to(device=scale_b.device, dtype=scale_b.dtype)
+        threshold_bc = threshold_bc_cpu.to(device=scale_b.device, dtype=scale_b.dtype)
+        if bool(getattr(residual_gate, "activation_head_enable", False)):
+            active_score_b = residual_gate.activation_prob(feat_b).to(device=scale_b.device, dtype=scale_b.dtype)
+        elif activation_by_abs_scale:
+            active_score_b = scale_b.abs()
+        else:
+            active_score_b = scale_b
+
+        raw_pred_b = base_b + delta_b
+        base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
+        raw_err_bc = (raw_pred_b - y_b).pow(2).mean(dim=-1)
+        active_label = (base_err_bc - raw_err_bc) > min_improvement
+        active_pred = active_score_b > threshold_bc
+        scale_for_pred = scale_b * active_pred.to(dtype=scale_b.dtype) if apply_activation_threshold else scale_b
+        scaled_pred_b = base_b + scale_for_pred.unsqueeze(-1) * delta_b
+
+        tp += int((active_pred & active_label).sum().item())
+        fp += int((active_pred & (~active_label)).sum().item())
+        tn += int(((~active_pred) & (~active_label)).sum().item())
+        fn += int(((~active_pred) & active_label).sum().item())
+        tp_c += (active_pred & active_label).detach().cpu().sum(dim=0).to(dtype=torch.long)
+        fp_c += (active_pred & (~active_label)).detach().cpu().sum(dim=0).to(dtype=torch.long)
+        tn_c += ((~active_pred) & (~active_label)).detach().cpu().sum(dim=0).to(dtype=torch.long)
+        fn_c += ((~active_pred) & active_label).detach().cpu().sum(dim=0).to(dtype=torch.long)
+        base_se += float((base_b - y_b).pow(2).sum().item())
+        raw_se += float((raw_pred_b - y_b).pow(2).sum().item())
+        scaled_se += float((scaled_pred_b - y_b).pow(2).sum().item())
+        denom += int(y_b.numel())
+        scale_sum += float(scale_b.sum().item())
+        scale_abs_sum += float(scale_b.abs().sum().item())
+        scale_count += int(scale_b.numel())
+
+    total = tp + fp + tn + fn
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    specificity = tn / max(tn + fp, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1.0e-12)
+    base_mse = base_se / max(denom, 1)
+    raw_mse = raw_se / max(denom, 1)
+    scaled_mse = scaled_se / max(denom, 1)
+    names = list(channel_names) if channel_names is not None and len(channel_names) == c else [f"ch_{i}" for i in range(c)]
+    per_channel = []
+    for ci in range(c):
+        c_tp = int(tp_c[ci].item())
+        c_fp = int(fp_c[ci].item())
+        c_tn = int(tn_c[ci].item())
+        c_fn = int(fn_c[ci].item())
+        c_total = c_tp + c_fp + c_tn + c_fn
+        c_precision = c_tp / max(c_tp + c_fp, 1)
+        c_recall = c_tp / max(c_tp + c_fn, 1)
+        c_specificity = c_tn / max(c_tn + c_fp, 1)
+        c_f1 = 2.0 * c_precision * c_recall / max(c_precision + c_recall, 1.0e-12)
+        per_channel.append(
+            {
+                "channel": names[ci],
+                "cluster_id": (
+                    int(cluster_id_c.detach().cpu()[ci].item())
+                    if cluster_id_c is not None and int(cluster_id_c.numel()) == c
+                    else None
+                ),
+                "samples": int(c_total),
+                "start_hit_rate": float(c_recall),
+                "stop_hit_rate": float(c_specificity),
+                "precision": float(c_precision),
+                "f1": float(c_f1),
+                "accuracy": float((c_tp + c_tn) / max(c_total, 1)),
+                "target_positive_rate": float((c_tp + c_fn) / max(c_total, 1)),
+                "pred_positive_rate": float((c_tp + c_fp) / max(c_total, 1)),
+                "false_start_rate": float(c_fp / max(c_fp + c_tn, 1)),
+                "miss_start_rate": float(c_fn / max(c_fn + c_tp, 1)),
+                "true_positive": c_tp,
+                "false_positive": c_fp,
+                "true_negative": c_tn,
+                "false_negative": c_fn,
+            }
+        )
+    per_cluster = []
+    if cluster_id_c is not None and int(cluster_id_c.numel()) == c:
+        cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
+        for k in torch.unique(cid).tolist():
+            mask = cid == int(k)
+            k_tp = int(tp_c[mask].sum().item())
+            k_fp = int(fp_c[mask].sum().item())
+            k_tn = int(tn_c[mask].sum().item())
+            k_fn = int(fn_c[mask].sum().item())
+            k_total = k_tp + k_fp + k_tn + k_fn
+            k_precision = k_tp / max(k_tp + k_fp, 1)
+            k_recall = k_tp / max(k_tp + k_fn, 1)
+            k_specificity = k_tn / max(k_tn + k_fp, 1)
+            k_f1 = 2.0 * k_precision * k_recall / max(k_precision + k_recall, 1.0e-12)
+            per_cluster.append(
+                {
+                    "cluster_id": int(k),
+                    "samples": int(k_total),
+                    "start_hit_rate": float(k_recall),
+                    "stop_hit_rate": float(k_specificity),
+                    "precision": float(k_precision),
+                    "f1": float(k_f1),
+                    "accuracy": float((k_tp + k_tn) / max(k_total, 1)),
+                    "target_positive_rate": float((k_tp + k_fn) / max(k_total, 1)),
+                    "pred_positive_rate": float((k_tp + k_fp) / max(k_total, 1)),
+                    "false_start_rate": float(k_fp / max(k_fp + k_tn, 1)),
+                    "miss_start_rate": float(k_fn / max(k_fn + k_tp, 1)),
+                    "true_positive": k_tp,
+                    "false_positive": k_fp,
+                    "true_negative": k_tn,
+                    "false_negative": k_fn,
+                }
+            )
+    return {
+        "enable": True,
+        "threshold": threshold_summary,
+        "label_min_improvement": float(min_improvement),
+        "activation_by_abs_scale": bool(activation_by_abs_scale),
+        "apply_activation_threshold": bool(apply_activation_threshold),
+        "samples": int(total),
+        "accuracy": float((tp + tn) / max(total, 1)),
+        "hit_rate": float((tp + tn) / max(total, 1)),
+        "start_hit_rate": float(recall),
+        "stop_hit_rate": float(specificity),
+        "false_start_rate": float(fp / max(fp + tn, 1)),
+        "miss_start_rate": float(fn / max(fn + tp, 1)),
+        "balanced_accuracy": float(0.5 * (recall + specificity)),
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "f1": float(f1),
+        "true_positive": int(tp),
+        "false_positive": int(fp),
+        "true_negative": int(tn),
+        "false_negative": int(fn),
+        "target_positive_rate": float((tp + fn) / max(total, 1)),
+        "pred_positive_rate": float((tp + fp) / max(total, 1)),
+        "mean_scale": float(scale_sum / max(scale_count, 1)),
+        "mean_abs_scale": float(scale_abs_sum / max(scale_count, 1)),
+        "base_mse": float(base_mse),
+        "raw_residual_mse": float(raw_mse),
+        "scaled_mse": float(scaled_mse),
+        "raw_residual_gain_pct_vs_base": float(100.0 * (base_mse - raw_mse) / max(abs(base_mse), 1.0e-12)),
+        "scaled_gain_pct_vs_base": float(100.0 * (base_mse - scaled_mse) / max(abs(base_mse), 1.0e-12)),
+        "per_channel": per_channel,
+        "per_cluster": per_cluster,
+    }
+
+
+@torch.no_grad()
+def _select_pred_residual_activation_threshold(
+    tensors: Optional[Dict[str, torch.Tensor]],
+    residual_gate: Optional[KNNResidualGate],
+    device: torch.device,
+    batch_size: int,
+    label_min_improvement: float,
+    activation_by_abs_scale: bool,
+    indices: Optional[torch.Tensor],
+    max_candidates: int = 101,
+    selection_metric: str = "accuracy",
+    scope: str = "global",
+    channel_names: Optional[List[str]] = None,
+    cluster_id_c: Optional[torch.Tensor] = None,
+) -> Tuple[object, Dict[str, object]]:
+    if tensors is None or residual_gate is None:
+        return 0.0, {"mode": "auto", "reason": "missing_tensors_or_gate"}
+    feat = tensors["feat"]
+    base = tensors["base"]
+    delta = tensors["delta"]
+    y = tensors["y"]
+    n = int(feat.shape[0])
+    if n == 0:
+        return 0.0, {"mode": "auto", "reason": "empty_tensors"}
+    if indices is None:
+        indices = torch.arange(0, n, dtype=torch.long)
+    else:
+        indices = indices.detach().cpu().to(dtype=torch.long)
+    if indices.numel() == 0:
+        return 0.0, {"mode": "auto", "reason": "empty_indices"}
+
+    residual_gate.eval()
+    batch_size = max(1, int(batch_size))
+    min_improvement = max(0.0, float(label_min_improvement))
+    score_parts = []
+    label_parts = []
+    base_err_parts = []
+    scaled_err_parts = []
+    for b0 in range(0, int(indices.numel()), batch_size):
+        batch_idx = indices[b0:b0 + batch_size]
+        feat_b = feat.index_select(0, batch_idx).to(device)
+        base_b = base.index_select(0, batch_idx).to(device)
+        delta_b = delta.index_select(0, batch_idx).to(device)
+        y_b = y.index_select(0, batch_idx).to(device)
+        scale_b = residual_gate(feat_b)
+        if bool(getattr(residual_gate, "activation_head_enable", False)):
+            score_b = residual_gate.activation_prob(feat_b)
+        else:
+            score_b = scale_b.abs() if activation_by_abs_scale else scale_b
+        base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
+        raw_err_bc = (base_b + delta_b - y_b).pow(2).mean(dim=-1)
+        scaled_err_bc = (base_b + scale_b.unsqueeze(-1) * delta_b - y_b).pow(2).mean(dim=-1)
+        label_b = (base_err_bc - raw_err_bc) > min_improvement
+        score_parts.append(score_b.detach().cpu())
+        label_parts.append(label_b.detach().cpu())
+        base_err_parts.append(base_err_bc.detach().cpu())
+        scaled_err_parts.append(scaled_err_bc.detach().cpu())
+
+    scores = torch.cat(score_parts, dim=0)
+    labels = torch.cat(label_parts, dim=0)
+    base_err = torch.cat(base_err_parts, dim=0)
+    scaled_err = torch.cat(scaled_err_parts, dim=0)
+    if scores.numel() == 0:
+        return 0.0, {"mode": "auto", "reason": "empty_scores"}
+
+    metric_mode = str(selection_metric).lower()
+    if metric_mode not in {"accuracy", "balanced_accuracy", "f1", "mse"}:
+        raise ValueError("activation_threshold_selection_metric must be accuracy, balanced_accuracy, f1, or mse.")
+
+    def _best_for_vectors(
+        score_v: torch.Tensor,
+        label_v: torch.Tensor,
+        base_err_v: torch.Tensor,
+        scaled_err_v: torch.Tensor,
+    ) -> Tuple[float, Dict[str, object]]:
+        score_v = score_v.reshape(-1)
+        label_v = label_v.reshape(-1).to(dtype=torch.bool)
+        base_err_v = base_err_v.reshape(-1)
+        scaled_err_v = scaled_err_v.reshape(-1)
+        if score_v.numel() == 0:
+            return 0.0, {"reason": "empty_scores"}
+        if int(label_v.sum().item()) == 0:
+            threshold = float(score_v.max().item()) + 1.0e-6
+            return threshold, {"reason": "no_positive_labels", "threshold": threshold}
+        uniq = torch.unique(score_v)
+        if uniq.numel() > max_candidates:
+            candidates_v = torch.unique(torch.quantile(score_v, torch.linspace(0.0, 1.0, steps=max_candidates)))
+        else:
+            candidates_v = uniq
+        candidates_v = torch.unique(
+            torch.cat(
+                [
+                    torch.tensor([0.0], dtype=score_v.dtype),
+                    candidates_v,
+                    torch.tensor([float(score_v.max().item()) + 1.0e-6], dtype=score_v.dtype),
+                ],
+                dim=0,
+            )
+        )
+        best_v = {
+            "threshold": 0.0,
+            "accuracy": -1.0,
+            "balanced_accuracy": -1.0,
+            "f1": -1.0,
+            "mse": float("inf"),
+            "precision": 0.0,
+            "recall": 0.0,
+            "specificity": 0.0,
+            "pred_positive_rate": 0.0,
+            "target_positive_rate": float(label_v.float().mean().item()),
+            "num_candidates": int(candidates_v.numel()),
+        }
+        for cand in candidates_v.tolist():
+            pred = score_v > float(cand)
+            tp = int((pred & label_v).sum().item())
+            fp = int((pred & (~label_v)).sum().item())
+            tn = int(((~pred) & (~label_v)).sum().item())
+            fn = int(((~pred) & label_v).sum().item())
+            total = tp + fp + tn + fn
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            specificity = tn / max(tn + fp, 1)
+            balanced_accuracy = 0.5 * (recall + specificity)
+            f1 = 2.0 * precision * recall / max(precision + recall, 1.0e-12)
+            acc = (tp + tn) / max(total, 1)
+            mse = float(torch.where(pred, scaled_err_v, base_err_v).mean().item())
+            if metric_mode == "mse":
+                better = (mse < best_v["mse"]) or (
+                    abs(mse - best_v["mse"]) <= 1.0e-12 and balanced_accuracy > best_v["balanced_accuracy"]
+                )
+            elif metric_mode == "f1":
+                better = (f1 > best_v["f1"]) or (
+                    abs(f1 - best_v["f1"]) <= 1.0e-12 and balanced_accuracy > best_v["balanced_accuracy"]
+                )
+            elif metric_mode == "balanced_accuracy":
+                better = (balanced_accuracy > best_v["balanced_accuracy"]) or (
+                    abs(balanced_accuracy - best_v["balanced_accuracy"]) <= 1.0e-12 and f1 > best_v["f1"]
+                )
+            else:
+                better = (acc > best_v["accuracy"]) or (abs(acc - best_v["accuracy"]) <= 1.0e-12 and f1 > best_v["f1"])
+            if better:
+                best_v.update(
+                    {
+                        "threshold": float(cand),
+                        "accuracy": float(acc),
+                        "balanced_accuracy": float(balanced_accuracy),
+                        "f1": float(f1),
+                        "mse": float(mse),
+                        "precision": float(precision),
+                        "recall": float(recall),
+                        "specificity": float(specificity),
+                        "pred_positive_rate": float((tp + fp) / max(total, 1)),
+                    }
+                )
+        return float(best_v["threshold"]), best_v
+
+    scope_mode = str(scope).lower()
+    if scope_mode in {"per_channel", "channel", "channels"}:
+        c = int(scores.shape[1])
+        names = list(channel_names) if channel_names is not None and len(channel_names) == c else [f"ch_{i}" for i in range(c)]
+        thresholds = []
+        per_channel = []
+        for ci in range(c):
+            thr, info = _best_for_vectors(scores[:, ci], labels[:, ci], base_err[:, ci], scaled_err[:, ci])
+            thresholds.append(float(thr))
+            item = dict(info)
+            item["channel"] = names[ci]
+            item["cluster_id"] = (
+                int(cluster_id_c.detach().cpu()[ci].item())
+                if cluster_id_c is not None and int(cluster_id_c.numel()) == c
+                else None
+            )
+            per_channel.append(item)
+        return thresholds, {
+            "mode": "auto",
+            "scope": "channel",
+            "selection_metric": metric_mode,
+            "threshold": thresholds,
+            "per_channel": per_channel,
+        }
+    if scope_mode in {"per_cluster", "cluster", "clusters"}:
+        c = int(scores.shape[1])
+        if cluster_id_c is None or int(cluster_id_c.numel()) != c:
+            raise ValueError("activation_threshold_scope=cluster requires cluster_id_c with one id per channel.")
+        cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
+        thresholds = torch.zeros(c, dtype=torch.float32)
+        per_cluster = []
+        for k in torch.unique(cid).tolist():
+            mask = cid == int(k)
+            thr, info = _best_for_vectors(scores[:, mask], labels[:, mask], base_err[:, mask], scaled_err[:, mask])
+            thresholds[mask] = float(thr)
+            item = dict(info)
+            item["cluster_id"] = int(k)
+            per_cluster.append(item)
+        return [float(v) for v in thresholds.tolist()], {
+            "mode": "auto",
+            "scope": "cluster",
+            "selection_metric": metric_mode,
+            "threshold": [float(v) for v in thresholds.tolist()],
+            "per_cluster": per_cluster,
+        }
+
+    thr, info = _best_for_vectors(scores, labels, base_err, scaled_err)
+    info.update({"mode": "auto", "scope": "global", "selection_metric": metric_mode})
+    return float(thr), info
+
+
+@torch.no_grad()
+def evaluate_gate_penalty_hit_metrics(
+    model: nn.Module,
+    gate: ClusterwiseMoEGate,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    penalty_scale: Optional[torch.Tensor],
+    select_ranks: Optional[List[int]],
+    gate_soft_weight: float,
+    label_min_improvement: float = 0.0,
+) -> Optional[Dict[str, object]]:
+    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
+        return None
+    moe_enable = bool(moe_cfg.get("enable", True))
+    if not moe_enable:
+        return None
+
+    model.eval()
+    gate.eval()
+    pred_residual.eval()
+    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
+    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
+    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
+    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
+
+    P = len(penalty_names)
+    total = positive_total = hit_total = positive_hit_total = 0
+    selected_positive = 0
+    base_se = oracle_se = selected_se = 0.0
+    denom = 0
+    oracle_count_p = torch.zeros(P, dtype=torch.long)
+    selected_count_p = torch.zeros(P, dtype=torch.long)
+    positive_oracle_count_p = torch.zeros(P, dtype=torch.long)
+    min_improvement = max(0.0, float(label_min_improvement))
+
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        y_base = model(x, cluster_id_c)
+        feat_bcf = extract_gate_features(x)
+        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        route_pen_bkp = _router_penalty_context_from_history(
+            x_bcl=x,
+            yhat_base_bch=y_base,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            penalty_scale=penalty_scale,
+            cluster_id_c=cluster_id_c,
+            K=K,
+        )
+        mask_bkp, probs_bkp, skip_bk, _ = gate(
+            feat_bkf,
+            straight_through=False,
+            penalty_context_bkp=route_pen_bkp,
+            penalty_context_mode=router_mode,
+            penalty_context_weight=router_penalty_context_weight,
+            penalty_context_detach=router_detach_penalty_context,
+            penalty_context_score=router_penalty_context_score,
+        )
+        rank_mask = None
+        if select_ranks is not None:
+            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+            rank_mask = mask_bkp
+        if gate_soft_weight > 0.0:
+            probs_sel = probs_bkp
+            if rank_mask is not None:
+                probs_sel = probs_sel * rank_mask
+                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            probs_sel = probs_sel * target_mass
+            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
+
+        pred_out = pred_residual(
+            x,
+            y_base,
+            cluster_id_c,
+            mask_bkp,
+            skip_bk=skip_bk if allow_skip else None,
+        )
+        residuals = pred_out.get("residuals")
+        intervention_bcp = pred_out.get("intervention_bcp")
+        alpha_cp = pred_out.get("alpha_cp")
+        if residuals is None or intervention_bcp is None or alpha_cp is None or residuals.numel() == 0:
+            continue
+
+        scale_bcp = intervention_bcp * alpha_cp.unsqueeze(0)
+        cand_bcpH = y_base.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
+        err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
+        base_err_bc = (y_base - y).pow(2).mean(dim=-1)
+        oracle_err_bc, oracle_p_bc = err_bcp.min(dim=-1)
+        route_bcp = mask_bkp[:, cluster_id_c, :]
+        probs_bcp = probs_bkp[:, cluster_id_c, :]
+        selected_score_bcp = route_bcp * probs_bcp
+        selected_p_bc = selected_score_bcp.argmax(dim=-1)
+        selected_err_bc = err_bcp.gather(-1, selected_p_bc.unsqueeze(-1)).squeeze(-1)
+
+        positive_bc = (base_err_bc - oracle_err_bc) > min_improvement
+        hit_bc = selected_p_bc == oracle_p_bc
+        selected_positive_bc = (base_err_bc - selected_err_bc) > min_improvement
+
+        total += int(hit_bc.numel())
+        positive_total += int(positive_bc.sum().item())
+        hit_total += int(hit_bc.sum().item())
+        positive_hit_total += int((hit_bc & positive_bc).sum().item())
+        selected_positive += int(selected_positive_bc.sum().item())
+        base_se += float((y_base - y).pow(2).sum().item())
+        oracle_se += float(oracle_err_bc.sum().item() * y.shape[-1])
+        selected_se += float(selected_err_bc.sum().item() * y.shape[-1])
+        denom += int(y.numel())
+        oracle_count_p += torch.bincount(oracle_p_bc.reshape(-1).detach().cpu(), minlength=P)[:P]
+        selected_count_p += torch.bincount(selected_p_bc.reshape(-1).detach().cpu(), minlength=P)[:P]
+        positive_oracle_count_p += torch.bincount(
+            oracle_p_bc[positive_bc].reshape(-1).detach().cpu(),
+            minlength=P,
+        )[:P]
+
+    if total <= 0:
+        return None
+    base_mse = base_se / max(denom, 1)
+    oracle_mse = oracle_se / max(denom, 1)
+    selected_mse = selected_se / max(denom, 1)
+    return {
+        "enable": True,
+        "samples": int(total),
+        "label_min_improvement": float(min_improvement),
+        "top1_hit_rate_all": float(hit_total / max(total, 1)),
+        "top1_hit_rate_on_positive_oracle": float(positive_hit_total / max(positive_total, 1)),
+        "oracle_positive_rate": float(positive_total / max(total, 1)),
+        "selected_positive_rate": float(selected_positive / max(total, 1)),
+        "base_mse": float(base_mse),
+        "oracle_mse": float(oracle_mse),
+        "selected_top1_mse": float(selected_mse),
+        "oracle_gain_pct_vs_base": float(100.0 * (base_mse - oracle_mse) / max(abs(base_mse), 1.0e-12)),
+        "selected_top1_gain_pct_vs_base": float(
+            100.0 * (base_mse - selected_mse) / max(abs(base_mse), 1.0e-12)
+        ),
+        "oracle_count": {name: int(oracle_count_p[i].item()) for i, name in enumerate(penalty_names)},
+        "positive_oracle_count": {
+            name: int(positive_oracle_count_p[i].item()) for i, name in enumerate(penalty_names)
+        },
+        "selected_count": {name: int(selected_count_p[i].item()) for i, name in enumerate(penalty_names)},
     }
 
 
@@ -1315,6 +2021,10 @@ def train_pred_residual_gate(
     if hold_idx.numel() == 0:
         hold_idx = train_idx
     standardize_features = bool(cfg.get("standardize_features", False))
+    activation_head_enable = bool(cfg.get("activation_head_enable", False))
+    activation_feature_mode = str(cfg.get("activation_feature_mode", "full"))
+    activation_train_soft_gating = bool(cfg.get("activation_train_soft_gating", False))
+    activation_cluster_bias_enable = bool(cfg.get("activation_cluster_bias_enable", False))
 
     residual_gate = KNNResidualGate(
         feat_dim=int(feat.shape[-1]),
@@ -1324,7 +2034,13 @@ def train_pred_residual_gate(
         max_scale=float(cfg.get("max_scale", 1.0)),
         init_scale=float(cfg.get("init_scale", 0.8)),
         scale_mode=str(cfg.get("scale_mode", "sigmoid")),
+        activation_head=activation_head_enable,
+        activation_init_prob=float(cfg.get("activation_init_prob", 0.5)),
+        activation_cluster_ids=cluster_id_c.detach().cpu() if activation_cluster_bias_enable else None,
+        activation_cluster_bias=activation_cluster_bias_enable,
     ).to(device)
+    activation_feature_mask = _activation_feature_mask_for_mode(activation_feature_mode, int(feat.shape[-1]))
+    residual_gate.set_activation_feature_mask(activation_feature_mask.to(device))
     lr = float(cfg.get("lr", 1.0e-3))
     weight_decay = float(cfg.get("weight_decay", 1.0e-4))
     batch_size = max(1, int(cfg.get("batch_size", 256)))
@@ -1338,6 +2054,26 @@ def train_pred_residual_gate(
     if selection_metric not in {"mse", "mae"}:
         raise ValueError("moe.pred_side_residual.gate_calibrator.selection_metric must be mse or mae.")
     beta = float(cfg.get("beta", 0.5))
+    activation_threshold_raw = cfg.get("activation_threshold", 0.1)
+    activation_threshold_auto = str(activation_threshold_raw).lower() == "auto"
+    activation_threshold = 0.1 if activation_threshold_auto else float(activation_threshold_raw)
+    activation_label_min_improvement = float(cfg.get("activation_label_min_improvement", 0.0))
+    activation_by_abs_scale = bool(
+        cfg.get("activation_by_abs_scale", str(cfg.get("scale_mode", "sigmoid")).lower() == "signed_tanh")
+    )
+    apply_activation_threshold = bool(cfg.get("apply_activation_threshold", False))
+    activation_bce_weight = float(cfg.get("activation_bce_weight", 0.0))
+    activation_inactive_scale_weight = float(cfg.get("activation_inactive_scale_weight", 0.0))
+    activation_pos_weight_cfg = cfg.get("activation_pos_weight", "auto")
+    activation_pos_weight_scope = str(cfg.get("activation_pos_weight_scope", "global")).lower()
+    if activation_pos_weight_scope not in {"global", "cluster", "channel"}:
+        raise ValueError("activation_pos_weight_scope must be global, cluster, or channel.")
+    activation_pos_weight_min = float(cfg.get("activation_pos_weight_min", 1.0e-6))
+    activation_pos_weight_max = float(cfg.get("activation_pos_weight_max", 5.0))
+    activation_rate_balance_weight = float(cfg.get("activation_rate_balance_weight", 0.0))
+    activation_rate_balance_scope = str(cfg.get("activation_rate_balance_scope", "global")).lower()
+    if activation_rate_balance_scope not in {"global", "cluster"}:
+        raise ValueError("activation_rate_balance_scope must be global or cluster.")
     opt = torch.optim.AdamW(residual_gate.parameters(), lr=lr, weight_decay=weight_decay)
     best_state = None
     best_hold = float("inf")
@@ -1361,14 +2097,130 @@ def train_pred_residual_gate(
             }
         )
 
-    def _loss_for(scale_bc: torch.Tensor, base_bch: torch.Tensor, delta_bch: torch.Tensor, y_bch: torch.Tensor):
-        pred = base_bch + scale_bc.unsqueeze(-1) * delta_bch
+    max_gate_scale = max(float(residual_gate.max_scale), 1.0e-6)
+
+    def _active_labels(base_bch: torch.Tensor, delta_bch: torch.Tensor, y_bch: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
+            raw_err_bc = (base_bch + delta_bch - y_bch).pow(2).mean(dim=-1)
+            return (base_err_bc - raw_err_bc) > activation_label_min_improvement
+
+    def _scale_activation_prob(scale_bc: torch.Tensor) -> torch.Tensor:
+        if activation_by_abs_scale:
+            prob = scale_bc.abs() / max_gate_scale
+        elif str(residual_gate.scale_mode) == "signed_tanh":
+            prob = (scale_bc / max_gate_scale + 1.0) * 0.5
+        else:
+            prob = scale_bc / max_gate_scale
+        return prob.clamp(1.0e-6, 1.0 - 1.0e-6)
+
+    activation_pos_weight = 1.0
+    activation_pos_weight_bc: Optional[torch.Tensor] = None
+    activation_pos_weight_summary: object = 1.0
+    if activation_bce_weight > 0.0:
+        if str(activation_pos_weight_cfg).lower() == "auto":
+            pos_c = torch.zeros(c, dtype=torch.float64)
+            neg_c = torch.zeros(c, dtype=torch.float64)
+            for b0 in range(0, int(train_idx.numel()), batch_size):
+                batch_idx = train_idx[b0:b0 + batch_size]
+                labels_b = _active_labels(
+                    base.index_select(0, batch_idx),
+                    delta.index_select(0, batch_idx),
+                    y.index_select(0, batch_idx),
+                ).detach().cpu()
+                pos_c += labels_b.sum(dim=0).to(dtype=torch.float64)
+                neg_c += (~labels_b).sum(dim=0).to(dtype=torch.float64)
+            if activation_pos_weight_scope == "channel":
+                weight_c = (neg_c / pos_c.clamp_min(1.0)).clamp(
+                    max(activation_pos_weight_min, 1.0e-6),
+                    max(activation_pos_weight_max, 1.0e-6),
+                )
+                activation_pos_weight_bc = weight_c.to(device=device, dtype=torch.float32).view(1, -1)
+                activation_pos_weight_summary = [float(v) for v in weight_c.tolist()]
+                activation_pos_weight = float(weight_c.mean().item())
+            elif activation_pos_weight_scope == "cluster":
+                cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
+                weight_c = torch.ones(c, dtype=torch.float64)
+                for k in torch.unique(cid).tolist():
+                    mask = cid == int(k)
+                    pos_k = pos_c[mask].sum()
+                    neg_k = neg_c[mask].sum()
+                    weight_k = (neg_k / pos_k.clamp_min(1.0)).clamp(
+                        max(activation_pos_weight_min, 1.0e-6),
+                        max(activation_pos_weight_max, 1.0e-6),
+                    )
+                    weight_c[mask] = weight_k
+                activation_pos_weight_bc = weight_c.to(device=device, dtype=torch.float32).view(1, -1)
+                activation_pos_weight_summary = [float(v) for v in weight_c.tolist()]
+                activation_pos_weight = float(weight_c.mean().item())
+            else:
+                pos = float(pos_c.sum().item())
+                neg = float(neg_c.sum().item())
+                activation_pos_weight = min(
+                    max(neg / max(pos, 1.0), max(activation_pos_weight_min, 1.0e-6)),
+                    max(activation_pos_weight_max, 1.0e-6),
+                )
+                activation_pos_weight_summary = float(activation_pos_weight)
+        else:
+            activation_pos_weight = float(activation_pos_weight_cfg)
+            activation_pos_weight_summary = float(activation_pos_weight)
+
+    def _loss_for(
+        scale_bc: torch.Tensor,
+        base_bch: torch.Tensor,
+        delta_bch: torch.Tensor,
+        y_bch: torch.Tensor,
+        feat_bcf: Optional[torch.Tensor] = None,
+    ):
+        scale_for_loss = scale_bc
+        activation_prob_bc = None
+        if activation_head_enable and feat_bcf is not None:
+            activation_prob_bc = residual_gate.activation_prob(feat_bcf).to(dtype=scale_bc.dtype)
+            if activation_train_soft_gating:
+                scale_for_loss = scale_for_loss * activation_prob_bc
+        pred = base_bch + scale_for_loss.unsqueeze(-1) * delta_bch
         if loss_kind == "mse":
             loss = (pred - y_bch).pow(2).mean()
         elif loss_kind == "smooth_l1":
             loss = torch.nn.functional.smooth_l1_loss(pred, y_bch, beta=beta)
         else:
             loss = (pred - y_bch).abs().mean()
+        if activation_bce_weight > 0.0:
+            labels_bc = _active_labels(base_bch, delta_bch, y_bch).to(dtype=scale_bc.dtype)
+            prob_bc = (
+                activation_prob_bc
+                if activation_prob_bc is not None
+                else _scale_activation_prob(scale_bc)
+            )
+            pos_weight = (
+                activation_pos_weight_bc.to(device=scale_bc.device, dtype=scale_bc.dtype)
+                if activation_pos_weight_bc is not None
+                else torch.as_tensor(float(activation_pos_weight), device=scale_bc.device, dtype=scale_bc.dtype)
+            )
+            bce_bc = -(
+                pos_weight * labels_bc * prob_bc.log()
+                + (1.0 - labels_bc) * (1.0 - prob_bc).log()
+            )
+            loss = loss + activation_bce_weight * bce_bc.mean()
+            if activation_rate_balance_weight > 0.0:
+                if activation_rate_balance_scope == "cluster":
+                    cid = cluster_id_c.to(device=prob_bc.device, dtype=torch.long)
+                    rate_loss = torch.zeros((), device=prob_bc.device, dtype=prob_bc.dtype)
+                    num_rates = 0
+                    for k in torch.unique(cid).tolist():
+                        mask = cid == int(k)
+                        if bool(mask.any().item()):
+                            prob_rate = prob_bc[:, mask].mean()
+                            label_rate = labels_bc[:, mask].mean()
+                            rate_loss = rate_loss + (prob_rate - label_rate).pow(2)
+                            num_rates += 1
+                    loss = loss + activation_rate_balance_weight * rate_loss / max(num_rates, 1)
+                else:
+                    loss = loss + activation_rate_balance_weight * (prob_bc.mean() - labels_bc.mean()).pow(2)
+            if activation_inactive_scale_weight > 0.0:
+                inactive_bc = labels_bc < 0.5
+                if bool(inactive_bc.any().item()):
+                    loss = loss + activation_inactive_scale_weight * prob_bc[inactive_bc].pow(2).mean()
         if scale_reg > 0.0:
             loss = loss + scale_reg * (scale_bc - init_scale).pow(2).mean()
         return loss
@@ -1388,7 +2240,10 @@ def train_pred_residual_gate(
                 delta_b = delta.index_select(0, batch_idx).to(device)
                 y_b = y.index_select(0, batch_idx).to(device)
                 scale_b = residual_gate(feat_b)
-                pred_b = base_b + scale_b.unsqueeze(-1) * delta_b
+                scale_for_pred_b = scale_b
+                if activation_train_soft_gating and activation_head_enable:
+                    scale_for_pred_b = scale_for_pred_b * residual_gate.activation_prob(feat_b).to(dtype=scale_b.dtype)
+                pred_b = base_b + scale_for_pred_b.unsqueeze(-1) * delta_b
                 err = pred_b - y_b
                 ae += float(err.abs().sum().item())
                 se += float(err.pow(2).sum().item())
@@ -1407,7 +2262,7 @@ def train_pred_residual_gate(
             delta_b = delta.index_select(0, batch_idx).to(device)
             y_b = y.index_select(0, batch_idx).to(device)
             scale_b = residual_gate(feat_b)
-            loss = _loss_for(scale_b, base_b, delta_b, y_b)
+            loss = _loss_for(scale_b, base_b, delta_b, y_b, feat_bcf=feat_b)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(residual_gate.parameters(), float(cfg.get("grad_clip", 1.0)))
@@ -1423,11 +2278,85 @@ def train_pred_residual_gate(
         residual_gate.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     train_mae, train_mse, train_scale_c = _eval_idx(train_idx)
     hold_mae, hold_mse, hold_scale_c = _eval_idx(hold_idx)
+    activation_threshold_selection = {"mode": "fixed", "threshold": float(activation_threshold)}
+    if activation_threshold_auto:
+        activation_threshold, activation_threshold_selection = _select_pred_residual_activation_threshold(
+            tensors=tensors,
+            residual_gate=residual_gate,
+            device=device,
+            batch_size=batch_size,
+            label_min_improvement=activation_label_min_improvement,
+            activation_by_abs_scale=activation_by_abs_scale,
+            indices=hold_idx,
+            max_candidates=int(cfg.get("activation_threshold_candidates", 101)),
+            selection_metric=str(cfg.get("activation_threshold_selection_metric", "accuracy")),
+            scope=str(cfg.get("activation_threshold_scope", "global")),
+            channel_names=channel_names,
+            cluster_id_c=cluster_id_c,
+        )
+    activation_threshold_tensor = torch.as_tensor(activation_threshold, dtype=torch.float32)
+    if activation_threshold_tensor.numel() == 1:
+        residual_gate.activation_threshold = float(activation_threshold_tensor.reshape(-1)[0].item())
+    elif activation_threshold_tensor.numel() == c:
+        residual_gate.activation_threshold = [float(v) for v in activation_threshold_tensor.reshape(-1).tolist()]
+        residual_gate.activation_threshold_c = activation_threshold_tensor.reshape(-1).detach().cpu()
+    else:
+        raise ValueError(f"activation_threshold must be scalar or length {c}, got {int(activation_threshold_tensor.numel())}")
+    residual_gate.apply_activation_threshold = bool(apply_activation_threshold)
+    residual_gate.activation_by_abs_scale = bool(activation_by_abs_scale)
+    train_activation = _pred_residual_gate_activation_metrics_from_tensors(
+        tensors=tensors,
+        residual_gate=residual_gate,
+        device=device,
+        batch_size=batch_size,
+        activation_threshold=activation_threshold,
+        label_min_improvement=activation_label_min_improvement,
+        activation_by_abs_scale=activation_by_abs_scale,
+        apply_activation_threshold=apply_activation_threshold,
+        indices=train_idx,
+        channel_names=channel_names,
+        cluster_id_c=cluster_id_c,
+    )
+    hold_activation = _pred_residual_gate_activation_metrics_from_tensors(
+        tensors=tensors,
+        residual_gate=residual_gate,
+        device=device,
+        batch_size=batch_size,
+        activation_threshold=activation_threshold,
+        label_min_improvement=activation_label_min_improvement,
+        activation_by_abs_scale=activation_by_abs_scale,
+        apply_activation_threshold=apply_activation_threshold,
+        indices=hold_idx,
+        channel_names=channel_names,
+        cluster_id_c=cluster_id_c,
+    )
     summary = {
         "enable": True,
         "loss": loss_kind,
         "selection_metric": selection_metric,
         "scale_mode": str(residual_gate.scale_mode),
+        "activation_threshold": (
+            [float(v) for v in torch.as_tensor(activation_threshold).reshape(-1).tolist()]
+            if torch.as_tensor(activation_threshold).numel() > 1
+            else float(torch.as_tensor(activation_threshold).reshape(-1)[0].item())
+        ),
+        "activation_threshold_selection": activation_threshold_selection,
+        "activation_label_min_improvement": float(activation_label_min_improvement),
+        "activation_by_abs_scale": bool(activation_by_abs_scale),
+        "apply_activation_threshold": bool(apply_activation_threshold),
+        "activation_head_enable": bool(activation_head_enable),
+        "activation_feature_mode": str(activation_feature_mode),
+        "activation_feature_mask": [float(v) for v in activation_feature_mask.reshape(-1).tolist()],
+        "activation_train_soft_gating": bool(activation_train_soft_gating),
+        "activation_cluster_bias_enable": bool(activation_cluster_bias_enable),
+        "activation_bce_weight": float(activation_bce_weight),
+        "activation_inactive_scale_weight": float(activation_inactive_scale_weight),
+        "activation_pos_weight": activation_pos_weight_summary,
+        "activation_pos_weight_scope": str(activation_pos_weight_scope),
+        "activation_pos_weight_min": float(activation_pos_weight_min),
+        "activation_pos_weight_max": float(activation_pos_weight_max),
+        "activation_rate_balance_weight": float(activation_rate_balance_weight),
+        "activation_rate_balance_scope": str(activation_rate_balance_scope),
         "train_windows": int(train_idx.numel()),
         "holdout_windows": int(hold_idx.numel()),
         "best_epoch": int(best_epoch),
@@ -1439,6 +2368,8 @@ def train_pred_residual_gate(
         "train_mean_scale": [float(v) for v in train_scale_c.tolist()],
         "holdout_mean_scale": [float(v) for v in hold_scale_c.tolist()],
         "feature_standardization": feature_std_summary,
+        "train_activation": train_activation,
+        "holdout_activation": hold_activation,
     }
     residual_gate.eval()
     return residual_gate, summary
@@ -1773,6 +2704,7 @@ def main():
     router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
     pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
     pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
     pred_residual_specialization_weight = (
@@ -1788,6 +2720,8 @@ def main():
     allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable and P > 0
     skip_cost = float(moe_cfg.get("skip_cost", 0.0)) if allow_skip else 0.0
     skip_init_bias = float(moe_cfg.get("skip_init_bias", -2.0))
+    skip_supervision_weight = float(moe_cfg.get("skip_supervision_weight", 0.0)) if allow_skip else 0.0
+    skip_supervision_margin = float(moe_cfg.get("skip_supervision_margin", 0.0))
     raw_ranks = moe_cfg.get("select_ranks", None)
     if raw_ranks is None:
         select_ranks = [1, 2]
@@ -2572,13 +3506,14 @@ def main():
             )
             feat_bcf = extract_gate_features(x)  # [B,C,F]
             feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
-            _, probs_bkp, skip_bk, skip_prob_bk = gate(feat_bkf, straight_through=False)  # [B,K,P]
-            probs_bkp = _apply_router_penalty_context(
-                probs_bkp,
-                pen_bkp,
-                router_mode=router_mode,
+            _, probs_bkp, skip_bk, skip_prob_bk = gate(
+                feat_bkf,
+                straight_through=False,
+                penalty_context_bkp=pen_bkp,
+                penalty_context_mode=router_mode,
                 penalty_context_weight=router_penalty_context_weight,
-                detach_penalty_context=router_detach_penalty_context,
+                penalty_context_detach=router_detach_penalty_context,
+                penalty_context_score=router_penalty_context_score,
             )
             sum_probs += probs_bkp.sum(dim=0)
             if allow_skip:
@@ -2676,13 +3611,14 @@ def main():
             )
             feat_bcf = extract_gate_features(x)
             feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
-            mask_bkp, probs_bkp, skip_bk, _ = gate(feat_bkf, straight_through=False)
-            probs_bkp = _apply_router_penalty_context(
-                probs_bkp,
-                route_pen_bkp,
-                router_mode=router_mode,
+            mask_bkp, probs_bkp, skip_bk, _ = gate(
+                feat_bkf,
+                straight_through=False,
+                penalty_context_bkp=route_pen_bkp,
+                penalty_context_mode=router_mode,
                 penalty_context_weight=router_penalty_context_weight,
-                detach_penalty_context=router_detach_penalty_context,
+                penalty_context_detach=router_detach_penalty_context,
+                penalty_context_score=router_penalty_context_score,
             )
             if select_ranks is not None:
                 mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
@@ -2792,13 +3728,11 @@ def main():
                 gate_params,
                 feat_bkf,
                 straight_through=straight_through,
-            )
-            probs_bkp = _apply_router_penalty_context(
-                probs_bkp,
-                route_pen_bkp,
-                router_mode=router_mode,
+                penalty_context_bkp=route_pen_bkp,
+                penalty_context_mode=router_mode,
                 penalty_context_weight=router_penalty_context_weight,
-                detach_penalty_context=router_detach_penalty_context,
+                penalty_context_detach=router_detach_penalty_context,
+                penalty_context_score=router_penalty_context_score,
             )
             rank_mask = None
             if select_ranks is not None:
@@ -3110,13 +4044,14 @@ def main():
 
             if moe_enable and P > 0:
                 straight_through = (not bool(moe_cfg["detach_penalty_grad"])) and (not (bilevel_enable and bilevel_optimize_gate))
-                mask_bkp, probs_bkp, skip_bk, skip_prob_bk = gate(feat_bkf, straight_through=straight_through)
-                probs_bkp = _apply_router_penalty_context(
-                    probs_bkp,
-                    route_pen_bkp,
-                    router_mode=router_mode,
+                mask_bkp, probs_bkp, skip_bk, skip_prob_bk = gate(
+                    feat_bkf,
+                    straight_through=straight_through,
+                    penalty_context_bkp=route_pen_bkp,
+                    penalty_context_mode=router_mode,
                     penalty_context_weight=router_penalty_context_weight,
-                    detach_penalty_context=router_detach_penalty_context,
+                    penalty_context_detach=router_detach_penalty_context,
+                    penalty_context_score=router_penalty_context_score,
                 )
                 rank_mask = None
                 if select_ranks is not None:
@@ -3235,6 +4170,34 @@ def main():
                     intervention_weight=pred_residual_intervention_weight,
                 )
                 loss_bk = objective_loss_bk + pred_loss_terms["total_bk"]
+                if (
+                    allow_skip
+                    and skip_supervision_weight > 0.0
+                    and pred_residual is not None
+                    and skip_prob_bk is not None
+                ):
+                    with torch.no_grad():
+                        pred_no_skip = pred_residual(
+                            x,
+                            yhat_base,
+                            cluster_id_c,
+                            mask_bkp.detach(),
+                            skip_bk=None,
+                        )
+                        yhat_no_skip = pred_no_skip["y_final"]
+                        base_mse_bc_for_skip = (yhat_base - y).pow(2).mean(dim=-1)
+                        no_skip_mse_bc = (yhat_no_skip - y).pow(2).mean(dim=-1)
+                        base_mse_bk_for_skip = scatter_mean_bc_to_bk(base_mse_bc_for_skip, cluster_id_c, K)
+                        no_skip_mse_bk = scatter_mean_bc_to_bk(no_skip_mse_bc, cluster_id_c, K)
+                        skip_label_bk = (
+                            base_mse_bk_for_skip + float(skip_supervision_margin) < no_skip_mse_bk
+                        ).to(dtype=skip_prob_bk.dtype)
+                    skip_prob_clamped = skip_prob_bk.clamp(1.0e-6, 1.0 - 1.0e-6)
+                    skip_bce_bk = -(
+                        skip_label_bk * skip_prob_clamped.log()
+                        + (1.0 - skip_label_bk) * (1.0 - skip_prob_clamped).log()
+                    )
+                    loss_bk = loss_bk + skip_supervision_weight * skip_bce_bk
                 if (not bilevel_enable) and learnable_lambda is not None and learnable_lambda_reg_weight > 0.0:
                     loss_bk = loss_bk + learnable_lambda_reg_weight * learnable_lambda.regularization().unsqueeze(0)
                 if (not bilevel_enable) and dynamic_lambda is not None and dynamic_lambda_reg_weight > 0.0:
@@ -3535,6 +4498,7 @@ def main():
     pred_residual_gate_model = None
     pred_residual_gate_summary = None
     pred_residual_selection_summary = None
+    moe_gate_penalty_hit_summary = None
     calibration_summary = {
         "enable": bool(calibration_enable),
         "method": str(calibration_method),
@@ -3714,11 +4678,29 @@ def main():
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
             elif residual_selection_policy in {"val_mse_gate", "val_mse_gate_guarded"}:
                 gate_calib_cfg = pred_residual_cfg.get("gate_calibrator", {}) or {}
+                gate_calib_source_split = str(gate_calib_cfg.get("source_split", "val")).lower()
+                if gate_calib_source_split in {"train", "training"}:
+                    gate_calib_loader = DataLoader(
+                        dtr,
+                        batch_size=int(cfg["train"]["batch_size"]),
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=pin_mem,
+                    )
+                    gate_calib_source_split = "train"
+                elif gate_calib_source_split in {"val", "validation"}:
+                    gate_calib_loader = val_loader_summary
+                    gate_calib_source_split = "val"
+                else:
+                    raise ValueError(
+                        "moe.pred_side_residual.gate_calibrator.source_split must be train or val "
+                        f"(got {gate_calib_source_split!r})."
+                    )
                 pred_residual_gate_model, pred_residual_gate_summary = train_pred_residual_gate(
                     model=model,
                     gate=gate,
                     pred_residual=pred_residual,
-                    loader=val_loader_summary,
+                    loader=gate_calib_loader,
                     cluster_id_c=cluster_id_c,
                     K=K,
                     moe_cfg=moe_cfg,
@@ -3731,6 +4713,8 @@ def main():
                     channel_names=channel_names,
                     cfg=gate_calib_cfg,
                 )
+                if pred_residual_gate_summary is not None:
+                    pred_residual_gate_summary["source_split"] = gate_calib_source_split
                 if pred_residual_gate_model is None:
                     pred_residual_channel_scale_c = zero_residual_scale_c
                     val_scaled_mse_c = val_mse_c_pred_base
@@ -3771,6 +4755,52 @@ def main():
                         residual_correction_ch=residual_correction_base_ch,
                         knn_hybrid=None,
                         eval_start=val_eval_start,
+                    )
+                    val_gate_tensors = _collect_pred_residual_gate_tensors(
+                        model=model,
+                        gate=gate,
+                        pred_residual=pred_residual,
+                        loader=val_loader_summary,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        moe_cfg=moe_cfg,
+                        device=device,
+                        penalty_names=penalty_names,
+                        penalty_fns=penalty_fns,
+                        penalty_scale=penalty_scale,
+                        select_ranks=select_ranks,
+                        gate_soft_weight=gate_soft_weight,
+                    )
+                    pred_residual_gate_summary["val_activation"] = _pred_residual_gate_activation_metrics_from_tensors(
+                        tensors=val_gate_tensors,
+                        residual_gate=pred_residual_gate_model,
+                        device=device,
+                        batch_size=int(gate_calib_cfg.get("batch_size", 256)),
+                        activation_threshold=getattr(
+                            pred_residual_gate_model,
+                            "activation_threshold_c",
+                            getattr(
+                                pred_residual_gate_model,
+                                "activation_threshold",
+                                pred_residual_gate_summary.get("activation_threshold", 0.1),
+                            ),
+                        ),
+                        label_min_improvement=float(gate_calib_cfg.get("activation_label_min_improvement", 0.0)),
+                        activation_by_abs_scale=bool(
+                            gate_calib_cfg.get(
+                                "activation_by_abs_scale",
+                                str(gate_calib_cfg.get("scale_mode", "sigmoid")).lower() == "signed_tanh",
+                            )
+                        ),
+                        apply_activation_threshold=bool(
+                            getattr(
+                                pred_residual_gate_model,
+                                "apply_activation_threshold",
+                                gate_calib_cfg.get("apply_activation_threshold", False),
+                            )
+                        ),
+                        channel_names=channel_names,
+                        cluster_id_c=cluster_id_c,
                     )
                     val_scaled_mse_c = val_gate_mse_c
                     val_scaled_mae_c = val_gate_mae_c
@@ -3874,6 +4904,36 @@ def main():
                 f"val_scaled_MSE={pred_residual_selection_summary['val_scaled_avg_mse']:.6f}, "
                 f"mean_scale={pred_residual_selection_summary['mean_scale']:.3f}"
             )
+        if pred_residual is not None and moe_enable and P > 0:
+            val_penalty_hit = evaluate_gate_penalty_hit_metrics(
+                model=model,
+                gate=gate,
+                pred_residual=pred_residual,
+                loader=val_loader_summary,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                moe_cfg=moe_cfg,
+                device=device,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                select_ranks=select_ranks,
+                gate_soft_weight=gate_soft_weight,
+                label_min_improvement=float(
+                    pred_residual_cfg.get(
+                        "gate_hit_label_min_improvement",
+                        pred_residual_cfg.get("selection_min_abs_improvement", 0.0),
+                    )
+                ),
+            )
+            moe_gate_penalty_hit_summary = {"val": val_penalty_hit, "test": None}
+            if val_penalty_hit is not None:
+                print(
+                    "Gate penalty hit(val): "
+                    f"top1={val_penalty_hit['top1_hit_rate_all']:.3f}, "
+                    f"positive_top1={val_penalty_hit['top1_hit_rate_on_positive_oracle']:.3f}, "
+                    f"selected_gain={val_penalty_hit['selected_top1_gain_pct_vs_base']:.3f}%"
+                )
         if knn_hybrid_val is not None:
             knn_hybrid_val.reset_confidence_stats()
             val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop(
@@ -3939,6 +4999,88 @@ def main():
             knn_hybrid=None,
             eval_start=test_eval_start,
         )
+        if pred_residual_gate_model is not None and pred_residual_gate_summary is not None:
+            test_gate_tensors = _collect_pred_residual_gate_tensors(
+                model=model,
+                gate=gate,
+                pred_residual=pred_residual,
+                loader=dl_te,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                moe_cfg=moe_cfg,
+                device=device,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                select_ranks=select_ranks,
+                gate_soft_weight=gate_soft_weight,
+            )
+            gate_calib_cfg_for_report = pred_residual_cfg.get("gate_calibrator", {}) or {}
+            pred_residual_gate_summary["test_activation"] = _pred_residual_gate_activation_metrics_from_tensors(
+                tensors=test_gate_tensors,
+                residual_gate=pred_residual_gate_model,
+                device=device,
+                batch_size=int(gate_calib_cfg_for_report.get("batch_size", 256)),
+                activation_threshold=getattr(
+                    pred_residual_gate_model,
+                    "activation_threshold_c",
+                    getattr(
+                        pred_residual_gate_model,
+                        "activation_threshold",
+                        pred_residual_gate_summary.get("activation_threshold", 0.1),
+                    ),
+                ),
+                label_min_improvement=float(gate_calib_cfg_for_report.get("activation_label_min_improvement", 0.0)),
+                activation_by_abs_scale=bool(
+                    gate_calib_cfg_for_report.get(
+                        "activation_by_abs_scale",
+                        str(gate_calib_cfg_for_report.get("scale_mode", "sigmoid")).lower() == "signed_tanh",
+                    )
+                ),
+                apply_activation_threshold=bool(
+                    getattr(
+                        pred_residual_gate_model,
+                        "apply_activation_threshold",
+                        gate_calib_cfg_for_report.get("apply_activation_threshold", False),
+                    )
+                ),
+                channel_scale_c=pred_residual_channel_scale_c,
+                channel_names=channel_names,
+                cluster_id_c=cluster_id_c,
+            )
+        if pred_residual is not None and moe_enable and P > 0:
+            test_penalty_hit = evaluate_gate_penalty_hit_metrics(
+                model=model,
+                gate=gate,
+                pred_residual=pred_residual,
+                loader=dl_te,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                moe_cfg=moe_cfg,
+                device=device,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                select_ranks=select_ranks,
+                gate_soft_weight=gate_soft_weight,
+                label_min_improvement=float(
+                    pred_residual_cfg.get(
+                        "gate_hit_label_min_improvement",
+                        pred_residual_cfg.get("selection_min_abs_improvement", 0.0),
+                    )
+                ),
+            )
+            if moe_gate_penalty_hit_summary is None:
+                moe_gate_penalty_hit_summary = {"val": None, "test": test_penalty_hit}
+            else:
+                moe_gate_penalty_hit_summary["test"] = test_penalty_hit
+            if test_penalty_hit is not None:
+                print(
+                    "Gate penalty hit(test): "
+                    f"top1={test_penalty_hit['top1_hit_rate_all']:.3f}, "
+                    f"positive_top1={test_penalty_hit['top1_hit_rate_on_positive_oracle']:.3f}, "
+                    f"selected_gain={test_penalty_hit['selected_top1_gain_pct_vs_base']:.3f}%"
+                )
     test_loss_hybrid_k = None
     test_mse_hybrid_k = None
     test_mae_hybrid_k = None
@@ -4594,6 +5736,18 @@ def main():
         "moe_residual": moe_residual_summary,
         "moe_residual_selection": pred_residual_selection_summary,
         "moe_residual_gate_calibrator": pred_residual_gate_summary,
+        "moe_gate_penalty_hit": moe_gate_penalty_hit_summary,
+        "moe_router": {
+            "mode": str(router_mode),
+            "penalty_context_weight": float(router_penalty_context_weight),
+            "penalty_context_score": str(router_penalty_context_score),
+            "detach_penalty_context": bool(router_detach_penalty_context),
+            "context_applied_inside_gate_logits": True,
+            "allow_skip": bool(allow_skip),
+            "skip_cost": float(skip_cost),
+            "skip_supervision_weight": float(skip_supervision_weight),
+            "skip_supervision_margin": float(skip_supervision_margin),
+        },
         "val": val_summary,
         "test": None if skip_test else {
             "avg_mae": avg_mae,

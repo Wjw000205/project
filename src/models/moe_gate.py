@@ -125,6 +125,11 @@ class ClusterwiseMoEGate(nn.Module):
         self,
         feat_bkf: torch.Tensor,
         straight_through: bool = True,
+        penalty_context_bkp: Optional[torch.Tensor] = None,
+        penalty_context_mode: str = "learned",
+        penalty_context_weight: float = 0.0,
+        penalty_context_detach: bool = True,
+        penalty_context_score: str = "high_violation",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         feat_bkf: [B,K,F]
@@ -143,6 +148,31 @@ class ClusterwiseMoEGate(nn.Module):
         logits = torch.einsum("bkh,khp->bkp", h, W2) + b2.unsqueeze(0)    # [B,K,P]
         if self.P > 0 and self.penalty_prior_strength > 0.0:
             logits = logits + (self.penalty_prior_strength * self.penalty_prior_logits[:, :self.P].unsqueeze(0))
+        mode = str(penalty_context_mode).lower()
+        if penalty_context_bkp is not None and penalty_context_bkp.numel() > 0 and mode != "learned":
+            context = penalty_context_bkp.detach() if bool(penalty_context_detach) else penalty_context_bkp
+            if context.shape != logits.shape:
+                raise ValueError(f"Expected penalty_context_bkp shape {tuple(logits.shape)}, got {tuple(context.shape)}")
+            context_logits = context.clamp_min(1.0e-8).log()
+            score_mode = str(penalty_context_score).lower()
+            if score_mode in {"low", "low_penalty", "low_violation", "min_penalty"}:
+                context_logits = -context_logits
+            elif score_mode not in {"high", "high_penalty", "high_violation", "max_penalty"}:
+                raise ValueError(
+                    "penalty_context_score must be high_violation or low_violation "
+                    f"(got {penalty_context_score!r})."
+                )
+            weight = float(penalty_context_weight)
+            if mode == "penalty_only":
+                logits = (weight if weight > 0.0 else 1.0) * context_logits
+            elif mode == "penalty_context":
+                if weight > 0.0:
+                    logits = logits + weight * context_logits
+            else:
+                raise ValueError(
+                    "penalty_context_mode must be learned, penalty_context, or penalty_only "
+                    f"(got {penalty_context_mode!r})."
+                )
         if self.logit_clip > 0.0:
             logits = self.logit_clip * torch.tanh(logits / self.logit_clip)
         if self.training and self.noise_std > 0.0:
