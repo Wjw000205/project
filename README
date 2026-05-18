@@ -1,534 +1,480 @@
-# MoELoss
+# GIMoE: Cluster-Aware Time-Series Forecasting
 
-MoELoss 是一个面向多变量时间序列预测的实验项目。项目先按通道相关性进行聚类，再为每个聚类训练独立预测专家，并用 MoE 路由器选择不同预测惩罚项参与训练。当前代码还支持动态 lambda、聚类画像、KNN shape hybrid 后处理、跨数据集迁移和多数据集多预测长度批量实验。
+本仓库是 `project` 的实验代码，主要研究面向多变量时间序列预测的
+**簇感知预测架构** 和 **GIMoE / penalty-guided residual experts**。
 
-## 目录结构
+当前主线不是大模型式通用预训练，而是一个可解释、可控的轻量预测框架：
+
+1. 先根据通道相关性或周期画像对变量分簇。
+2. 每个簇拥有独立预测专家，避免所有通道共享同一预测头。
+3. GIMoE 根据输入、簇特征和 penalty 画像选择合适的 residual expert。
+4. penalty-guided residual experts 以残差形式修正 base prediction。
+5. 迁移实验通过簇画像和通道匹配展示同源数据集上的 zero-shot / fine-tune 潜力。
+
+> 当前仓库也包含 adaptive participation 的探索代码，用于研究
+> “什么时候启用 penalty、启用哪个 penalty”。这部分目前作为未来方向和诊断工具保留，
+> 不建议直接作为当前论文主贡献包装。
+
+## Repository Scope
+
+核心贡献建议聚焦：
+
+- **Cluster-aware forecasting**：通道聚类后按簇训练预测头。
+- **GIMoE residual experts**：用 penalty-guided residual experts 做可控修正。
+- **Interpretability**：输出 cluster portrait、penalty routing、lambda 和 gate 诊断。
+- **Transferability**：同源 ETT 数据集之间展示 zero-shot transfer 能力，作为结构带来的附加能力。
+
+需要谨慎表述：
+
+- KNN hybrid 是可选后处理，不作为 GIMoE 主贡献。
+- calibration 相关实验已降级为对照或诊断，不作为主方法。
+- adaptive participation 仍处在探索阶段，当前更适合作 future work。
+
+## Project Layout
 
 ```text
 .
-├── configs/                         # 训练、迁移和微调配置
+├── configs/                         # 训练、迁移和 fine-tune 配置
 │   ├── ETTh1.yaml
+│   ├── ETTh2.yaml
 │   ├── ETTm1.yaml
-│   ├── ETTm1ToETTh1.yaml            # src.transfer 使用的迁移配置
-│   └── finetune/ETTh1_from_ETTm1.yaml
-├── data/                            # CSV 数据集
-├── outputs/                         # 训练结果、模型、图像和批量实验结果
-├── scripts/                         # 实验、分析、批量运行和 CSV->Excel 脚本
+│   ├── ETTm2.yaml
+│   ├── ETTm1ToETTh1.yaml
+│   ├── ETTm1ToETTh2.yaml
+│   ├── ETTm1ToETTm2.yaml
+│   ├── ETTm2ToETTm1.yaml
+│   ├── weather.yaml
+│   ├── electricity.yaml
+│   └── traffic.yaml
+├── data/                            # 数据集 CSV / NPZ / 原始文件
+├── outputs/                         # 实验输出，默认不作为代码逻辑依赖
+├── paper_figures/                   # 论文图、架构图和 transfer 图
+├── scripts/                         # 搜索、消融、迁移、可视化脚本
 └── src/
     ├── train.py                     # 主训练入口
-    ├── transfer.py                  # 跨数据集迁移评估入口
-    ├── data/                        # CSV 读取和滑窗构造
-    ├── models/                      # 聚类预测器、MoE gate、lambda、penalty
-    └── utils/                       # 聚类、指标、画像、KNN hybrid、绘图等工具
+    ├── transfer.py                  # zero-shot transfer 入口
+    ├── data/                        # CSV 读取与滑窗
+    ├── models/                      # predictor / gate / lambda / residual MoE
+    └── utils/                       # clustering / metric / plotting / KNN / memory
 ```
 
-## 环境准备
+## Environment
 
-建议使用 Python 3.10 或 3.12。GPU 训练需要安装与本机 CUDA 匹配的 PyTorch。
+推荐使用已有 Conda 环境 `my_fram`：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -c "import torch; print(torch.cuda.is_available())"
+```
+
+基础依赖：
 
 ```powershell
 pip install numpy pandas torch scikit-learn pyyaml matplotlib psutil
 ```
 
-说明：
-
-- `psutil` 只用于统计资源占用，缺失时训练仍可运行。
-- `scripts/export_result_to_excel.py` 使用 Python 标准库生成 `.xlsx`，不依赖 `openpyxl` 或 Excel 本体。
-- 如果只在 CPU 上运行，把配置文件里的 `exp.device` 改为 `cpu`。
-
-## 数据格式
-
-输入数据是带表头的 CSV。默认第 0 列是时间列，其余列必须是可转为浮点数的通道值。
-
-```csv
-date,HUFL,HULL,MUFL,MULL,LUFL,LULL,OT
-2016-07-01 00:00:00,5.827,2.009,1.599,0.462,4.203,1.341,30.531
-```
-
-相关配置：
-
-```yaml
-data:
-  csv_path: data/ETTh1.csv
-  date_col: 0
-  train_ratio: 0.7
-  val_ratio: 0.1
-  test_ratio: 0.2
-window:
-  input_len: 336
-  pred_len: 720
-```
-
-`input_len` 是历史窗口长度，`pred_len` 是预测长度。代码会在 train/val/test 各自切分内构造严格滑窗，输出形状为 `[N, C, L]` 和 `[N, C, H]`。
-
-## 快速开始
-
-### 单数据集训练
-
-```powershell
-python -m src.train --config configs/ETTh1.yaml
-```
-
-常用配置也可以直接替换：
-
-```powershell
-python -m src.train --config configs/ETTm1.yaml
-python -m src.train --config configs/ETTm2.yaml
-python -m src.train --config configs/weather.yaml
-python -m src.train --config configs/electricity.yaml
-```
-
-训练完成后，主要结果会写入配置中的 `exp.out_dir`，例如 `outputs/ETTh1`。
-
-### ETTm1 到 ETTh1 微调
-
-先训练源域 ETTm1，再运行微调配置：
-
-```powershell
-python -m src.train --config configs/ETTm1.yaml
-python -m src.train --config configs/finetune/ETTh1_from_ETTm1.yaml
-```
-
-微调配置中的关键字段：
-
-```yaml
-finetune:
-  enable: true
-  checkpoint_path: outputs/ETTm1/best_checkpoint.pt
-  memory_path: outputs/ETTm1/cluster_memory.pt
-  cluster_map: corr
-  strict_window: true
-  strict_model: true
-```
-
-`cluster_map: corr` 会根据源域和目标域聚类原型的相关性建立目标聚类到源聚类的映射。`strict_window` 和 `strict_model` 为 `true` 时，要求源模型窗口长度、预测长度和模型结构与目标配置匹配。
-
-### 跨数据集迁移评估
-
-`src.transfer` 使用源模型的 checkpoint 和 cluster memory，在目标数据集上做聚类映射和测试评估。
-
-```powershell
-python -m src.transfer --config configs/ETTm1ToETTh1.yaml
-python -m src.transfer --config configs/ETTm1ToETTm2.yaml
-python -m src.transfer --config configs/ETTm1ToTraffic.yaml
-```
-
-迁移配置中的 `source` 指向源域产物，`transfer.corr_mode` 控制目标通道如何匹配源聚类：
-
-```yaml
-source:
-  memory_path: outputs/ETTm1/cluster_memory.pt
-  checkpoint_path: outputs/ETTm1/best_checkpoint.pt
-transfer:
-  corr_mode: cycle_template
-  corr_align: head
-  resample:
-    enable: true
-    target_step_minutes: 15
-```
-
-## 批量实验
-
-`scripts/run_all_datasets_horizons.py` 会为多个配置和多个预测长度生成临时配置、串行训练，并汇总长表和宽表结果。
-
-运行所有默认数据集和默认预测长度：
-
-```powershell
-python scripts/run_all_datasets_horizons.py --device cuda:0
-```
-
-默认批量规则：
-
-- 普通数据集使用预测长度 `96 192 336 720`，并保留各自配置文件里的 `window.input_len`。
-- `bandwidth` / `bandwidth_multi` 使用预测长度 `24 48 96 168`，且每个生成配置都会固定设置 `window.input_len = 24`。
-- 如果显式传入 `--horizons`，脚本会使用命令行给定的预测长度；bandwidth 仍会固定使用 24 步输入窗口。
-
-只运行指定数据集和预测长度：
-
-```powershell
-python scripts/run_all_datasets_horizons.py `
-  --configs configs\electricity.yaml `
-  --horizons 336 720 `
-  --device cuda:0 `
-  --knn-selection-policy hybrid
-```
-
-常用参数：
-
-- `--configs`：显式指定一个或多个 YAML，优先级高于自动发现。
-- `--horizons`：覆盖预测长度；普通数据集默认是 `96 192 336 720`，bandwidth 默认是 `24 48 96 168`。
-- `--out-root`：批量输出根目录，默认 `outputs/all_datasets_horizons`。
-- `--epochs`：覆盖所有生成配置的训练轮数，适合快速验证。
-- `--reuse-existing`：如果目标目录已有 `run_summary.json`，直接读取汇总，不重新训练。
-- `--dry-run`：只生成计划和配置，不启动训练。
-- `--keep-artifacts`：保留图、画像、checkpoint、memory 等产物。默认批量脚本会关闭部分重量级产物以节省空间。
-- `--disable-knn-hybrid`：禁用 KNN hybrid。
-- `--knn-selection-policy`：控制最终选择 base 还是 hybrid，可选 `hybrid`、`val_mse_margin`、`val_mse`、`base`。
-
-批量结果默认写入：
-
-```text
-outputs/all_datasets_horizons/results.csv
-outputs/all_datasets_horizons/results_wide.csv
-outputs/all_datasets_horizons/configs/*.yaml
-outputs/all_datasets_horizons/<dataset>/pred_<horizon>/
-```
-
-## 导出 Excel
-
-把 `outputs/result.csv` 导出为 Excel：
-
-```powershell
-python scripts\export_result_to_excel.py
-```
-
-默认输出：
-
-```text
-outputs/result.xlsx
-```
-
-指定输入和输出：
-
-```powershell
-python scripts\export_result_to_excel.py outputs\all_datasets_horizons\results.csv -o outputs\all_datasets_horizons\results.xlsx
-```
-
-可选参数：
-
-- `--sheet-name`：指定工作表名称。
-- `--encoding`：指定 CSV 编码；默认依次尝试 `utf-8-sig`、`utf-8`、`gb18030`。
-- `--no-infer-numbers`：所有单元格按文本写入，不自动把数字字符串转成数值。
-
-## 核心训练流程
-
-`src.train` 的主要流程如下：
-
-1. 读取 CSV，并按 `data.train_ratio`、`val_ratio`、`test_ratio` 切分。
-2. 根据 `normalize.global_zscore` 做全局 z-score 标准化；如果启用 `normalize.train_only`，均值和标准差只从训练段估计。
-3. 计算通道 Pearson 相关矩阵，或读取已有 `corr.save_path`。
-4. 根据 `cluster.method` 对通道聚类，得到每个通道的 `cluster_id`。
-5. 为每个聚类构建预测专家，即 `model.predictor` 指定的模型。
-6. 计算基础 MSE 和启用的 penalty，并由 MoE gate 选择 penalty 路由。
-7. 使用固定 lambda、动态 lambda 或 learnable lambda 对 penalty 加权。
-8. 根据 `train.selection_metric` 和 early stopping 保存每个聚类的最佳状态。
-9. 可选构建 KNN shape bank，对 base prediction 做 hybrid 后处理。
-10. 在 test split 输出 MAE/MSE、每通道指标、cluster penalty 概率和运行摘要。
-
-## 配置说明
-
-### exp
-
-```yaml
-exp:
-  name: cluster_moe_example
-  out_dir: outputs/ETTh1
-  seed: 2026
-  deterministic: true
-  device: cuda:0
-```
-
-- `out_dir`：所有训练产物的输出目录。
-- `deterministic`：启用更稳定的随机性控制。
-- `device`：优先使用的设备。如果 CUDA 不可用，代码会回退到 CPU。
-
-### corr 和 cluster
-
-```yaml
-corr:
-  compute: true
-  save_path: outputs/ETTh1/corr.npy
-cluster:
-  method: leader
-  n_clusters: 3
-  distance_threshold: 0.7
-  merge_small_clusters: true
-```
-
-支持的聚类方法包括：
-
-- `leader` / `greedy_leader`
-- `agglomerative` / `agglo`
-- `kmeans` / `k-means`
-- `spectral` / `spectral_clustering`
-- `dbscan`
-- `random` / `rand`
-
-`distance_threshold` 常用于 `leader` 和层次聚类；`merge_small_clusters` 会把过小聚类合并到更相近的大聚类。
-
-### model
-
-```yaml
-model:
-  predictor: mlp
-  hidden_dim: 128
-  dropout: 0.35
-```
-
-支持的 `model.predictor`：
-
-- `mlp` / `cluster_mlp`
-- `attn_mlp`
-- `context_mlp`
-- `nlinear`
-- `dlinear`
-- `patchtst` / `patch_transformer`
-- `nbeats`
-- `gru`
-- `tcn`
-
-额外开关：
-
-- `revin: true`：为预测器包一层 RevIN。
-- `seasonal_residual: true`：用周期残差包装预测器。
-
-### penalties
-
-```yaml
-penalties:
-  enabled:
-    - jump
-    - smooth
-    - level
-    - delta
-  jump_threshold: 0.6
-```
-
-支持的 penalty：
-
-- `amp`：预测和真实值的波动幅度对齐。
-- `jitter`：二阶差分平滑约束。
-- `jump`：在真实序列存在明显跳变的位置约束预测跳变。
-- `smooth`：一阶差分平滑约束。
-- `level`：均值/水平对齐。
-- `delta`：一阶差分对齐。
-
-### moe
-
-```yaml
-moe:
-  enable: true
-  topk: 1
-  gate_hidden_dim: 64
-  select_ranks: [1]
-  gate_entropy_weight: 0.02
-  gate_balance_weight: 0.01
-  router_mode: penalty_context
-  allow_skip: true
-  skip_cost: 0.15
-  lambda_init:
-    jump: 0.1
-    smooth: 0.1
-    level: 0.1
-    delta: 0.1
-```
-
-关键字段：
-
-- `enable`：是否启用 MoE penalty 路由。
-- `topk`：gate 每个聚类选择的 penalty 数量。
-- `select_ranks`：可以只选指定排序位置的 penalty，例如 `[1]` 表示只取概率最高项。
-- `router_mode: penalty_context`：在路由时融合当前 penalty 上下文。
-- `allow_skip`：允许 gate 跳过 penalty。
-- `lambda_init`：每个 penalty 的基础权重。
-- `lambda_min` 和 `lambda_schedule`：控制 lambda 下限和调度。
-
-动态 lambda：
-
-```yaml
-moe:
-  dynamic_lambda:
-    enable: true
-    mode: multiscale
-    hidden_dim: 24
-    segment_bins: [4, 8]
-    max_factor: 1.5
-    mix: 0.6
-    reg_weight: 0.0001
-```
-
-Learnable lambda：
-
-```yaml
-moe:
-  learnable_lambda:
-    enable: false
-    reg_weight: 0.01
-    bilevel:
-      enable: true
-      outer_lr: 0.005
-      inner_lr: 0.001
-```
-
-### train 和 early_stop
-
-```yaml
-train:
-  epochs: 100
-  batch_size: 64
-  lr: 0.001
-  mse_weight: 0.9
-  selection_metric: val_mse
-  weight_decay: 0.0002
-  grad_clip: 1.0
-  penalty_warmup_epochs: 15
-early_stop:
-  patience: 10
-  min_delta: 1.0e-06
-```
-
-`selection_metric` 可选：
-
-- `val_loss`
-- `val_mse`
-- `train_loss`
-- `train_mse`
-
-当前常用配置选择 `val_mse`，即按验证集 MSE 选择最佳聚类专家状态。
-
-### knn_hybrid
-
-```yaml
-knn_hybrid:
-  enable: true
-  mode: rolling
-  scope: same_cluster
-  bank_split: history
-  k: 256
-  alpha: 1.4
-  feature_mode: joint
-  template_mode: residual
-  adaptive_alpha: agreement
-  selection_policy: val_mse_margin
-```
-
-KNN hybrid 用历史窗口的形状特征检索相似样本，再把检索模板与模型预测融合。常用字段：
-
-- `mode`：`fixed` 或 `rolling`。
-- `scope`：`same_cluster` 或 `same_channel`。
-- `bank_split`：使用哪个切分构建检索库。
-- `k`：近邻数量。
-- `alpha`：KNN 修正强度。
-- `alpha_horizon_ref`、`alpha_horizon_power`：按预测长度缩放 alpha。
-- `feature_mode`：例如 `hist` 或 `joint`。
-- `template_mode`：例如 `future` 或 `residual`。
-- `adaptive_alpha`：`none`、`agreement`、`distance`、`confidence`、`distance_agreement`。
-- `selection_policy`：最终结果选择策略。
-
-## 输出文件
-
-单次训练输出目录通常包含：
-
-```text
-outputs/<dataset>/
-├── run_summary.json              # 总结：配置、best_epoch、val/test、selected、timing、resources
-├── test_metrics.csv              # 每通道 MAE/MSE
-├── best_checkpoint.pt            # 最佳模型、gate、lambda 和必要 meta
-├── cluster_memory.pt             # 聚类原型和通道聚类信息
-├── cluster_penalty_probs.csv     # 每个聚类的 penalty 选择概率和 skip 统计
-├── cluster_lambda_stats.csv      # 动态 lambda 统计
-├── corr.npy                      # 通道相关矩阵
-├── knn_shape_bank.pt             # KNN hybrid 检索库
-├── loss_curves/                  # 每聚类训练/验证曲线
-├── plots/                        # 随机、best、worst 预测图
-└── cluster_portraits/            # 聚类画像和雷达图
-```
-
-`run_summary.json` 中最重要的字段：
-
-- `test.avg_mae`、`test.avg_mse`：base 模型测试结果。
-- `test_hybrid.avg_mae`、`test_hybrid.avg_mse`：启用 KNN hybrid 后的测试结果。
-- `selected.variant`：最终选择 `base` 还是 `hybrid`。
-- `selected.avg_mae`、`selected.avg_mse`：按选择策略得到的最终结果。
-- `timing`：总耗时和平均每 epoch 耗时。
-- `resources`：CPU/GPU 和输出目录占用。
-
-## 常用脚本
-
-### 对比 MoE 开关
-
-```powershell
-python scripts\compare_moe_on_off.py --config configs\ETTm1.yaml
-```
-
-用于比较开启/关闭 MoE penalty 路由时的结果，并保存样本窗口图和汇总 CSV。
-
-### KNN shape 变体比较
-
-```powershell
-python scripts\compare_knn_shape_variants.py --config configs\ETTh1.yaml
-```
-
-用于比较 KNN hybrid 的 scope、mode、alpha、k 等设置。
-
-### 可视化通道相关性和聚类
-
-```powershell
-python scripts\plot_ettm1_channels_corr.py
-python scripts\plot_weather_channels_corr.py
-```
-
-会读取对应数据和配置，绘制通道曲线、相关性或聚类摘要图。
-
-### 搜索 ETTm1 penalty lambda
-
-```powershell
-python scripts\search_ettm1_lambdas.py
-```
-
-用于在 ETTm1 上搜索 penalty 权重组合。运行前请先查看脚本参数，避免一次性启动过大的搜索空间。
-
-## 建议实验流程
-
-1. 先用 `configs/ETTh1.yaml` 或 `configs/ETTm1.yaml` 跑通单次训练。
-2. 检查 `run_summary.json`、`test_metrics.csv` 和 `cluster_penalty_probs.csv`。
-3. 如果 hybrid 表现稳定，使用 `run_all_datasets_horizons.py` 批量跑多个 horizon。
-4. 使用 `scripts/export_result_to_excel.py` 把汇总 CSV 导出为 Excel。
-5. 需要迁移时，先确保源域存在 `best_checkpoint.pt` 和 `cluster_memory.pt`，再运行 `src.transfer` 或 fine-tune 配置。
-
-## 常见问题
-
-### CUDA 不可用
-
-如果配置是 `cuda:0` 但机器没有可用 GPU，代码会回退 CPU。为了避免误判速度，建议直接改为：
+如果没有 GPU，把配置里的设备改为：
 
 ```yaml
 exp:
   device: cpu
 ```
 
-### 批量结果里 `selected_variant` 是 base 还是 hybrid
+## Data Format
 
-由 `knn_hybrid.selection_policy` 决定：
+输入数据是带表头的 CSV。默认第 0 列为时间列，其余列为浮点通道值。
 
-- `hybrid`：总是选 hybrid。
-- `base`：总是选 base。
-- `val_mse`：验证集 hybrid MSE 更低才选 hybrid。
-- `val_mse_margin`：验证集提升超过最小绝对/相对阈值才选 hybrid。
+```csv
+date,HUFL,HULL,MUFL,MULL,LUFL,LULL,OT
+2016-07-01 00:00:00,5.827,2.009,1.599,0.462,4.203,1.341,30.531
+```
 
-### `run_summary.json not found`
-
-通常表示训练进程失败或提前退出。检查对应运行目录里的 `.log`、`.err.log`，以及批量结果 CSV 的 `error` 列。
-
-### 输出目录太大
-
-批量脚本默认会关闭部分重量级产物。单次训练如果空间紧张，可以在配置里关闭：
+典型配置：
 
 ```yaml
-plot:
-  enable: false
-portrait:
-  enable: false
-memory:
-  save_checkpoint: false
+data:
+  csv_path: data/ETTm1.csv
+  date_col: 0
+  max_rows: 57600
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+window:
+  input_len: 336
+  pred_len: 96
+  past_context: true
+normalize:
+  global_zscore: true
+  train_only: true
+cluster:
+  train_only: true
 ```
 
-### 如何复用已有结果
+## No-Leak Protocol
 
-批量实验使用：
+当前实验默认遵循以下口径：
+
+- normalization 统计量只从 train split 估计：`normalize.train_only=true`。
+- channel clustering 只使用 train split：`cluster.train_only=true`。
+- 参数选择、gate calibration、transfer route selection 尽量基于 validation。
+- test split 只用于最终报告，不用于调参。
+- adaptive oracle diagnostics 默认只在 train/val 上使用，`report_test_oracle=false`。
+- `run_summary.json -> leakage_audit` 会记录关键泄露相关开关。
+
+如果是搜索脚本，建议先设置：
+
+```yaml
+eval:
+  skip_test: true
+```
+
+待 validation 选择完成后，再对最终候选做一次 test。
+
+## Quick Start
+
+单数据集训练：
 
 ```powershell
-python scripts\run_all_datasets_horizons.py --reuse-existing
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\ETTm1.yaml
 ```
 
-它会读取已有 `run_summary.json` 重新生成汇总表，而不会重新训练。
+其他 ETT 配置：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\ETTh1.yaml
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\ETTh2.yaml
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\ETTm2.yaml
+```
+
+常用大数据集：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\weather.yaml
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\electricity.yaml
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.train --config configs\traffic.yaml
+```
+
+训练输出位于配置中的 `exp.out_dir`，核心文件包括：
+
+```text
+run_summary.json
+test_metrics.csv
+cluster_penalty_probs.csv
+cluster_lambda_stats.csv
+best_checkpoint.pt
+cluster_memory.pt
+```
+
+## Core Architecture
+
+### Cluster-Aware Predictor
+
+`src.models.cluster_predictor` 根据 `cluster_id_c` 调用对应簇的预测头。
+
+常用预测头：
+
+- `mlp`
+- `dlinear`
+- `nlinear`
+- `patchtst`
+- `gru`
+- `tcn`
+
+当前 ETT 主配置主要使用 `mlp`，并固定：
+
+```yaml
+window:
+  input_len: 336
+model:
+  predictor: mlp
+```
+
+### GIMoE / Penalty-Guided Residual Experts
+
+GIMoE 由三部分组成：
+
+- **MoE gate**：根据簇特征、输入历史和 penalty context 选择 penalty。
+- **penalty-guided residual experts**：每个 penalty 对应独立 residual expert。
+- **validation-selected residual scaling**：用 validation 控制 residual 是否参与以及参与强度。
+
+典型配置片段：
+
+```yaml
+moe:
+  enable: true
+  topk: 1
+  select_ranks: [1]
+  gate_route_on_penalty_only: true
+  pred_side_residual:
+    enable: true
+    feature_mode: legacy
+    alpha_scale: 1.1
+    selection_policy: val_mse_gate
+    detach_routed_penalty_pred: false
+penalties:
+  enabled:
+    - level
+```
+
+解释：
+
+- `penalties.enabled` 决定 residual experts 的候选集合。
+- `topk` / `select_ranks` 决定 gate 选择哪些 penalty。
+- `pred_side_residual.selection_policy` 决定如何基于 validation 选择 residual 输出。
+- `detach_routed_penalty_pred=false` 保留 residual 路径对训练的影响。
+
+### Adaptive Participation
+
+当前代码支持：
+
+```yaml
+moe:
+  pred_side_residual:
+    adaptive_participation:
+      enable: true
+      label_scope: positive_or_routed
+      target_rate_weight: 0.1
+      report_threshold: 0.35
+```
+
+这部分用于探索：
+
+- 这种 input 是否应该启用 penalty。
+- 哪个 penalty 更可能有效。
+- continuous participation probability 与 oracle improvement 的关系。
+
+目前实验显示 penalty 选择信号较清晰，但启停更像连续弱参与，不应作为当前主结论强行二值化。
+
+## Current Reference Results
+
+### ETT Horizon Sweep
+
+参考文件：
+
+```text
+outputs/ett_horizon_sweep/results.csv
+```
+
+该表统一跑了四个 ETT 数据集的 `96 / 192 / 336 / 720` 步预测，`input_len=336`。
+下表列出 base test MSE：
+
+| Dataset | H=96 | H=192 | H=336 | H=720 |
+|---|---:|---:|---:|---:|
+| ETTh1 | 0.3617 | 0.4120 | 0.4323 | 0.4525 |
+| ETTh2 | 0.2872 | 0.3630 | 0.3904 | 0.4199 |
+| ETTm1 | 0.2845 | 0.3282 | 0.3694 | 0.4335 |
+| ETTm2 | 0.1651 | 0.2345 | 0.2875 | 0.4192 |
+
+说明：
+
+- `base_test_mse` 是非 KNN hybrid 的模型测试结果。
+- `selected_test_mse` 可能根据 validation 策略选择 base 或 hybrid。
+- 若论文主张 GIMoE，需要优先使用 matched on/off ablation，而不是 hybrid selected 数字。
+
+### ETTm1 H96 GIMoE On/Off
+
+参考文件：
+
+```text
+outputs/ettm1_h96_gimoe_2pct_refine_summary.csv
+```
+
+matched on/off 口径下，当前可复现的正收益配置：
+
+| Candidate | MoE Off MSE | MoE On MSE | Gain |
+|---|---:|---:|---:|
+| level_lam020 | 0.292128 | 0.285406 | 2.30% |
+| level_lam250 | 0.292128 | 0.285446 | 2.29% |
+| level_lam005 | 0.292128 | 0.286012 | 2.09% |
+| level_valscale | 0.292128 | 0.286281 | 2.00% |
+
+当前结论：
+
+- GIMoE 的 no-leak 正收益是存在的。
+- 收益更稳定地来自 `level` 类 bias/level correction，而不是所有 penalty 同时参与。
+- 强行要求每个模块单独提升并不合理，论文中应强调整体 GIMoE 配置的增益和可解释性。
+
+## Transfer Experiments
+
+迁移入口：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.transfer --config configs\ETTm1ToETTh1.yaml
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.transfer --config configs\ETTm1ToETTh2.yaml
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m src.transfer --config configs\ETTm1ToETTm2.yaml
+```
+
+transfer 配置核心字段：
+
+```yaml
+source:
+  memory_path: outputs/ETTm1/cluster_memory.pt
+  checkpoint_path: outputs/ETTm1/best_checkpoint.pt
+transfer:
+  route_fit_scope: train
+  corr_mode: cycle_template
+  corr_align: head
+  resample:
+    enable: true
+```
+
+当前推荐表述：
+
+- zero-shot transfer 是结构带来的自然能力展示。
+- 在 ETTh1 / ETTh2 等数据较少的同源目标上更有优势。
+- 在 ETTm2 等数据充分目标上接近或略弱于 self-training 是合理现象。
+- cross-domain 到 Traffic / Electricity / Weather 需要作为 limitation 谨慎报告。
+
+## Fine-Tune Transfer
+
+fine-tune 脚本：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\run_ettm1_finetune_transfer.py
+```
+
+建议 protocol：
+
+- source checkpoint 作为初始化。
+- target train split 训练。
+- target validation early stopping。
+- learning rate 使用 from-scratch 的 0.1 到 0.2 倍。
+- 不用 test 调参。
+
+论文中建议分开报告：
+
+- self-training
+- zero-shot transfer
+- fine-tune transfer
+
+## Ablation and Search Scripts
+
+### MoE On/Off
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\compare_moe_on_off.py --config configs\ETTm1.yaml
+```
+
+### ETTm1 H96 GIMoE Search
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\run_ettm1_h96_gimoe_gain_search.py
+```
+
+### Module / Backbone Ablation
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\run_ettm1_ablation.py
+```
+
+### Full ETT Horizon Sweep
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\run_ett_horizon_sweep.py
+```
+
+输出：
+
+```text
+outputs/ett_horizon_sweep/results.csv
+```
+
+### Penalty / Lambda Validation Search
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\run_ett_penalty_lambda_val_search.py
+```
+
+## Visualization
+
+主架构图：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\draw_gimoe_architecture.py
+```
+
+常用诊断图：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\plot_ett_val_calibration_clean.py
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python scripts\summarize_ettm1_full_target_transfer.py
+```
+
+输出通常位于：
+
+```text
+paper_figures/
+outputs/*/
+```
+
+## Output Summary
+
+单次训练的 `run_summary.json` 中常用字段：
+
+- `val.avg_mse`
+- `test.avg_mse`
+- `test_hybrid.avg_mse`
+- `selected.variant`
+- `selected.avg_mse`
+- `moe_residual_selection`
+- `moe_gate_penalty_hit`
+- `adaptive_participation`
+- `leakage_audit`
+- `timing`
+- `resources`
+
+每通道测试指标：
+
+```text
+test_metrics.csv
+```
+
+路由和 penalty 统计：
+
+```text
+cluster_penalty_probs.csv
+cluster_lambda_stats.csv
+```
+
+## Paper-Oriented Narrative
+
+推荐论文叙事：
+
+1. 多变量时间序列中，不同通道并不共享完全一致的动态模式。
+2. 先做通道聚类，让预测头具备簇感知能力，可以稳定提升基础预测能力。
+3. 单一全局 penalty 对所有通道并不合适，因此引入 GIMoE，让不同簇和输入选择不同 residual expert。
+4. penalty-guided residual experts 以残差方式修正 base prediction，保持主预测器稳定。
+5. 路由概率、penalty 画像和 residual selection 提供可解释性。
+6. 同源 transfer 展示该结构具备一定 zero-shot 可迁移性，但 cross-domain transfer 仍是限制。
+
+建议主动承认：
+
+- GIMoE 的收益依赖 penalty 组合和 lambda，不能声称所有 penalty 都单独有效。
+- adaptive participation 仍是未来工作。
+- transfer 只作为辅助能力展示，不作为核心 SOTA 结论。
+
+## Useful Checks
+
+编译检查：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -m py_compile src\train.py src\transfer.py src\models\residual_moe.py
+```
+
+YAML 检查：
+
+```powershell
+F:\Anaconda3\Scripts\conda.exe run -n my_fram python -c "import yaml; [yaml.safe_load(open(p, encoding='utf-8')) for p in ['configs/ETTh1.yaml','configs/ETTh2.yaml','configs/ETTm1.yaml','configs/ETTm2.yaml']]; print('ok')"
+```
+
+只跑 validation、不碰 test：
+
+```yaml
+eval:
+  skip_test: true
+```
+
+## Notes
+
+- 本 README 面向 `project` 仓库，不是 `project2`。
+- 当前本地实验目录可能包含大量历史搜索产物；论文引用结果时应明确对应 CSV 和 run directory。
+- test-driven 搜索结果必须标注为 test-optimized；validation-selected 结果才能作为更干净的泛化报告。
