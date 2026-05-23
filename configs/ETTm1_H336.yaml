@@ -1,10 +1,9 @@
 exp:
-  name: ETTm1_pred_96
-  out_dir: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11
+  name: ETTm1_H336
+  out_dir: outputs/ETTm1_H336
   seed: 2026
   deterministic: true
   device: cuda:0
-
 data:
   csv_path: data/ETTm1.csv
   date_col: 0
@@ -12,20 +11,16 @@ data:
   train_ratio: 0.6
   val_ratio: 0.2
   test_ratio: 0.2
-
 window:
   input_len: 336
-  pred_len: 720
+  pred_len: 336
   past_context: true
-
 normalize:
   train_only: true
   global_zscore: true
-
 corr:
   compute: true
-  save_path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/corr.npy
-
+  save_path: outputs/ETTm1_H336/corr.npy
 cluster:
   method: leader
   n_clusters: 3
@@ -42,12 +37,18 @@ cluster:
   merge_small_clusters: true
   no_merge_if_channels_lt: 7
   train_only: true
-
+  feature_aware:
+    enable: true
+    weight: 1.0
+    acf_lags:
+    - 1
+    - 24
+    - 96
+  singleton_merge_strategy: pool
 model:
-  predictor: mlp
+  predictor: channel_head_mlp
   hidden_dim: 256
   dropout: 0.2
-
 moe:
   enable: true
   topk: 1
@@ -55,9 +56,9 @@ moe:
   gate_hidden_dim: 32
   min_k_for_extensions: 3
   safeguard_hidden_dim: 64
-  select_ranks: [1]
+  select_ranks:
+  - 1
   detach_penalty_grad: false
-
   lambda_init:
     level: 0.1
     delta: 0.1
@@ -73,7 +74,6 @@ moe:
     delta: none
     d2_match: none
     diff_amp: none
-
   pred_side_residual:
     enable: true
     feature_mode: legacy
@@ -86,7 +86,7 @@ moe:
     use_y_base_input: true
     intervention_enable: false
     intervention_init: -2.0
-    intervention_weight: 1.0e-3
+    intervention_weight: 0.001
     detach_routed_penalty_pred: false
     selection_policy: val_mse_gate
     selection_min_abs_improvement: 0.0
@@ -115,18 +115,24 @@ moe:
       batch_size: 256
       max_scale: 1.0
       init_scale: 0.8
-      scale_reg: 1.0e-4
-
+      scale_reg: 0.0001
+    penalty_selector_enable: true
+    selector_temperature: 1.0
+    selector_use_cluster_context: true
+    fusion_gate_enable: true
+    fusion_init: -1.5
+    fusion_use_cluster_context: true
   dynamic_lambda:
     enable: true
     mode: multiscale
     hidden_dim: 32
-    segment_bins: [4, 8]
+    segment_bins:
+    - 4
+    - 8
     max_factor: 1.5
     mix: 0.6
     dropout: 0.0
-    reg_weight: 1.0e-4
-
+    reg_weight: 0.0001
   learnable_lambda:
     enable: false
     reg_weight: 0.01
@@ -138,7 +144,6 @@ moe:
       inner_lr: 0.001
       val_metric: val_mse
       steps_per_epoch: 10
-
   gate_entropy_weight: 0.0
   gate_balance_weight: 0.0
   gate_route_on_penalty_only: true
@@ -173,18 +178,43 @@ moe:
     gamma: 0.2
     init_bias: -2.0
   gate_logit_clip: 5.0
-
+  explainability:
+    enable: true
+    splits:
+    - train
+    - val
+    - test
+    max_batches: 0
+  cluster_penalty_prior:
+    enable: true
+    topk: 1
+    hard_topk: true
+    temperature: 0.7
+    smoothing: 0.0
+    use_normalized_penalty: true
+    logit_strength: 0.0
+    use_as_balance_target: false
+  channel_penalty_prior:
+    enable: true
+    topk: 1
+    hard_topk: true
+    temperature: 0.7
+    smoothing: 0.0
+    use_normalized_penalty: true
 penalties:
-  enabled: [level, delta, d2_match, diff_amp]
+  enabled:
+  - level
+  - delta
+  - d2_match
+  - diff_amp
   jump_threshold: 0.6
-
 train:
   epochs: 100
   batch_size: 64
   lr: 0.001
   mse_weight: 0.9
   selection_metric: val_mse
-  weight_decay: 1.0e-4
+  weight_decay: 0.0001
   grad_clip: 1.0
   penalty_warmup_epochs: 10
   mae_objective:
@@ -196,12 +226,10 @@ train:
     name: plateau
     factor: 0.5
     patience: 3
-    min_lr: 1.0e-6
-
+    min_lr: 1.0e-06
 early_stop:
   patience: 10
-  min_delta: 1.0e-6
-
+  min_delta: 1.0e-06
 knn_hybrid:
   enable: false
   mode: rolling
@@ -226,7 +254,16 @@ knn_hybrid:
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/knn_shape_bank.pt
-
+  path: outputs/ETTm1_H336/knn_shape_bank.pt
 eval:
   skip_test: false
+plot:
+  enable: false
+portrait:
+  out_dir: outputs/ETTm1_H336/cluster_portraits
+  enable: false
+memory:
+  path: outputs/ETTm1_H336/cluster_memory.pt
+  checkpoint_path: outputs/ETTm1_H336/best_checkpoint.pt
+  enable: false
+  save_checkpoint: false

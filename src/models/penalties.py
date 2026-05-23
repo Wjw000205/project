@@ -201,6 +201,32 @@ def penalty_trend(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return (trend_p - trend_t).pow(2)
 
 
+def penalty_seasonal_align(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Coarse horizon-profile alignment. This gives the MoE a penalty key for
+    same-phase / long-context residual adapters without using input history in
+    the penalty itself. It compares a small pooled profile of y_hat and y.
+
+    Returns: [B, C]
+    """
+    H = min(int(y_hat.shape[-1]), int(y.shape[-1]))
+    if H <= 0:
+        return torch.zeros(y_hat.shape[0], y_hat.shape[1], device=y_hat.device, dtype=y_hat.dtype)
+    points = max(1, min(8, H))
+    pred = y_hat[..., :H]
+    target = y[..., :H]
+    if H % points == 0:
+        width = H // points
+        pred_profile = pred.reshape(*pred.shape[:2], points, width).mean(dim=-1)
+        target_profile = target.reshape(*target.shape[:2], points, width).mean(dim=-1)
+    else:
+        pred_chunks = torch.tensor_split(pred, points, dim=-1)
+        target_chunks = torch.tensor_split(target, points, dim=-1)
+        pred_profile = torch.stack([chunk.mean(dim=-1) for chunk in pred_chunks], dim=-1)
+        target_profile = torch.stack([chunk.mean(dim=-1) for chunk in target_chunks], dim=-1)
+    return (pred_profile - target_profile).pow(2).mean(dim=-1)
+
+
 # -----------------------------------------------------------------------------
 # Cross-penalty utilities.
 # -----------------------------------------------------------------------------
@@ -244,6 +270,7 @@ _PENALTY_FACTORIES: Dict[str, Callable[[float], Callable[..., torch.Tensor]]] = 
     "direction": lambda jump_thr: (lambda yhat, y: penalty_direction(yhat, y)),
     "range":     lambda jump_thr: (lambda yhat, y: penalty_range(yhat, y)),
     "trend":     lambda jump_thr: (lambda yhat, y: penalty_trend(yhat, y)),
+    "seasonal_align": lambda jump_thr: (lambda yhat, y: penalty_seasonal_align(yhat, y)),
     # `jump` needs jump_thr captured at build time:
     "jump":      lambda jump_thr: (lambda yhat, y, _t=float(jump_thr): penalty_jump(yhat, y, thr=_t)),
 }
@@ -301,6 +328,7 @@ def build_penalty_compute(enabled: list, jump_thr: float) -> Callable:
     needs_centered = "corr" in name_set
     needs_range = "range" in name_set
     needs_trend = "trend" in name_set
+    needs_seasonal_align = "seasonal_align" in name_set
     thr = float(jump_thr)
 
     def compute(yhat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -379,6 +407,11 @@ def build_penalty_compute(enabled: list, jump_thr: float) -> Callable:
                     results.append(_zero())
                 else:
                     results.append(((yhat[..., -1] - yhat[..., 0]) - (y[..., -1] - y[..., 0])).pow(2))
+            elif name == "seasonal_align":
+                if not needs_seasonal_align:
+                    results.append(_zero())
+                else:
+                    results.append(penalty_seasonal_align(yhat, y))
             else:
                 # 已在 enabled 校验阶段排除未知项；此处仅作防御
                 raise ValueError(f"Unknown penalty: '{name}'")

@@ -38,7 +38,7 @@ cluster:
   no_merge_if_channels_lt: 7
   train_only: true
 model:
-  predictor: mlp
+  predictor: channel_head_mlp
   hidden_dim: 256
   dropout: 0.2
 moe:

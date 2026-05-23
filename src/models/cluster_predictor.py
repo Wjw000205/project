@@ -53,6 +53,39 @@ class ClusterwiseRevIN(_ClusterPredictorBase):
         self.base.load_cluster_state(k, state)
 
 
+class ClusterwiseInputTail(_ClusterPredictorBase):
+    """Expose a long input window to outer modules while feeding only its tail to the base predictor."""
+
+    def __init__(self, base: _ClusterPredictorBase, input_len: int, tail_len: int):
+        super().__init__(num_clusters=base.K)
+        self.base = base
+        self.L = int(input_len)
+        self.tail_len = int(tail_len)
+        self.H = int(base.H)
+        if self.tail_len <= 0:
+            raise ValueError("model.predictor_input_len must be positive.")
+        if self.tail_len > self.L:
+            raise ValueError(
+                f"model.predictor_input_len={self.tail_len} cannot exceed window.input_len={self.L}."
+            )
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        if x_bcl.shape[-1] < self.tail_len:
+            raise ValueError(
+                f"Input length {int(x_bcl.shape[-1])} is shorter than predictor tail length {self.tail_len}."
+            )
+        return self.base(x_bcl[..., -self.tail_len :], cluster_id_c)
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        return self.base.get_cluster_params(k)
+
+    def get_cluster_state(self, k: int):
+        return self.base.get_cluster_state(k)
+
+    def load_cluster_state(self, k: int, state):
+        self.base.load_cluster_state(k, state)
+
+
 class ClusterwiseSeasonalResidual(_ClusterPredictorBase):
     def __init__(self, base: _ClusterPredictorBase, period: int, num_periods: int = 1):
         super().__init__(num_clusters=base.K)
@@ -100,6 +133,24 @@ class ClusterwiseSeasonalResidual(_ClusterPredictorBase):
 
     def load_cluster_state(self, k: int, state):
         self.base.load_cluster_state(k, state)
+
+
+class ClusterwiseSeasonalAnchor(ClusterwiseSeasonalResidual):
+    def __init__(
+        self,
+        base: _ClusterPredictorBase,
+        period: int,
+        num_periods: int = 1,
+        delta_scale: float = 1.0,
+    ):
+        super().__init__(base=base, period=period, num_periods=num_periods)
+        self.delta_scale = float(delta_scale)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        seasonal = self._seasonal_baseline(x_bcl)
+        base_pred = self.base(x_bcl, cluster_id_c)
+        last = x_bcl[..., -1:]
+        return seasonal + self.delta_scale * (base_pred - last)
 
 
 class ClusterwiseRecursiveRollout(_ClusterPredictorBase):
@@ -483,6 +534,7 @@ class ClusterwiseChannelHeadMLP(_ClusterPredictorBase):
         cluster_id_c: torch.Tensor,
         dropout: float = 0.0,
         residual: bool = True,
+        include_seasonal_profile: bool = False,
     ):
         super().__init__(num_clusters=num_clusters)
         self.L = int(input_len)
@@ -575,6 +627,540 @@ class ClusterwiseChannelHeadMLP(_ClusterPredictorBase):
             c = int(i.item())
             self.W2[c].data.copy_(w2[j])
             self.b2[c].data.copy_(b2[j])
+
+
+class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
+    def __init__(
+        self,
+        num_clusters: int,
+        input_len: int,
+        pred_len: int,
+        hidden_dim: int,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        dropout: float = 0.0,
+        residual: bool = True,
+        include_delta: bool = True,
+    ):
+        super().__init__(num_clusters=num_clusters)
+        self.L = int(input_len)
+        self.H = int(pred_len)
+        self.D = int(hidden_dim)
+        self.C = int(num_channels)
+        self.residual = bool(residual)
+        self.include_delta = bool(include_delta)
+        self.input_dim = self.L * (3 if self.include_delta else 2)
+        if cluster_id_c.numel() != self.C:
+            raise ValueError(
+                f"context_channel_head_mlp expected cluster_id_c length {self.C}, got {int(cluster_id_c.numel())}."
+            )
+        self.register_buffer("cluster_id_c", cluster_id_c.detach().long().cpu(), persistent=False)
+
+        self.W1 = nn.ParameterList(
+            [nn.Parameter(torch.empty(self.input_dim, self.D)) for _ in range(num_clusters)]
+        )
+        self.b1 = nn.ParameterList(
+            [nn.Parameter(torch.zeros(self.D)) for _ in range(num_clusters)]
+        )
+        self.W2 = nn.ParameterList(
+            [nn.Parameter(torch.empty(self.D, self.H)) for _ in range(self.C)]
+        )
+        self.b2 = nn.ParameterList(
+            [nn.Parameter(torch.zeros(self.H)) for _ in range(self.C)]
+        )
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for w in self.W1:
+            nn.init.xavier_uniform_(w)
+        for w in self.W2:
+            nn.init.xavier_uniform_(w)
+
+    def _cluster_channel_idx(self, k: int) -> torch.Tensor:
+        return (self.cluster_id_c == int(k)).nonzero(as_tuple=False).view(-1)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        if cluster_id_c.numel() != self.C:
+            raise ValueError(
+                f"context_channel_head_mlp expected {self.C} channels, got {int(cluster_id_c.numel())}."
+            )
+        last = x_bcl[..., -1:]
+        x_in = x_bcl - last if self.residual else x_bcl
+        cluster_mean_bkl = scatter_mean_bcl_to_bkl(x_in, cluster_id_c, self.K)
+        cluster_mean_bcl = cluster_mean_bkl.index_select(1, cluster_id_c)
+        feat_parts = [x_in, cluster_mean_bcl]
+        if self.include_delta:
+            feat_parts.append(x_in - cluster_mean_bcl)
+        feat_bcf = torch.cat(feat_parts, dim=-1)
+
+        W1 = torch.stack(list(self.W1), dim=0).index_select(0, cluster_id_c)
+        b1 = torch.stack(list(self.b1), dim=0).index_select(0, cluster_id_c)
+        W2 = torch.stack(list(self.W2), dim=0)
+        b2 = torch.stack(list(self.b2), dim=0)
+
+        h = torch.einsum("bcl,cld->bcd", feat_bcf, W1) + b1.unsqueeze(0)
+        h = self.drop(self.act(h))
+        y = torch.einsum("bcd,cdh->bch", h, W2) + b2.unsqueeze(0)
+        return y + last if self.residual else y
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = [self.W1[k], self.b1[k]]
+        idx = self._cluster_channel_idx(k)
+        params.extend(self.W2[int(i.item())] for i in idx)
+        params.extend(self.b2[int(i.item())] for i in idx)
+        return params
+
+    def get_cluster_state(self, k: int):
+        idx = self._cluster_channel_idx(k)
+        if idx.numel() > 0:
+            w2 = torch.stack([self.W2[int(i.item())].detach().cpu() for i in idx], dim=0)
+            b2 = torch.stack([self.b2[int(i.item())].detach().cpu() for i in idx], dim=0)
+        else:
+            w2 = torch.empty(0, self.D, self.H)
+            b2 = torch.empty(0, self.H)
+        return {
+            "W1": self.W1[k].detach().cpu(),
+            "b1": self.b1[k].detach().cpu(),
+            "channel_idx": idx.detach().cpu(),
+            "W2": w2,
+            "b2": b2,
+        }
+
+    def load_cluster_state(self, k: int, state):
+        device = self.W1[k].device
+        self.W1[k].data.copy_(state["W1"].to(device))
+        self.b1[k].data.copy_(state["b1"].to(device))
+        idx = self._cluster_channel_idx(k)
+        saved_idx = state.get("channel_idx", idx.detach().cpu())
+        if saved_idx.numel() != idx.numel() or not torch.equal(saved_idx.cpu(), idx.detach().cpu()):
+            raise ValueError(f"context_channel_head_mlp cluster {k} channel indices do not match checkpoint state.")
+        w2 = state["W2"].to(device)
+        b2 = state["b2"].to(device)
+        for j, i in enumerate(idx):
+            c = int(i.item())
+            self.W2[c].data.copy_(w2[j])
+            self.b2[c].data.copy_(b2[j])
+
+
+class ClusterwiseLongContextChannelHeadMLP(_ClusterPredictorBase):
+    def __init__(
+        self,
+        num_clusters: int,
+        input_len: int,
+        tail_len: int,
+        pred_len: int,
+        hidden_dim: int,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        dropout: float = 0.0,
+        residual: bool = True,
+        include_seasonal_profile: bool = False,
+        output_mode: str = "direct",
+        chunk_len: int = 96,
+        anchor_points: Optional[int] = None,
+        detail_scale: float = 0.25,
+    ):
+        super().__init__(num_clusters=num_clusters)
+        self.L = int(input_len)
+        self.tail_len = int(tail_len)
+        self.H = int(pred_len)
+        self.D = int(hidden_dim)
+        self.C = int(num_channels)
+        self.residual = bool(residual)
+        self.include_seasonal_profile = bool(include_seasonal_profile)
+        self.output_mode = str(output_mode or "direct").lower()
+        if self.output_mode not in {"direct", "anchor"}:
+            raise ValueError("long_context_channel_head_mlp output_mode must be 'direct' or 'anchor'.")
+        self.chunk_len = max(int(chunk_len), 1)
+        self.num_segments = int((self.H + self.chunk_len - 1) // self.chunk_len)
+        default_anchor_points = int((self.H + self.chunk_len - 1) // self.chunk_len) + 1
+        self.anchor_points = max(int(anchor_points or default_anchor_points), 2)
+        self.detail_scale = float(detail_scale)
+        self.context_dim = 10
+        self.input_dim = self.tail_len + (self.tail_len if self.include_seasonal_profile else 0) + self.context_dim
+        if self.tail_len <= 0:
+            raise ValueError("long_context_channel_head_mlp requires positive predictor_input_len.")
+        if self.tail_len > self.L:
+            raise ValueError(
+                f"predictor_input_len={self.tail_len} cannot exceed input_len={self.L}."
+            )
+        if cluster_id_c.numel() != self.C:
+            raise ValueError(
+                f"long_context_channel_head_mlp expected cluster_id_c length {self.C}, got {int(cluster_id_c.numel())}."
+            )
+        self.register_buffer("cluster_id_c", cluster_id_c.detach().long().cpu(), persistent=False)
+
+        self.W1 = nn.ParameterList(
+            [nn.Parameter(torch.empty(self.input_dim, self.D)) for _ in range(num_clusters)]
+        )
+        self.b1 = nn.ParameterList(
+            [nn.Parameter(torch.zeros(self.D)) for _ in range(num_clusters)]
+        )
+        if self.output_mode == "direct":
+            self.W2 = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.D, self.H)) for _ in range(self.C)]
+            )
+            self.b2 = nn.ParameterList(
+                [nn.Parameter(torch.zeros(self.H)) for _ in range(self.C)]
+            )
+            self.anchor_emb = nn.ParameterList()
+            self.W_anchor = nn.ParameterList()
+            self.b_anchor = nn.ParameterList()
+            self.detail_emb = nn.ParameterList()
+            self.W_detail = nn.ParameterList()
+            self.b_detail = nn.ParameterList()
+        else:
+            self.W2 = nn.ParameterList()
+            self.b2 = nn.ParameterList()
+            self.anchor_emb = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.anchor_points, self.D)) for _ in range(num_clusters)]
+            )
+            self.W_anchor = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.D, 1)) for _ in range(self.C)]
+            )
+            self.b_anchor = nn.ParameterList(
+                [nn.Parameter(torch.zeros(self.anchor_points)) for _ in range(self.C)]
+            )
+            self.detail_emb = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.num_segments, self.D)) for _ in range(num_clusters)]
+            )
+            self.W_detail = nn.ParameterList(
+                [nn.Parameter(torch.empty(self.D, self.chunk_len)) for _ in range(self.C)]
+            )
+            self.b_detail = nn.ParameterList(
+                [nn.Parameter(torch.zeros(self.num_segments, self.chunk_len)) for _ in range(self.C)]
+            )
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for w in self.W1:
+            nn.init.xavier_uniform_(w)
+        for w in self.W2:
+            nn.init.xavier_uniform_(w)
+        for emb in self.anchor_emb:
+            nn.init.normal_(emb, mean=0.0, std=0.02)
+        for w in self.W_anchor:
+            nn.init.xavier_uniform_(w)
+        for emb in self.detail_emb:
+            nn.init.normal_(emb, mean=0.0, std=0.02)
+        for w in self.W_detail:
+            nn.init.xavier_uniform_(w)
+
+    def _cluster_channel_idx(self, k: int) -> torch.Tensor:
+        return (self.cluster_id_c == int(k)).nonzero(as_tuple=False).view(-1)
+
+    def _lag_delta(self, x_bcl: torch.Tensor, lag: int, std_bc: torch.Tensor) -> torch.Tensor:
+        idx = int(x_bcl.shape[-1]) - 1 - int(lag)
+        if idx < 0:
+            return torch.zeros_like(std_bc)
+        return (x_bcl[..., -1] - x_bcl[..., idx]) / std_bc.clamp_min(1.0e-6)
+
+    def _seasonal_acf(self, x_bcl: torch.Tensor, lag: int) -> torch.Tensor:
+        lag = int(lag)
+        if int(x_bcl.shape[-1]) <= lag:
+            return x_bcl.new_zeros(x_bcl.shape[:2])
+        a = x_bcl[..., lag:]
+        b = x_bcl[..., :-lag]
+        a = a - a.mean(dim=-1, keepdim=True)
+        b = b - b.mean(dim=-1, keepdim=True)
+        num = (a * b).mean(dim=-1)
+        den = (a.pow(2).mean(dim=-1) * b.pow(2).mean(dim=-1)).sqrt()
+        return num / den.clamp_min(1.0e-6)
+
+    def _interpolate_anchor(self, anchor_bca: torch.Tensor) -> torch.Tensor:
+        b, c, a = anchor_bca.shape
+        curve = F.interpolate(
+            anchor_bca.reshape(b * c, 1, a),
+            size=self.H,
+            mode="linear",
+            align_corners=True,
+        )
+        return curve.reshape(b, c, self.H)
+
+    def _context_features(self, x_bcl: torch.Tensor) -> torch.Tensor:
+        eps = 1.0e-6
+        B, C, L = x_bcl.shape
+        tail = x_bcl[..., -self.tail_len :]
+        last = x_bcl[..., -1:]
+        if self.residual:
+            tail_feat = tail - last
+        else:
+            tail_feat = tail
+        parts = [tail_feat]
+
+        if self.include_seasonal_profile:
+            prev_cycles = max((L - self.tail_len) // self.tail_len, 0)
+            if prev_cycles > 0:
+                start = L - (prev_cycles + 1) * self.tail_len
+                prev = x_bcl[..., start : L - self.tail_len]
+                seasonal = prev.reshape(B, C, prev_cycles, self.tail_len).mean(dim=2)
+                seasonal = seasonal - last if self.residual else seasonal
+            else:
+                seasonal = torch.zeros_like(tail_feat)
+            parts.append(seasonal)
+
+        mean = x_bcl.mean(dim=-1)
+        std = x_bcl.std(dim=-1, unbiased=False).clamp_min(eps)
+        range_over_std = (x_bcl.amax(dim=-1) - x_bcl.amin(dim=-1)) / std
+        t_l = torch.linspace(-1.0, 1.0, steps=L, device=x_bcl.device, dtype=x_bcl.dtype).view(1, 1, L)
+        slope = ((x_bcl - mean.unsqueeze(-1)) * t_l).mean(dim=-1) / t_l.pow(2).mean().clamp_min(eps)
+        slope = slope / std
+        mean_delta = (mean - last.squeeze(-1)) / std
+        std_log = std.log()
+        lag1 = self._lag_delta(x_bcl, self.tail_len, std)
+        lag2 = self._lag_delta(x_bcl, 2 * self.tail_len, std)
+
+        if L >= 2 * self.tail_len:
+            prev = x_bcl[..., -2 * self.tail_len : -self.tail_len]
+            prev_mean_delta = (tail.mean(dim=-1) - prev.mean(dim=-1)) / std
+            prev_std_ratio = (
+                tail.std(dim=-1, unbiased=False).clamp_min(eps)
+                / prev.std(dim=-1, unbiased=False).clamp_min(eps)
+            ).clamp(1.0e-3, 1.0e3).log()
+        else:
+            prev_mean_delta = torch.zeros_like(mean)
+            prev_std_ratio = torch.zeros_like(mean)
+
+        acf1 = self._seasonal_acf(x_bcl, self.tail_len)
+        acf2 = self._seasonal_acf(x_bcl, 2 * self.tail_len)
+        context = torch.stack(
+            [
+                mean_delta,
+                std_log,
+                range_over_std,
+                slope,
+                lag1,
+                lag2,
+                prev_mean_delta,
+                prev_std_ratio,
+                acf1,
+                acf2,
+            ],
+            dim=-1,
+        )
+        context = torch.nan_to_num(context, nan=0.0, posinf=8.0, neginf=-8.0).clamp(-8.0, 8.0)
+        parts.append(context)
+        return torch.cat(parts, dim=-1)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        if cluster_id_c.numel() != self.C:
+            raise ValueError(
+                f"long_context_channel_head_mlp expected {self.C} channels, got {int(cluster_id_c.numel())}."
+            )
+        last = x_bcl[..., -1:]
+        feat_bcd = self._context_features(x_bcl)
+        W1 = torch.stack(list(self.W1), dim=0).index_select(0, cluster_id_c)
+        b1 = torch.stack(list(self.b1), dim=0).index_select(0, cluster_id_c)
+
+        h = torch.einsum("bcd,cdm->bcm", feat_bcd, W1) + b1.unsqueeze(0)
+        h = self.drop(self.act(h))
+        if self.output_mode == "direct":
+            W2 = torch.stack(list(self.W2), dim=0)
+            b2 = torch.stack(list(self.b2), dim=0)
+            y = torch.einsum("bcm,cmh->bch", h, W2) + b2.unsqueeze(0)
+        else:
+            anchor_emb = torch.stack(list(self.anchor_emb), dim=0).index_select(0, cluster_id_c)
+            W_anchor = torch.stack(list(self.W_anchor), dim=0)
+            b_anchor = torch.stack(list(self.b_anchor), dim=0)
+            h_anchor = h.unsqueeze(2) + anchor_emb.unsqueeze(0)
+            anchor_bca = torch.einsum("bcam,cmo->bcao", h_anchor, W_anchor).squeeze(-1)
+            anchor_bca = anchor_bca + b_anchor.unsqueeze(0)
+            anchor_bch = self._interpolate_anchor(anchor_bca)
+
+            detail_emb = torch.stack(list(self.detail_emb), dim=0).index_select(0, cluster_id_c)
+            W_detail = torch.stack(list(self.W_detail), dim=0)
+            b_detail = torch.stack(list(self.b_detail), dim=0)
+            h_detail = h.unsqueeze(2) + detail_emb.unsqueeze(0)
+            detail_bcsh = torch.einsum("bcsm,cmh->bcsh", h_detail, W_detail)
+            detail_bcsh = detail_bcsh + b_detail.unsqueeze(0)
+            detail_bcsh = detail_bcsh - detail_bcsh.mean(dim=-1, keepdim=True)
+            detail_bch = detail_bcsh.reshape(h.shape[0], self.C, self.num_segments * self.chunk_len)[..., : self.H]
+            y = anchor_bch + self.detail_scale * detail_bch
+        return y + last if self.residual else y
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = [self.W1[k], self.b1[k]]
+        idx = self._cluster_channel_idx(k)
+        if self.output_mode == "direct":
+            params.extend(self.W2[int(i.item())] for i in idx)
+            params.extend(self.b2[int(i.item())] for i in idx)
+        else:
+            params.extend([self.anchor_emb[k], self.detail_emb[k]])
+            params.extend(self.W_anchor[int(i.item())] for i in idx)
+            params.extend(self.b_anchor[int(i.item())] for i in idx)
+            params.extend(self.W_detail[int(i.item())] for i in idx)
+            params.extend(self.b_detail[int(i.item())] for i in idx)
+        return params
+
+    def get_cluster_state(self, k: int):
+        idx = self._cluster_channel_idx(k)
+        state = {
+            "W1": self.W1[k].detach().cpu(),
+            "b1": self.b1[k].detach().cpu(),
+            "channel_idx": idx.detach().cpu(),
+            "output_mode": self.output_mode,
+        }
+        if self.output_mode == "direct":
+            if idx.numel() > 0:
+                state["W2"] = torch.stack([self.W2[int(i.item())].detach().cpu() for i in idx], dim=0)
+                state["b2"] = torch.stack([self.b2[int(i.item())].detach().cpu() for i in idx], dim=0)
+            else:
+                state["W2"] = torch.empty(0, self.D, self.H)
+                state["b2"] = torch.empty(0, self.H)
+        else:
+            state["anchor_emb"] = self.anchor_emb[k].detach().cpu()
+            state["detail_emb"] = self.detail_emb[k].detach().cpu()
+            if idx.numel() > 0:
+                state["W_anchor"] = torch.stack([self.W_anchor[int(i.item())].detach().cpu() for i in idx], dim=0)
+                state["b_anchor"] = torch.stack([self.b_anchor[int(i.item())].detach().cpu() for i in idx], dim=0)
+                state["W_detail"] = torch.stack([self.W_detail[int(i.item())].detach().cpu() for i in idx], dim=0)
+                state["b_detail"] = torch.stack([self.b_detail[int(i.item())].detach().cpu() for i in idx], dim=0)
+            else:
+                state["W_anchor"] = torch.empty(0, self.D, 1)
+                state["b_anchor"] = torch.empty(0, self.anchor_points)
+                state["W_detail"] = torch.empty(0, self.D, self.chunk_len)
+                state["b_detail"] = torch.empty(0, self.num_segments, self.chunk_len)
+        return state
+
+    def load_cluster_state(self, k: int, state):
+        device = self.W1[k].device
+        self.W1[k].data.copy_(state["W1"].to(device))
+        self.b1[k].data.copy_(state["b1"].to(device))
+        idx = self._cluster_channel_idx(k)
+        saved_idx = state.get("channel_idx", idx.detach().cpu())
+        if saved_idx.numel() != idx.numel() or not torch.equal(saved_idx.cpu(), idx.detach().cpu()):
+            raise ValueError(f"long_context_channel_head_mlp cluster {k} channel indices do not match checkpoint state.")
+        if self.output_mode == "direct":
+            w2 = state["W2"].to(device)
+            b2 = state["b2"].to(device)
+            for j, i in enumerate(idx):
+                c = int(i.item())
+                self.W2[c].data.copy_(w2[j])
+                self.b2[c].data.copy_(b2[j])
+        else:
+            self.anchor_emb[k].data.copy_(state["anchor_emb"].to(device))
+            self.detail_emb[k].data.copy_(state["detail_emb"].to(device))
+            w_anchor = state["W_anchor"].to(device)
+            b_anchor = state["b_anchor"].to(device)
+            w_detail = state["W_detail"].to(device)
+            b_detail = state["b_detail"].to(device)
+            for j, i in enumerate(idx):
+                c = int(i.item())
+                self.W_anchor[c].data.copy_(w_anchor[j])
+                self.b_anchor[c].data.copy_(b_anchor[j])
+                self.W_detail[c].data.copy_(w_detail[j])
+                self.b_detail[c].data.copy_(b_detail[j])
+
+
+class ClusterwiseSeasonalityGatedChannelHeadMLP(_ClusterPredictorBase):
+    def __init__(
+        self,
+        num_clusters: int,
+        input_len: int,
+        tail_len: int,
+        pred_len: int,
+        hidden_dim: int,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        dropout: float = 0.0,
+        residual: bool = True,
+        include_seasonal_profile: bool = True,
+        chunk_len: int = 96,
+        anchor_points: Optional[int] = None,
+        detail_scale: float = 0.25,
+        mix_init: float = -2.0,
+        gate_strength: float = 0.0,
+        gate_threshold: float = 0.75,
+    ):
+        super().__init__(num_clusters=num_clusters)
+        self.L = int(input_len)
+        self.tail_len = int(tail_len)
+        self.H = int(pred_len)
+        self.C = int(num_channels)
+        self.gate_strength = float(gate_strength)
+        self.gate_threshold = float(gate_threshold)
+        if cluster_id_c.numel() != self.C:
+            raise ValueError(
+                f"seasonality_gated_channel_head_mlp expected cluster_id_c length {self.C}, got {int(cluster_id_c.numel())}."
+            )
+        self.register_buffer("cluster_id_c", cluster_id_c.detach().long().cpu(), persistent=False)
+        self.full_head = ClusterwiseChannelHeadMLP(
+            num_clusters=num_clusters,
+            input_len=input_len,
+            pred_len=pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=num_channels,
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            residual=residual,
+        )
+        self.seasonal_head = ClusterwiseLongContextChannelHeadMLP(
+            num_clusters=num_clusters,
+            input_len=input_len,
+            tail_len=tail_len,
+            pred_len=pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=num_channels,
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            residual=residual,
+            include_seasonal_profile=include_seasonal_profile,
+            output_mode="anchor",
+            chunk_len=chunk_len,
+            anchor_points=anchor_points,
+            detail_scale=detail_scale,
+        )
+        self.mix_logit_c = nn.Parameter(torch.full((self.C,), float(mix_init)))
+
+    def _seasonality_score(self, x_bcl: torch.Tensor) -> torch.Tensor:
+        if self.gate_strength == 0.0:
+            return x_bcl.new_zeros(x_bcl.shape[:2])
+        acf = self.seasonal_head._seasonal_acf(x_bcl, self.tail_len)
+        acf = torch.nan_to_num(acf, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        return self.gate_strength * (acf - self.gate_threshold)
+
+    def seasonal_mix(self, x_bcl: torch.Tensor) -> torch.Tensor:
+        logits = self.mix_logit_c.to(device=x_bcl.device, dtype=x_bcl.dtype).view(1, self.C)
+        logits = logits + self._seasonality_score(x_bcl)
+        return torch.sigmoid(logits)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        y_full = self.full_head(x_bcl, cluster_id_c)
+        y_seasonal = self.seasonal_head(x_bcl, cluster_id_c)
+        mix = self.seasonal_mix(x_bcl).unsqueeze(-1)
+        return y_full + mix * (y_seasonal - y_full)
+
+    def _cluster_channel_idx(self, k: int) -> torch.Tensor:
+        return (self.cluster_id_c == int(k)).nonzero(as_tuple=False).view(-1)
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        params: List[nn.Parameter] = []
+        params.extend(self.full_head.get_cluster_params(k))
+        params.extend(self.seasonal_head.get_cluster_params(k))
+        params.append(self.mix_logit_c)
+        return params
+
+    def get_cluster_state(self, k: int):
+        idx = self._cluster_channel_idx(k)
+        return {
+            "full_head": self.full_head.get_cluster_state(k),
+            "seasonal_head": self.seasonal_head.get_cluster_state(k),
+            "channel_idx": idx.detach().cpu(),
+            "mix_logit": self.mix_logit_c.detach().cpu().index_select(0, idx.detach().cpu()),
+        }
+
+    def load_cluster_state(self, k: int, state):
+        self.full_head.load_cluster_state(k, state["full_head"])
+        self.seasonal_head.load_cluster_state(k, state["seasonal_head"])
+        idx = self._cluster_channel_idx(k)
+        saved_idx = state.get("channel_idx", idx.detach().cpu())
+        if saved_idx.numel() != idx.numel() or not torch.equal(saved_idx.cpu(), idx.detach().cpu()):
+            raise ValueError(f"seasonality_gated_channel_head_mlp cluster {k} channel indices do not match checkpoint state.")
+        self.mix_logit_c.data.index_copy_(0, idx.to(self.mix_logit_c.device), state["mix_logit"].to(self.mix_logit_c.device))
 
 
 class ClusterwiseAttnMLP(_ClusterPredictorBase):
@@ -1251,6 +1837,161 @@ class ClusterwiseGRU(_ClusterPredictorBase):
         self.experts[k].load_state_dict(state_dev, strict=True)
 
 
+class _LSTMExpert(nn.Module):
+    def __init__(self, hidden_dim: int, pred_len: int, dropout: float, num_layers: int):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.head = nn.Linear(hidden_dim, pred_len)
+
+    def forward(self, x_bli: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x_bli)
+        h = self.drop(out[:, -1, :])
+        return self.head(h)
+
+
+class ClusterwiseLSTM(_ClusterPredictorBase):
+    def __init__(
+        self,
+        num_clusters: int,
+        input_len: int,
+        pred_len: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+    ):
+        super().__init__(num_clusters=num_clusters)
+        self.L = input_len
+        self.H = pred_len
+        self.experts = nn.ModuleList(
+            [
+                _LSTMExpert(
+                    hidden_dim=hidden_dim,
+                    pred_len=pred_len,
+                    dropout=dropout,
+                    num_layers=num_layers,
+                )
+                for _ in range(num_clusters)
+            ]
+        )
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        b, c, _ = x_bcl.shape
+        y_bch = x_bcl.new_zeros((b, c, self.H))
+        for k in range(self.K):
+            idx = (cluster_id_c == k).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            x_bnl = x_bcl.index_select(1, idx)
+            x_bnl = x_bnl.reshape(-1, self.L).unsqueeze(-1)
+            y_bn = self.experts[k](x_bnl)
+            y_bnh = y_bn.view(b, idx.numel(), self.H)
+            y_bch = y_bch.index_copy(1, idx, y_bnh)
+        return y_bch
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        return list(self.experts[k].parameters())
+
+    def get_cluster_state(self, k: int):
+        return {n: t.detach().cpu() for n, t in self.experts[k].state_dict().items()}
+
+    def load_cluster_state(self, k: int, state):
+        device = next(self.experts[k].parameters()).device
+        state_dev = {n: t.to(device) for n, t in state.items()}
+        self.experts[k].load_state_dict(state_dev, strict=True)
+
+
+class ClusterwiseChannelLSTMMixer(_ClusterPredictorBase):
+    def __init__(
+        self,
+        num_clusters: int,
+        input_len: int,
+        pred_len: int,
+        hidden_dim: int,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        dropout: float = 0.0,
+        lstm_num_layers: int = 1,
+        lstm_hidden_dim: Optional[int] = None,
+        mix_init: float = -2.0,
+        hard_lstm_channels: Optional[List[int]] = None,
+    ):
+        super().__init__(num_clusters=num_clusters)
+        self.L = int(input_len)
+        self.H = int(pred_len)
+        self.C = int(num_channels)
+        if cluster_id_c.numel() != self.C:
+            raise ValueError(
+                f"channel_lstm_mixer expected cluster_id_c length {self.C}, got {int(cluster_id_c.numel())}."
+            )
+        self.register_buffer("cluster_id_c", cluster_id_c.detach().long().cpu(), persistent=False)
+        self.channel_head = ClusterwiseChannelHeadMLP(
+            num_clusters=num_clusters,
+            input_len=input_len,
+            pred_len=pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=num_channels,
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            residual=True,
+        )
+        lstm_base = ClusterwiseLSTM(
+            num_clusters=num_clusters,
+            input_len=input_len,
+            pred_len=pred_len,
+            hidden_dim=int(lstm_hidden_dim or hidden_dim),
+            dropout=dropout,
+            num_layers=lstm_num_layers,
+        )
+        self.lstm_revin = ClusterwiseRevIN(base=lstm_base)
+        self.mix_logit_c = nn.Parameter(torch.full((self.C,), float(mix_init)))
+        if hard_lstm_channels is None:
+            hard_mask = torch.full((self.C,), float("nan"), dtype=torch.float32)
+        else:
+            hard_mask = torch.zeros((self.C,), dtype=torch.float32)
+            for c in hard_lstm_channels:
+                if 0 <= int(c) < self.C:
+                    hard_mask[int(c)] = 1.0
+        self.register_buffer("hard_lstm_mask_c", hard_mask, persistent=False)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        y_channel = self.channel_head(x_bcl, cluster_id_c)
+        y_lstm = self.lstm_revin(x_bcl, cluster_id_c)
+        if torch.isfinite(self.hard_lstm_mask_c).all():
+            mix = self.hard_lstm_mask_c.to(device=x_bcl.device, dtype=x_bcl.dtype).view(1, self.C, 1)
+        else:
+            mix = torch.sigmoid(self.mix_logit_c.to(device=x_bcl.device, dtype=x_bcl.dtype)).view(1, self.C, 1)
+        return y_channel + mix * (y_lstm - y_channel)
+
+    def _cluster_channel_idx(self, k: int) -> torch.Tensor:
+        return (self.cluster_id_c == int(k)).nonzero(as_tuple=False).view(-1)
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        params = []
+        params.extend(self.channel_head.get_cluster_params(k))
+        params.extend(self.lstm_revin.get_cluster_params(k))
+        params.append(self.mix_logit_c)
+        return params
+
+    def get_cluster_state(self, k: int):
+        return {
+            "channel_head": self.channel_head.get_cluster_state(k),
+            "lstm_revin": self.lstm_revin.get_cluster_state(k),
+            "mix_logit_c": self.mix_logit_c.detach().cpu(),
+        }
+
+    def load_cluster_state(self, k: int, state):
+        self.channel_head.load_cluster_state(k, state["channel_head"])
+        self.lstm_revin.load_cluster_state(k, state["lstm_revin"])
+        self.mix_logit_c.data.copy_(state["mix_logit_c"].to(self.mix_logit_c.device))
+
+
 class _Chomp1d(nn.Module):
     def __init__(self, chomp_size: int):
         super().__init__()
@@ -1471,19 +2212,41 @@ def build_cluster_predictor(
     cluster_id_c: Optional[torch.Tensor] = None,
 ) -> nn.Module:
     predictor = str(model_cfg.get("predictor", "mlp")).lower()
+    force_revin = predictor in {"lstm_revin", "revin_lstm"}
+    if force_revin:
+        predictor = "lstm"
+    internal_tail_predictor = predictor in {
+        "long_context_channel_head_mlp",
+        "lc_channel_head_mlp",
+        "summary_channel_head_mlp",
+        "long_context_anchor_channel_head_mlp",
+        "lc_anchor_channel_head_mlp",
+        "summary_anchor_channel_head_mlp",
+        "seasonality_gated_channel_head_mlp",
+        "seasonal_hybrid_channel_head_mlp",
+    }
     hidden_dim = int(model_cfg["hidden_dim"])
     dropout = float(model_cfg.get("dropout", 0.0))
     recursive_enable = bool(model_cfg.get("recursive_rollout", False))
     recursive_chunk_len = int(model_cfg.get("recursive_chunk_len", 96))
     base_pred_len = recursive_chunk_len if recursive_enable else pred_len
+    predictor_input_len_raw = model_cfg.get("predictor_input_len", model_cfg.get("base_input_len", input_len))
+    predictor_input_len = int(predictor_input_len_raw)
+    if predictor_input_len <= 0:
+        raise ValueError("model.predictor_input_len must be positive.")
+    if predictor_input_len > int(input_len):
+        raise ValueError(
+            f"model.predictor_input_len={predictor_input_len} cannot exceed window.input_len={int(input_len)}."
+        )
+    base_input_len = int(input_len) if internal_tail_predictor else predictor_input_len
 
     base_predictor: nn.Module
     if predictor in {"mlp", "cluster_mlp"}:
-        base_predictor = ClusterwiseMLP(num_clusters, input_len, base_pred_len, hidden_dim, dropout)
+        base_predictor = ClusterwiseMLP(num_clusters, base_input_len, base_pred_len, hidden_dim, dropout)
     elif predictor in {"segment_mlp", "seg_mlp", "chunk_mlp"}:
         base_predictor = ClusterwiseSegmentMLP(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
@@ -1493,7 +2256,7 @@ def build_cluster_predictor(
         default_anchor_points = int((base_pred_len + 95) // 96) + 1
         base_predictor = ClusterwiseLongAnchorMLP(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
@@ -1507,7 +2270,7 @@ def build_cluster_predictor(
             raise ValueError("model.predictor=channel_head_mlp requires num_channels and cluster_id_c.")
         base_predictor = ClusterwiseChannelHeadMLP(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             num_channels=int(num_channels),
@@ -1515,10 +2278,80 @@ def build_cluster_predictor(
             dropout=dropout,
             residual=bool(model_cfg.get("channel_head_residual", True)),
         )
+    elif predictor in {"context_channel_head_mlp", "cluster_context_channel_head_mlp", "cc_channel_head_mlp"}:
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.predictor=context_channel_head_mlp requires num_channels and cluster_id_c.")
+        base_predictor = ClusterwiseContextChannelHeadMLP(
+            num_clusters=num_clusters,
+            input_len=base_input_len,
+            pred_len=base_pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            residual=bool(model_cfg.get("context_channel_head_residual", True)),
+            include_delta=bool(model_cfg.get("context_channel_head_include_delta", True)),
+        )
+    elif predictor in {
+        "long_context_channel_head_mlp",
+        "lc_channel_head_mlp",
+        "summary_channel_head_mlp",
+        "long_context_anchor_channel_head_mlp",
+        "lc_anchor_channel_head_mlp",
+        "summary_anchor_channel_head_mlp",
+    }:
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.predictor=long_context_channel_head_mlp requires num_channels and cluster_id_c.")
+        output_mode = (
+            "anchor"
+            if predictor in {
+                "long_context_anchor_channel_head_mlp",
+                "lc_anchor_channel_head_mlp",
+                "summary_anchor_channel_head_mlp",
+            }
+            else str(model_cfg.get("long_context_output_mode", "direct"))
+        )
+        base_predictor = ClusterwiseLongContextChannelHeadMLP(
+            num_clusters=num_clusters,
+            input_len=int(input_len),
+            tail_len=predictor_input_len,
+            pred_len=base_pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            residual=bool(model_cfg.get("long_context_channel_head_residual", True)),
+            include_seasonal_profile=bool(model_cfg.get("long_context_include_seasonal_profile", False)),
+            output_mode=output_mode,
+            chunk_len=int(model_cfg.get("anchor_chunk_len", model_cfg.get("segment_chunk_len", 96))),
+            anchor_points=model_cfg.get("anchor_points", None),
+            detail_scale=float(model_cfg.get("anchor_detail_scale", 0.25)),
+        )
+    elif predictor in {"seasonality_gated_channel_head_mlp", "seasonal_hybrid_channel_head_mlp"}:
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.predictor=seasonality_gated_channel_head_mlp requires num_channels and cluster_id_c.")
+        base_predictor = ClusterwiseSeasonalityGatedChannelHeadMLP(
+            num_clusters=num_clusters,
+            input_len=int(input_len),
+            tail_len=predictor_input_len,
+            pred_len=base_pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            residual=bool(model_cfg.get("seasonal_hybrid_residual", True)),
+            include_seasonal_profile=bool(model_cfg.get("long_context_include_seasonal_profile", True)),
+            chunk_len=int(model_cfg.get("anchor_chunk_len", model_cfg.get("segment_chunk_len", 96))),
+            anchor_points=model_cfg.get("anchor_points", None),
+            detail_scale=float(model_cfg.get("anchor_detail_scale", 0.25)),
+            mix_init=float(model_cfg.get("seasonal_mix_init", -2.0)),
+            gate_strength=float(model_cfg.get("seasonal_gate_strength", 0.0)),
+            gate_threshold=float(model_cfg.get("seasonal_gate_threshold", 0.75)),
+        )
     elif predictor == "attn_mlp":
         base_predictor = ClusterwiseAttnMLP(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
@@ -1527,7 +2360,7 @@ def build_cluster_predictor(
     elif predictor == "context_mlp":
         base_predictor = ClusterwiseContextMLP(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
@@ -1536,13 +2369,13 @@ def build_cluster_predictor(
     elif predictor == "nlinear":
         base_predictor = ClusterwiseNLinear(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
         )
     elif predictor == "dlinear":
         base_predictor = ClusterwiseDLinear(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             kernel_size=int(model_cfg.get("dlinear_kernel_size", 25)),
         )
@@ -1551,7 +2384,7 @@ def build_cluster_predictor(
             raise ValueError("model.predictor=channel_dlinear requires num_channels and cluster_id_c.")
         base_predictor = ClusterwiseChannelDLinear(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             num_channels=int(num_channels),
             cluster_id_c=cluster_id_c,
@@ -1560,7 +2393,7 @@ def build_cluster_predictor(
     elif predictor in {"patchtst", "patch_transformer"}:
         base_predictor = ClusterwisePatchTST(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             d_model=int(model_cfg.get("patch_d_model", hidden_dim)),
             dropout=dropout,
@@ -1573,7 +2406,7 @@ def build_cluster_predictor(
     elif predictor == "nbeats":
         base_predictor = ClusterwiseNBEATS(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
@@ -1583,16 +2416,43 @@ def build_cluster_predictor(
     elif predictor == "gru":
         base_predictor = ClusterwiseGRU(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
             num_layers=int(model_cfg.get("gru_num_layers", 1)),
         )
+    elif predictor == "lstm":
+        base_predictor = ClusterwiseLSTM(
+            num_clusters=num_clusters,
+            input_len=base_input_len,
+            pred_len=base_pred_len,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            num_layers=int(model_cfg.get("lstm_num_layers", 1)),
+        )
+    elif predictor in {"channel_lstm_mixer", "channel_lstm_moe", "backbone_moe"}:
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.predictor=channel_lstm_mixer requires num_channels and cluster_id_c.")
+        base_predictor = ClusterwiseChannelLSTMMixer(
+            num_clusters=num_clusters,
+            input_len=base_input_len,
+            pred_len=base_pred_len,
+            hidden_dim=hidden_dim,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            dropout=dropout,
+            lstm_num_layers=int(model_cfg.get("lstm_num_layers", 1)),
+            lstm_hidden_dim=int(model_cfg.get("lstm_hidden_dim", hidden_dim)),
+            mix_init=float(model_cfg.get("backbone_mix_init", model_cfg.get("mixer_lstm_init", -2.0))),
+            hard_lstm_channels=list(model_cfg.get("backbone_lstm_channel_indices", []))
+            if bool(model_cfg.get("backbone_hard_route", False))
+            else None,
+        )
     elif predictor == "tcn":
         base_predictor = ClusterwiseTCN(
             num_clusters=num_clusters,
-            input_len=input_len,
+            input_len=base_input_len,
             pred_len=base_pred_len,
             hidden_dim=hidden_dim,
             dropout=dropout,
@@ -1602,13 +2462,19 @@ def build_cluster_predictor(
         )
     else:
         raise ValueError(
-            f"Unknown model.predictor='{predictor}'. Supported: mlp, segment_mlp, long_anchor_mlp, channel_head_mlp, attn_mlp, context_mlp, nlinear, dlinear, channel_dlinear, patchtst, nbeats, gru, tcn."
+            f"Unknown model.predictor='{predictor}'. Supported: mlp, segment_mlp, long_anchor_mlp, channel_head_mlp, context_channel_head_mlp, long_context_channel_head_mlp, long_context_anchor_channel_head_mlp, seasonality_gated_channel_head_mlp, attn_mlp, context_mlp, nlinear, dlinear, channel_dlinear, patchtst, nbeats, gru, lstm, lstm_revin, channel_lstm_mixer, tcn."
         )
 
-    if bool(model_cfg.get("revin", False)):
+    if force_revin or bool(model_cfg.get("revin", False)):
         base_predictor = ClusterwiseRevIN(
             base=base_predictor,
             eps=float(model_cfg.get("revin_eps", 1.0e-5)),
+        )
+    if predictor_input_len != int(input_len) and not internal_tail_predictor:
+        base_predictor = ClusterwiseInputTail(
+            base=base_predictor,
+            input_len=int(input_len),
+            tail_len=predictor_input_len,
         )
     if recursive_enable:
         base_predictor = ClusterwiseRecursiveRollout(base=base_predictor, pred_len=pred_len)
@@ -1617,6 +2483,13 @@ def build_cluster_predictor(
             base=base_predictor,
             period=int(model_cfg.get("seasonal_period", 96)),
             num_periods=int(model_cfg.get("seasonal_num_periods", 1)),
+        )
+    if bool(model_cfg.get("seasonal_anchor", False)):
+        base_predictor = ClusterwiseSeasonalAnchor(
+            base=base_predictor,
+            period=int(model_cfg.get("seasonal_anchor_period", model_cfg.get("seasonal_period", 96))),
+            num_periods=int(model_cfg.get("seasonal_anchor_num_periods", model_cfg.get("seasonal_num_periods", 1))),
+            delta_scale=float(model_cfg.get("seasonal_anchor_delta_scale", 1.0)),
         )
     basis_cfg = model_cfg.get("temporal_basis_adapter", {})
     if basis_cfg is None:

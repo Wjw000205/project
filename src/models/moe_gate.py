@@ -64,6 +64,7 @@ class ClusterwiseMoEGate(nn.Module):
         prior_prob = torch.full(prior_shape, 1.0 / max(num_penalties, 1), dtype=torch.float32)
         self.register_buffer("penalty_prior_prob", prior_prob, persistent=False)
         self.register_buffer("penalty_prior_logits", prior_prob.clamp_min(1.0e-8).log(), persistent=False)
+        self.register_buffer("penalty_allowed_mask", torch.ones_like(prior_prob), persistent=False)
         self.penalty_prior_strength = 0.0
 
         # 每个簇一个 gate（参数按簇存矩阵），避免 python 循环
@@ -121,6 +122,20 @@ class ClusterwiseMoEGate(nn.Module):
             return None
         return self.penalty_prior_prob[:, :self.P]
 
+    def set_penalty_allowed_mask(self, allowed_kp: Optional[torch.Tensor]):
+        if self.P <= 0 or allowed_kp is None or allowed_kp.numel() == 0:
+            self.penalty_allowed_mask.fill_(1.0)
+            return
+        allowed = allowed_kp.to(device=self.penalty_allowed_mask.device, dtype=self.penalty_allowed_mask.dtype)
+        expected_shape = self.penalty_allowed_mask[:, :self.P].shape
+        if allowed.shape != expected_shape:
+            raise ValueError(f"Expected allowed mask shape {tuple(expected_shape)}, got {tuple(allowed.shape)}")
+        allowed = (allowed > 0).to(dtype=self.penalty_allowed_mask.dtype)
+        empty = allowed.sum(dim=-1, keepdim=True) <= 0
+        if bool(empty.any().item()):
+            allowed = torch.where(empty, torch.ones_like(allowed), allowed)
+        self.penalty_allowed_mask[:, :self.P].copy_(allowed)
+
     def forward(
         self,
         feat_bkf: torch.Tensor,
@@ -148,6 +163,10 @@ class ClusterwiseMoEGate(nn.Module):
         logits = torch.einsum("bkh,khp->bkp", h, W2) + b2.unsqueeze(0)    # [B,K,P]
         if self.P > 0 and self.penalty_prior_strength > 0.0:
             logits = logits + (self.penalty_prior_strength * self.penalty_prior_logits[:, :self.P].unsqueeze(0))
+        allowed = None
+        if self.P > 0:
+            allowed = self.penalty_allowed_mask[:, :self.P].to(device=logits.device, dtype=torch.bool)
+            logits = logits.masked_fill(~allowed.unsqueeze(0), -1.0e9)
         mode = str(penalty_context_mode).lower()
         if penalty_context_bkp is not None and penalty_context_bkp.numel() > 0 and mode != "learned":
             context = penalty_context_bkp.detach() if bool(penalty_context_detach) else penalty_context_bkp
@@ -186,6 +205,8 @@ class ClusterwiseMoEGate(nn.Module):
         top_idx = probs.topk(k=k, dim=-1).indices  # [B,K,k]
         hard = torch.zeros_like(probs)
         hard.scatter_(-1, top_idx, 1.0)
+        if allowed is not None:
+            hard = hard * allowed.unsqueeze(0).to(dtype=hard.dtype)
 
         if straight_through:
             mask = hard - probs.detach() + probs

@@ -1,6 +1,6 @@
 exp:
-  name: electricity_H96_amp_dir_h128_l003_do01
-  out_dir: outputs/electricity_H96_amp_dir_h128_l003_do01
+  name: electricity_H96_amp_dir_h128_weighted_do0
+  out_dir: outputs/electricity_H96_amp_dir_h128_weighted_do0
   seed: 2026
   deterministic: true
   device: cuda:0
@@ -8,14 +8,15 @@ exp:
 data:
   csv_path: data/electricity.csv
   date_col: 0
-  train_ratio: 0.7
-  val_ratio: 0.1
-  test_ratio: 0.2
+  train_ratio: 0.6999695863746959
+  val_ratio: 0.10006082725060828
+  test_ratio: 0.19996958637469586
   max_rows: 0
 
 window:
   input_len: 336
   pred_len: 96
+  past_context: true
 
 normalize:
   global_zscore: true
@@ -23,7 +24,7 @@ normalize:
 
 corr:
   compute: true
-  save_path: outputs/electricity_H96_amp_dir_h128_l003_do01/corr.npy
+  save_path: outputs/electricity_H96_amp_dir_h128_weighted_do0/corr.npy
 
 cluster:
   method: leader
@@ -45,7 +46,7 @@ cluster:
 model:
   predictor: mlp
   hidden_dim: 128
-  dropout: 0.1
+  dropout: 0.0
 
 moe:
   topk: 1
@@ -55,10 +56,10 @@ moe:
   select_ranks: [1]
   detach_penalty_grad: false
   lambda_init:
-    amp_under: 0.03
-    delta: 0.03
-    diff_amp: 0.03
-    direction: 0.03
+    amp_under: 0.02
+    delta: 0.01
+    diff_amp: 0.04
+    direction: 0.01
   dynamic_lambda:
     enable: false
     mode: multiscale
@@ -118,14 +119,14 @@ penalties:
   jump_threshold: 0.6
 
 train:
-  epochs: 12
-  batch_size: 4
+  epochs: 100
+  batch_size: 64
   lr: 0.001
   mse_weight: 0.9
   selection_metric: val_mse
   weight_decay: 1.0e-4
   grad_clip: 1.0
-  penalty_warmup_epochs: 5
+  penalty_warmup_epochs: 3
   lr_scheduler:
     name: plateau
     factor: 0.5
@@ -141,7 +142,7 @@ plot:
 
 portrait:
   enable: false
-  out_dir: outputs/electricity_H96_amp_dir_h128_l003_do01/cluster_portraits
+  out_dir: outputs/electricity_H96_amp_dir_h128_weighted_do0/cluster_portraits
 
 knn_hybrid:
   enable: false
@@ -166,7 +167,7 @@ knn_hybrid:
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/electricity_H96_amp_dir_h128_l003_do01/knn_shape_bank.pt
+  path: outputs/electricity_H96_amp_dir_h128_weighted_do0/knn_shape_bank.pt
 
 eval:
   skip_test: false
@@ -177,5 +178,5 @@ calibration:
 memory:
   enable: false
   save_checkpoint: false
-  path: outputs/electricity_H96_amp_dir_h128_l003_do01/cluster_memory.pt
-  checkpoint_path: outputs/electricity_H96_amp_dir_h128_l003_do01/best_checkpoint.pt
+  path: outputs/electricity_H96_amp_dir_h128_weighted_do0/cluster_memory.pt
+  checkpoint_path: outputs/electricity_H96_amp_dir_h128_weighted_do0/best_checkpoint.pt

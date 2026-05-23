@@ -1,31 +1,26 @@
 exp:
-  name: ETTm1_pred_96
-  out_dir: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11
+  name: ETTh1_H720
+  out_dir: outputs/ETTh1_H720
   seed: 2026
   deterministic: true
   device: cuda:0
-
 data:
-  csv_path: data/ETTm1.csv
+  csv_path: data/ETTh1.csv
   date_col: 0
-  max_rows: 57600
+  max_rows: 14400
   train_ratio: 0.6
   val_ratio: 0.2
   test_ratio: 0.2
-
 window:
   input_len: 336
   pred_len: 720
   past_context: true
-
 normalize:
-  train_only: true
   global_zscore: true
-
+  train_only: true
 corr:
   compute: true
-  save_path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/corr.npy
-
+  save_path: outputs/ETTh1_H720/corr.npy
 cluster:
   method: leader
   n_clusters: 3
@@ -42,51 +37,50 @@ cluster:
   merge_small_clusters: true
   no_merge_if_channels_lt: 7
   train_only: true
-
+  feature_aware:
+    enable: true
+    weight: 1.0
+    acf_lags:
+    - 1
+    - 24
+    - 96
+  singleton_merge_strategy: pool
 model:
-  predictor: mlp
-  hidden_dim: 256
-  dropout: 0.2
-
+  predictor: channel_head_mlp
+  hidden_dim: 192
+  dropout: 0.3
+  dlinear_kernel_size: 13
+  channel_adapter:
+    enable: false
+    rank: 8
+    init: zero_delta
+    scale: 1.0
+  revin: true
 moe:
-  enable: true
   topk: 1
+  enable: true
   freeze_lambda: false
   gate_hidden_dim: 32
-  min_k_for_extensions: 3
-  safeguard_hidden_dim: 64
-  select_ranks: [1]
+  select_ranks:
+  - 1
   detach_penalty_grad: false
-
   lambda_init:
-    level: 0.1
-    delta: 0.1
-    d2_match: 0.1
-    diff_amp: 0.1
-  lambda_min:
-    level: 0.0
-    delta: 0.0
-    d2_match: 0.0
-    diff_amp: 0.0
-  lambda_schedule:
-    level: none
-    delta: none
-    d2_match: none
-    diff_amp: none
-
+    delta: 0.005000000000000001
+    trend: 0.0025000000000000005
+    direction: 0.005000000000000001
   pred_side_residual:
     enable: true
     feature_mode: legacy
-    residual_clip: 0.0
+    residual_clip: 3.0
     corrector_hidden: 32
     init_alpha: -3.0
-    alpha_scale: 1.1
+    alpha_scale: 1.2
     specialization_weight: 0.1
     norm_weight: 0.0
     use_y_base_input: true
     intervention_enable: false
     intervention_init: -2.0
-    intervention_weight: 1.0e-3
+    intervention_weight: 0.001
     detach_routed_penalty_pred: false
     selection_policy: val_mse_gate
     selection_min_abs_improvement: 0.0
@@ -110,35 +104,33 @@ moe:
       loss: mse
       selection_metric: mse
       epochs: 30
-      train_fraction: 0.7
+      train_fraction: 0.85
       hidden_dim: 32
       batch_size: 256
       max_scale: 1.0
-      init_scale: 0.8
-      scale_reg: 1.0e-4
-
+      init_scale: 0.6
+      scale_reg: 0.0005
+      scale_mode: sigmoid
+      standardize_features: true
+    penalty_selector_enable: true
+    selector_temperature: 1.0
+    selector_use_cluster_context: true
+    fusion_gate_enable: true
+    fusion_init: -1.5
+    fusion_use_cluster_context: true
   dynamic_lambda:
     enable: true
     mode: multiscale
     hidden_dim: 32
-    segment_bins: [4, 8]
+    segment_bins:
+    - 4
+    - 8
     max_factor: 1.5
     mix: 0.6
     dropout: 0.0
-    reg_weight: 1.0e-4
-
+    reg_weight: 0.0001
   learnable_lambda:
     enable: false
-    reg_weight: 0.01
-    share_floor: 0.05
-    bilevel:
-      enable: true
-      optimize_gate: false
-      outer_lr: 0.005
-      inner_lr: 0.001
-      val_metric: val_mse
-      steps_per_epoch: 10
-
   gate_entropy_weight: 0.0
   gate_balance_weight: 0.0
   gate_route_on_penalty_only: true
@@ -151,82 +143,113 @@ moe:
   gate_temperature: 1.0
   gate_noise_std: 0.2
   gate_init_bias:
-    enable: true
+    enable: false
     values:
-      level: 2.0
       default: 0.0
   gate_soft_weight: 0.0
   gate_prob_floor: 0.0
   gate_entropy_target_frac: 0.7
-  residual_gate:
-    enable: true
-    alpha: 0.7
-  pred_aware:
-    enable: true
-    use_pred_features: true
-    use_penalty_input: false
-  penalty_ema:
-    enable: true
-    decay: 0.9
-  sigmoid_branch:
-    enable: true
-    gamma: 0.2
-    init_bias: -2.0
+  lambda_min:
+    delta: 0.0
+    trend: 0.0
+    direction: 0.0
+  lambda_schedule:
+    delta: none
+    trend: none
+    direction: none
   gate_logit_clip: 5.0
-
+  explainability:
+    enable: true
+    splits:
+    - train
+    - val
+    - test
+    max_batches: 0
+  cluster_penalty_prior:
+    enable: true
+    topk: 1
+    hard_topk: true
+    temperature: 0.7
+    smoothing: 0.0
+    use_normalized_penalty: true
+    logit_strength: 0.0
+    use_as_balance_target: false
+  channel_penalty_prior:
+    enable: true
+    topk: 1
+    hard_topk: true
+    temperature: 0.7
+    smoothing: 0.0
+    use_normalized_penalty: true
 penalties:
-  enabled: [level, delta, d2_match, diff_amp]
+  enabled:
+  - delta
+  - trend
+  - direction
   jump_threshold: 0.6
-
 train:
   epochs: 100
   batch_size: 64
   lr: 0.001
-  mse_weight: 0.9
-  selection_metric: val_mse
-  weight_decay: 1.0e-4
-  grad_clip: 1.0
-  penalty_warmup_epochs: 10
+  mse_weight: 0.1
   mae_objective:
     enable: true
     kind: l1
-    weight: 0.6
+    weight: 1.4
     warmup_epochs: 5
+  selection_metric: val_mse
+  weight_decay: 0.001
+  grad_clip: 1.0
   lr_scheduler:
     name: plateau
     factor: 0.5
     patience: 3
-    min_lr: 1.0e-6
-
+    min_lr: 1.0e-06
+  penalty_warmup_epochs: 15
 early_stop:
   patience: 10
-  min_delta: 1.0e-6
-
+  min_delta: 1.0e-06
+plot:
+  enable: false
+portrait:
+  enable: false
+  out_dir: outputs/ETTh1_H720/cluster_portraits
+  dpi: 140
+  max_points: 2000
+  jump_threshold: 0.6
 knn_hybrid:
   enable: false
   mode: rolling
-  scope: same_channel
+  scope: same_cluster
   bank_split: history
   use_for_model_selection: false
-  k: 96
+  k: 512
   alpha: 1.8
+  alpha_horizon_ref: 96
+  alpha_horizon_power: 0.0
   shape_bins: 24
   diff_bins: 12
   pred_shape_bins: 16
   pred_diff_bins: 8
   feature_mode: joint
   template_mode: residual
-  adaptive_alpha: confidence
+  adaptive_alpha: none
   confidence_floor: 0.0
   distance_sharpness: 1.0
   selection_policy: val_mae_guarded
   selection_min_rel_improvement: 0.0
   selection_max_rel_mse_regression: 0.03
-  bank_stride: 2
+  bank_stride: 1
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/knn_shape_bank.pt
-
+  path: outputs/ETTh1_H720/knn_shape_bank.pt
 eval:
   skip_test: false
+calibration:
+  enable: false
+memory:
+  enable: false
+  save_checkpoint: false
+  path: outputs/ETTh1_H720/cluster_memory.pt
+  checkpoint_path: outputs/ETTh1_H720/best_checkpoint.pt
