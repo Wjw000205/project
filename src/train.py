@@ -83,6 +83,71 @@ def print_clusters(clusters: Dict[int, List[int]], channel_names: List[str]):
         chs = [channel_names[i] for i in clusters[k]]
         print(f"Cluster {k}: [" + ", ".join(chs) + "]")
 
+
+def compute_channel_shape_features(data_tc: torch.Tensor, acf_lags: Optional[List[int]] = None) -> torch.Tensor:
+    """
+    Train-only channel descriptors for feature-aware clustering.
+    Returns [C,F], one row per channel. These descriptors use only the
+    clustering fit segment and never inspect validation/test targets.
+    """
+    if data_tc.ndim != 2:
+        raise ValueError(f"Expected data_tc [T,C], got {tuple(data_tc.shape)}")
+    T, C = data_tc.shape
+    x = data_tc.to(dtype=torch.float32)
+    device = x.device
+    eps = 1.0e-6
+    mean_c = x.mean(dim=0)
+    std_c = x.std(dim=0).clamp_min(eps)
+    centered = x - mean_c.view(1, C)
+    t = torch.linspace(-1.0, 1.0, steps=max(T, 1), device=device, dtype=x.dtype).view(T, 1)
+    trend_c = (centered * t).mean(dim=0) / t.pow(2).mean().clamp_min(eps)
+    range_c = (x.max(dim=0).values - x.min(dim=0).values) / std_c
+    q95_c = torch.quantile(x, 0.95, dim=0)
+    q05_c = torch.quantile(x, 0.05, dim=0)
+    iqr90_c = (q95_c - q05_c) / std_c
+    if T > 1:
+        d1 = x[1:] - x[:-1]
+        d1_abs_c = d1.abs().mean(dim=0) / std_c
+        d1_std_c = d1.std(dim=0) / std_c
+        jump_thr = d1.abs().mean(dim=0, keepdim=True) + 2.0 * d1.std(dim=0, keepdim=True).clamp_min(eps)
+        jump_rate_c = (d1.abs() > jump_thr).to(dtype=x.dtype).mean(dim=0)
+    else:
+        d1_abs_c = torch.zeros(C, device=device, dtype=x.dtype)
+        d1_std_c = torch.zeros_like(d1_abs_c)
+        jump_rate_c = torch.zeros_like(d1_abs_c)
+    if T > 2:
+        d2 = x[2:] - (2.0 * x[1:-1]) + x[:-2]
+        d2_abs_c = d2.abs().mean(dim=0) / std_c
+        curvature_c = d2.abs().mean(dim=0) / (d1_abs_c * std_c + eps)
+    else:
+        d2_abs_c = torch.zeros(C, device=device, dtype=x.dtype)
+        curvature_c = torch.zeros_like(d2_abs_c)
+    feats = [
+        mean_c,
+        std_c,
+        trend_c,
+        range_c,
+        iqr90_c,
+        d1_abs_c,
+        d1_std_c,
+        d2_abs_c,
+        curvature_c,
+        jump_rate_c,
+    ]
+    lags = acf_lags if acf_lags is not None else [1, 24, 96]
+    for lag in lags:
+        lag = int(lag)
+        if lag <= 0 or T <= lag + 1:
+            feats.append(torch.zeros(C, device=device, dtype=x.dtype))
+            continue
+        a = centered[:-lag]
+        b = centered[lag:]
+        cov = (a * b).mean(dim=0)
+        var = centered.pow(2).mean(dim=0).clamp_min(eps)
+        feats.append((cov / var).clamp(-1.0, 1.0))
+    return torch.stack(feats, dim=1)
+
+
 GATE_FEATURE_NAMES = [
     "mean",
     "std",
@@ -197,6 +262,19 @@ def build_gate_prior_from_penalty_portrait(
     prior = prior / prior.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
     return prior
 
+
+def build_topk_penalty_mask(prior_kp: Optional[torch.Tensor], topk: int) -> Optional[torch.Tensor]:
+    if prior_kp is None or prior_kp.numel() == 0:
+        return None
+    K, P = prior_kp.shape
+    if P <= 0:
+        return torch.zeros_like(prior_kp)
+    k = max(1, min(int(topk), P))
+    idx = prior_kp.topk(k=k, dim=-1).indices
+    mask = torch.zeros_like(prior_kp, dtype=torch.float32)
+    mask.scatter_(-1, idx, 1.0)
+    return mask
+
 @torch.no_grad()
 def compute_cluster_penalty_portrait(
     loader: DataLoader,
@@ -228,6 +306,36 @@ def compute_cluster_penalty_portrait(
     if cnt == 0:
         return torch.zeros((K, len(penalty_names)), device=device)
     return sum_kp / float(cnt)
+
+
+@torch.no_grad()
+def compute_channel_penalty_portrait(
+    loader: DataLoader,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    num_channels: int,
+    pred_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if len(penalty_names) == 0 or len(loader) == 0:
+        return torch.zeros((num_channels, len(penalty_names)), device=device)
+    sum_cp = torch.zeros(num_channels, len(penalty_names), device=device)
+    cnt = 0
+    for x, y, _ in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        last = x[..., -1:]
+        yhat = last.expand(-1, -1, pred_len)
+        pen_bcp = []
+        for name in penalty_names:
+            pen_bc = penalty_fns[name](yhat, y)
+            pen_bcp.append(pen_bc)
+        pen_bcp = torch.stack(pen_bcp, dim=-1)
+        sum_cp += pen_bcp.sum(dim=0)
+        cnt += int(pen_bcp.shape[0])
+    if cnt == 0:
+        return torch.zeros((num_channels, len(penalty_names)), device=device)
+    return sum_cp / float(cnt)
 
 
 def _rowwise_corr(a_kt: torch.Tensor, b_mt: torch.Tensor, align: str = "head", eps: float = 1.0e-6) -> torch.Tensor:
@@ -282,6 +390,7 @@ def _select_rank_mask(probs_bkp: torch.Tensor, select_ranks: List[int], straight
         top_idx = torch.stack([order[..., r] for r in ranks], dim=-1)
     hard = torch.zeros_like(probs_bkp)
     hard.scatter_(-1, top_idx, 1.0)
+    hard = hard * (probs_bkp > 0).to(dtype=hard.dtype)
     if straight_through:
         return hard - probs_bkp.detach() + probs_bkp
     return hard
@@ -554,6 +663,7 @@ def eval_loop(
     knn_fusion_scale_ch: Optional[torch.Tensor] = None,
     knn_fusion_gate: Optional[nn.Module] = None,
     eval_start: int = 0,
+    diagnostic_collector: Optional[Dict[str, object]] = None,
 ):
     model.eval()
     gate.eval()
@@ -636,6 +746,8 @@ def eval_loop(
             probs_bkp = None
             skip_bk = None
 
+        yhat_residual_raw = yhat_base
+        residual_gate_scale = None
         if pred_residual is not None and moe_enable and P > 0:
             pred_out = pred_residual(
                 x,
@@ -644,7 +756,8 @@ def eval_loop(
                 mask_bkp,
                 skip_bk=skip_bk if allow_skip else None,
             )
-            yhat = pred_out["y_final"]
+            yhat_residual_raw = pred_out["y_final"]
+            yhat = yhat_residual_raw
             if pred_residual_gate is not None:
                 pred_residual_gate.eval()
                 gate_feat = _knn_gate_features(x, yhat_base, yhat)
@@ -678,9 +791,11 @@ def eval_loop(
                 if pred_residual_scale_c is not None:
                     channel_scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
                     scale = scale * channel_scale
+                residual_gate_scale = scale
                 yhat = yhat_base + scale * (yhat - yhat_base)
             elif pred_residual_scale_c is not None:
                 scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
+                residual_gate_scale = scale.expand(yhat.shape[0], -1, -1)
                 yhat = yhat_base + scale * (yhat - yhat_base)
         else:
             yhat = yhat_base
@@ -700,6 +815,28 @@ def eval_loop(
         if residual_correction_ch is not None:
             corr_ch = residual_correction_ch.to(device=yhat.device, dtype=yhat.dtype)
             yhat = yhat + corr_ch.unsqueeze(0)
+
+        if diagnostic_collector is not None:
+            limit = int(diagnostic_collector.get("limit", 0))
+            count = int(diagnostic_collector.get("count", 0))
+            take = max(0, min(int(x.shape[0]), limit - count))
+            if take > 0:
+                parts = diagnostic_collector.setdefault("parts", {})
+                parts.setdefault("idx", []).append((eval_start + idx[:take]).detach().cpu())
+                parts.setdefault("x", []).append(x[:take].detach().cpu())
+                parts.setdefault("y_true", []).append(y[:take].detach().cpu())
+                parts.setdefault("y_base", []).append(yhat_base[:take].detach().cpu())
+                parts.setdefault("y_residual_raw", []).append(yhat_residual_raw[:take].detach().cpu())
+                parts.setdefault("y_final", []).append(yhat[:take].detach().cpu())
+                if probs_bkp is not None:
+                    parts.setdefault("gate_probs", []).append(probs_bkp[:take].detach().cpu())
+                if mask_bkp is not None:
+                    parts.setdefault("gate_mask", []).append(mask_bkp[:take].detach().cpu())
+                if skip_bk is not None:
+                    parts.setdefault("skip_prob", []).append(skip_bk[:take].detach().cpu())
+                if residual_gate_scale is not None:
+                    parts.setdefault("residual_gate_scale", []).append(residual_gate_scale[:take].detach().cpu())
+                diagnostic_collector["count"] = count + take
 
         # base error metrics per channel
         err_bch = yhat - y
@@ -1910,11 +2047,14 @@ def evaluate_gate_penalty_hit_metrics(
         )
         residuals = pred_out.get("residuals")
         intervention_bcp = pred_out.get("intervention_bcp")
+        selector_bcp = pred_out.get("selector_bcp")
         alpha_cp = pred_out.get("alpha_cp")
         if residuals is None or intervention_bcp is None or alpha_cp is None or residuals.numel() == 0:
             continue
+        if selector_bcp is None:
+            selector_bcp = torch.ones_like(intervention_bcp)
 
-        scale_bcp = intervention_bcp * alpha_cp.unsqueeze(0)
+        scale_bcp = intervention_bcp * selector_bcp * alpha_cp.unsqueeze(0)
         cand_bcpH = y_base.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
         err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
         base_err_bc = (y_base - y).pow(2).mean(dim=-1)
@@ -1971,6 +2111,332 @@ def evaluate_gate_penalty_hit_metrics(
         },
         "selected_count": {name: int(selected_count_p[i].item()) for i, name in enumerate(penalty_names)},
     }
+
+
+def _pearson_list(xs: List[float], ys: List[float]) -> Optional[float]:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    x = np.asarray(xs, dtype=np.float64)
+    y = np.asarray(ys, dtype=np.float64)
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = float(np.sqrt((x * x).sum()) * np.sqrt((y * y).sum()))
+    if denom <= 1.0e-12:
+        return None
+    return float((x * y).sum() / denom)
+
+
+@torch.no_grad()
+def evaluate_penalty_explainability(
+    model: nn.Module,
+    gate: ClusterwiseMoEGate,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    penalty_scale: Optional[torch.Tensor],
+    select_ranks: Optional[List[int]],
+    gate_soft_weight: float,
+    split_name: str,
+    penalty_portrait_kp: Optional[torch.Tensor] = None,
+    prior_prob_kp: Optional[torch.Tensor] = None,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    max_batches: int = 0,
+) -> Optional[Dict[str, object]]:
+    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
+        return None
+    moe_enable = bool(moe_cfg.get("enable", True))
+    if not moe_enable:
+        return None
+
+    model.eval()
+    gate.eval()
+    pred_residual.eval()
+    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
+    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
+    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
+    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
+
+    P = len(penalty_names)
+    cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
+    cid_cpu = cluster_id_c.detach().cpu().to(dtype=torch.long)
+    cluster_channel_count = torch.bincount(cid_cpu, minlength=K).clamp_min(1).to(dtype=torch.float32)
+
+    total_bc_k = torch.zeros(K, dtype=torch.float64)
+    base_err_sum_k = torch.zeros(K, dtype=torch.float64)
+    final_err_sum_k = torch.zeros(K, dtype=torch.float64)
+    fusion_sum_k = torch.zeros(K, dtype=torch.float64)
+    selected_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    oracle_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    positive_oracle_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    selected_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    gate_prob_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    route_weight_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    selector_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    intervention_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    single_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    selected_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    selected_gain_count_kp = torch.zeros(K, P, dtype=torch.float64)
+
+    total_decisions = 0
+    total_selected = 0
+    total_oracle_positive = 0
+    total_selected_positive = 0
+    batch_count = 0
+
+    for x, y, _ in loader:
+        batch_count += 1
+        if max_batches > 0 and batch_count > int(max_batches):
+            break
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        y_base = model(x, cluster_id_c)
+        feat_bcf = extract_gate_features(x)
+        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        route_pen_bkp = _router_penalty_context_from_history(
+            x_bcl=x,
+            yhat_base_bch=y_base,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            penalty_scale=penalty_scale,
+            cluster_id_c=cluster_id_c,
+            K=K,
+        )
+        mask_bkp, probs_bkp, skip_bk, _ = gate(
+            feat_bkf,
+            straight_through=False,
+            penalty_context_bkp=route_pen_bkp,
+            penalty_context_mode=router_mode,
+            penalty_context_weight=router_penalty_context_weight,
+            penalty_context_detach=router_detach_penalty_context,
+            penalty_context_score=router_penalty_context_score,
+        )
+        rank_mask = None
+        if select_ranks is not None:
+            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+            rank_mask = mask_bkp
+        if gate_soft_weight > 0.0:
+            probs_sel = probs_bkp
+            if rank_mask is not None:
+                probs_sel = probs_sel * rank_mask
+                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            probs_sel = probs_sel * target_mass
+            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
+
+        pred_out = pred_residual(
+            x,
+            y_base,
+            cluster_id_c,
+            mask_bkp,
+            skip_bk=skip_bk if allow_skip else None,
+        )
+        residuals = pred_out.get("residuals")
+        alpha_cp = pred_out.get("alpha_cp")
+        if residuals is None or alpha_cp is None or residuals.numel() == 0:
+            continue
+
+        route_bcp = pred_out.get("route_bcp", mask_bkp[:, cid_c, :])
+        effective_route_bcp = pred_out.get("effective_route_bcp", route_bcp)
+        selector_bcp = pred_out.get("selector_bcp", torch.ones_like(route_bcp))
+        intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp))
+        fusion_bc = pred_out.get("fusion_bc", torch.ones_like(route_bcp[..., 0]))
+        y_final = pred_out["y_final"]
+
+        alpha_bcp = alpha_cp.unsqueeze(0)
+        single_scale_bcp = alpha_bcp * selector_bcp * intervention_bcp
+        cand_bcpH = y_base.unsqueeze(2) + single_scale_bcp.unsqueeze(-1) * residuals
+        base_err_bc = (y_base - y).pow(2).mean(dim=-1)
+        final_err_bc = (y_final - y).pow(2).mean(dim=-1)
+        cand_err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
+        gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
+        oracle_gain_bc, oracle_p_bc = gain_bcp.max(dim=-1)
+        selected_bool_bcp = route_bcp > 0
+        selected_positive_bcp = selected_bool_bcp & (gain_bcp > 0)
+        positive_oracle_bc = oracle_gain_bc > 0
+
+        total_decisions += int(base_err_bc.numel())
+        total_selected += int(selected_bool_bcp.sum().item())
+        total_oracle_positive += int(positive_oracle_bc.sum().item())
+        total_selected_positive += int(selected_positive_bcp.sum().item())
+
+        for k in range(K):
+            ch_mask = cid_c == int(k)
+            if not bool(ch_mask.any().item()):
+                continue
+            base_k = base_err_bc[:, ch_mask]
+            final_k = final_err_bc[:, ch_mask]
+            total_k = int(base_k.numel())
+            total_bc_k[k] += total_k
+            base_err_sum_k[k] += float(base_k.sum().item())
+            final_err_sum_k[k] += float(final_k.sum().item())
+            fusion_sum_k[k] += float(fusion_bc[:, ch_mask].sum().item())
+
+            selected_count_kp[k] += selected_bool_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            selected_positive_count_kp[k] += selected_positive_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            gate_prob_sum_kp[k] += probs_bkp[:, k, :].sum(dim=0).detach().cpu().to(dtype=torch.float64) * int(ch_mask.sum().item())
+            route_weight_sum_kp[k] += effective_route_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            selector_sum_kp[k] += selector_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            intervention_sum_kp[k] += intervention_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            single_gain_sum_kp[k] += gain_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            selected_gain_sum_kp[k] += (gain_bcp[:, ch_mask, :] * selected_bool_bcp[:, ch_mask, :].to(gain_bcp.dtype)).sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+            selected_gain_count_kp[k] += selected_bool_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
+
+            oracle_k = oracle_p_bc[:, ch_mask].detach().cpu().reshape(-1)
+            oracle_pos_k = oracle_p_bc[:, ch_mask][positive_oracle_bc[:, ch_mask]].detach().cpu().reshape(-1)
+            oracle_count_kp[k] += torch.bincount(oracle_k, minlength=P)[:P].to(dtype=torch.float64)
+            if oracle_pos_k.numel() > 0:
+                positive_oracle_count_kp[k] += torch.bincount(oracle_pos_k, minlength=P)[:P].to(dtype=torch.float64)
+
+    if total_decisions <= 0:
+        return None
+
+    if penalty_portrait_kp is not None:
+        portrait = penalty_portrait_kp.detach().cpu().to(dtype=torch.float64)
+    else:
+        portrait = torch.full((K, P), float("nan"), dtype=torch.float64)
+    if prior_prob_kp is not None:
+        prior = prior_prob_kp.detach().cpu().to(dtype=torch.float64)
+    else:
+        prior = torch.full((K, P), float("nan"), dtype=torch.float64)
+    if allowed_mask_kp is not None:
+        allowed = allowed_mask_kp.detach().cpu().to(dtype=torch.float64)
+    else:
+        allowed = torch.ones(K, P, dtype=torch.float64)
+
+    penalty_corr = {}
+    denom_kp = (total_bc_k.view(K, 1)).clamp_min(1.0)
+    mean_gain_kp = single_gain_sum_kp / denom_kp
+    for p, name in enumerate(penalty_names):
+        xs = [float(portrait[k, p].item()) for k in range(K) if math.isfinite(float(portrait[k, p].item()))]
+        ys = [float(mean_gain_kp[k, p].item()) for k in range(K) if math.isfinite(float(portrait[k, p].item()))]
+        penalty_corr[name] = _pearson_list(xs, ys)
+
+    rows = []
+    per_cluster = []
+    for k in range(K):
+        cluster_total = float(total_bc_k[k].item())
+        base_mse_k = float(base_err_sum_k[k].item() / max(cluster_total, 1.0))
+        final_mse_k = float(final_err_sum_k[k].item() / max(cluster_total, 1.0))
+        cluster_gain = float(100.0 * (base_mse_k - final_mse_k) / max(abs(base_mse_k), 1.0e-12))
+        cluster_rows = []
+        for p, name in enumerate(penalty_names):
+            selected_count = float(selected_count_kp[k, p].item())
+            selected_gain_count = float(selected_gain_count_kp[k, p].item())
+            mean_gain = float(mean_gain_kp[k, p].item())
+            selected_mean_gain = float(selected_gain_sum_kp[k, p].item() / max(selected_gain_count, 1.0))
+            prior_value = float(prior[k, p].item()) if math.isfinite(float(prior[k, p].item())) else None
+            portrait_value = float(portrait[k, p].item()) if math.isfinite(float(portrait[k, p].item())) else None
+            allowed_value = bool(allowed[k, p].item() > 0.5)
+            if allowed_value and mean_gain > 0.0:
+                reason = "train_prior_allowed_and_positive_split_gain"
+            elif allowed_value:
+                reason = "train_prior_allowed_but_nonpositive_split_gain"
+            elif mean_gain > 0.0:
+                reason = "blocked_by_train_prior_but_positive_split_gain"
+            else:
+                reason = "low_prior_or_nonpositive_split_gain"
+            row = {
+                "split": split_name,
+                "cluster_id": int(k),
+                "cluster_channels": int(cluster_channel_count[k].item()),
+                "penalty": name,
+                "train_diagnostic_score": portrait_value,
+                "train_prior_prob": prior_value,
+                "allowed_by_train_prior": allowed_value,
+                "prior_actual_gain_corr_for_penalty": penalty_corr.get(name),
+                "selected_count": int(selected_count),
+                "selected_rate": float(selected_count / max(cluster_total, 1.0)),
+                "oracle_count": int(oracle_count_kp[k, p].item()),
+                "oracle_rate": float(oracle_count_kp[k, p].item() / max(cluster_total, 1.0)),
+                "positive_oracle_count": int(positive_oracle_count_kp[k, p].item()),
+                "positive_oracle_rate": float(positive_oracle_count_kp[k, p].item() / max(cluster_total, 1.0)),
+                "selected_positive_count": int(selected_positive_count_kp[k, p].item()),
+                "selected_positive_rate": float(selected_positive_count_kp[k, p].item() / max(selected_count, 1.0)),
+                "mean_gate_prob": float(gate_prob_sum_kp[k, p].item() / max(cluster_total, 1.0)),
+                "mean_effective_route_weight": float(route_weight_sum_kp[k, p].item() / max(cluster_total, 1.0)),
+                "mean_selector": float(selector_sum_kp[k, p].item() / max(cluster_total, 1.0)),
+                "mean_intervention": float(intervention_sum_kp[k, p].item() / max(cluster_total, 1.0)),
+                "mean_single_penalty_gain_mse": mean_gain,
+                "selected_mean_gain_mse": selected_mean_gain,
+                "cluster_base_mse": base_mse_k,
+                "cluster_final_mse": final_mse_k,
+                "cluster_final_gain_pct": cluster_gain,
+                "mean_fusion_gate": float(fusion_sum_k[k].item() / max(cluster_total, 1.0)),
+                "reason": reason,
+            }
+            rows.append(row)
+            cluster_rows.append(row)
+        cluster_rows_sorted = sorted(
+            cluster_rows,
+            key=lambda item: (
+                bool(item["allowed_by_train_prior"]),
+                float(item["mean_single_penalty_gain_mse"]),
+                float(item["selected_rate"]),
+            ),
+            reverse=True,
+        )
+        per_cluster.append(
+            {
+                "cluster_id": int(k),
+                "channels": int(cluster_channel_count[k].item()),
+                "base_mse": base_mse_k,
+                "final_mse": final_mse_k,
+                "final_gain_pct": cluster_gain,
+                "top_penalties": [
+                    {
+                        "penalty": item["penalty"],
+                        "allowed_by_train_prior": item["allowed_by_train_prior"],
+                        "train_prior_prob": item["train_prior_prob"],
+                        "mean_single_penalty_gain_mse": item["mean_single_penalty_gain_mse"],
+                        "selected_rate": item["selected_rate"],
+                        "reason": item["reason"],
+                    }
+                    for item in cluster_rows_sorted[: min(3, len(cluster_rows_sorted))]
+                ],
+            }
+        )
+
+    base_mse = float(base_err_sum_k.sum().item() / max(total_decisions, 1))
+    final_mse = float(final_err_sum_k.sum().item() / max(total_decisions, 1))
+    return {
+        "split": split_name,
+        "samples": int(total_decisions),
+        "selected_penalty_events": int(total_selected),
+        "oracle_positive_events": int(total_oracle_positive),
+        "selected_positive_events": int(total_selected_positive),
+        "base_mse": base_mse,
+        "final_mse": final_mse,
+        "final_gain_pct_vs_base": float(100.0 * (base_mse - final_mse) / max(abs(base_mse), 1.0e-12)),
+        "prior_actual_gain_corr": penalty_corr,
+        "per_cluster": per_cluster,
+        "rows": rows,
+    }
+
+
+def save_penalty_explainability_artifacts(
+    out_dir: str,
+    explainability: Dict[str, object],
+) -> Dict[str, str]:
+    paths = {}
+    json_path = os.path.join(out_dir, "penalty_explainability.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(explainability, f, ensure_ascii=False, indent=2)
+    paths["json"] = json_path
+    rows = []
+    for split_payload in explainability.get("splits", {}).values():
+        if isinstance(split_payload, dict):
+            rows.extend(split_payload.get("rows", []))
+    if len(rows) > 0:
+        csv_path = os.path.join(out_dir, "penalty_explainability.csv")
+        pd.DataFrame(rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
+        paths["csv"] = csv_path
+    return paths
 
 
 def train_pred_residual_gate(
@@ -2447,6 +2913,22 @@ def main():
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             np.save(save_path, corr_cc.detach().cpu().numpy())
             print(f"Saved corr matrix to {save_path} (shape {corr_cc.shape})")
+    feature_aware_cfg = cl.get("feature_aware", {}) or {}
+    cluster_extra_features_cf = None
+    if bool(feature_aware_cfg.get("enable", False)):
+        raw_lags = feature_aware_cfg.get("acf_lags", [1, 24, 96])
+        if raw_lags is None:
+            acf_lags = []
+        elif isinstance(raw_lags, (list, tuple)):
+            acf_lags = [int(v) for v in raw_lags]
+        else:
+            acf_lags = [int(raw_lags)]
+        cluster_extra_features_cf = compute_channel_shape_features(cluster_fit_tc, acf_lags=acf_lags)
+        print(
+            "Feature-aware clustering enabled: "
+            f"feature_weight={float(feature_aware_cfg.get('weight', 0.0)):.3f}, "
+            f"features={int(cluster_extra_features_cf.shape[1])}, acf_lags={acf_lags}"
+        )
 
     # 4) 鑱氱被 + 灏忕皣鍚堝苟绛栫暐
     rs = cl.get("random_state", 0)
@@ -2466,7 +2948,12 @@ def main():
         random_state=None if rs is None else int(rs),
         min_cluster_size=int(cl["min_cluster_size"]),
         merge_small_clusters=bool(cl["merge_small_clusters"]),
+        singleton_merge_strategy=str(cl.get("singleton_merge_strategy", "pool")),
+        singleton_merge_distance_threshold=cl.get("singleton_merge_distance_threshold", None),
+        singleton_merge_min_size=int(cl.get("singleton_merge_min_size", 2)),
         no_merge_if_channels_lt=int(cl["no_merge_if_channels_lt"]),
+        extra_features_cf=cluster_extra_features_cf,
+        feature_weight=float(feature_aware_cfg.get("weight", 0.0)) if cluster_extra_features_cf is not None else 0.0,
     )
     K = int(cluster_id_c.max().item() + 1)
     print(f"Clusters: K={K}")
@@ -2633,8 +3120,16 @@ def main():
     # cluster portraits (prototype + penalty metrics)
     portrait_cfg = cfg.get("portrait", {})
     gate_prior_cfg = cfg.get("moe", {}).get("gate_prior", {})
-    need_penalty_portrait = bool(portrait_cfg.get("enable", False)) or bool(gate_prior_cfg.get("enable", False))
+    cluster_penalty_prior_cfg = cfg.get("moe", {}).get("cluster_penalty_prior", {}) or {}
+    channel_penalty_prior_cfg = cfg.get("moe", {}).get("channel_penalty_prior", {}) or {}
+    need_penalty_portrait = (
+        bool(portrait_cfg.get("enable", False))
+        or bool(gate_prior_cfg.get("enable", False))
+        or bool(cluster_penalty_prior_cfg.get("enable", False))
+        or bool(channel_penalty_prior_cfg.get("enable", False))
+    )
     penalty_portrait_kp = None
+    channel_penalty_portrait_cp = None
     if need_penalty_portrait and len(penalty_names) > 0:
         # Portrait generation is diagnostic; keep it from advancing the shuffled
         # training loader RNG before model/gate initialization.
@@ -2658,6 +3153,10 @@ def main():
         penalty_portrait_kp = compute_cluster_penalty_portrait(
             portrait_loader, penalty_names, penalty_fns, cluster_id_c, K, H, device
         )
+        if bool(channel_penalty_prior_cfg.get("enable", False)):
+            channel_penalty_portrait_cp = compute_channel_penalty_portrait(
+                portrait_loader, penalty_names, penalty_fns, C, H, device
+            )
     if bool(portrait_cfg.get("enable", False)):
         portrait_dir = portrait_cfg.get("out_dir", os.path.join(out_dir, "cluster_portraits"))
         portrait_dpi = int(portrait_cfg.get("dpi", 140))
@@ -2757,6 +3256,44 @@ def main():
             for k in range(K):
                 gate.b2[k].add_(bias_p)
         print(f"Gate init bias applied: {dict(zip(penalty_names, [float(v) for v in bias_p.detach().cpu().tolist()]))}")
+    channel_expert_mask_c = None
+    channel_expert_cfg = pred_residual_cfg.get("channel_expert_adapters", {}) or {}
+    if pred_residual_enable and bool(channel_expert_cfg.get("enable", False)):
+        raw_cluster_id_c, _ = cluster_channels_by_corr(
+            corr_cc=corr_cc,
+            data_tc=cluster_fit_tc,
+            n_clusters=cl.get("n_clusters", None),
+            distance_threshold=cl.get("distance_threshold", None),
+            linkage=cl.get("linkage", "average"),
+            method=cl.get("method", "agglomerative"),
+            kmeans_n_init=int(cl.get("kmeans_n_init", 10)),
+            kmeans_max_iter=int(cl.get("kmeans_max_iter", 300)),
+            spectral_affinity=cl.get("spectral_affinity", "corr"),
+            rbf_gamma=float(cl.get("rbf_gamma", 1.0)),
+            dbscan_eps=cl.get("dbscan_eps", None),
+            dbscan_min_samples=int(cl.get("dbscan_min_samples", 5)),
+            random_state=None if rs is None else int(rs),
+            min_cluster_size=1,
+            merge_small_clusters=False,
+            no_merge_if_channels_lt=int(cl["no_merge_if_channels_lt"]),
+            extra_features_cf=cluster_extra_features_cf,
+            feature_weight=float(feature_aware_cfg.get("weight", 0.0)) if cluster_extra_features_cf is not None else 0.0,
+        )
+        raw_sizes = torch.bincount(raw_cluster_id_c, minlength=int(raw_cluster_id_c.max().item() + 1))
+        final_sizes = torch.bincount(cluster_id_c, minlength=K)
+        mode = str(channel_expert_cfg.get("mode", "merged_singletons")).lower()
+        if mode in {"all", "all_channels"}:
+            channel_expert_mask_c = torch.ones(C, dtype=torch.bool, device=device)
+        else:
+            channel_expert_mask_c = (
+                (raw_sizes[raw_cluster_id_c].to(device=device) == 1)
+                & (final_sizes[cluster_id_c].to(device=device) > 1)
+            )
+        print(
+            "Channel expert adapters enabled: "
+            f"mode={mode}, channels={int(channel_expert_mask_c.sum().item())}/{C}, "
+            f"mask={[bool(v) for v in channel_expert_mask_c.detach().cpu().tolist()]}"
+        )
     pred_residual = None
     if pred_residual_enable:
         pred_residual = ClusterwisePredResidualMoE(
@@ -2772,18 +3309,39 @@ def main():
             residual_clip=float(pred_residual_cfg.get("residual_clip", 0.0)),
             intervention_enable=bool(pred_residual_cfg.get("intervention_enable", False)),
             intervention_init=float(pred_residual_cfg.get("intervention_init", -2.0)),
+            penalty_selector_enable=bool(pred_residual_cfg.get("penalty_selector_enable", False)),
+            selector_temperature=float(pred_residual_cfg.get("selector_temperature", 1.0)),
+            selector_use_cluster_context=bool(pred_residual_cfg.get("selector_use_cluster_context", True)),
+            fusion_gate_enable=bool(pred_residual_cfg.get("fusion_gate_enable", False)),
+            fusion_init=float(pred_residual_cfg.get("fusion_init", 0.0)),
+            fusion_use_cluster_context=bool(pred_residual_cfg.get("fusion_use_cluster_context", True)),
+            num_channels=C,
+            channel_expert_mask_c=channel_expert_mask_c,
+            channel_expert_cluster_id_c=cluster_id_c,
+            channel_expert_mode=str((pred_residual_cfg.get("channel_expert_adapters", {}) or {}).get("mode_type", "override")),
+            penalty_names=penalty_names,
+            seasonal_anchor_names=list(pred_residual_cfg.get("seasonal_anchor_names", [])),
+            seasonal_anchor_period=int(pred_residual_cfg.get("seasonal_anchor_period", 96)),
+            seasonal_anchor_num_periods=int(pred_residual_cfg.get("seasonal_anchor_num_periods", 1)),
+            seasonal_anchor_scale=float(pred_residual_cfg.get("seasonal_anchor_scale", 1.0)),
         ).to(device)
         print(
             "Prediction residual MoE enabled: "
             f"hidden={pred_residual.hidden_dim}, feature_mode={pred_residual.feature_mode}, "
             f"alpha_scale={pred_residual.alpha_scale:.3f}, "
             f"residual_clip={pred_residual.residual_clip:.3f}, "
+            f"seasonal_anchor_names={list(pred_residual_cfg.get('seasonal_anchor_names', []))}, "
+            f"seasonal_anchor_period={int(pred_residual_cfg.get('seasonal_anchor_period', 96))}, "
+            f"seasonal_anchor_scale={float(pred_residual_cfg.get('seasonal_anchor_scale', 1.0)):.3f}, "
             f"specialization_weight={pred_residual_specialization_weight:.6f}, "
             f"norm_weight={pred_residual_norm_weight:.6f}, "
             f"intervention_weight={pred_residual_intervention_weight:.6f}, "
-            f"detach_routed_penalty_pred={pred_residual_detach_routed_penalty_pred}"
+            f"detach_routed_penalty_pred={pred_residual_detach_routed_penalty_pred}, "
+            f"penalty_selector={pred_residual.penalty_selector_enable}, "
+            f"fusion_gate={pred_residual.fusion_gate_enable}"
         )
     gate_balance_target_kp = None
+    gate_prior_prob_kp = None
     gate_prior_enable = bool(gate_prior_cfg.get("enable", False)) and penalty_portrait_kp is not None and P > 0
     if gate_prior_enable:
         gate_prior_prob_kp = build_gate_prior_from_penalty_portrait(
@@ -2800,6 +3358,69 @@ def main():
         if bool(gate_prior_cfg.get("use_as_balance_target", True)):
             gate_balance_target_kp = gate_prior_prob_kp
         print(f"Gate prior enabled: strength={gate.penalty_prior_strength:.3f}, prior={gate_prior_prob_kp.detach().cpu().tolist()}")
+    cluster_penalty_prior_enable = (
+        bool(cluster_penalty_prior_cfg.get("enable", False))
+        and penalty_portrait_kp is not None
+        and P > 0
+    )
+    cluster_penalty_prior_prob_kp = None
+    cluster_penalty_allowed_mask_kp = None
+    if cluster_penalty_prior_enable:
+        cluster_penalty_prior_prob_kp = build_gate_prior_from_penalty_portrait(
+            penalty_kp=penalty_portrait_kp,
+            penalty_scale=penalty_scale,
+            temperature=float(cluster_penalty_prior_cfg.get("temperature", 1.0)),
+            smoothing=float(cluster_penalty_prior_cfg.get("smoothing", 0.0)),
+            use_normalized_penalty=bool(cluster_penalty_prior_cfg.get("use_normalized_penalty", True)),
+        )
+        logit_strength = float(cluster_penalty_prior_cfg.get("logit_strength", 0.0))
+        if logit_strength > 0.0:
+            gate.set_penalty_prior(cluster_penalty_prior_prob_kp, strength=logit_strength)
+        topk = int(cluster_penalty_prior_cfg.get("topk", 0))
+        if topk > 0 and bool(cluster_penalty_prior_cfg.get("hard_topk", True)):
+            cluster_penalty_allowed_mask_kp = build_topk_penalty_mask(cluster_penalty_prior_prob_kp, topk=topk)
+            gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+        if bool(cluster_penalty_prior_cfg.get("use_as_balance_target", False)):
+            gate_balance_target_kp = cluster_penalty_prior_prob_kp
+        prior_list = (
+            cluster_penalty_prior_prob_kp.detach().cpu().tolist()
+            if cluster_penalty_prior_prob_kp is not None
+            else None
+        )
+        mask_list = (
+            cluster_penalty_allowed_mask_kp.detach().cpu().tolist()
+            if cluster_penalty_allowed_mask_kp is not None
+            else None
+        )
+        print(
+            "Cluster penalty prior enabled: "
+            f"topk={topk}, hard_topk={bool(cluster_penalty_prior_cfg.get('hard_topk', True))}, "
+            f"logit_strength={logit_strength:.3f}, prior={prior_list}, allowed_mask={mask_list}"
+        )
+    if (
+        bool(channel_penalty_prior_cfg.get("enable", False))
+        and pred_residual is not None
+        and channel_penalty_portrait_cp is not None
+        and P > 0
+    ):
+        channel_penalty_prior_prob_cp = build_gate_prior_from_penalty_portrait(
+            penalty_kp=channel_penalty_portrait_cp,
+            penalty_scale=penalty_scale,
+            temperature=float(channel_penalty_prior_cfg.get("temperature", 1.0)),
+            smoothing=float(channel_penalty_prior_cfg.get("smoothing", 0.0)),
+            use_normalized_penalty=bool(channel_penalty_prior_cfg.get("use_normalized_penalty", True)),
+        )
+        topk = int(channel_penalty_prior_cfg.get("topk", 0))
+        if topk > 0 and bool(channel_penalty_prior_cfg.get("hard_topk", True)):
+            channel_penalty_allowed_mask_cp = build_topk_penalty_mask(channel_penalty_prior_prob_cp, topk=topk)
+            pred_residual.set_channel_penalty_allowed_mask(channel_penalty_allowed_mask_cp)
+        else:
+            channel_penalty_allowed_mask_cp = None
+        print(
+            "Channel penalty prior enabled: "
+            f"topk={topk}, hard_topk={bool(channel_penalty_prior_cfg.get('hard_topk', True))}, "
+            f"allowed_mask={channel_penalty_allowed_mask_cp.detach().cpu().tolist() if channel_penalty_allowed_mask_cp is not None else None}"
+        )
 
     epochs = int(cfg["train"]["epochs"])
 
@@ -4499,6 +5120,7 @@ def main():
     pred_residual_gate_summary = None
     pred_residual_selection_summary = None
     moe_gate_penalty_hit_summary = None
+    penalty_explainability_summary = None
     calibration_summary = {
         "enable": bool(calibration_enable),
         "method": str(calibration_method),
@@ -4974,6 +5596,13 @@ def main():
     plot_cache = {}
     best_sample = {}
     worst_sample = {}
+    diagnostics_cfg = cfg.get("diagnostics", {}) or {}
+    prediction_diag = bool(diagnostics_cfg.get("save_prediction_intermediates", False))
+    prediction_diag_collector = (
+        {"limit": int(diagnostics_cfg.get("prediction_sample_count", 32)), "count": 0, "parts": {}}
+        if prediction_diag
+        else None
+    )
     if not skip_test:
         test_loss_k, test_mse_k, test_mae_k, mse_c, mae_c, plot_cache, best_sample, worst_sample = eval_loop(
             model, gate, lam_kp_test,
@@ -4998,6 +5627,7 @@ def main():
             residual_correction_ch=residual_correction_base_ch,
             knn_hybrid=None,
             eval_start=test_eval_start,
+            diagnostic_collector=prediction_diag_collector,
         )
         if pred_residual_gate_model is not None and pred_residual_gate_summary is not None:
             test_gate_tensors = _collect_pred_residual_gate_tensors(
@@ -5081,6 +5711,91 @@ def main():
                     f"positive_top1={test_penalty_hit['top1_hit_rate_on_positive_oracle']:.3f}, "
                     f"selected_gain={test_penalty_hit['selected_top1_gain_pct_vs_base']:.3f}%"
                 )
+    explain_cfg = moe_cfg.get("explainability", {}) or {}
+    explain_enable = bool(explain_cfg.get("enable", False))
+    if explain_enable and pred_residual is not None and moe_enable and P > 0:
+        max_batches = int(explain_cfg.get("max_batches", 0))
+        requested_splits = [str(x).lower() for x in explain_cfg.get("splits", ["train", "val", "test"])]
+        split_loaders: Dict[str, DataLoader] = {}
+        if "train" in requested_splits and len(dtr) > 0:
+            split_loaders["train"] = DataLoader(
+                dtr,
+                batch_size=int(cfg["train"]["batch_size"]),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+        if "val" in requested_splits and len(dva) > 0:
+            split_loaders["val"] = DataLoader(
+                dva,
+                batch_size=int(cfg["train"]["batch_size"]),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+        if "test" in requested_splits and (not skip_test) and len(dte) > 0:
+            split_loaders["test"] = dl_te
+
+        prior_for_explain = cluster_penalty_prior_prob_kp if cluster_penalty_prior_prob_kp is not None else gate_prior_prob_kp
+        allowed_for_explain = cluster_penalty_allowed_mask_kp
+        split_payloads = {}
+        for split_name, split_loader in split_loaders.items():
+            payload = evaluate_penalty_explainability(
+                model=model,
+                gate=gate,
+                pred_residual=pred_residual,
+                loader=split_loader,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                moe_cfg=moe_cfg,
+                device=device,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                select_ranks=select_ranks,
+                gate_soft_weight=gate_soft_weight,
+                split_name=split_name,
+                penalty_portrait_kp=penalty_portrait_kp,
+                prior_prob_kp=prior_for_explain,
+                allowed_mask_kp=allowed_for_explain,
+                max_batches=max_batches,
+            )
+            if payload is not None:
+                split_payloads[split_name] = payload
+                print(
+                    f"Penalty explainability({split_name}): "
+                    f"gain={payload['final_gain_pct_vs_base']:.3f}%, "
+                    f"selected_events={payload['selected_penalty_events']}, "
+                    f"oracle_positive_events={payload['oracle_positive_events']}"
+                )
+        penalty_explainability_summary = {
+            "enable": True,
+            "max_batches": int(max_batches),
+            "splits": split_payloads,
+            "train_only_prior": {
+                "source": "train_split_penalty_portrait" if penalty_portrait_kp is not None else None,
+                "penalty_names": list(penalty_names),
+                "diagnostic_score": (
+                    penalty_portrait_kp.detach().cpu().tolist()
+                    if penalty_portrait_kp is not None
+                    else None
+                ),
+                "prior_prob": (
+                    prior_for_explain.detach().cpu().tolist()
+                    if prior_for_explain is not None
+                    else None
+                ),
+                "allowed_mask": (
+                    allowed_for_explain.detach().cpu().tolist()
+                    if allowed_for_explain is not None
+                    else None
+                ),
+            },
+        }
+        penalty_explainability_summary["artifact_paths"] = save_penalty_explainability_artifacts(
+            out_dir,
+            penalty_explainability_summary,
+        )
     test_loss_hybrid_k = None
     test_mse_hybrid_k = None
     test_mae_hybrid_k = None
@@ -5679,6 +6394,23 @@ def main():
     if not skip_test and df is not None:
         df.to_csv(os.path.join(out_dir, "test_metrics.csv"), index=False)
         np.save(os.path.join(out_dir, "test_loss_per_cluster.npy"), test_loss_k.detach().cpu().numpy())
+        if prediction_diag_collector is not None:
+            diag_parts = prediction_diag_collector.get("parts", {}) or {}
+            arrays = {
+                key: torch.cat(value, dim=0).numpy()
+                for key, value in diag_parts.items()
+                if isinstance(value, list) and len(value) > 0
+            }
+            arrays["cluster_id"] = cluster_id_c.detach().cpu().numpy()
+            np.savez_compressed(os.path.join(out_dir, "prediction_intermediates.npz"), **arrays)
+            diag_meta = {
+                "sample_count": int(prediction_diag_collector.get("count", 0)),
+                "channel_names": list(channel_names),
+                "penalty_names": list(penalty_names),
+                "note": "Rows are test windows; y_residual_raw is before residual gate scaling, y_final is after selected residual/calibration before optional KNN.",
+            }
+            with open(os.path.join(out_dir, "prediction_intermediates_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(diag_meta, f, ensure_ascii=False, indent=2)
 
     if (not skip_test) and plot_enable and (plot_idx is not None):
         plot_dir = os.path.join(out_dir, "plots")
@@ -5737,6 +6469,7 @@ def main():
         "moe_residual_selection": pred_residual_selection_summary,
         "moe_residual_gate_calibrator": pred_residual_gate_summary,
         "moe_gate_penalty_hit": moe_gate_penalty_hit_summary,
+        "penalty_explainability": penalty_explainability_summary,
         "moe_router": {
             "mode": str(router_mode),
             "penalty_context_weight": float(router_penalty_context_weight),

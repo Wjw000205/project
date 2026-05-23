@@ -477,4 +477,4 @@ eval:
 
 - 本 README 面向 `project` 仓库，不是 `project2`。
 - 当前本地实验目录可能包含大量历史搜索产物；论文引用结果时应明确对应 CSV 和 run directory。
-- test-driven 搜索结果必须标注为 test-optimized；validation-selected 结果才能作为更干净的泛化报告。
+- 直接用测试指标筛选的内部搜索结果只能作为内部记录；validation-selected 结果才能作为更干净的泛化报告。

@@ -24,6 +24,17 @@ BANDWIDTH_INPUT_LEN = 24
 ETTH1_PAPER_NORM_PRED_LEN = 96
 ETTH1_PAPER_NORM_MAX_ROWS = 14400
 ETTH1_PAPER_NORM_INPUT_LEN = 336
+TSL_EXTERNAL_SPLIT = {
+    "electricity": (0.6999695863746959, 0.10006082725060828, 0.19996958637469586),
+    "weather": (0.6999962046455139, 0.10000759070897222, 0.1999962046455139),
+    "traffic": (0.7, 0.1, 0.2),
+}
+TSL_ETT_SPLIT = {
+    "ETTh1": ("data/ETTh1.csv", 14400, 0.6, 0.2, 0.2),
+    "ETTh2": ("data/ETTh2.csv", 14400, 0.6, 0.2, 0.2),
+    "ETTm1": ("data/ETTm1.csv", 57600, 0.6, 0.2, 0.2),
+    "ETTm2": ("data/ETTm2.csv", 57600, 0.6, 0.2, 0.2),
+}
 RESULT_FIELDS = [
     "status",
     "dataset",
@@ -98,7 +109,9 @@ def discover_configs(config_dir: Path) -> List[Path]:
     return sorted(path for path in config_dir.glob("*.yaml") if is_train_dataset_config(path))
 
 
-def config_dataset_name(path: Path, cfg: Dict[str, Any]) -> str:
+def config_dataset_name(path: Path, cfg: Dict[str, Any], *, prefer_stem: bool = False) -> str:
+    if prefer_stem:
+        return path.stem
     out_dir = str(cfg.get("exp", {}).get("out_dir", "")).strip().replace("\\", "/")
     if out_dir:
         name = Path(out_dir).name
@@ -182,6 +195,38 @@ def apply_etth1_paper_norm_96(cfg: Dict[str, Any]) -> None:
     knn_cfg["anchor_mode"] = "last"
 
 
+def apply_tsl_alignment(cfg: Dict[str, Any], dataset: str) -> None:
+    """Apply the data protocol used by the TSL-aligned main tables."""
+    cfg.setdefault("data", {})
+    cfg["data"]["date_col"] = 0
+    data_stem = Path(str(cfg["data"].get("csv_path", ""))).stem
+    dataset_key = dataset if dataset in TSL_ETT_SPLIT else data_stem
+    if dataset_key in TSL_ETT_SPLIT:
+        csv_path, max_rows, train_ratio, val_ratio, test_ratio = TSL_ETT_SPLIT[dataset_key]
+        cfg["data"]["csv_path"] = csv_path
+        cfg["data"]["max_rows"] = max_rows
+        cfg["data"]["train_ratio"] = train_ratio
+        cfg["data"]["val_ratio"] = val_ratio
+        cfg["data"]["test_ratio"] = test_ratio
+    else:
+        key = dataset.lower()
+        if key not in TSL_EXTERNAL_SPLIT:
+            key = data_stem.lower()
+        if key in TSL_EXTERNAL_SPLIT:
+            train_ratio, val_ratio, test_ratio = TSL_EXTERNAL_SPLIT[key]
+            cfg["data"]["max_rows"] = 0
+            cfg["data"]["train_ratio"] = train_ratio
+            cfg["data"]["val_ratio"] = val_ratio
+            cfg["data"]["test_ratio"] = test_ratio
+
+    cfg.setdefault("normalize", {})
+    cfg["normalize"]["global_zscore"] = True
+    cfg["normalize"]["train_only"] = True
+
+    cfg.setdefault("cluster", {})
+    cfg["cluster"]["train_only"] = True
+
+
 def ensure_local_output_paths(
     cfg: Dict[str, Any],
     out_dir: Path,
@@ -235,8 +280,15 @@ def make_run_config(
     dataset: str,
     pred_len: int,
     input_len: int | None,
+    batch_size: int | None,
     out_root: Path,
     epochs: int | None,
+    train_lr: float | None,
+    train_weight_decay: float | None,
+    early_patience: int | None,
+    lr_scheduler_patience: int | None,
+    lr_scheduler_factor: float | None,
+    mae_objective_weight: float | None,
     device: str | None,
     keep_artifacts: bool,
     disable_knn_hybrid: bool,
@@ -245,15 +297,39 @@ def make_run_config(
     knn_selection_min_rel_improvement: float | None,
     knn_selection_min_abs_improvement: float | None,
     etth1_paper_norm_96: bool,
+    tsl_align: bool,
 ) -> tuple[Dict[str, Any], Path]:
     cfg = copy.deepcopy(base_cfg)
+    if tsl_align:
+        apply_tsl_alignment(cfg, dataset)
     cfg.setdefault("window", {})
     if input_len is not None:
         cfg["window"]["input_len"] = int(input_len)
     cfg["window"]["pred_len"] = int(pred_len)
+    if batch_size is not None:
+        cfg.setdefault("train", {})
+        cfg["train"]["batch_size"] = int(batch_size)
     if epochs is not None:
         cfg.setdefault("train", {})
         cfg["train"]["epochs"] = int(epochs)
+    if train_lr is not None:
+        cfg.setdefault("train", {})
+        cfg["train"]["lr"] = float(train_lr)
+    if train_weight_decay is not None:
+        cfg.setdefault("train", {})
+        cfg["train"]["weight_decay"] = float(train_weight_decay)
+    if early_patience is not None:
+        cfg.setdefault("early_stop", {})
+        cfg["early_stop"]["patience"] = int(early_patience)
+    if lr_scheduler_patience is not None:
+        cfg.setdefault("train", {}).setdefault("lr_scheduler", {})
+        cfg["train"]["lr_scheduler"]["patience"] = int(lr_scheduler_patience)
+    if lr_scheduler_factor is not None:
+        cfg.setdefault("train", {}).setdefault("lr_scheduler", {})
+        cfg["train"]["lr_scheduler"]["factor"] = float(lr_scheduler_factor)
+    if mae_objective_weight is not None:
+        cfg.setdefault("train", {}).setdefault("mae_objective", {})
+        cfg["train"]["mae_objective"]["weight"] = float(mae_objective_weight)
     if device:
         cfg.setdefault("exp", {})
         cfg["exp"]["device"] = device
@@ -666,14 +742,16 @@ def run_train(config_path: Path, out_dir: Path, show_child_progress: bool) -> in
     stdout_path = out_dir / "stdout.log"
     stderr_path = out_dir / "stderr.log"
     cmd = [sys.executable, "-m", "src.train", "--config", str(config_path)]
+    env = os.environ.copy()
+    env["MOELOSS_PROGRESS_LEAVE"] = "0"
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     if show_child_progress:
         stdout_path.write_text(
             "stdout was streamed to the interactive console to show the child progress bar.\n",
             encoding="utf-8",
         )
         with stderr_path.open("w", encoding="utf-8") as stderr_f:
-            env = os.environ.copy()
-            env["MOELOSS_PROGRESS_LEAVE"] = "0"
             completed = subprocess.run(
                 cmd,
                 cwd=str(REPO_ROOT),
@@ -689,6 +767,7 @@ def run_train(config_path: Path, out_dir: Path, show_child_progress: bool) -> in
                 text=True,
                 stdout=stdout_f,
                 stderr=stderr_f,
+                env=env,
             )
     return int(completed.returncode)
 
@@ -713,6 +792,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--results-csv", type=str, default=None)
     ap.add_argument("--wide-csv", type=str, default=None)
     ap.add_argument("--epochs", type=int, default=None, help="Optional epoch override for every run.")
+    ap.add_argument("--input-len", type=int, default=None, help="Optional input length override for every run.")
+    ap.add_argument("--batch-size", type=int, default=None, help="Optional train batch size override for every run.")
+    ap.add_argument("--train-lr", type=float, default=None, help="Optional train.lr override for every run.")
+    ap.add_argument("--train-weight-decay", type=float, default=None, help="Optional train.weight_decay override for every run.")
+    ap.add_argument("--early-patience", type=int, default=None, help="Optional early_stop.patience override for every run.")
+    ap.add_argument("--lr-scheduler-patience", type=int, default=None, help="Optional train.lr_scheduler.patience override.")
+    ap.add_argument("--lr-scheduler-factor", type=float, default=None, help="Optional train.lr_scheduler.factor override.")
+    ap.add_argument("--mae-objective-weight", type=float, default=None, help="Optional train.mae_objective.weight override.")
     ap.add_argument("--device", type=str, default=None, help="Optional device override, e.g. cuda:0 or cpu.")
     ap.add_argument("--reuse-existing", action="store_true", help="Read an existing run_summary.json instead of rerunning.")
     ap.add_argument("--dry-run", action="store_true", help="Only write generated configs and planned CSV rows.")
@@ -721,6 +808,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--stop-on-error", action="store_true", help="Stop after the first failed training run.")
     ap.add_argument("--keep-artifacts", action="store_true", help="Keep plot, portrait, memory and checkpoint outputs enabled.")
     ap.add_argument("--disable-knn-hybrid", action="store_true", help="Disable knn_hybrid in generated configs.")
+    ap.add_argument(
+        "--tsl-align",
+        action="store_true",
+        help=(
+            "Force the TSL-aligned data protocol: ETT uses the standard 0.6/0.2/0.2 splits "
+            "with max_rows 14400/57600, Electricity/Weather/Traffic use 0.7/0.1/0.2, "
+            "and normalization/cluster fitting use train only."
+        ),
+    )
     ap.add_argument(
         "--etth1-paper-norm-96",
         action="store_true",
@@ -756,6 +852,11 @@ def parse_args() -> argparse.Namespace:
         help="Require this absolute validation improvement before selecting hybrid.",
     )
     ap.add_argument("--no-child-progress", action="store_true", help="Keep child training stdout in logs instead of showing its progress bar.")
+    ap.add_argument(
+        "--dataset-name-from-stem",
+        action="store_true",
+        help="Use each config filename stem as the dataset name instead of inferring it from exp.out_dir.",
+    )
     return ap.parse_args()
 
 
@@ -785,7 +886,7 @@ def main() -> None:
     config_items = []
     for base_config in config_paths:
         base_cfg = load_yaml(base_config)
-        dataset = config_dataset_name(base_config, base_cfg)
+        dataset = config_dataset_name(base_config, base_cfg, prefer_stem=bool(args.dataset_name_from_stem))
         data_csv = str(base_cfg.get("data", {}).get("csv_path", ""))
         bandwidth_special = is_bandwidth_config(base_config, dataset, base_cfg)
         horizons = horizons_for_config(base_config, dataset, base_cfg, args.horizons)
@@ -799,15 +900,22 @@ def main() -> None:
     for base_config, base_cfg, dataset, data_csv, bandwidth_special, horizons in config_items:
         for horizon in horizons:
             run_idx += 1
-            input_len = BANDWIDTH_INPUT_LEN if bandwidth_special else None
+            input_len = args.input_len if args.input_len is not None else (BANDWIDTH_INPUT_LEN if bandwidth_special else None)
             keep_artifacts_for_run = bool(args.keep_artifacts or bandwidth_special)
             cfg, out_dir = make_run_config(
                 base_cfg,
                 dataset=dataset,
                 pred_len=int(horizon),
                 input_len=input_len,
+                batch_size=args.batch_size,
                 out_root=out_root,
                 epochs=args.epochs,
+                train_lr=args.train_lr,
+                train_weight_decay=args.train_weight_decay,
+                early_patience=args.early_patience,
+                lr_scheduler_patience=args.lr_scheduler_patience,
+                lr_scheduler_factor=args.lr_scheduler_factor,
+                mae_objective_weight=args.mae_objective_weight,
                 device=args.device,
                 keep_artifacts=keep_artifacts_for_run,
                 disable_knn_hybrid=bool(args.disable_knn_hybrid),
@@ -816,6 +924,7 @@ def main() -> None:
                 knn_selection_min_rel_improvement=args.knn_selection_min_rel_improvement,
                 knn_selection_min_abs_improvement=args.knn_selection_min_abs_improvement,
                 etth1_paper_norm_96=bool(args.etth1_paper_norm_96),
+                tsl_align=bool(args.tsl_align),
             )
             config_path = out_root / "configs" / f"{dataset}_pred_{horizon}.yaml"
             write_yaml(config_path, cfg)
