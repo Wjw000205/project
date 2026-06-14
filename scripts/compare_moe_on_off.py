@@ -372,6 +372,8 @@ def load_eval_modules(
         input_len=input_len,
         pred_len=pred_len,
         model_cfg=model_cfg,
+        num_channels=meta.get("num_channels", None),
+        cluster_id_c=meta.get("cluster_id_c", None),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

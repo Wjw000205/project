@@ -12,7 +12,7 @@ data:
   test_ratio: 0.19996958637469586
   max_rows: 0
 window:
-  input_len: 336
+  input_len: 96
   pred_len: 720
   past_context: true
 normalize:

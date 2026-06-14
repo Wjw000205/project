@@ -11,7 +11,7 @@ data:
   val_ratio: 0.1
   test_ratio: 0.2
 window:
-  input_len: 336
+  input_len: 96
   pred_len: 192
 normalize:
   global_zscore: true

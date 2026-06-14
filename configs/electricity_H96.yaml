@@ -1,18 +1,18 @@
 exp:
-  name: electricity_H96
-  out_dir: outputs/electricity_H96
+  name: electricity_H96_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy
+  out_dir: outputs/bayes_search_electricity_weather_8configs/final_runs/electricity/H96/trial_0021_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy
   seed: 2026
   deterministic: true
   device: cuda:0
 data:
   csv_path: data/electricity.csv
   date_col: 0
-  train_ratio: 0.6999695863746959
-  val_ratio: 0.10006082725060828
-  test_ratio: 0.19996958637469586
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
   max_rows: 0
 window:
-  input_len: 336
+  input_len: 96
   pred_len: 96
   past_context: true
 normalize:
@@ -20,11 +20,11 @@ normalize:
   train_only: true
 corr:
   compute: true
-  save_path: outputs/electricity_H96/corr.npy
+  save_path: outputs/bayes_search_electricity_weather_8configs/final_runs/electricity/H96/trial_0021_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy/corr.npy
 cluster:
   method: leader
   n_clusters: 3
-  distance_threshold: 0.7
+  distance_threshold: 0.6855423898885412
   linkage: average
   kmeans_n_init: 10
   kmeans_max_iter: 300
@@ -34,13 +34,23 @@ cluster:
   dbscan_min_samples: 2
   random_state: 2026
   min_cluster_size: 2
-  merge_small_clusters: true
+  merge_small_clusters: false
   no_merge_if_channels_lt: 7
   train_only: true
+  feature_aware:
+    enable: false
+    weight: 0.0
+    acf_lags:
+    - 1
+    - 24
+    - 96
 model:
   predictor: mlp
-  hidden_dim: 128
-  dropout: 0.0
+  hidden_dim: 256
+  dropout: 0.0468935703282562
+  context_channel_head_include_delta: true
+  channel_head_residual: true
+  context_channel_head_residual: true
 moe:
   topk: 1
   enable: true
@@ -50,10 +60,11 @@ moe:
   - 1
   detach_penalty_grad: false
   lambda_init:
-    amp_under: 0.02
-    delta: 0.01
-    diff_amp: 0.04
-    direction: 0.01
+    amp_under: 0.02693171136352346
+    range: 0.05386342272704692
+    delta: 0.02693171136352346
+    diff_amp: 0.02693171136352346
+    direction: 0.01885219795446642
   dynamic_lambda:
     enable: false
     mode: multiscale
@@ -83,46 +94,80 @@ moe:
   router_penalty_context_weight: 0.0
   router_detach_penalty_context: true
   allow_skip: true
-  skip_cost: 0.15
+  skip_cost: 0.23073356986971394
   skip_init_bias: -2.0
-  gate_temperature: 1.2
-  gate_noise_std: 0.2
+  gate_temperature: 0.892961150014985
+  gate_noise_std: 0.15621020105136857
   gate_soft_weight: 0.0
   gate_prob_floor: 0.0
   gate_entropy_target_frac: 0.7
   lambda_min:
     amp_under: 0.0
+    range: 0.0
     delta: 0.0
     diff_amp: 0.0
     direction: 0.0
   lambda_schedule:
     amp_under: none
+    range: none
     delta: none
     diff_amp: none
     direction: none
   gate_logit_clip: 5.0
   pred_side_residual:
-    enable: false
-    corrector_hidden: 16
-    alpha_scale: 0.6
-    selection_policy: val_mse_gate
+    enable: true
+    corrector_hidden: 64
+    alpha_scale: 0.3733555458106823
+    selection_policy: val_mse_gate_guarded
     gate_calibrator:
       epochs: 10
       batch_size: 128
+    feature_mode: legacy
+    residual_clip: 4.0
+    specialization_weight: 0.05
+    norm_weight: 0.0001
+    intervention_weight: 0.001
+    penalty_selector_enable: true
+    selector_temperature: 1.0
+    selector_use_cluster_context: true
+    fusion_gate_enable: true
+    fusion_init: -0.5
+    fusion_use_cluster_context: true
+    channel_expert_adapters:
+      enable: true
+      mode: merged_singletons
+      mode_type: override
+  cluster_penalty_prior:
+    enable: true
+    topk: 1
+    hard_topk: true
+    logit_strength: 0.5296336824602615
+    temperature: 1.0
+    smoothing: 0.02
+    use_normalized_penalty: true
+    use_as_balance_target: false
+  channel_penalty_prior:
+    enable: true
+    topk: 1
+    hard_topk: true
+    temperature: 1.0
+    smoothing: 0.02
+    use_normalized_penalty: true
 penalties:
   enabled:
   - amp_under
+  - range
   - delta
   - diff_amp
   - direction
   jump_threshold: 0.6
 train:
-  epochs: 100
-  batch_size: 64
-  lr: 0.001
+  epochs: 50
+  batch_size: 128
+  lr: 0.001309395478035077
   mse_weight: 0.9
   selection_metric: val_mse
-  weight_decay: 0.0001
+  weight_decay: 1.0644440818212169e-05
   grad_clip: 1.0
   penalty_warmup_epochs: 3
   lr_scheduler:
@@ -131,13 +176,13 @@ train:
     patience: 3
     min_lr: 1.0e-06
 early_stop:
-  patience: 5
+  patience: 10
   min_delta: 1.0e-06
 plot:
   enable: false
 portrait:
   enable: false
-  out_dir: outputs/electricity_H96/cluster_portraits
+  out_dir: outputs/bayes_search_electricity_weather_8configs/final_runs/electricity/H96/trial_0021_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy/cluster_portraits
 knn_hybrid:
   enable: false
   mode: rolling
@@ -161,7 +206,7 @@ knn_hybrid:
   distance_weight: inverse
   anchor_mode: last
   bank_chunk_size: 8192
-  path: outputs/electricity_H96/knn_shape_bank.pt
+  path: outputs/bayes_search_electricity_weather_8configs/final_runs/electricity/H96/trial_0021_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy/knn_shape_bank.pt
 eval:
   skip_test: false
 calibration:
@@ -169,5 +214,5 @@ calibration:
 memory:
   enable: false
   save_checkpoint: false
-  path: outputs/electricity_H96/cluster_memory.pt
-  checkpoint_path: outputs/electricity_H96/best_checkpoint.pt
+  path: outputs/bayes_search_electricity_weather_8configs/final_runs/electricity/H96/trial_0021_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy/cluster_memory.pt
+  checkpoint_path: outputs/bayes_search_electricity_weather_8configs/final_runs/electricity/H96/trial_0021_amp_range_dir_mlp_h256_do0p0469_l0p0269_level_heavy_lr0p0013_wd1em05_wu3_bs128_dt0p69_fa0_gt0p89_gn0p16_sk0p23_pk1_ps0p53_gated_ra0p37_legacy/best_checkpoint.pt

@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import pandas as pd
 try:
     from torch.func import functional_call as _torch_functional_call
@@ -35,7 +35,14 @@ except Exception:
 from .utils.yaml_io import load_yaml
 from .utils.seed import set_seed
 from .data.reader import read_csv_time_series
-from .data.windows import global_zscore, make_label_range_windows, make_strict_windows, WindowTensorDataset
+from .data.windows import (
+    WindowTensorDataset,
+    global_zscore,
+    make_label_range_windows,
+    make_lazy_label_range_window_dataset,
+    make_lazy_strict_window_dataset,
+    make_strict_windows,
+)
 from .utils.pearson import pearson_corr_matrix
 from .utils.clustering import cluster_channels_by_corr
 from .models.cluster_predictor import build_cluster_predictor
@@ -58,6 +65,8 @@ from .utils.cluster_memory import (
 )
 from .utils.knn_shape import KNNShapeConfig, ShapeKNNHybrid, predict_bank_outputs, save_shape_knn_bank
 from .utils.console_progress import PurpleProgressBar
+from .utils.diagnostic_sampling import select_prediction_sample_indices
+
 
 def _get_rss_mb() -> float:
     if psutil is None:
@@ -78,10 +87,222 @@ def _dir_size_mb(path: str) -> float:
                 continue
     return float(total) / (1024.0 * 1024.0)
 
+
+def _shape_tuple(tensor: torch.Tensor) -> Tuple[int, ...]:
+    return tuple(int(v) for v in tensor.shape)
+
+
+@torch.no_grad()
+def _partial_load_matching_state_dict(
+    module: nn.Module,
+    source_state: Dict[str, torch.Tensor],
+    *,
+    max_report: int = 40,
+) -> Dict[str, object]:
+    """Copy only source tensors whose names and shapes match the target module."""
+    target_state = module.state_dict()
+    loaded: List[str] = []
+    skipped_shape: List[Dict[str, object]] = []
+    skipped_missing: List[str] = []
+    skipped_non_tensor: List[str] = []
+
+    for name, src_tensor in source_state.items():
+        if not torch.is_tensor(src_tensor):
+            skipped_non_tensor.append(str(name))
+            continue
+        if name not in target_state:
+            skipped_missing.append(str(name))
+            continue
+        dst_tensor = target_state[name]
+        if _shape_tuple(dst_tensor) != _shape_tuple(src_tensor):
+            skipped_shape.append(
+                {
+                    "name": str(name),
+                    "source_shape": list(_shape_tuple(src_tensor)),
+                    "target_shape": list(_shape_tuple(dst_tensor)),
+                }
+            )
+            continue
+        dst_tensor.copy_(src_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype))
+        loaded.append(str(name))
+
+    return {
+        "loaded_count": len(loaded),
+        "skipped_shape_count": len(skipped_shape),
+        "skipped_missing_count": len(skipped_missing),
+        "skipped_non_tensor_count": len(skipped_non_tensor),
+        "loaded": loaded[:max_report],
+        "skipped_shape": skipped_shape[:max_report],
+        "skipped_missing": skipped_missing[:max_report],
+        "skipped_non_tensor": skipped_non_tensor[:max_report],
+    }
+
 def print_clusters(clusters: Dict[int, List[int]], channel_names: List[str]):
     for k in sorted(clusters.keys()):
         chs = [channel_names[i] for i in clusters[k]]
         print(f"Cluster {k}: [" + ", ".join(chs) + "]")
+
+
+def _make_torch_generator(seed: Optional[int]) -> Optional[torch.Generator]:
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _freeze_module_params(module: nn.Module) -> int:
+    frozen = 0
+    for param in module.parameters():
+        param.requires_grad_(False)
+        frozen += int(param.numel())
+    return frozen
+
+
+def _validation_holdout_split_counts(total: int, holdout_fraction: float, min_holdout: int) -> Tuple[int, int]:
+    total = int(total)
+    if total <= 0:
+        return 0, 0
+    holdout_fraction = float(holdout_fraction)
+    min_holdout = max(0, int(min_holdout))
+    if holdout_fraction <= 0.0:
+        return total, 0
+    holdout_n = max(min_holdout, int(round(total * holdout_fraction)))
+    if holdout_n <= 0 or holdout_n >= total:
+        return total, 0
+    select_n = total - holdout_n
+    if select_n <= 0:
+        return total, 0
+    return select_n, holdout_n
+
+
+def _contiguous_segment_ranges(total: int, segment_count: int) -> List[Tuple[int, int]]:
+    total = int(total)
+    if total <= 0:
+        return []
+    segment_count = max(1, min(int(segment_count), total))
+    base = total // segment_count
+    extra = total % segment_count
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    for idx in range(segment_count):
+        length = base + (1 if idx < extra else 0)
+        end = start + length
+        if end > start:
+            ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _top_positive_improvement_mask(improvement_c: torch.Tensor, max_channels: int) -> torch.Tensor:
+    improvement_c = improvement_c.detach().cpu()
+    positive_c = improvement_c > 0
+    max_channels = int(max_channels)
+    if max_channels <= 0 or int(positive_c.sum().item()) <= max_channels:
+        return positive_c
+    scores = torch.where(positive_c, improvement_c, torch.full_like(improvement_c, float("-inf")))
+    keep_idx = torch.topk(scores, k=max_channels).indices
+    keep_c = torch.zeros_like(positive_c, dtype=torch.bool)
+    keep_c[keep_idx] = True
+    return keep_c
+
+
+def _loss_normalization_enabled(cfg: object) -> bool:
+    if isinstance(cfg, bool):
+        return bool(cfg)
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("enable", False))
+
+
+def _loss_normalization_term_set(cfg: object, names: List[str]) -> set:
+    if not isinstance(cfg, dict):
+        return set(names)
+    raw_terms = cfg.get("terms", "all")
+    if raw_terms is None or str(raw_terms).lower() == "all":
+        return set(names)
+    if isinstance(raw_terms, str):
+        return {part.strip() for part in raw_terms.split(",") if part.strip()}
+    return {str(part) for part in raw_terms}
+
+
+def _normalize_loss_terms(
+    terms: Dict[str, torch.Tensor],
+    cfg: object,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Optional[torch.Tensor]]]:
+    if not _loss_normalization_enabled(cfg):
+        return dict(terms), {name: None for name in terms}
+
+    cfg_dict = cfg if isinstance(cfg, dict) else {}
+    mode = str(cfg_dict.get("mode", "std")).lower()
+    eps = float(cfg_dict.get("eps", 1.0e-6))
+    min_scale = float(cfg_dict.get("min_scale", eps))
+    max_scale = float(cfg_dict.get("max_scale", 0.0))
+    include = _loss_normalization_term_set(cfg, list(terms.keys()))
+
+    normalized: Dict[str, torch.Tensor] = {}
+    scales: Dict[str, Optional[torch.Tensor]] = {}
+    for name, value in terms.items():
+        if name not in include:
+            normalized[name] = value
+            scales[name] = None
+            continue
+        ref = value.detach().to(dtype=torch.float32)
+        if ref.numel() == 0:
+            scale = torch.tensor(min_scale, device=value.device, dtype=torch.float32)
+        elif mode in {"std", "batch_std"}:
+            scale = ref.std(unbiased=False)
+        elif mode in {"mean_abs", "abs_mean", "mean"}:
+            scale = ref.abs().mean()
+        elif mode == "rms":
+            scale = ref.pow(2).mean().sqrt()
+        else:
+            raise ValueError(
+                f"Unsupported train.loss_normalization.mode='{mode}'. "
+                "Expected std, mean_abs, or rms."
+            )
+        scale = scale.clamp_min(max(eps, min_scale))
+        if max_scale > 0.0:
+            scale = scale.clamp_max(max_scale)
+        normalized[name] = value / scale.to(device=value.device, dtype=value.dtype)
+        scales[name] = scale.detach().cpu()
+    return normalized, scales
+
+
+def _accumulate_detached_sum_(
+    accumulator: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    dim: int = 0,
+) -> torch.Tensor:
+    accumulator.add_(values.detach().sum(dim=dim).to(device=accumulator.device, dtype=accumulator.dtype))
+    return accumulator
+
+
+def _lr_warmup_scale(epoch: int, warmup_epochs: int, start_factor: float = 0.1) -> float:
+    warmup_epochs = int(warmup_epochs)
+    if warmup_epochs <= 0 or int(epoch) > warmup_epochs:
+        return 1.0
+    if warmup_epochs == 1:
+        return 1.0
+    start = min(max(float(start_factor), 0.0), 1.0)
+    progress = max(0.0, min(1.0, float(int(epoch) - 1) / float(warmup_epochs - 1)))
+    return round(start + (1.0 - start) * progress, 12)
+
+
+def _set_optimizer_lr_scale(optimizers: List[torch.optim.Optimizer], scale: float) -> None:
+    scale = float(scale)
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group.setdefault("initial_lr", float(group["lr"]))
+            group["lr"] = float(group["initial_lr"]) * scale
+
+
+def _should_update_swa(epoch: int, start_epoch: int, update_every: int) -> bool:
+    update_every = max(1, int(update_every))
+    epoch = int(epoch)
+    start_epoch = int(start_epoch)
+    return epoch >= start_epoch and ((epoch - start_epoch) % update_every == 0)
 
 
 def compute_channel_shape_features(data_tc: torch.Tensor, acf_lags: Optional[List[int]] = None) -> torch.Tensor:
@@ -628,6 +849,992 @@ def _named_param_dict(module: Optional[nn.Module], detach: bool = False) -> Opti
         params[name] = param.detach() if detach else param
     return params
 
+
+def _parse_positive_ints(raw) -> List[int]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = []
+        for part in raw.split(","):
+            part = part.strip()
+            if part:
+                value = int(part)
+                if value > 0:
+                    values.append(value)
+        return values
+    if isinstance(raw, (int, float)):
+        value = int(raw)
+        return [value] if value > 0 else []
+    values = []
+    for item in raw:
+        value = int(item)
+        if value > 0:
+            values.append(value)
+    return values
+
+
+def history_anchor_enabled(cfg: Optional[dict]) -> bool:
+    cfg = cfg or {}
+    alpha_by_channel = cfg.get("alpha_by_channel", None)
+    if alpha_by_channel is not None:
+        alpha_enabled = any(float(v) > 0.0 for v in alpha_by_channel)
+    else:
+        alpha_enabled = float(cfg.get("alpha", 0.0) or 0.0) > 0.0
+    return (
+        bool(cfg.get("enable", False))
+        and len(_parse_positive_ints(cfg.get("lags", ()))) > 0
+        and alpha_enabled
+    )
+
+
+def _normalize_history_anchor_cfg(cfg: Optional[dict]) -> dict:
+    out = dict(cfg or {})
+    if history_anchor_enabled(out) and "history_scope" not in out:
+        out["history_scope"] = "input_window"
+    return out
+
+
+def _validate_strict_history_anchor_scope(cfg: Optional[dict], *, source: str) -> None:
+    cfg = cfg or {}
+    if not history_anchor_enabled(cfg):
+        return
+    if bool(cfg.get("allow_all_observed", False)):
+        return
+    history_scope = str(cfg.get("history_scope", "input_window")).lower()
+    if history_scope != "input_window":
+        raise ValueError(
+            f"{source}.history_scope must be 'input_window' for strict input-window training; "
+            f"got {history_scope!r}. Set {source}.allow_all_observed=true only for oracle diagnostics."
+        )
+
+
+def _history_anchor_values(
+    observed_history_tc: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    *,
+    input_len: int,
+    pred_len: int,
+    channel_count: int,
+    lags: List[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    history_scope: str = "input_window",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    observed = observed_history_tc.detach().to(device=device, dtype=dtype)
+    if observed.ndim != 2:
+        raise ValueError("history_anchor observed history must have shape [time, channel].")
+    if int(observed.shape[1]) != int(channel_count):
+        raise ValueError("history_anchor observed history channel count must match predictions.")
+    history_scope = str(history_scope).lower()
+    if history_scope not in {"all_observed", "input_window"}:
+        raise ValueError("history_anchor.history_scope must be 'all_observed' or 'input_window'.")
+
+    starts = query_start_abs_b.detach().to(device=device, dtype=torch.long).reshape(1, -1, 1)
+    steps = torch.arange(int(pred_len), device=device, dtype=torch.long).view(1, 1, -1)
+    lag_t = torch.as_tensor(lags, device=device, dtype=torch.long).view(-1, 1, 1)
+    forecast_start = starts + int(input_len)
+    idx_lbh = forecast_start + steps - lag_t
+    valid_lbh = (
+        (idx_lbh >= 0)
+        & (idx_lbh < forecast_start)
+        & (idx_lbh < int(observed.shape[0]))
+    )
+    if history_scope == "input_window":
+        valid_lbh = valid_lbh & (idx_lbh >= starts)
+    idx_lbh = idx_lbh.clamp(min=0, max=max(int(observed.shape[0]) - 1, 0))
+    values_lbhc = observed.index_select(0, idx_lbh.reshape(-1)).view(
+        int(lag_t.shape[0]),
+        int(query_start_abs_b.numel()),
+        int(pred_len),
+        int(channel_count),
+    )
+    values_bchl = values_lbhc.permute(1, 3, 2, 0)
+    valid_bh1l = valid_lbh.permute(1, 2, 0).unsqueeze(2).to(dtype=dtype)
+    valid_bchl = valid_bh1l.permute(0, 2, 1, 3)
+    count_b1h = valid_bh1l.sum(dim=-1).permute(0, 2, 1).clamp_min(1.0)
+    anchor_bch = (values_bchl * valid_bchl).sum(dim=-1) / count_b1h
+    mask_b1h = valid_bh1l.sum(dim=-1).permute(0, 2, 1) > 0
+    return anchor_bch, mask_b1h
+
+
+def apply_history_anchor_adapter(
+    pred_bch: torch.Tensor,
+    *,
+    base_pred_bch: torch.Tensor,
+    observed_history_tc: Optional[torch.Tensor],
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    cfg: Optional[dict],
+) -> torch.Tensor:
+    cfg = cfg or {}
+    if not history_anchor_enabled(cfg):
+        return pred_bch
+    if observed_history_tc is None:
+        raise ValueError("model.history_anchor requires observed history.")
+    lags = _parse_positive_ints(cfg.get("lags", ()))
+    blend_target = str(cfg.get("blend_target", "prediction")).lower()
+    if blend_target not in {"prediction", "base"}:
+        raise ValueError("model.history_anchor.blend_target must be 'prediction' or 'base'.")
+
+    anchor_bch, mask_b1h = _history_anchor_values(
+        observed_history_tc,
+        query_start_abs_b,
+        input_len=int(input_len),
+        pred_len=int(pred_bch.shape[-1]),
+        channel_count=int(pred_bch.shape[1]),
+        lags=lags,
+        device=pred_bch.device,
+        dtype=pred_bch.dtype,
+        history_scope=str(cfg.get("history_scope", "input_window")),
+    )
+    alpha_by_channel = cfg.get("alpha_by_channel", None)
+    if alpha_by_channel is not None:
+        alpha_values = [float(v) for v in alpha_by_channel]
+        if len(alpha_values) != int(pred_bch.shape[1]):
+            raise ValueError(
+                "model.history_anchor.alpha_by_channel length must match the channel count "
+                f"({len(alpha_values)} != {int(pred_bch.shape[1])})."
+            )
+        alpha = torch.as_tensor(alpha_values, device=pred_bch.device, dtype=pred_bch.dtype).view(1, -1, 1)
+    else:
+        alpha = float(cfg.get("alpha", 0.0) or 0.0)
+    if blend_target == "prediction":
+        blended = pred_bch + alpha * (anchor_bch - pred_bch)
+    else:
+        blended = pred_bch + alpha * (anchor_bch - base_pred_bch)
+    return torch.where(mask_b1h.to(device=pred_bch.device), blended, pred_bch)
+
+
+def apply_moe_history_anchor_expert(
+    pred_bch: torch.Tensor,
+    *,
+    base_pred_bch: torch.Tensor,
+    observed_history_tc: Optional[torch.Tensor],
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    cfg: Optional[dict],
+) -> torch.Tensor:
+    cfg = cfg or {}
+    if not bool(cfg.get("enable", False)):
+        return pred_bch
+    expert_cfg = dict(cfg)
+    expert_cfg["enable"] = True
+    expert_cfg = _normalize_history_anchor_cfg(expert_cfg)
+    return apply_history_anchor_adapter(
+        pred_bch,
+        base_pred_bch=base_pred_bch,
+        observed_history_tc=observed_history_tc,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len),
+        cfg=expert_cfg,
+    )
+
+
+def build_train_phase_anchor_table(
+    data_tc: torch.Tensor,
+    *,
+    train_end: int,
+    period: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if int(period) <= 0:
+        raise ValueError("train_stat_anchor_expert.period must be positive.")
+    train_end = max(0, min(int(train_end), int(data_tc.shape[0])))
+    if train_end <= 0:
+        raise ValueError("train_stat_anchor_expert requires non-empty train data.")
+    train = data_tc[:train_end].detach()
+    period = int(period)
+    table = torch.zeros(period, int(train.shape[1]), dtype=train.dtype, device=train.device)
+    counts = torch.zeros(period, dtype=torch.long, device=train.device)
+    phases = torch.arange(train_end, device=train.device, dtype=torch.long) % period
+    table.index_add_(0, phases, train)
+    counts.index_add_(0, phases, torch.ones(train_end, dtype=torch.long, device=train.device))
+    global_mean = train.mean(dim=0)
+    nonempty = counts > 0
+    if bool(nonempty.any()):
+        table[nonempty] = table[nonempty] / counts[nonempty].to(dtype=train.dtype).unsqueeze(-1)
+    if bool((~nonempty).any()):
+        table[~nonempty] = global_mean
+    return table, counts
+
+
+def build_train_phase_delta_anchor_table(
+    data_tc: torch.Tensor,
+    *,
+    train_end: int,
+    input_len: int,
+    pred_len: int,
+    period: int,
+    reference: str = "last",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if int(period) <= 0:
+        raise ValueError("train_stat_anchor_expert.period must be positive.")
+    reference = str(reference).lower()
+    if reference not in {"last", "repeat"}:
+        raise ValueError("train_stat_anchor_expert.reference must be 'last' or 'repeat'.")
+    train_end = max(0, min(int(train_end), int(data_tc.shape[0])))
+    input_len = int(input_len)
+    pred_len = int(pred_len)
+    period = int(period)
+    n_windows = train_end - input_len - pred_len + 1
+    if n_windows <= 0:
+        raise ValueError("train_stat_anchor_expert phase_delta requires at least one full train window.")
+    data = data_tc.detach()
+    table = torch.zeros(period, pred_len, int(data.shape[1]), dtype=data.dtype, device=data.device)
+    counts = torch.zeros(period, dtype=torch.long, device=data.device)
+    global_sum = torch.zeros(pred_len, int(data.shape[1]), dtype=data.dtype, device=data.device)
+    for start in range(n_windows):
+        forecast_start = start + input_len
+        phase = int(forecast_start % period)
+        target_hc = data[forecast_start : forecast_start + pred_len]
+        if reference == "last":
+            ref_hc = data[forecast_start - 1].view(1, -1).expand(pred_len, -1)
+        else:
+            pos_h = torch.arange(pred_len, device=data.device, dtype=torch.long) % input_len
+            ref_hc = data[start : start + input_len].index_select(0, pos_h)
+        delta_hc = target_hc - ref_hc
+        table[phase] += delta_hc
+        counts[phase] += 1
+        global_sum += delta_hc
+    global_delta = global_sum / float(n_windows)
+    nonempty = counts > 0
+    if bool(nonempty.any()):
+        table[nonempty] = table[nonempty] / counts[nonempty].to(dtype=data.dtype).view(-1, 1, 1)
+    if bool((~nonempty).any()):
+        table[~nonempty] = global_delta
+    return table, counts
+
+
+def build_train_phase_residual_anchor_table(
+    base_pred_nch: torch.Tensor,
+    target_nch: torch.Tensor,
+    *,
+    query_start_abs_n: torch.Tensor,
+    input_len: int,
+    period: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if int(period) <= 0:
+        raise ValueError("train_residual_anchor_expert.period must be positive.")
+    if base_pred_nch.shape != target_nch.shape:
+        raise ValueError("base_pred and target must have the same [window, channel, horizon] shape.")
+    if base_pred_nch.ndim != 3:
+        raise ValueError("base_pred and target must have shape [window, channel, horizon].")
+    starts = query_start_abs_n.detach().to(dtype=torch.long).reshape(-1)
+    if int(starts.numel()) != int(base_pred_nch.shape[0]):
+        raise ValueError("query_start_abs_n length must match the number of windows.")
+    period = int(period)
+    residual_nhc = (target_nch.detach() - base_pred_nch.detach()).permute(0, 2, 1).contiguous()
+    horizon = int(residual_nhc.shape[1])
+    channel_count = int(residual_nhc.shape[2])
+    table = torch.zeros(period, horizon, channel_count, dtype=residual_nhc.dtype, device=residual_nhc.device)
+    counts = torch.zeros(period, dtype=torch.long, device=residual_nhc.device)
+    phases = (starts.to(device=residual_nhc.device) + int(input_len)) % period
+    table.index_add_(0, phases, residual_nhc)
+    counts.index_add_(0, phases, torch.ones_like(phases, dtype=torch.long, device=residual_nhc.device))
+    global_mean = residual_nhc.mean(dim=0)
+    nonempty = counts > 0
+    if bool(nonempty.any()):
+        table[nonempty] = table[nonempty] / counts[nonempty].to(dtype=residual_nhc.dtype).view(-1, 1, 1)
+    if bool((~nonempty).any()):
+        table[~nonempty] = global_mean
+    return table, counts
+
+
+def build_train_stat_anchor_from_config(
+    data_tc: torch.Tensor,
+    *,
+    train_end: int,
+    input_len: int,
+    pred_len: int,
+    cfg: Optional[dict],
+    prefix: str = "moe.train_stat_anchor_expert",
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, object]]:
+    cfg = cfg or {}
+    summary: Dict[str, object] = {"enable": bool(cfg.get("enable", False))}
+    if not bool(cfg.get("enable", False)):
+        return None, None, summary
+
+    period = int(cfg.get("period", 96))
+    mode = str(cfg.get("mode", "phase_mean")).lower()
+    reference = str(cfg.get("reference", "last")).lower()
+    if mode == "phase_delta":
+        table, counts = build_train_phase_delta_anchor_table(
+            data_tc,
+            train_end=int(train_end),
+            input_len=int(input_len),
+            pred_len=int(pred_len),
+            period=period,
+            reference=reference,
+        )
+    elif mode == "phase_mean":
+        table, counts = build_train_phase_anchor_table(
+            data_tc,
+            train_end=int(train_end),
+            period=period,
+        )
+    else:
+        raise ValueError(f"{prefix}.mode must be 'phase_mean' or 'phase_delta'.")
+
+    summary.update(
+        {
+            "period": int(period),
+            "mode": str(mode),
+            "reference": str(reference),
+            "source_split": "train",
+            "train_end": int(train_end),
+            "min_count": int(counts.min().item()),
+            "max_count": int(counts.max().item()),
+            "alpha": float(cfg.get("alpha", 0.0) or 0.0),
+            "blend_target": str(cfg.get("blend_target", "prediction")),
+        }
+    )
+    return table, counts, summary
+
+
+def _anchor_alpha_from_cfg(
+    cfg: dict,
+    *,
+    channel_count: int,
+    horizon: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    prefix: str,
+) -> Tuple[float | torch.Tensor, bool]:
+    alpha_by_channel_horizon = cfg.get("alpha_by_channel_horizon", None)
+    alpha_by_channel = cfg.get("alpha_by_channel", None)
+    if alpha_by_channel_horizon is not None:
+        rows = [[float(v) for v in row] for row in alpha_by_channel_horizon]
+        if len(rows) != int(channel_count):
+            raise ValueError(
+                f"{prefix}.alpha_by_channel_horizon row count must match the channel count "
+                f"({len(rows)} != {int(channel_count)})."
+            )
+        segments = int(cfg.get("alpha_horizon_segments", len(rows[0]) if rows else 0))
+        if segments <= 0:
+            raise ValueError(f"{prefix}.alpha_horizon_segments must be positive.")
+        if any(len(row) != segments for row in rows):
+            raise ValueError("Each alpha_by_channel_horizon row must match alpha_horizon_segments.")
+        scale_cs = torch.as_tensor(rows, device=device, dtype=dtype)
+        seg_idx_h = torch.div(
+            torch.arange(int(horizon), device=device, dtype=torch.long) * segments,
+            max(int(horizon), 1),
+            rounding_mode="floor",
+        ).clamp_max(segments - 1)
+        alpha: float | torch.Tensor = scale_cs.index_select(1, seg_idx_h).view(1, int(channel_count), int(horizon))
+        return alpha, any(v > 0.0 for row in rows for v in row)
+    if alpha_by_channel is not None:
+        alpha_values = [float(v) for v in alpha_by_channel]
+        if len(alpha_values) != int(channel_count):
+            raise ValueError(
+                f"{prefix}.alpha_by_channel length must match the channel count "
+                f"({len(alpha_values)} != {int(channel_count)})."
+            )
+        alpha = torch.as_tensor(alpha_values, device=device, dtype=dtype).view(1, -1, 1)
+        return alpha, any(v > 0.0 for v in alpha_values)
+    alpha = float(cfg.get("alpha", 0.0) or 0.0)
+    return alpha, alpha > 0.0
+
+
+def apply_train_residual_anchor_expert(
+    pred_bch: torch.Tensor,
+    *,
+    base_pred_bch: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    residual_anchor_phc: Optional[torch.Tensor],
+    cfg: Optional[dict],
+) -> torch.Tensor:
+    cfg = cfg or {}
+    if not bool(cfg.get("enable", False)):
+        return pred_bch
+    if residual_anchor_phc is None:
+        raise ValueError("moe.train_residual_anchor_expert requires a train residual anchor table.")
+    alpha, alpha_active = _anchor_alpha_from_cfg(
+        cfg,
+        channel_count=int(pred_bch.shape[1]),
+        horizon=int(pred_bch.shape[-1]),
+        device=pred_bch.device,
+        dtype=pred_bch.dtype,
+        prefix="moe.train_residual_anchor_expert",
+    )
+    if not alpha_active:
+        return pred_bch
+    table = residual_anchor_phc.detach().to(device=pred_bch.device, dtype=pred_bch.dtype)
+    if table.ndim != 3 or int(table.shape[1]) != int(pred_bch.shape[-1]) or int(table.shape[2]) != int(pred_bch.shape[1]):
+        raise ValueError("train_residual_anchor_expert table must have shape [period, horizon, channel].")
+    blend_target = str(cfg.get("blend_target", "prediction")).lower()
+    if blend_target not in {"prediction", "base"}:
+        raise ValueError("moe.train_residual_anchor_expert.blend_target must be 'prediction' or 'base'.")
+    phases_b = (query_start_abs_b.detach().to(device=pred_bch.device, dtype=torch.long) + int(input_len)) % int(table.shape[0])
+    residual_bhc = table.index_select(0, phases_b).view(
+        int(pred_bch.shape[0]),
+        int(pred_bch.shape[-1]),
+        int(pred_bch.shape[1]),
+    )
+    residual_bch = residual_bhc.permute(0, 2, 1).contiguous()
+    if blend_target == "prediction":
+        return pred_bch + alpha * residual_bch
+    return pred_bch + alpha * (base_pred_bch + residual_bch - base_pred_bch)
+
+
+def apply_train_stat_input_centering(
+    x_bcl: torch.Tensor,
+    *,
+    query_start_abs_b: torch.Tensor,
+    stat_anchor_pc: Optional[torch.Tensor],
+    cfg: Optional[dict],
+) -> torch.Tensor:
+    cfg = cfg or {}
+    if not (bool(cfg.get("enable", False)) and bool(cfg.get("input_center", False))):
+        return x_bcl
+    if stat_anchor_pc is None:
+        raise ValueError("model.train_stat_adapter input_center requires a train phase anchor table.")
+    mode = str(cfg.get("mode", "phase_mean")).lower()
+    if mode != "phase_mean":
+        raise ValueError("model.train_stat_adapter input_center currently requires mode='phase_mean'.")
+    table = stat_anchor_pc.detach().to(device=x_bcl.device, dtype=x_bcl.dtype)
+    if table.ndim != 2 or int(table.shape[1]) != int(x_bcl.shape[1]):
+        raise ValueError("model.train_stat_adapter phase_mean table must have shape [period, channel].")
+    starts = query_start_abs_b.detach().to(device=x_bcl.device, dtype=torch.long).view(-1, 1)
+    steps = torch.arange(int(x_bcl.shape[-1]), device=x_bcl.device, dtype=torch.long).view(1, -1)
+    phases_bl = (starts + steps) % int(table.shape[0])
+    anchor_blc = table.index_select(0, phases_bl.reshape(-1)).view(
+        int(x_bcl.shape[0]),
+        int(x_bcl.shape[-1]),
+        int(x_bcl.shape[1]),
+    )
+    scale = float(cfg.get("input_center_scale", 1.0) or 0.0)
+    return x_bcl - scale * anchor_blc.permute(0, 2, 1).contiguous()
+
+
+def apply_train_stat_anchor_expert(
+    pred_bch: torch.Tensor,
+    *,
+    base_pred_bch: torch.Tensor,
+    x_bcl: Optional[torch.Tensor] = None,
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    stat_anchor_pc: Optional[torch.Tensor],
+    cfg: Optional[dict],
+) -> torch.Tensor:
+    cfg = cfg or {}
+    if not bool(cfg.get("enable", False)):
+        return pred_bch
+    if stat_anchor_pc is None:
+        raise ValueError("moe.train_stat_anchor_expert requires a train phase anchor table.")
+    alpha_by_channel_horizon = cfg.get("alpha_by_channel_horizon", None)
+    alpha_by_channel = cfg.get("alpha_by_channel", None)
+    if alpha_by_channel_horizon is not None:
+        rows = [[float(v) for v in row] for row in alpha_by_channel_horizon]
+        if len(rows) != int(pred_bch.shape[1]):
+            raise ValueError(
+                "moe.train_stat_anchor_expert.alpha_by_channel_horizon row count must match the channel count "
+                f"({len(rows)} != {int(pred_bch.shape[1])})."
+            )
+        segments = int(cfg.get("alpha_horizon_segments", len(rows[0]) if rows else 0))
+        if segments <= 0:
+            raise ValueError("moe.train_stat_anchor_expert.alpha_horizon_segments must be positive.")
+        if any(len(row) != segments for row in rows):
+            raise ValueError("Each alpha_by_channel_horizon row must match alpha_horizon_segments.")
+        scale_cs = torch.as_tensor(rows, device=pred_bch.device, dtype=pred_bch.dtype)
+        horizon = int(pred_bch.shape[-1])
+        seg_idx_h = torch.div(
+            torch.arange(horizon, device=pred_bch.device, dtype=torch.long) * segments,
+            max(horizon, 1),
+            rounding_mode="floor",
+        ).clamp_max(segments - 1)
+        alpha: float | torch.Tensor = scale_cs.index_select(1, seg_idx_h).view(1, int(pred_bch.shape[1]), horizon)
+        alpha_active = any(v > 0.0 for row in rows for v in row)
+    elif alpha_by_channel is not None:
+        alpha_values = [float(v) for v in alpha_by_channel]
+        if len(alpha_values) != int(pred_bch.shape[1]):
+            raise ValueError(
+                "moe.train_stat_anchor_expert.alpha_by_channel length must match the channel count "
+                f"({len(alpha_values)} != {int(pred_bch.shape[1])})."
+            )
+        alpha: float | torch.Tensor = torch.as_tensor(
+            alpha_values,
+            device=pred_bch.device,
+            dtype=pred_bch.dtype,
+        ).view(1, -1, 1)
+        alpha_active = any(v > 0.0 for v in alpha_values)
+    else:
+        alpha = float(cfg.get("alpha", 0.0) or 0.0)
+        alpha_active = alpha > 0.0
+    if not alpha_active:
+        return pred_bch
+    blend_target = str(cfg.get("blend_target", "prediction")).lower()
+    if blend_target not in {"prediction", "base"}:
+        raise ValueError("moe.train_stat_anchor_expert.blend_target must be 'prediction' or 'base'.")
+    combine_mode = str(cfg.get("combine_mode", "blend")).lower()
+    if combine_mode not in {"blend", "anchor_plus_prediction"}:
+        raise ValueError("moe.train_stat_anchor_expert.combine_mode must be 'blend' or 'anchor_plus_prediction'.")
+    table = stat_anchor_pc.detach().to(device=pred_bch.device, dtype=pred_bch.dtype)
+    mode = str(cfg.get("mode", "phase_mean")).lower()
+    if mode not in {"phase_mean", "phase_delta"}:
+        raise ValueError("moe.train_stat_anchor_expert.mode must be 'phase_mean' or 'phase_delta'.")
+    period = int(table.shape[0])
+    starts = query_start_abs_b.detach().to(device=pred_bch.device, dtype=torch.long)
+    steps = torch.arange(int(pred_bch.shape[-1]), device=pred_bch.device, dtype=torch.long).view(1, -1)
+    if mode == "phase_delta":
+        if table.ndim != 3 or int(table.shape[1]) != int(pred_bch.shape[-1]) or int(table.shape[2]) != int(pred_bch.shape[1]):
+            raise ValueError("train_stat_anchor_expert phase_delta table must have shape [period, horizon, channel].")
+        if x_bcl is None:
+            raise ValueError("moe.train_stat_anchor_expert phase_delta requires x_bcl.")
+        reference = str(cfg.get("reference", "last")).lower()
+        if reference == "last":
+            ref_bch = x_bcl[..., -1:].to(device=pred_bch.device, dtype=pred_bch.dtype).expand_as(pred_bch)
+        elif reference == "repeat":
+            pos_h = torch.arange(int(pred_bch.shape[-1]), device=pred_bch.device, dtype=torch.long) % int(x_bcl.shape[-1])
+            ref_bch = x_bcl.to(device=pred_bch.device, dtype=pred_bch.dtype).index_select(-1, pos_h)
+        else:
+            raise ValueError("moe.train_stat_anchor_expert.reference must be 'last' or 'repeat'.")
+        phases_b = (starts + int(input_len)) % period
+        delta_bhc = table.index_select(0, phases_b).view(
+            int(pred_bch.shape[0]),
+            int(pred_bch.shape[-1]),
+            int(pred_bch.shape[1]),
+        )
+        anchor_bch = ref_bch + delta_bhc.permute(0, 2, 1).contiguous()
+    else:
+        if table.ndim != 2 or int(table.shape[1]) != int(pred_bch.shape[1]):
+            raise ValueError("train_stat_anchor_expert phase_mean table must have shape [period, channel].")
+        phases_bh = (starts.view(-1, 1) + int(input_len) + steps) % period
+        anchor_bhc = table.index_select(0, phases_bh.reshape(-1)).view(
+            int(pred_bch.shape[0]),
+            int(pred_bch.shape[-1]),
+            int(pred_bch.shape[1]),
+        )
+        anchor_bch = anchor_bhc.permute(0, 2, 1).contiguous()
+    if combine_mode == "anchor_plus_prediction":
+        return anchor_bch + alpha * pred_bch
+    if blend_target == "prediction":
+        return pred_bch + alpha * (anchor_bch - pred_bch)
+    return pred_bch + alpha * (anchor_bch - base_pred_bch)
+
+
+def select_channel_anchor_scales(
+    base_bch: torch.Tensor,
+    anchor_bch: torch.Tensor,
+    target_bch: torch.Tensor,
+    *,
+    metric: str = "mse",
+    max_scale: float = 1.0,
+    steps: int = 21,
+    channel_chunk_size: int = 8,
+    sample_chunk_size: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if base_bch.shape != anchor_bch.shape or base_bch.shape != target_bch.shape:
+        raise ValueError("base, anchor, and target tensors must have the same [batch, channel, horizon] shape.")
+    metric = str(metric).lower()
+    if metric not in {"mse", "mae"}:
+        raise ValueError("train_stat_anchor_expert.scale_selection.metric must be mse or mae.")
+    steps = max(2, int(steps))
+    scale_grid = torch.linspace(
+        0.0,
+        float(max_scale),
+        steps,
+        device=base_bch.device,
+        dtype=base_bch.dtype,
+    )
+    channel_count = int(base_bch.shape[1])
+    chunk_size = max(1, min(channel_count, int(channel_chunk_size))) if channel_count > 0 else 1
+    sample_chunk_size = max(1, min(int(base_bch.shape[0]), int(sample_chunk_size))) if int(base_bch.shape[0]) > 0 else 1
+    scales_c = torch.empty(channel_count, device=base_bch.device, dtype=base_bch.dtype)
+    scores_c = torch.empty_like(scales_c)
+    for c0 in range(0, channel_count, chunk_size):
+        c1 = min(channel_count, c0 + chunk_size)
+        score_sum_sc = torch.zeros(
+            int(scale_grid.numel()),
+            c1 - c0,
+            device=base_bch.device,
+            dtype=base_bch.dtype,
+        )
+        total_count = 0
+        for b0 in range(0, int(base_bch.shape[0]), sample_chunk_size):
+            b1 = min(int(base_bch.shape[0]), b0 + sample_chunk_size)
+            base_chunk = base_bch[b0:b1, c0:c1, :]
+            anchor_chunk = anchor_bch[b0:b1, c0:c1, :]
+            target_chunk = target_bch[b0:b1, c0:c1, :]
+            cand_sbch = base_chunk.unsqueeze(0) + scale_grid.view(-1, 1, 1, 1) * (
+                anchor_chunk - base_chunk
+            ).unsqueeze(0)
+            err_sbch = cand_sbch - target_chunk.unsqueeze(0)
+            if metric == "mae":
+                score_sum_sc += err_sbch.abs().sum(dim=(1, 3))
+            else:
+                score_sum_sc += err_sbch.pow(2).sum(dim=(1, 3))
+            total_count += int(b1 - b0) * int(base_bch.shape[-1])
+        score_sc = score_sum_sc / max(float(total_count), 1.0)
+        best_idx_c = score_sc.argmin(dim=0)
+        scales_c[c0:c1] = scale_grid.index_select(0, best_idx_c)
+        scores_c[c0:c1] = score_sc.gather(0, best_idx_c.view(1, -1)).squeeze(0)
+    return scales_c.detach(), scores_c.detach()
+
+
+def select_channel_horizon_anchor_scales(
+    base_bch: torch.Tensor,
+    anchor_bch: torch.Tensor,
+    target_bch: torch.Tensor,
+    *,
+    metric: str = "mse",
+    max_scale: float = 1.0,
+    steps: int = 21,
+    segments: int = 4,
+    channel_chunk_size: int = 8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if base_bch.shape != anchor_bch.shape or base_bch.shape != target_bch.shape:
+        raise ValueError("base, anchor, and target tensors must have the same [batch, channel, horizon] shape.")
+    metric = str(metric).lower()
+    if metric not in {"mse", "mae"}:
+        raise ValueError("train_stat_anchor_expert.scale_selection.metric must be mse or mae.")
+    steps = max(2, int(steps))
+    segments = max(1, int(segments))
+    horizon = int(base_bch.shape[-1])
+    scale_grid = torch.linspace(
+        0.0,
+        float(max_scale),
+        steps,
+        device=base_bch.device,
+        dtype=base_bch.dtype,
+    )
+    scales_cs = torch.zeros(int(base_bch.shape[1]), segments, device=base_bch.device, dtype=base_bch.dtype)
+    scores_cs = torch.zeros_like(scales_cs)
+    channel_count = int(base_bch.shape[1])
+    chunk_size = max(1, min(channel_count, int(channel_chunk_size))) if channel_count > 0 else 1
+    for segment in range(segments):
+        start = (segment * horizon) // segments
+        end = ((segment + 1) * horizon) // segments
+        if end <= start:
+            end = min(horizon, start + 1)
+        for c0 in range(0, channel_count, chunk_size):
+            c1 = min(channel_count, c0 + chunk_size)
+            base_seg = base_bch[:, c0:c1, start:end]
+            anchor_seg = anchor_bch[:, c0:c1, start:end]
+            target_seg = target_bch[:, c0:c1, start:end]
+            cand_sbch = base_seg.unsqueeze(0) + scale_grid.view(-1, 1, 1, 1) * (
+                anchor_seg - base_seg
+            ).unsqueeze(0)
+            err_sbch = cand_sbch - target_seg.unsqueeze(0)
+            if metric == "mae":
+                score_sc = err_sbch.abs().mean(dim=(1, 3))
+            else:
+                score_sc = err_sbch.pow(2).mean(dim=(1, 3))
+            best_idx_c = score_sc.argmin(dim=0)
+            scales_cs[c0:c1, segment] = scale_grid.index_select(0, best_idx_c)
+            scores_cs[c0:c1, segment] = score_sc.gather(0, best_idx_c.view(1, -1)).squeeze(0)
+    return scales_cs.detach(), scores_cs.detach()
+
+
+@torch.no_grad()
+def select_train_stat_anchor_scales_from_loader(
+    *,
+    model: nn.Module,
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    device: torch.device,
+    history_anchor_cfg: Optional[dict],
+    observed_history_tc: Optional[torch.Tensor],
+    input_len: int,
+    eval_start: int,
+    stat_anchor_pc: torch.Tensor,
+    train_stat_anchor_cfg: dict,
+    metric: str,
+    max_scale: float,
+    steps: int,
+    horizon_segments: int = 1,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    if len(loader) == 0:
+        raise ValueError("train_stat_anchor_expert.scale_selection requires a non-empty validation loader.")
+    model.eval()
+    base_parts: List[torch.Tensor] = []
+    anchor_parts: List[torch.Tensor] = []
+    target_parts: List[torch.Tensor] = []
+    unit_cfg = dict(train_stat_anchor_cfg)
+    unit_cfg["enable"] = True
+    unit_cfg["alpha"] = 1.0
+    unit_cfg.pop("alpha_by_channel", None)
+    unit_cfg.pop("alpha_by_channel_horizon", None)
+    unit_cfg.pop("alpha_horizon_segments", None)
+    combine_mode = str(unit_cfg.get("combine_mode", "blend")).lower()
+    for x, y, idx in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+        query_start_abs_b = int(eval_start) + idx
+        if bool((model_train_stat_adapter_cfg or {}).get("enable", False)) and bool(
+            (model_train_stat_adapter_cfg or {}).get("input_center", False)
+        ):
+            x_model = apply_train_stat_input_centering(
+                x,
+                query_start_abs_b=query_start_abs_b,
+                stat_anchor_pc=model_train_stat_adapter_pc,
+                cfg=model_train_stat_adapter_cfg,
+            )
+        else:
+            x_model = apply_train_stat_input_centering(
+                x,
+                query_start_abs_b=query_start_abs_b,
+                stat_anchor_pc=stat_anchor_pc,
+                cfg=train_stat_anchor_cfg,
+            )
+        y_base_raw = model(x_model, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_anchor = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=stat_anchor_pc,
+            cfg=unit_cfg,
+        )
+        if combine_mode == "anchor_plus_prediction":
+            anchor_only = y_anchor - y_base
+            base_parts.append(anchor_only.detach().cpu())
+            anchor_parts.append(y_anchor.detach().cpu())
+        else:
+            base_parts.append(y_base.detach().cpu())
+            anchor_parts.append(y_anchor.detach().cpu())
+        target_parts.append(y.detach().cpu())
+    base_bch = torch.cat(base_parts, dim=0)
+    anchor_bch = torch.cat(anchor_parts, dim=0)
+    target_bch = torch.cat(target_parts, dim=0)
+    if int(horizon_segments) > 1:
+        scales, scores = select_channel_horizon_anchor_scales(
+            base_bch,
+            anchor_bch,
+            target_bch,
+            metric=metric,
+            max_scale=float(max_scale),
+            steps=int(steps),
+            segments=int(horizon_segments),
+        )
+    else:
+        scales, scores = select_channel_anchor_scales(
+            base_bch,
+            anchor_bch,
+            target_bch,
+            metric=metric,
+            max_scale=float(max_scale),
+            steps=int(steps),
+        )
+    return scales, scores, int(base_bch.shape[0])
+
+
+@torch.no_grad()
+def build_train_residual_anchor_table_from_loader(
+    *,
+    model: nn.Module,
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    device: torch.device,
+    history_anchor_cfg: Optional[dict],
+    observed_history_tc: Optional[torch.Tensor],
+    input_len: int,
+    eval_start: int,
+    period: int,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_stat_anchor_cfg: Optional[dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    if len(loader) == 0:
+        raise ValueError("train_residual_anchor_expert requires a non-empty train loader.")
+    if int(period) <= 0:
+        raise ValueError("train_residual_anchor_expert.period must be positive.")
+    model.eval()
+    period = int(period)
+    table_sum_phc: Optional[torch.Tensor] = None
+    global_sum_hc: Optional[torch.Tensor] = None
+    counts_p: Optional[torch.Tensor] = None
+    n_windows = 0
+    for x, y, idx in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=train_stat_anchor_pc,
+            cfg=train_stat_anchor_cfg,
+        )
+        residual_bhc = (y.detach() - y_base.detach()).permute(0, 2, 1).contiguous().cpu()
+        if table_sum_phc is None:
+            horizon = int(residual_bhc.shape[1])
+            channel_count = int(residual_bhc.shape[2])
+            table_sum_phc = torch.zeros(period, horizon, channel_count, dtype=residual_bhc.dtype)
+            global_sum_hc = torch.zeros(horizon, channel_count, dtype=residual_bhc.dtype)
+            counts_p = torch.zeros(period, dtype=torch.long)
+        phases_b = (query_start_abs_b.detach().cpu().to(dtype=torch.long) + int(input_len)) % period
+        table_sum_phc.index_add_(0, phases_b, residual_bhc)
+        counts_p.index_add_(0, phases_b, torch.ones_like(phases_b, dtype=torch.long))
+        global_sum_hc += residual_bhc.sum(dim=0)
+        n_windows += int(residual_bhc.shape[0])
+    if table_sum_phc is None or global_sum_hc is None or counts_p is None or n_windows <= 0:
+        raise ValueError("train_residual_anchor_expert requires at least one train window.")
+    table_phc = table_sum_phc
+    global_mean_hc = global_sum_hc / float(n_windows)
+    nonempty = counts_p > 0
+    if bool(nonempty.any()):
+        table_phc[nonempty] = table_phc[nonempty] / counts_p[nonempty].to(dtype=table_phc.dtype).view(-1, 1, 1)
+    if bool((~nonempty).any()):
+        table_phc[~nonempty] = global_mean_hc
+    return table_phc, counts_p, int(n_windows)
+
+
+@torch.no_grad()
+def select_train_residual_anchor_scales_from_loader(
+    *,
+    model: nn.Module,
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    device: torch.device,
+    history_anchor_cfg: Optional[dict],
+    observed_history_tc: Optional[torch.Tensor],
+    input_len: int,
+    eval_start: int,
+    residual_anchor_phc: torch.Tensor,
+    train_residual_anchor_cfg: dict,
+    metric: str,
+    max_scale: float,
+    steps: int,
+    horizon_segments: int = 1,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_stat_anchor_cfg: Optional[dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    if len(loader) == 0:
+        raise ValueError("train_residual_anchor_expert.scale_selection requires a non-empty validation loader.")
+    model.eval()
+    base_parts: List[torch.Tensor] = []
+    anchor_parts: List[torch.Tensor] = []
+    target_parts: List[torch.Tensor] = []
+    unit_cfg = dict(train_residual_anchor_cfg)
+    unit_cfg["enable"] = True
+    unit_cfg["alpha"] = 1.0
+    unit_cfg.pop("alpha_by_channel", None)
+    unit_cfg.pop("alpha_by_channel_horizon", None)
+    for x, y, idx in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=train_stat_anchor_pc,
+            cfg=train_stat_anchor_cfg,
+        )
+        y_anchor = apply_train_residual_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            residual_anchor_phc=residual_anchor_phc,
+            cfg=unit_cfg,
+        )
+        base_parts.append(y_base.detach().cpu())
+        anchor_parts.append(y_anchor.detach().cpu())
+        target_parts.append(y.detach().cpu())
+    base_bch = torch.cat(base_parts, dim=0)
+    anchor_bch = torch.cat(anchor_parts, dim=0)
+    target_bch = torch.cat(target_parts, dim=0)
+    if int(horizon_segments) > 1:
+        scales, scores = select_channel_horizon_anchor_scales(
+            base_bch,
+            anchor_bch,
+            target_bch,
+            metric=metric,
+            max_scale=float(max_scale),
+            steps=int(steps),
+            segments=int(horizon_segments),
+        )
+    else:
+        scales, scores = select_channel_anchor_scales(
+            base_bch,
+            anchor_bch,
+            target_bch,
+            metric=metric,
+            max_scale=float(max_scale),
+            steps=int(steps),
+        )
+    return scales, scores, int(base_bch.shape[0])
+
+
 @torch.no_grad()
 def eval_loop(
     model: nn.Module,
@@ -657,12 +1864,22 @@ def eval_loop(
     mae_objective_beta: float = 1.0,
     pred_residual: Optional[ClusterwisePredResidualMoE] = None,
     pred_residual_gate: Optional[nn.Module] = None,
+    pred_residual_selector: Optional[nn.Module] = None,
     pred_residual_scale_c: Optional[torch.Tensor] = None,
     residual_correction_ch: Optional[torch.Tensor] = None,
     knn_hybrid: ShapeKNNHybrid = None,
     knn_fusion_scale_ch: Optional[torch.Tensor] = None,
     knn_fusion_gate: Optional[nn.Module] = None,
     eval_start: int = 0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    calendar_feature_tf: Optional[torch.Tensor] = None,
+    calendar_residual_coef_cf: Optional[torch.Tensor] = None,
     diagnostic_collector: Optional[Dict[str, object]] = None,
 ):
     model.eval()
@@ -678,6 +1895,9 @@ def eval_loop(
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
+    moe_history_anchor_expert_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
+    train_stat_anchor_expert_cfg = moe_cfg.get("train_stat_anchor_expert", {}) or {}
+    train_residual_anchor_expert_cfg = moe_cfg.get("train_residual_anchor_expert", {}) or {}
 
     P = len(penalty_names)
     total_loss_sum = torch.zeros(K, device=device)
@@ -701,7 +1921,31 @@ def eval_loop(
         y = y.to(device, non_blocking=True)
         idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
 
-        yhat_base = model(x, cluster_id_c)
+        query_start_abs_b = eval_start + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        yhat_base_raw = model(x_model, cluster_id_c)
+        yhat_base = apply_history_anchor_adapter(
+            yhat_base_raw,
+            base_pred_bch=yhat_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len or x.shape[-1]),
+            cfg=history_anchor_cfg,
+        )
+        yhat_base = apply_train_stat_anchor_expert(
+            yhat_base,
+            base_pred_bch=yhat_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len or x.shape[-1]),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
 
         # Route on the base prediction. This keeps the router's penalty
         # context independent from the residual expert it is selecting.
@@ -758,7 +2002,17 @@ def eval_loop(
             )
             yhat_residual_raw = pred_out["y_final"]
             yhat = yhat_residual_raw
-            if pred_residual_gate is not None:
+            if pred_residual_selector is not None:
+                pred_residual_selector.eval()
+                cand_bcpH = _pred_residual_candidate_predictions(
+                    yhat_base,
+                    pred_out,
+                    pred_residual_scale_c=pred_residual_scale_c,
+                )
+                if cand_bcpH is not None:
+                    yhat, _ = pred_residual_selector.select_prediction(x, yhat_base, cand_bcpH)
+                    yhat_residual_raw = yhat
+            elif pred_residual_gate is not None:
                 pred_residual_gate.eval()
                 gate_feat = _knn_gate_features(x, yhat_base, yhat)
                 scale = pred_residual_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
@@ -800,9 +2054,41 @@ def eval_loop(
         else:
             yhat = yhat_base
 
+        if moe_enable and bool(moe_history_anchor_expert_cfg.get("enable", False)):
+            yhat = apply_moe_history_anchor_expert(
+                yhat,
+                base_pred_bch=yhat_base,
+                observed_history_tc=observed_history_tc,
+                query_start_abs_b=query_start_abs_b,
+                input_len=int(input_len or x.shape[-1]),
+                cfg=moe_history_anchor_expert_cfg,
+            )
+        if moe_enable and bool(train_stat_anchor_expert_cfg.get("enable", False)):
+            yhat = apply_train_stat_anchor_expert(
+                yhat,
+                base_pred_bch=yhat_base,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                input_len=int(input_len or x.shape[-1]),
+                stat_anchor_pc=train_stat_anchor_pc,
+                cfg=train_stat_anchor_expert_cfg,
+            )
+        if (
+            moe_enable
+            and bool(train_residual_anchor_expert_cfg.get("enable", False))
+            and train_residual_anchor_phc is not None
+        ):
+            yhat = apply_train_residual_anchor_expert(
+                yhat,
+                base_pred_bch=yhat_base,
+                query_start_abs_b=query_start_abs_b,
+                input_len=int(input_len or x.shape[-1]),
+                residual_anchor_phc=train_residual_anchor_phc,
+                cfg=train_residual_anchor_expert_cfg,
+            )
+
         if knn_hybrid is not None:
             yhat_pre_knn = yhat
-            query_start_abs_b = eval_start + idx
             yhat = knn_hybrid.hybridize_batch(x, yhat, cluster_id_c, query_start_abs_b=query_start_abs_b)
             if knn_fusion_scale_ch is not None:
                 scale = knn_fusion_scale_ch.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
@@ -815,28 +2101,46 @@ def eval_loop(
         if residual_correction_ch is not None:
             corr_ch = residual_correction_ch.to(device=yhat.device, dtype=yhat.dtype)
             yhat = yhat + corr_ch.unsqueeze(0)
+        yhat = apply_calendar_residual_correction(
+            yhat,
+            calendar_feature_tf=calendar_feature_tf,
+            calendar_residual_coef_cf=calendar_residual_coef_cf,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len or x.shape[-1]),
+        )
 
         if diagnostic_collector is not None:
             limit = int(diagnostic_collector.get("limit", 0))
             count = int(diagnostic_collector.get("count", 0))
-            take = max(0, min(int(x.shape[0]), limit - count))
-            if take > 0:
+            selected_idx = diagnostic_collector.get("indices")
+            if selected_idx is not None:
+                selected_idx = selected_idx.to(device=idx.device, dtype=torch.long)
+                take_pos = torch.isin(idx, selected_idx).nonzero(as_tuple=False).view(-1)
+                remaining = max(0, limit - count)
+                if int(take_pos.numel()) > remaining:
+                    take_pos = take_pos[:remaining]
+            else:
+                take = max(0, min(int(x.shape[0]), limit - count))
+                take_pos = torch.arange(take, device=x.device, dtype=torch.long)
+            if int(take_pos.numel()) > 0:
                 parts = diagnostic_collector.setdefault("parts", {})
-                parts.setdefault("idx", []).append((eval_start + idx[:take]).detach().cpu())
-                parts.setdefault("x", []).append(x[:take].detach().cpu())
-                parts.setdefault("y_true", []).append(y[:take].detach().cpu())
-                parts.setdefault("y_base", []).append(yhat_base[:take].detach().cpu())
-                parts.setdefault("y_residual_raw", []).append(yhat_residual_raw[:take].detach().cpu())
-                parts.setdefault("y_final", []).append(yhat[:take].detach().cpu())
+                parts.setdefault("idx", []).append((eval_start + idx.index_select(0, take_pos)).detach().cpu())
+                parts.setdefault("x", []).append(x.index_select(0, take_pos).detach().cpu())
+                parts.setdefault("y_true", []).append(y.index_select(0, take_pos).detach().cpu())
+                parts.setdefault("y_base", []).append(yhat_base.index_select(0, take_pos).detach().cpu())
+                parts.setdefault("y_residual_raw", []).append(yhat_residual_raw.index_select(0, take_pos).detach().cpu())
+                parts.setdefault("y_final", []).append(yhat.index_select(0, take_pos).detach().cpu())
                 if probs_bkp is not None:
-                    parts.setdefault("gate_probs", []).append(probs_bkp[:take].detach().cpu())
+                    parts.setdefault("gate_probs", []).append(probs_bkp.index_select(0, take_pos).detach().cpu())
                 if mask_bkp is not None:
-                    parts.setdefault("gate_mask", []).append(mask_bkp[:take].detach().cpu())
+                    parts.setdefault("gate_mask", []).append(mask_bkp.index_select(0, take_pos).detach().cpu())
                 if skip_bk is not None:
-                    parts.setdefault("skip_prob", []).append(skip_bk[:take].detach().cpu())
+                    parts.setdefault("skip_prob", []).append(skip_bk.index_select(0, take_pos).detach().cpu())
                 if residual_gate_scale is not None:
-                    parts.setdefault("residual_gate_scale", []).append(residual_gate_scale[:take].detach().cpu())
-                diagnostic_collector["count"] = count + take
+                    parts.setdefault("residual_gate_scale", []).append(
+                        residual_gate_scale.index_select(0, take_pos).detach().cpu()
+                    )
+                diagnostic_collector["count"] = count + int(take_pos.numel())
 
         # base error metrics per channel
         err_bch = yhat - y
@@ -978,6 +2282,376 @@ def estimate_residual_correction(
     return corr_ch.detach().cpu()
 
 
+def _calendar_features_from_datetime(
+    dates: pd.Series | pd.DatetimeIndex,
+    cfg: dict,
+) -> Tuple[torch.Tensor, List[str]]:
+    dt = pd.to_datetime(dates, errors="coerce")
+    if isinstance(dt, pd.Series):
+        dt = pd.DatetimeIndex(dt)
+    if dt.isna().any():
+        raise ValueError("calendar_residual requires parseable timestamps in data.date_col.")
+
+    features: List[np.ndarray] = []
+    names: List[str] = []
+    if bool(cfg.get("include_bias", True)):
+        features.append(np.ones(len(dt), dtype=np.float32))
+        names.append("bias")
+
+    harmonics = max(1, int(cfg.get("tod_harmonics", cfg.get("harmonics", 2))))
+    if bool(cfg.get("time_of_day", True)):
+        seconds = (
+            dt.hour.to_numpy(dtype=np.float32) * 3600.0
+            + dt.minute.to_numpy(dtype=np.float32) * 60.0
+            + dt.second.to_numpy(dtype=np.float32)
+        )
+        phase = seconds / float(24 * 3600)
+        for h in range(1, harmonics + 1):
+            angle = (2.0 * math.pi * float(h)) * phase
+            features.append(np.sin(angle).astype(np.float32))
+            names.append(f"tod_sin_{h}")
+            features.append(np.cos(angle).astype(np.float32))
+            names.append(f"tod_cos_{h}")
+
+    if bool(cfg.get("day_of_week", True)):
+        phase = dt.dayofweek.to_numpy(dtype=np.float32) / 7.0
+        angle = 2.0 * math.pi * phase
+        features.append(np.sin(angle).astype(np.float32))
+        names.append("dow_sin")
+        features.append(np.cos(angle).astype(np.float32))
+        names.append("dow_cos")
+
+    if bool(cfg.get("month_of_year", False)):
+        phase = (dt.month.to_numpy(dtype=np.float32) - 1.0) / 12.0
+        angle = 2.0 * math.pi * phase
+        features.append(np.sin(angle).astype(np.float32))
+        names.append("month_sin")
+        features.append(np.cos(angle).astype(np.float32))
+        names.append("month_cos")
+
+    if len(features) == 0:
+        raise ValueError("calendar_residual must enable at least one feature.")
+    return torch.from_numpy(np.stack(features, axis=1).astype(np.float32)), names
+
+
+def build_calendar_feature_tensor(csv_path: str, date_col: int, max_rows: int, cfg: dict) -> Tuple[torch.Tensor, List[str]]:
+    df = pd.read_csv(csv_path, usecols=[int(date_col)])
+    if int(max_rows or 0) > 0:
+        df = df.iloc[: int(max_rows)]
+    return _calendar_features_from_datetime(df.iloc[:, 0], cfg)
+
+
+def calendar_feature_batch(
+    calendar_feature_tf: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    pred_len: int,
+) -> torch.Tensor:
+    device = query_start_abs_b.device
+    steps_h = torch.arange(int(pred_len), device=device, dtype=torch.long)
+    idx_bh = query_start_abs_b.to(device=device, dtype=torch.long).view(-1, 1) + int(input_len) + steps_h.view(1, -1)
+    if int(idx_bh.min().item()) < 0 or int(idx_bh.max().item()) >= int(calendar_feature_tf.shape[0]):
+        raise ValueError("calendar_residual forecast index is outside timestamp range.")
+    flat = idx_bh.reshape(-1)
+    feat = calendar_feature_tf.to(device=device).index_select(0, flat)
+    return feat.view(idx_bh.shape[0], idx_bh.shape[1], int(calendar_feature_tf.shape[1]))
+
+
+def apply_calendar_residual_correction(
+    yhat_bch: torch.Tensor,
+    calendar_feature_tf: Optional[torch.Tensor],
+    calendar_residual_coef_cf: Optional[torch.Tensor],
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+) -> torch.Tensor:
+    if calendar_feature_tf is None or calendar_residual_coef_cf is None:
+        return yhat_bch
+    feat_bhf = calendar_feature_batch(
+        calendar_feature_tf=calendar_feature_tf,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len),
+        pred_len=int(yhat_bch.shape[-1]),
+    ).to(device=yhat_bch.device, dtype=yhat_bch.dtype)
+    coef_cf = calendar_residual_coef_cf.to(device=yhat_bch.device, dtype=yhat_bch.dtype)
+    return yhat_bch + torch.einsum("bhf,cf->bch", feat_bhf, coef_cf)
+
+
+def _solve_calendar_residual_coefficients(
+    xtx: torch.Tensor,
+    xty: Optional[torch.Tensor],
+    n_rows: int,
+    n_windows: int,
+    cfg: dict,
+) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
+    if xty is None or n_rows <= 0:
+        return None, {"enable": False, "reason": "no_fit_rows"}
+    feat_dim = int(xtx.shape[0])
+    ridge = max(0.0, float(cfg.get("ridge", 1.0e-3)))
+    shrink = float(cfg.get("shrink", 1.0))
+    max_abs = float(cfg.get("max_abs", 0.0))
+    eye = torch.eye(feat_dim, dtype=torch.float64, device=xtx.device)
+    if not bool(cfg.get("regularize_bias", False)) and feat_dim > 0:
+        eye[0, 0] = 0.0
+    coef_fc = torch.linalg.solve(xtx + ridge * eye, xty)
+    coef_cf = coef_fc.transpose(0, 1).to(dtype=torch.float32) * float(shrink)
+    if max_abs > 0.0:
+        coef_cf = coef_cf.clamp(min=-max_abs, max=max_abs)
+    return coef_cf.detach(), {
+        "enable": True,
+        "source_split": str(cfg.get("source_split", "train")),
+        "fit_windows": int(n_windows),
+        "fit_rows": int(n_rows),
+        "feature_dim": int(feat_dim),
+        "ridge": float(ridge),
+        "shrink": float(shrink),
+        "max_abs": float(max_abs),
+        "coef_mean_abs": float(coef_cf.abs().mean().item()),
+        "coef_max_abs": float(coef_cf.abs().max().item()),
+    }
+
+
+def _fit_calendar_residual_from_prediction_parts(
+    idx_parts: List[torch.Tensor],
+    y_true_parts: List[torch.Tensor],
+    y_pred_parts: List[torch.Tensor],
+    calendar_feature_tf: torch.Tensor,
+    input_len: int,
+    cfg: dict,
+) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
+    if len(idx_parts) == 0:
+        return None, {"enable": False, "reason": "empty_prediction_parts"}
+    device = calendar_feature_tf.device
+    feat_dim = int(calendar_feature_tf.shape[1])
+    xtx = torch.zeros((feat_dim, feat_dim), dtype=torch.float64, device=device)
+    xty = None
+    n_rows = 0
+    n_windows = 0
+    max_windows = int(cfg.get("max_windows", 0) or 0)
+    for idx_part, y_true_part, y_pred_part in zip(idx_parts, y_true_parts, y_pred_parts):
+        if max_windows > 0 and n_windows >= max_windows:
+            break
+        idx = idx_part.to(device=device, dtype=torch.long)
+        y_true = y_true_part.to(device=device)
+        y_pred = y_pred_part.to(device=device, dtype=y_true.dtype)
+        if max_windows > 0 and n_windows + int(idx.shape[0]) > max_windows:
+            keep = max(0, max_windows - n_windows)
+            idx = idx[:keep]
+            y_true = y_true[:keep]
+            y_pred = y_pred[:keep]
+        feat_bhf = calendar_feature_batch(
+            calendar_feature_tf=calendar_feature_tf,
+            query_start_abs_b=idx,
+            input_len=int(input_len),
+            pred_len=int(y_true.shape[-1]),
+        ).to(device=device, dtype=torch.float64)
+        feat_nf = feat_bhf.reshape(-1, feat_dim)
+        residual_nc = (y_true - y_pred).permute(0, 2, 1).reshape(-1, y_true.shape[1]).to(dtype=torch.float64)
+        xtx += feat_nf.transpose(0, 1).matmul(feat_nf)
+        batch_xty = feat_nf.transpose(0, 1).matmul(residual_nc)
+        xty = batch_xty if xty is None else xty + batch_xty
+        n_rows += int(feat_nf.shape[0])
+        n_windows += int(idx.shape[0])
+    coef_cf, summary = _solve_calendar_residual_coefficients(
+        xtx=xtx,
+        xty=xty,
+        n_rows=n_rows,
+        n_windows=n_windows,
+        cfg=cfg,
+    )
+    summary["fit_target"] = "prediction_parts"
+    return coef_cf, summary
+
+
+@torch.no_grad()
+def fit_calendar_residual_correction(
+    model: nn.Module,
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    device: torch.device,
+    calendar_feature_tf: torch.Tensor,
+    input_len: int,
+    eval_start: int,
+    cfg: dict,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
+    if len(loader) == 0:
+        return None, {"enable": False, "reason": "empty_loader"}
+    max_windows = int(cfg.get("max_windows", 0) or 0)
+
+    model.eval()
+    feat_dim = int(calendar_feature_tf.shape[1])
+    xtx = torch.zeros((feat_dim, feat_dim), dtype=torch.float64, device=device)
+    xty = None
+    n_rows = 0
+    n_windows = 0
+
+    for x, y, idx in loader:
+        if max_windows > 0 and n_windows >= max_windows:
+            break
+        if max_windows > 0 and n_windows + int(x.shape[0]) > max_windows:
+            keep = max(0, max_windows - n_windows)
+            x = x[:keep]
+            y = y[:keep]
+            idx = idx[:keep]
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        yhat = model(x_model, cluster_id_c)
+        yhat = apply_history_anchor_adapter(
+            yhat,
+            base_pred_bch=yhat,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        feat_bhf = calendar_feature_batch(
+            calendar_feature_tf=calendar_feature_tf,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            pred_len=int(y.shape[-1]),
+        ).to(device=device, dtype=torch.float64)
+        feat_nf = feat_bhf.reshape(-1, feat_dim)
+        residual_nc = (y - yhat).permute(0, 2, 1).reshape(-1, y.shape[1]).to(dtype=torch.float64)
+        xtx += feat_nf.transpose(0, 1).matmul(feat_nf)
+        batch_xty = feat_nf.transpose(0, 1).matmul(residual_nc)
+        xty = batch_xty if xty is None else xty + batch_xty
+        n_rows += int(feat_nf.shape[0])
+        n_windows += int(x.shape[0])
+
+    coef_cf, summary = _solve_calendar_residual_coefficients(
+        xtx=xtx,
+        xty=xty,
+        n_rows=n_rows,
+        n_windows=n_windows,
+        cfg=cfg,
+    )
+    summary["fit_target"] = "base_path"
+    return coef_cf, summary
+
+
+@torch.no_grad()
+def fit_calendar_residual_correction_from_eval_path(
+    model: nn.Module,
+    gate: ClusterwiseMoEGate,
+    lambda_kp: torch.Tensor,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    calendar_feature_tf: torch.Tensor,
+    input_len: int,
+    cfg: dict,
+    channel_count: int,
+    select_ranks: Optional[List[int]] = None,
+    mse_weight: float = 1.0,
+    gate_entropy_weight: float = 0.0,
+    gate_balance_weight: float = 0.0,
+    gate_soft_weight: float = 0.0,
+    gate_entropy_target_frac: float = 0.0,
+    penalty_scale: Optional[torch.Tensor] = None,
+    dynamic_lambda: Optional[ClusterwiseDynamicLambda] = None,
+    lambda_min_kp: Optional[torch.Tensor] = None,
+    mae_objective_weight: float = 0.0,
+    mae_objective_kind: str = "l1",
+    mae_objective_beta: float = 1.0,
+    pred_residual: Optional[ClusterwisePredResidualMoE] = None,
+    pred_residual_gate: Optional[nn.Module] = None,
+    pred_residual_selector: Optional[nn.Module] = None,
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
+    residual_correction_ch: Optional[torch.Tensor] = None,
+    knn_hybrid: ShapeKNNHybrid = None,
+    knn_fusion_scale_ch: Optional[torch.Tensor] = None,
+    knn_fusion_gate: Optional[nn.Module] = None,
+    eval_start: int = 0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
+    if len(loader) == 0:
+        return None, {"enable": False, "reason": "empty_loader"}
+    max_windows = int(cfg.get("max_windows", 0) or 0)
+    try:
+        loader_windows = int(len(loader.dataset))
+    except Exception:
+        loader_windows = int(len(loader))
+    collect_limit = loader_windows if max_windows <= 0 else min(loader_windows, max_windows)
+    diagnostic_collector: Dict[str, object] = {"limit": int(collect_limit), "count": 0, "parts": {}}
+    eval_loop(
+        model=model,
+        gate=gate,
+        lambda_kp=lambda_kp,
+        penalty_names=penalty_names,
+        penalty_fns=penalty_fns,
+        loader=loader,
+        cluster_id_c=cluster_id_c,
+        K=K,
+        moe_cfg=moe_cfg,
+        device=device,
+        select_ranks=select_ranks,
+        collect_plot=False,
+        channel_count=channel_count,
+        mse_weight=mse_weight,
+        gate_entropy_weight=gate_entropy_weight,
+        gate_balance_weight=gate_balance_weight,
+        gate_soft_weight=gate_soft_weight,
+        gate_entropy_target_frac=gate_entropy_target_frac,
+        penalty_scale=penalty_scale,
+        dynamic_lambda=dynamic_lambda,
+        lambda_min_kp=lambda_min_kp,
+        mae_objective_weight=mae_objective_weight,
+        mae_objective_kind=mae_objective_kind,
+        mae_objective_beta=mae_objective_beta,
+        pred_residual=pred_residual,
+        pred_residual_gate=pred_residual_gate,
+        pred_residual_selector=pred_residual_selector,
+        pred_residual_scale_c=pred_residual_scale_c,
+        residual_correction_ch=residual_correction_ch,
+        knn_hybrid=knn_hybrid,
+        knn_fusion_scale_ch=knn_fusion_scale_ch,
+        knn_fusion_gate=knn_fusion_gate,
+        eval_start=eval_start,
+        history_anchor_cfg=history_anchor_cfg,
+        observed_history_tc=observed_history_tc,
+        input_len=input_len,
+        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+        calendar_feature_tf=None,
+        calendar_residual_coef_cf=None,
+        diagnostic_collector=diagnostic_collector,
+    )
+    parts = diagnostic_collector.get("parts", {}) or {}
+    coef_cf, summary = _fit_calendar_residual_from_prediction_parts(
+        idx_parts=list(parts.get("idx", [])),
+        y_true_parts=list(parts.get("y_true", [])),
+        y_pred_parts=list(parts.get("y_final", [])),
+        calendar_feature_tf=calendar_feature_tf,
+        input_len=input_len,
+        cfg=cfg,
+    )
+    summary["fit_target"] = "final_eval_path"
+    summary["fit_eval_start"] = int(eval_start)
+    return coef_cf, summary
+
+
 @torch.no_grad()
 def estimate_knn_fusion_scale(
     model: nn.Module,
@@ -1092,6 +2766,196 @@ def _knn_gate_features(
         ],
         dim=-1,
     )
+
+
+def _pred_residual_candidate_predictions(
+    y_base_bch: torch.Tensor,
+    pred_out: Dict[str, torch.Tensor],
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    residuals = pred_out.get("residuals")
+    alpha_cp = pred_out.get("alpha_cp")
+    intervention_bcp = pred_out.get("intervention_bcp")
+    selector_bcp = pred_out.get("selector_bcp")
+    if residuals is None or alpha_cp is None or intervention_bcp is None:
+        return None
+    if residuals.numel() == 0:
+        return None
+    if selector_bcp is None:
+        selector_bcp = torch.ones_like(intervention_bcp)
+    scale_bcp = intervention_bcp * selector_bcp * alpha_cp.unsqueeze(0)
+    if pred_residual_scale_c is not None:
+        channel_scale = pred_residual_scale_c.to(device=y_base_bch.device, dtype=y_base_bch.dtype).view(1, -1, 1)
+        scale_bcp = scale_bcp * channel_scale
+    return y_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
+
+
+def _candidate_selector_targets(
+    *,
+    base_bch: torch.Tensor,
+    cand_bcpH: torch.Tensor,
+    y_bch: torch.Tensor,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+) -> torch.Tensor:
+    base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
+    cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
+    best_err_bc, best_p_bc = cand_err_bcp.min(dim=-1)
+    gain_bc = base_err_bc - best_err_bc
+    required_bc = torch.maximum(
+        torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
+        max(0.0, float(min_rel_improvement)) * base_err_bc.abs().clamp_min(1.0e-12),
+    )
+    return torch.where(gain_bc > required_bc, best_p_bc.to(dtype=torch.long) + 1, torch.zeros_like(best_p_bc))
+
+
+class PredResidualCandidateSelector(nn.Module):
+    def __init__(
+        self,
+        feat_dim: int,
+        num_channels: int,
+        num_penalties: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.0,
+        init_skip_bias: float = 0.0,
+        init_penalty_bias: float = 0.0,
+        use_penalty_identity: bool = False,
+    ):
+        super().__init__()
+        self.base_F = int(feat_dim)
+        self.C = int(num_channels)
+        self.P = int(num_penalties)
+        self.use_penalty_identity = bool(use_penalty_identity)
+        self.F = self.base_F + (self.P if self.use_penalty_identity else 0)
+        hidden = int(hidden_dim)
+        self.register_buffer("feature_mean", torch.zeros(1, 1, self.F), persistent=True)
+        self.register_buffer("feature_std", torch.ones(1, 1, self.F), persistent=True)
+        self.register_buffer("feature_standardize_enabled", torch.tensor(0.0), persistent=True)
+        self.net = nn.Sequential(
+            nn.Linear(self.F, hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
+            nn.Linear(hidden, 1),
+        )
+        self.skip_net = nn.Sequential(
+            nn.Linear(self.F, hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
+            nn.Linear(hidden, 1),
+        )
+        self.skip_bias = nn.Parameter(torch.full((self.C,), float(init_skip_bias)))
+        self.penalty_bias = nn.Parameter(torch.full((self.P,), float(init_penalty_bias)))
+        self.penalty_channel_bias = nn.Parameter(torch.zeros(self.C, self.P))
+        self.decision_margin = 0.0
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for module in list(self.net) + list(self.skip_net):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        for seq in (self.net, self.skip_net):
+            last = seq[-1]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+
+    def set_feature_standardization(self, mean_f: torch.Tensor, std_f: torch.Tensor) -> None:
+        mean = mean_f.detach().view(1, 1, self.F).to(device=self.feature_mean.device, dtype=self.feature_mean.dtype)
+        std = std_f.detach().view(1, 1, self.F).to(device=self.feature_std.device, dtype=self.feature_std.dtype)
+        self.feature_mean.copy_(mean)
+        self.feature_std.copy_(std.clamp_min(1.0e-6))
+        self.feature_standardize_enabled.fill_(1.0)
+
+    def _standardize_feat(self, feat: torch.Tensor) -> torch.Tensor:
+        if bool(self.feature_standardize_enabled.item() > 0.5):
+            feat = (feat - self.feature_mean.to(device=feat.device, dtype=feat.dtype)) / self.feature_std.to(
+                device=feat.device,
+                dtype=feat.dtype,
+            )
+        return feat
+
+    def _append_penalty_identity(
+        self,
+        skip_feat_bcf: torch.Tensor,
+        cand_feat_bcpf: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_penalty_identity:
+            return skip_feat_bcf, cand_feat_bcpf
+        if int(skip_feat_bcf.shape[-1]) != self.base_F or int(cand_feat_bcpf.shape[-1]) != self.base_F:
+            raise ValueError(
+                f"Candidate selector expected base feature dim {self.base_F}, "
+                f"got skip={int(skip_feat_bcf.shape[-1])}, cand={int(cand_feat_bcpf.shape[-1])}."
+            )
+        P = int(cand_feat_bcpf.shape[2])
+        if P != self.P:
+            raise ValueError(f"Candidate selector expected {self.P} penalties, got {P}.")
+        skip_eye = torch.zeros(
+            *skip_feat_bcf.shape[:-1],
+            self.P,
+            device=skip_feat_bcf.device,
+            dtype=skip_feat_bcf.dtype,
+        )
+        eye = torch.eye(self.P, device=cand_feat_bcpf.device, dtype=cand_feat_bcpf.dtype).view(1, 1, self.P, self.P)
+        eye = eye.expand(*cand_feat_bcpf.shape[:2], self.P, self.P)
+        return torch.cat([skip_feat_bcf, skip_eye], dim=-1), torch.cat([cand_feat_bcpf, eye], dim=-1)
+
+    def logits_from_features(
+        self,
+        skip_feat_bcf: torch.Tensor,
+        cand_feat_bcpf: torch.Tensor,
+        apply_decision_margin: bool = False,
+    ) -> torch.Tensor:
+        skip_feat_bcf, cand_feat_bcpf = self._append_penalty_identity(skip_feat_bcf, cand_feat_bcpf)
+        skip_feat_bcf = self._standardize_feat(skip_feat_bcf)
+        cand_feat_bcpf = self._standardize_feat(cand_feat_bcpf)
+        skip_score_bc = self.skip_net(skip_feat_bcf).squeeze(-1) + self.skip_bias.view(1, -1)
+        cand_score_bcp = self.net(cand_feat_bcpf).squeeze(-1)
+        cand_score_bcp = cand_score_bcp + self.penalty_bias.view(1, 1, -1)
+        cand_score_bcp = cand_score_bcp + self.penalty_channel_bias.view(1, self.C, self.P)
+        if apply_decision_margin:
+            margin = torch.as_tensor(
+                float(getattr(self, "decision_margin", 0.0)),
+                device=cand_score_bcp.device,
+                dtype=cand_score_bcp.dtype,
+            )
+            cand_score_bcp = cand_score_bcp - margin
+        return torch.cat([skip_score_bc.unsqueeze(-1), cand_score_bcp], dim=-1)
+
+    def logits(self, x_bcl: torch.Tensor, base_bch: torch.Tensor, cand_bcpH: torch.Tensor) -> torch.Tensor:
+        skip_feat = _knn_gate_features(x_bcl, base_bch, base_bch)
+        cand_feat = torch.stack(
+            [_knn_gate_features(x_bcl, base_bch, cand_bcpH[:, :, p, :]) for p in range(int(cand_bcpH.shape[2]))],
+            dim=2,
+        )
+        return self.logits_from_features(skip_feat, cand_feat)
+
+    def select_from_features(
+        self,
+        skip_feat_bcf: torch.Tensor,
+        cand_feat_bcpf: torch.Tensor,
+        base_bch: torch.Tensor,
+        cand_bcpH: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits_bcq = self.logits_from_features(skip_feat_bcf, cand_feat_bcpf, apply_decision_margin=True)
+        selected_class_bc = logits_bcq.argmax(dim=-1)
+        all_pred_bcqh = torch.cat([base_bch.unsqueeze(2), cand_bcpH], dim=2)
+        gather_idx = selected_class_bc.view(*selected_class_bc.shape, 1, 1).expand(-1, -1, 1, int(base_bch.shape[-1]))
+        selected_bch = all_pred_bcqh.gather(2, gather_idx).squeeze(2)
+        return selected_bch, selected_class_bc
+
+    def select_prediction(
+        self,
+        x_bcl: torch.Tensor,
+        base_bch: torch.Tensor,
+        cand_bcpH: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        skip_feat = _knn_gate_features(x_bcl, base_bch, base_bch)
+        cand_feat = torch.stack(
+            [_knn_gate_features(x_bcl, base_bch, cand_bcpH[:, :, p, :]) for p in range(int(cand_bcpH.shape[2]))],
+            dim=2,
+        )
+        return self.select_from_features(skip_feat, cand_feat, base_bch, cand_bcpH)
 
 
 def _activation_feature_mask_for_mode(mode: str, feat_dim: int) -> torch.Tensor:
@@ -1457,6 +3321,10 @@ def _collect_pred_residual_gate_tensors(
     penalty_scale: Optional[torch.Tensor],
     select_ranks: Optional[List[int]] = None,
     gate_soft_weight: float = 0.0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
 ) -> Optional[Dict[str, torch.Tensor]]:
     if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
         return None
@@ -1477,10 +3345,19 @@ def _collect_pred_residual_gate_tensors(
     base_parts = []
     delta_parts = []
     y_parts = []
-    for x, y, _ in loader:
+    for x, y, idx in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        y_base = model(x, cluster_id_c)
+        idx = idx.to(device=device, dtype=torch.long)
+        y_base_raw = model(x, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=int(eval_start) + idx,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
         feat_bcf = extract_gate_features(x)
         feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
         route_pen_bkp = _router_penalty_context_from_history(
@@ -1975,6 +3852,10 @@ def evaluate_gate_penalty_hit_metrics(
     select_ranks: Optional[List[int]],
     gate_soft_weight: float,
     label_min_improvement: float = 0.0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
 ) -> Optional[Dict[str, object]]:
     if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
         return None
@@ -2001,10 +3882,19 @@ def evaluate_gate_penalty_hit_metrics(
     positive_oracle_count_p = torch.zeros(P, dtype=torch.long)
     min_improvement = max(0.0, float(label_min_improvement))
 
-    for x, y, _ in loader:
+    for x, y, idx in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        y_base = model(x, cluster_id_c)
+        idx = idx.to(device=device, dtype=torch.long)
+        y_base_raw = model(x, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=int(eval_start) + idx,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
         feat_bcf = extract_gate_features(x)
         feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
         route_pen_bkp = _router_penalty_context_from_history(
@@ -2161,6 +4051,7 @@ def evaluate_penalty_explainability(
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
+    moe_history_anchor_expert_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
 
     P = len(penalty_names)
     cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
@@ -2455,6 +4346,10 @@ def train_pred_residual_gate(
     gate_soft_weight: float,
     channel_names: List[str],
     cfg: Dict[str, object],
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
 ) -> Tuple[Optional[KNNResidualGate], Dict[str, object]]:
     tensors = _collect_pred_residual_gate_tensors(
         model=model,
@@ -2470,6 +4365,10 @@ def train_pred_residual_gate(
         penalty_scale=penalty_scale,
         select_ranks=select_ranks,
         gate_soft_weight=gate_soft_weight,
+        history_anchor_cfg=history_anchor_cfg,
+        observed_history_tc=observed_history_tc,
+        input_len=input_len,
+        eval_start=eval_start,
     )
     if tensors is None:
         return None, {"enable": False, "reason": "empty_loader_or_residual_disabled"}
@@ -2841,6 +4740,456 @@ def train_pred_residual_gate(
     return residual_gate, summary
 
 
+@torch.no_grad()
+def _collect_pred_residual_selector_tensors(
+    model: nn.Module,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_count: int,
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
+) -> Optional[Dict[str, torch.Tensor]]:
+    if len(loader) == 0 or pred_residual is None or int(penalty_count) <= 0:
+        return None
+    if not bool(moe_cfg.get("enable", True)):
+        return None
+
+    model.eval()
+    pred_residual.eval()
+    skip_feat_parts = []
+    cand_feat_parts = []
+    base_parts = []
+    cand_parts = []
+    y_parts = []
+    P = int(penalty_count)
+    for x, y, idx in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long)
+        y_base_raw = model(x, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=int(eval_start) + idx,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        mask_all_bkp = torch.ones(x.shape[0], int(K), P, device=device, dtype=y_base.dtype)
+        pred_out = pred_residual(
+            x,
+            y_base,
+            cluster_id_c,
+            mask_all_bkp,
+            skip_bk=None,
+        )
+        cand_bcpH = _pred_residual_candidate_predictions(
+            y_base,
+            pred_out,
+            pred_residual_scale_c=pred_residual_scale_c,
+        )
+        if cand_bcpH is None:
+            continue
+        skip_feat = _knn_gate_features(x, y_base, y_base)
+        cand_feat = torch.stack(
+            [_knn_gate_features(x, y_base, cand_bcpH[:, :, p, :]) for p in range(P)],
+            dim=2,
+        )
+        skip_feat_parts.append(skip_feat.detach().cpu())
+        cand_feat_parts.append(cand_feat.detach().cpu())
+        base_parts.append(y_base.detach().cpu())
+        cand_parts.append(cand_bcpH.detach().cpu())
+        y_parts.append(y.detach().cpu())
+
+    if len(skip_feat_parts) == 0:
+        return None
+    return {
+        "skip_feat": torch.cat(skip_feat_parts, dim=0),
+        "cand_feat": torch.cat(cand_feat_parts, dim=0),
+        "base": torch.cat(base_parts, dim=0),
+        "cand": torch.cat(cand_parts, dim=0),
+        "y": torch.cat(y_parts, dim=0),
+    }
+
+
+@torch.no_grad()
+def _pred_residual_selector_metrics_from_tensors(
+    tensors: Optional[Dict[str, torch.Tensor]],
+    selector: Optional[PredResidualCandidateSelector],
+    device: torch.device,
+    batch_size: int,
+    min_abs_improvement: float,
+    min_rel_improvement: float,
+    indices: Optional[torch.Tensor] = None,
+    penalty_names: Optional[List[str]] = None,
+) -> Optional[Dict[str, object]]:
+    if tensors is None or selector is None:
+        return None
+    skip_feat = tensors["skip_feat"]
+    cand_feat = tensors["cand_feat"]
+    base = tensors["base"]
+    cand = tensors["cand"]
+    y = tensors["y"]
+    n = int(base.shape[0])
+    if n == 0:
+        return None
+    if indices is None:
+        indices = torch.arange(0, n, dtype=torch.long)
+    else:
+        indices = indices.detach().cpu().to(dtype=torch.long)
+    if int(indices.numel()) == 0:
+        return None
+
+    selector.eval()
+    P = int(cand.shape[2])
+    q = P + 1
+    batch_size = max(1, int(batch_size))
+    base_se = selected_se = target_se = oracle_se = 0.0
+    denom = 0
+    correct = 0
+    total_bc = 0
+    selected_count_q = torch.zeros(q, dtype=torch.long)
+    target_count_q = torch.zeros(q, dtype=torch.long)
+    oracle_count_q = torch.zeros(q, dtype=torch.long)
+    for b0 in range(0, int(indices.numel()), batch_size):
+        batch_idx = indices[b0:b0 + batch_size]
+        skip_feat_b = skip_feat.index_select(0, batch_idx).to(device)
+        cand_feat_b = cand_feat.index_select(0, batch_idx).to(device)
+        base_b = base.index_select(0, batch_idx).to(device)
+        cand_b = cand.index_select(0, batch_idx).to(device)
+        y_b = y.index_select(0, batch_idx).to(device)
+        selected_b, selected_class_b = selector.select_from_features(skip_feat_b, cand_feat_b, base_b, cand_b)
+        target_b = _candidate_selector_targets(
+            base_bch=base_b,
+            cand_bcpH=cand_b,
+            y_bch=y_b,
+            min_abs_improvement=min_abs_improvement,
+            min_rel_improvement=min_rel_improvement,
+        )
+        all_pred_bq = torch.cat([base_b.unsqueeze(2), cand_b], dim=2)
+        target_pred_b = all_pred_bq.gather(
+            2,
+            target_b.view(*target_b.shape, 1, 1).expand(-1, -1, 1, int(base_b.shape[-1])),
+        ).squeeze(2)
+        base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
+        cand_err_bcp = (cand_b - y_b.unsqueeze(2)).pow(2).mean(dim=-1)
+        oracle_err_bc, oracle_p_bc = cand_err_bcp.min(dim=-1)
+        selected_se += float((selected_b - y_b).pow(2).sum().item())
+        target_se += float((target_pred_b - y_b).pow(2).sum().item())
+        oracle_se += float(oracle_err_bc.sum().item() * y_b.shape[-1])
+        base_se += float((base_b - y_b).pow(2).sum().item())
+        denom += int(y_b.numel())
+        total_bc += int(target_b.numel())
+        correct += int((selected_class_b == target_b).sum().item())
+        selected_count_q += torch.bincount(selected_class_b.detach().cpu().reshape(-1), minlength=q)[:q]
+        target_count_q += torch.bincount(target_b.detach().cpu().reshape(-1), minlength=q)[:q]
+        oracle_count_q += torch.bincount((oracle_p_bc.detach().cpu().reshape(-1) + 1), minlength=q)[:q]
+
+    if denom <= 0:
+        return None
+    base_mse = base_se / max(denom, 1)
+    selected_mse = selected_se / max(denom, 1)
+    target_mse = target_se / max(denom, 1)
+    oracle_mse = oracle_se / max(denom, 1)
+    names = ["skip"] + [str(name) for name in (penalty_names or [f"p{p}" for p in range(P)])]
+    return {
+        "samples": int(total_bc),
+        "accuracy": float(correct / max(total_bc, 1)),
+        "base_mse": float(base_mse),
+        "selected_mse": float(selected_mse),
+        "target_mse": float(target_mse),
+        "oracle_mse": float(oracle_mse),
+        "selected_gain_pct_vs_base": float(100.0 * (base_mse - selected_mse) / max(abs(base_mse), 1.0e-12)),
+        "target_gain_pct_vs_base": float(100.0 * (base_mse - target_mse) / max(abs(base_mse), 1.0e-12)),
+        "oracle_gain_pct_vs_base": float(100.0 * (base_mse - oracle_mse) / max(abs(base_mse), 1.0e-12)),
+        "selected_class_rate": {
+            names[i]: float(selected_count_q[i].item() / max(total_bc, 1)) for i in range(q)
+        },
+        "target_class_rate": {
+            names[i]: float(target_count_q[i].item() / max(total_bc, 1)) for i in range(q)
+        },
+        "oracle_class_rate": {
+            names[i]: float(oracle_count_q[i].item() / max(total_bc, 1)) for i in range(q)
+        },
+    }
+
+
+def train_pred_residual_candidate_selector(
+    model: nn.Module,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_names: List[str],
+    channel_names: List[str],
+    cfg: Dict[str, object],
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
+) -> Tuple[Optional[PredResidualCandidateSelector], Dict[str, object]]:
+    tensors = _collect_pred_residual_selector_tensors(
+        model=model,
+        pred_residual=pred_residual,
+        loader=loader,
+        cluster_id_c=cluster_id_c,
+        K=K,
+        moe_cfg=moe_cfg,
+        device=device,
+        penalty_count=len(penalty_names),
+        pred_residual_scale_c=pred_residual_scale_c,
+        history_anchor_cfg=history_anchor_cfg,
+        observed_history_tc=observed_history_tc,
+        input_len=input_len,
+        eval_start=eval_start,
+    )
+    if tensors is None:
+        return None, {"enable": False, "reason": "empty_loader_or_residual_disabled"}
+
+    skip_feat = tensors["skip_feat"]
+    cand_feat = tensors["cand_feat"]
+    base = tensors["base"]
+    cand = tensors["cand"]
+    y = tensors["y"]
+    n = int(base.shape[0])
+    c = int(base.shape[1])
+    p = int(cand.shape[2])
+    train_fraction = float(cfg.get("train_fraction", 0.75))
+    split = int(max(1, min(n - 1, round(n * train_fraction)))) if n > 1 else n
+    train_idx = torch.arange(0, split, dtype=torch.long)
+    hold_idx = torch.arange(split, n, dtype=torch.long)
+    if hold_idx.numel() == 0:
+        hold_idx = train_idx
+
+    selector = PredResidualCandidateSelector(
+        feat_dim=int(skip_feat.shape[-1]),
+        num_channels=c,
+        num_penalties=p,
+        hidden_dim=int(cfg.get("hidden_dim", 64)),
+        dropout=float(cfg.get("dropout", 0.0)),
+        init_skip_bias=float(cfg.get("init_skip_bias", 0.0)),
+        init_penalty_bias=float(cfg.get("init_penalty_bias", 0.0)),
+        use_penalty_identity=bool(cfg.get("use_penalty_identity", False)),
+    ).to(device)
+    standardize_features = bool(cfg.get("standardize_features", True))
+    feature_std_summary: Dict[str, object] = {
+        "standardize_features": bool(standardize_features),
+        "fit_windows": int(train_idx.numel()) if standardize_features else 0,
+        "min_std": None,
+        "max_std": None,
+    }
+    if standardize_features:
+        skip_train_raw = skip_feat.index_select(0, train_idx)
+        cand_train_raw = cand_feat.index_select(0, train_idx)
+        skip_train_aug, cand_train_aug = selector._append_penalty_identity(skip_train_raw, cand_train_raw)
+        skip_train = skip_train_aug.reshape(-1, int(skip_train_aug.shape[-1]))
+        cand_train = cand_train_aug.reshape(-1, int(cand_train_aug.shape[-1]))
+        feat_train = torch.cat([skip_train, cand_train], dim=0)
+        feat_mean = feat_train.mean(dim=0)
+        feat_std = feat_train.std(dim=0, unbiased=False).clamp_min(1.0e-6)
+        selector.set_feature_standardization(feat_mean.to(device), feat_std.to(device))
+        feature_std_summary.update({"min_std": float(feat_std.min().item()), "max_std": float(feat_std.max().item())})
+
+    min_abs_improvement = float(cfg.get("label_min_abs_improvement", cfg.get("min_abs_improvement", 0.0)))
+    min_rel_improvement = float(cfg.get("label_min_rel_improvement", cfg.get("min_rel_improvement", 0.0)))
+    lr = float(cfg.get("lr", 1.0e-3))
+    weight_decay = float(cfg.get("weight_decay", 1.0e-4))
+    batch_size = max(1, int(cfg.get("batch_size", 256)))
+    epochs = max(1, int(cfg.get("epochs", 40)))
+    grad_clip = float(cfg.get("grad_clip", 1.0))
+    positive_sample_weight = float(cfg.get("positive_sample_weight", 1.0))
+    negative_sample_weight = float(cfg.get("negative_sample_weight", 1.0))
+    class_weight_cfg = cfg.get("class_weight", "auto")
+    class_weight = None
+    class_weight_summary: object = None
+    train_target = _candidate_selector_targets(
+        base_bch=base.index_select(0, train_idx),
+        cand_bcpH=cand.index_select(0, train_idx),
+        y_bch=y.index_select(0, train_idx),
+        min_abs_improvement=min_abs_improvement,
+        min_rel_improvement=min_rel_improvement,
+    ).reshape(-1)
+    if isinstance(class_weight_cfg, str) and class_weight_cfg.lower() == "auto":
+        counts = torch.bincount(train_target, minlength=p + 1).to(dtype=torch.float32)
+        total = counts.sum().clamp_min(1.0)
+        weight = total / (float(p + 1) * counts.clamp_min(1.0))
+        weight = weight.clamp(
+            min=float(cfg.get("class_weight_min", 0.25)),
+            max=float(cfg.get("class_weight_max", 8.0)),
+        )
+        class_weight = weight.to(device)
+        class_weight_summary = [float(v) for v in weight.tolist()]
+    elif isinstance(class_weight_cfg, (list, tuple)):
+        weight = torch.as_tensor(class_weight_cfg, dtype=torch.float32)
+        if int(weight.numel()) != p + 1:
+            raise ValueError(f"candidate_selector.class_weight must have {p + 1} entries.")
+        class_weight = weight.to(device)
+        class_weight_summary = [float(v) for v in weight.tolist()]
+    elif isinstance(class_weight_cfg, str) and class_weight_cfg.lower() in {"none", "false", "off", "0"}:
+        class_weight = None
+        class_weight_summary = None
+    elif bool(class_weight_cfg):
+        scalar = float(class_weight_cfg)
+        class_weight = torch.ones(p + 1, dtype=torch.float32, device=device)
+        class_weight[1:] = scalar
+        class_weight_summary = [float(v) for v in class_weight.detach().cpu().tolist()]
+
+    opt = torch.optim.AdamW(selector.parameters(), lr=lr, weight_decay=weight_decay)
+    best_state = None
+    best_hold = float("inf")
+    best_epoch = 0
+
+    def _loss_for(batch_idx: torch.Tensor) -> torch.Tensor:
+        skip_feat_b = skip_feat.index_select(0, batch_idx).to(device)
+        cand_feat_b = cand_feat.index_select(0, batch_idx).to(device)
+        base_b = base.index_select(0, batch_idx).to(device)
+        cand_b = cand.index_select(0, batch_idx).to(device)
+        y_b = y.index_select(0, batch_idx).to(device)
+        target_b = _candidate_selector_targets(
+            base_bch=base_b,
+            cand_bcpH=cand_b,
+            y_bch=y_b,
+            min_abs_improvement=min_abs_improvement,
+            min_rel_improvement=min_rel_improvement,
+        )
+        logits_bcq = selector.logits_from_features(skip_feat_b, cand_feat_b)
+        loss_bc = torch.nn.functional.cross_entropy(
+            logits_bcq.reshape(-1, p + 1),
+            target_b.reshape(-1),
+            weight=class_weight,
+            reduction="none",
+        ).view_as(target_b).to(dtype=logits_bcq.dtype)
+        if positive_sample_weight != 1.0 or negative_sample_weight != 1.0:
+            sample_weight = torch.where(
+                target_b > 0,
+                torch.full_like(loss_bc, positive_sample_weight),
+                torch.full_like(loss_bc, negative_sample_weight),
+            )
+            loss_bc = loss_bc * sample_weight
+        return loss_bc.mean()
+
+    for ep in range(1, epochs + 1):
+        selector.train()
+        perm = train_idx[torch.randperm(train_idx.numel())]
+        for b0 in range(0, int(perm.numel()), batch_size):
+            batch_idx = perm[b0:b0 + batch_size]
+            loss = _loss_for(batch_idx)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(selector.parameters(), grad_clip)
+            opt.step()
+        hold_metrics = _pred_residual_selector_metrics_from_tensors(
+            tensors=tensors,
+            selector=selector,
+            device=device,
+            batch_size=batch_size,
+            min_abs_improvement=min_abs_improvement,
+            min_rel_improvement=min_rel_improvement,
+            indices=hold_idx,
+            penalty_names=penalty_names,
+        )
+        hold_mse = float((hold_metrics or {}).get("selected_mse", float("inf")))
+        if hold_mse < best_hold:
+            best_hold = hold_mse
+            best_epoch = ep
+            best_state = {k: v.detach().cpu().clone() for k, v in selector.state_dict().items()}
+
+    if best_state is not None:
+        selector.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    margin_raw = cfg.get("decision_margin", "auto")
+    margin_selection: Dict[str, object] = {"mode": "fixed", "margin": 0.0}
+    if isinstance(margin_raw, str) and margin_raw.lower() == "auto":
+        max_margin = max(0.0, float(cfg.get("decision_margin_max", 6.0)))
+        num_margin = max(2, int(cfg.get("decision_margin_candidates", 61)))
+        best_margin = 0.0
+        best_margin_mse = float("inf")
+        best_margin_gain = float("-inf")
+        margins = torch.linspace(0.0, max_margin, steps=num_margin).tolist()
+        for margin in margins:
+            selector.decision_margin = float(margin)
+            metrics = _pred_residual_selector_metrics_from_tensors(
+                tensors=tensors,
+                selector=selector,
+                device=device,
+                batch_size=batch_size,
+                min_abs_improvement=min_abs_improvement,
+                min_rel_improvement=min_rel_improvement,
+                indices=hold_idx,
+                penalty_names=penalty_names,
+            )
+            if metrics is None:
+                continue
+            mse = float(metrics.get("selected_mse", float("inf")))
+            gain = float(metrics.get("selected_gain_pct_vs_base", float("-inf")))
+            if mse < best_margin_mse:
+                best_margin_mse = mse
+                best_margin_gain = gain
+                best_margin = float(margin)
+        selector.decision_margin = float(best_margin)
+        margin_selection = {
+            "mode": "auto",
+            "margin": float(best_margin),
+            "holdout_selected_mse": float(best_margin_mse),
+            "holdout_gain_pct_vs_base": float(best_margin_gain),
+            "max_margin": float(max_margin),
+            "candidates": int(num_margin),
+        }
+    else:
+        selector.decision_margin = float(margin_raw)
+        margin_selection = {"mode": "fixed", "margin": float(selector.decision_margin)}
+    train_metrics = _pred_residual_selector_metrics_from_tensors(
+        tensors=tensors,
+        selector=selector,
+        device=device,
+        batch_size=batch_size,
+        min_abs_improvement=min_abs_improvement,
+        min_rel_improvement=min_rel_improvement,
+        indices=train_idx,
+        penalty_names=penalty_names,
+    )
+    hold_metrics = _pred_residual_selector_metrics_from_tensors(
+        tensors=tensors,
+        selector=selector,
+        device=device,
+        batch_size=batch_size,
+        min_abs_improvement=min_abs_improvement,
+        min_rel_improvement=min_rel_improvement,
+        indices=hold_idx,
+        penalty_names=penalty_names,
+    )
+    summary = {
+        "enable": True,
+        "train_windows": int(train_idx.numel()),
+        "holdout_windows": int(hold_idx.numel()),
+        "best_epoch": int(best_epoch),
+        "label_min_abs_improvement": float(min_abs_improvement),
+        "label_min_rel_improvement": float(min_rel_improvement),
+        "positive_sample_weight": float(positive_sample_weight),
+        "negative_sample_weight": float(negative_sample_weight),
+        "class_weight": class_weight_summary,
+        "use_penalty_identity": bool(selector.use_penalty_identity),
+        "decision_margin": float(selector.decision_margin),
+        "decision_margin_selection": margin_selection,
+        "feature_standardization": feature_std_summary,
+        "channel_names": list(channel_names),
+        "penalty_names": list(penalty_names),
+        "train": train_metrics,
+        "holdout": hold_metrics,
+    }
+    selector.eval()
+    return selector, summary
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
@@ -2931,30 +5280,48 @@ def main():
         )
 
     # 4) 鑱氱被 + 灏忕皣鍚堝苟绛栫暐
-    rs = cl.get("random_state", 0)
-    cluster_id_c, clusters = cluster_channels_by_corr(
-        corr_cc=corr_cc,
-        data_tc=cluster_fit_tc,
-        n_clusters=cl.get("n_clusters", None),
-        distance_threshold=cl.get("distance_threshold", None),
-        linkage=cl.get("linkage", "average"),
-        method=cl.get("method", "agglomerative"),
-        kmeans_n_init=int(cl.get("kmeans_n_init", 10)),
-        kmeans_max_iter=int(cl.get("kmeans_max_iter", 300)),
-        spectral_affinity=cl.get("spectral_affinity", "corr"),
-        rbf_gamma=float(cl.get("rbf_gamma", 1.0)),
-        dbscan_eps=cl.get("dbscan_eps", None),
-        dbscan_min_samples=int(cl.get("dbscan_min_samples", 5)),
-        random_state=None if rs is None else int(rs),
-        min_cluster_size=int(cl["min_cluster_size"]),
-        merge_small_clusters=bool(cl["merge_small_clusters"]),
-        singleton_merge_strategy=str(cl.get("singleton_merge_strategy", "pool")),
-        singleton_merge_distance_threshold=cl.get("singleton_merge_distance_threshold", None),
-        singleton_merge_min_size=int(cl.get("singleton_merge_min_size", 2)),
-        no_merge_if_channels_lt=int(cl["no_merge_if_channels_lt"]),
-        extra_features_cf=cluster_extra_features_cf,
-        feature_weight=float(feature_aware_cfg.get("weight", 0.0)) if cluster_extra_features_cf is not None else 0.0,
-    )
+    fixed_cluster_id = cl.get("fixed_cluster_id", None)
+    if fixed_cluster_id is not None:
+        cluster_id_c = torch.tensor(fixed_cluster_id, dtype=torch.long, device=device)
+        if int(cluster_id_c.numel()) != C:
+            raise ValueError(
+                f"cluster.fixed_cluster_id must contain one id per channel: "
+                f"got {int(cluster_id_c.numel())}, expected {C}."
+            )
+        if int(cluster_id_c.min().item()) < 0:
+            raise ValueError("cluster.fixed_cluster_id must be non-negative.")
+        # Preserve ids so transfer/fine-tune can map target channels directly
+        # onto the corresponding source cluster heads.
+        clusters = {
+            int(k): (cluster_id_c == int(k)).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+            for k in range(int(cluster_id_c.max().item()) + 1)
+        }
+        print("Using fixed channel cluster assignment from cluster.fixed_cluster_id.")
+    else:
+        rs = cl.get("random_state", 0)
+        cluster_id_c, clusters = cluster_channels_by_corr(
+            corr_cc=corr_cc,
+            data_tc=cluster_fit_tc,
+            n_clusters=cl.get("n_clusters", None),
+            distance_threshold=cl.get("distance_threshold", None),
+            linkage=cl.get("linkage", "average"),
+            method=cl.get("method", "agglomerative"),
+            kmeans_n_init=int(cl.get("kmeans_n_init", 10)),
+            kmeans_max_iter=int(cl.get("kmeans_max_iter", 300)),
+            spectral_affinity=cl.get("spectral_affinity", "corr"),
+            rbf_gamma=float(cl.get("rbf_gamma", 1.0)),
+            dbscan_eps=cl.get("dbscan_eps", None),
+            dbscan_min_samples=int(cl.get("dbscan_min_samples", 5)),
+            random_state=None if rs is None else int(rs),
+            min_cluster_size=int(cl["min_cluster_size"]),
+            merge_small_clusters=bool(cl["merge_small_clusters"]),
+            singleton_merge_strategy=str(cl.get("singleton_merge_strategy", "pool")),
+            singleton_merge_distance_threshold=cl.get("singleton_merge_distance_threshold", None),
+            singleton_merge_min_size=int(cl.get("singleton_merge_min_size", 2)),
+            no_merge_if_channels_lt=int(cl["no_merge_if_channels_lt"]),
+            extra_features_cf=cluster_extra_features_cf,
+            feature_weight=float(feature_aware_cfg.get("weight", 0.0)) if cluster_extra_features_cf is not None else 0.0,
+        )
     K = int(cluster_id_c.max().item() + 1)
     print(f"Clusters: K={K}")
     print_clusters(clusters, channel_names)
@@ -2977,36 +5344,97 @@ def main():
     # channels and long horizons can expand to tens of GB; batches are moved to
     # CUDA by the train/eval loops.
     data_window_tc = data_tc.detach().cpu()
-    past_context = bool(cfg.get("window", {}).get("past_context", False))
-    xtr, ytr = make_strict_windows(data_window_tc, L, H, 0, t_train)
-    train_start_offsets = torch.arange(0, len(xtr), dtype=torch.long)
+    window_cfg = cfg.get("window", {}) or {}
+    past_context = bool(window_cfg.get("past_context", False))
+    lazy_windows = bool(window_cfg.get("lazy", False))
+    knn_cfg = KNNShapeConfig.from_dict(cfg.get("knn_hybrid", {})).resolved_for_horizon(H)
+    if lazy_windows and knn_cfg.enable:
+        raise ValueError("window.lazy=true is incompatible with knn_hybrid.enable=true.")
+    history_anchor_cfg = cfg.get("model", {}).get("history_anchor", cfg.get("history_anchor", {})) or {}
+    history_anchor_cfg = _normalize_history_anchor_cfg(history_anchor_cfg)
+    _validate_strict_history_anchor_scope(history_anchor_cfg, source="model.history_anchor")
+    history_anchor_active = history_anchor_enabled(history_anchor_cfg)
+    if history_anchor_active:
+        print(
+            "History anchor adapter enabled: "
+            f"lags={_parse_positive_ints(history_anchor_cfg.get('lags', ()))}, "
+            f"alpha={float(history_anchor_cfg.get('alpha', 0.0)):.3f}, "
+            f"blend_target={str(history_anchor_cfg.get('blend_target', 'prediction')).lower()}, "
+            f"history_scope={str(history_anchor_cfg.get('history_scope', 'input_window')).lower()}"
+        )
+    calendar_residual_cfg = cfg.get("calendar_residual", {}) or {}
+    calendar_feature_tf = None
+    calendar_feature_names: List[str] = []
+    calendar_residual_coef_cf = None
+    calendar_residual_summary: Dict[str, object] = {
+        "enable": bool(calendar_residual_cfg.get("enable", False)),
+    }
+    if bool(calendar_residual_cfg.get("enable", False)):
+        calendar_feature_tf, calendar_feature_names = build_calendar_feature_tensor(
+            data_cfg["csv_path"],
+            date_col=int(data_cfg["date_col"]),
+            max_rows=max_rows,
+            cfg=calendar_residual_cfg,
+        )
+        calendar_feature_tf = calendar_feature_tf.to(device=device)
+        calendar_residual_summary.update(
+            {
+                "feature_names": list(calendar_feature_names),
+                "feature_dim": int(calendar_feature_tf.shape[1]),
+                "fit_source": str(calendar_residual_cfg.get("source_split", "train")),
+                "train_only": True,
+            }
+        )
+        print(
+            "Calendar residual adapter enabled: "
+            f"features={calendar_feature_names}, source=train"
+        )
+
     val_eval_start = t_train
     test_eval_start = t_val
-    if past_context:
-        xva, yva, val_eval_start = make_label_range_windows(data_window_tc, L, H, t_train, t_val)
-        if skip_test:
-            xte = torch.empty(0, C, L, dtype=data_window_tc.dtype)
-            yte = torch.empty(0, C, H, dtype=data_window_tc.dtype)
+
+    if lazy_windows:
+        xtr = ytr = xva = yva = xte = yte = None
+        dtr = make_lazy_strict_window_dataset(data_window_tc, L, H, 0, t_train)
+        train_start_offsets = dtr.start_offsets.clone()
+        if past_context:
+            dva, val_eval_start = make_lazy_label_range_window_dataset(data_window_tc, L, H, t_train, t_val)
+            if skip_test:
+                dte = make_lazy_strict_window_dataset(data_window_tc, L, H, 0, 0)
+            else:
+                dte, test_eval_start = make_lazy_label_range_window_dataset(data_window_tc, L, H, t_val, T)
         else:
-            xte, yte, test_eval_start = make_label_range_windows(data_window_tc, L, H, t_val, T)
+            dva = make_lazy_strict_window_dataset(data_window_tc, L, H, t_train, t_val)
+            if skip_test:
+                dte = make_lazy_strict_window_dataset(data_window_tc, L, H, 0, 0)
+            else:
+                dte = make_lazy_strict_window_dataset(data_window_tc, L, H, t_val, T)
     else:
-        xva, yva = make_strict_windows(data_window_tc, L, H, t_train, t_val)
-        if skip_test:
-            xte = torch.empty(0, C, L, dtype=data_window_tc.dtype)
-            yte = torch.empty(0, C, H, dtype=data_window_tc.dtype)
+        xtr, ytr = make_strict_windows(data_window_tc, L, H, 0, t_train)
+        train_start_offsets = torch.arange(0, len(xtr), dtype=torch.long)
+        if past_context:
+            xva, yva, val_eval_start = make_label_range_windows(data_window_tc, L, H, t_train, t_val)
+            if skip_test:
+                xte = torch.empty(0, C, L, dtype=data_window_tc.dtype)
+                yte = torch.empty(0, C, H, dtype=data_window_tc.dtype)
+            else:
+                xte, yte, test_eval_start = make_label_range_windows(data_window_tc, L, H, t_val, T)
         else:
-            xte, yte = make_strict_windows(data_window_tc, L, H, t_val, T)
+            xva, yva = make_strict_windows(data_window_tc, L, H, t_train, t_val)
+            if skip_test:
+                xte = torch.empty(0, C, L, dtype=data_window_tc.dtype)
+                yte = torch.empty(0, C, H, dtype=data_window_tc.dtype)
+            else:
+                xte, yte = make_strict_windows(data_window_tc, L, H, t_val, T)
+        dtr = WindowTensorDataset(xtr, ytr)
+        dva = WindowTensorDataset(xva, yva)
+        dte = WindowTensorDataset(xte, yte)
 
     print(
-        f"Windows: train={len(xtr)}, val={len(xva)}, test={len(xte)}, "
-        f"past_context={past_context}"
+        f"Windows: train={len(dtr)}, val={len(dva)}, test={len(dte)}, "
+        f"past_context={past_context}, lazy={lazy_windows}"
     )
 
-    dtr = WindowTensorDataset(xtr, ytr)
-    dva = WindowTensorDataset(xva, yva)
-    dte = WindowTensorDataset(xte, yte)
-
-    knn_cfg = KNNShapeConfig.from_dict(cfg.get("knn_hybrid", {})).resolved_for_horizon(H)
     knn_hybrid_val = None
     knn_hybrid_test = None
     knn_bank_path = None
@@ -3033,11 +5461,22 @@ def main():
             memory_len=t_train,
             device=device,
             dtype=data_tc.dtype,
-        )
+    )
 
     bs = int(cfg["train"]["batch_size"])
-    pin_mem = (device.type == "cuda") and (xtr.device.type == "cpu")
-    dl_tr = DataLoader(dtr, batch_size=bs, shuffle=True, num_workers=0, pin_memory=pin_mem)
+    pin_mem = (device.type == "cuda") and (data_window_tc.device.type == "cpu")
+    shuffle_seed = cfg["train"].get("shuffle_seed", None)
+    if shuffle_seed is None and bool(cfg["train"].get("fixed_shuffle_seed", False)):
+        shuffle_seed = int(cfg["exp"]["seed"])
+    train_generator = _make_torch_generator(None if shuffle_seed is None else int(shuffle_seed))
+    dl_tr = DataLoader(
+        dtr,
+        batch_size=bs,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=pin_mem,
+        generator=train_generator,
+    )
     dl_va = DataLoader(dva, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin_mem)
     dl_te = DataLoader(dte, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin_mem)
     # penalties
@@ -3082,6 +5521,9 @@ def main():
             f"Unsupported train.selection_metric='{selection_metric}'. "
             "Expected one of: val_loss, val_mse, val_mae, train_loss, train_mse, train_mae."
         )
+    loss_normalization_cfg = cfg["train"].get("loss_normalization", {}) or {}
+    if isinstance(loss_normalization_cfg, bool):
+        loss_normalization_cfg = {"enable": bool(loss_normalization_cfg)}
     penalty_warmup_epochs = int(cfg["train"].get("penalty_warmup_epochs", 0))
     penalty_scale_floor = float(cfg["train"].get("penalty_scale_floor", 1.0e-3))
 
@@ -3116,6 +5558,66 @@ def main():
         return scale.clamp_min(penalty_scale_floor)
 
     penalty_scale = compute_penalty_scale(dl_tr, H)
+
+    _validate_strict_history_anchor_scope(
+        cfg.get("moe", {}).get("history_anchor_expert", {}) or {},
+        source="moe.history_anchor_expert",
+    )
+    model_train_stat_adapter_cfg = cfg.get("model", {}).get("train_stat_adapter", {}) or {}
+    (
+        model_train_stat_adapter_pc,
+        model_train_stat_adapter_counts,
+        model_train_stat_adapter_summary,
+    ) = build_train_stat_anchor_from_config(
+        data_window_tc,
+        train_end=t_train,
+        input_len=L,
+        pred_len=H,
+        cfg=model_train_stat_adapter_cfg,
+        prefix="model.train_stat_adapter",
+    )
+    if bool(model_train_stat_adapter_cfg.get("enable", False)):
+        print(
+            "Model train-stat adapter enabled: "
+            f"mode={model_train_stat_adapter_summary.get('mode')}, "
+            f"period={model_train_stat_adapter_summary.get('period')}, "
+            f"alpha={float(model_train_stat_adapter_cfg.get('alpha', 0.0) or 0.0):.3f}, "
+            f"source=train[0:{t_train}]"
+        )
+
+    train_stat_anchor_cfg = cfg.get("moe", {}).get("train_stat_anchor_expert", {}) or {}
+    train_stat_anchor_pc, train_stat_anchor_counts, train_stat_anchor_summary = build_train_stat_anchor_from_config(
+        data_window_tc,
+        train_end=t_train,
+        input_len=L,
+        pred_len=H,
+        cfg=train_stat_anchor_cfg,
+        prefix="moe.train_stat_anchor_expert",
+    )
+    train_residual_anchor_cfg = cfg.get("moe", {}).get("train_residual_anchor_expert", {}) or {}
+    train_residual_anchor_phc = None
+    train_residual_anchor_summary: Dict[str, object] = {
+        "enable": bool(train_residual_anchor_cfg.get("enable", False)),
+    }
+    if bool(train_stat_anchor_cfg.get("enable", False)):
+        print(
+            "Train-stat anchor expert enabled: "
+            f"mode={train_stat_anchor_summary.get('mode')}, period={train_stat_anchor_summary.get('period')}, "
+            f"alpha={float(train_stat_anchor_cfg.get('alpha', 0.0) or 0.0):.3f}, "
+            f"source=train[0:{t_train}]"
+        )
+
+    def eval_loop_with_history(*args, **kwargs):
+        kwargs.setdefault("history_anchor_cfg", history_anchor_cfg)
+        kwargs.setdefault("observed_history_tc", data_window_tc)
+        kwargs.setdefault("input_len", L)
+        kwargs.setdefault("model_train_stat_adapter_pc", model_train_stat_adapter_pc)
+        kwargs.setdefault("model_train_stat_adapter_cfg", model_train_stat_adapter_cfg)
+        kwargs.setdefault("train_stat_anchor_pc", train_stat_anchor_pc)
+        kwargs.setdefault("train_residual_anchor_phc", train_residual_anchor_phc)
+        kwargs.setdefault("calendar_feature_tf", calendar_feature_tf)
+        kwargs.setdefault("calendar_residual_coef_cf", calendar_residual_coef_cf)
+        return eval_loop(*args, **kwargs)
 
     # cluster portraits (prototype + penalty metrics)
     portrait_cfg = cfg.get("portrait", {})
@@ -3548,6 +6050,7 @@ def main():
         src_k_count = int(meta.get("K", 0))
         src_input_len = int(meta.get("input_len", -1))
         src_pred_len = int(meta.get("pred_len", -1))
+        partial_model_state = bool(ft_cfg.get("partial_model_state", ft_cfg.get("partial_model", False)))
         if bool(ft_cfg.get("strict_window", True)) and (src_input_len != L or src_pred_len != H):
             raise ValueError(
                 "Fine-tune checkpoint window mismatch: "
@@ -3558,23 +6061,29 @@ def main():
             raise ValueError(f"Invalid source cluster count in fine-tune checkpoint: {src_k_count}")
 
         src_model_cfg = dict(meta.get("model_cfg", {}))
-        if bool(ft_cfg.get("strict_model", True)) and src_model_cfg != dict(model_cfg):
+        src_compare_model_cfg = dict(src_model_cfg)
+        tgt_compare_model_cfg = dict(model_cfg)
+        src_compare_model_cfg.pop("history_anchor", None)
+        tgt_compare_model_cfg.pop("history_anchor", None)
+        if bool(ft_cfg.get("strict_model", True)) and src_compare_model_cfg != tgt_compare_model_cfg:
             raise ValueError("Fine-tune source model_cfg differs from target model_cfg.")
         src_cluster_id_c = meta.get("cluster_id_c", None)
         src_num_channels = meta.get("num_channels", None)
         if bool(dict(src_model_cfg.get("channel_adapter", {}) or {}).get("enable", False)):
             if src_cluster_id_c is None or src_num_channels is None:
                 raise ValueError("Fine-tune source checkpoint with channel_adapter requires cluster_id_c and num_channels in meta.")
-        source_model = build_cluster_predictor(
-            num_clusters=src_k_count,
-            input_len=src_input_len,
-            pred_len=src_pred_len,
-            model_cfg=src_model_cfg,
-            num_channels=None if src_num_channels is None else int(src_num_channels),
-            cluster_id_c=src_cluster_id_c,
-        ).to(device)
-        source_model.load_state_dict(ckpt["model_state"], strict=True)
-        source_model.eval()
+        source_model = None
+        if bool(ft_cfg.get("load_model", True)) and not partial_model_state:
+            source_model = build_cluster_predictor(
+                num_clusters=src_k_count,
+                input_len=src_input_len,
+                pred_len=src_pred_len,
+                model_cfg=src_model_cfg,
+                num_channels=None if src_num_channels is None else int(src_num_channels),
+                cluster_id_c=src_cluster_id_c,
+            ).to(device)
+            source_model.load_state_dict(ckpt["model_state"], strict=True)
+            source_model.eval()
 
         map_mode = str(ft_cfg.get("cluster_map", "index")).lower()
         if map_mode in {"index", "same"}:
@@ -3594,10 +6103,53 @@ def main():
             )
             target_to_source_k = torch.argmax(corr_map, dim=1).to(torch.long)
 
-        if bool(ft_cfg.get("load_model", True)):
-            for k in range(K):
-                src_k = int(target_to_source_k[k].item())
+        def load_finetune_model_cluster_state(k: int, src_k: int) -> None:
+            try:
                 model.load_cluster_state(k, source_model.get_cluster_state(src_k))
+                return
+            except ValueError as exc:
+                if "channel_head_mlp cluster" not in str(exc):
+                    raise
+                required = ("W1", "b1", "W2", "b2", "_cluster_channel_idx")
+                if not all(hasattr(model, name) for name in required) or not all(hasattr(source_model, name) for name in required):
+                    raise
+                device = model.W1[k].device
+                model.W1[k].data.copy_(source_model.W1[src_k].to(device))
+                model.b1[k].data.copy_(source_model.b1[src_k].to(device))
+                target_idx = model._cluster_channel_idx(k)
+                for i in target_idx:
+                    c = int(i.item())
+                    if c >= len(source_model.W2):
+                        raise ValueError(f"Fine-tune channel-head transfer missing source channel {c}.") from exc
+                    model.W2[c].data.copy_(source_model.W2[c].to(device))
+                    model.b2[c].data.copy_(source_model.b2[c].to(device))
+                print(
+                    "Fine-tune channel_head_mlp warm start used source cluster shared layer "
+                    f"{src_k}->target {k} and channel-index output heads."
+                )
+
+        partial_model_summary = None
+        if bool(ft_cfg.get("load_model", True)):
+            if partial_model_state:
+                if "model_state" not in ckpt:
+                    raise ValueError(f"Fine-tune checkpoint is missing model_state: {ckpt_path}")
+                partial_model_summary = _partial_load_matching_state_dict(model, ckpt["model_state"])
+                if int(partial_model_summary["loaded_count"]) <= 0 and not bool(ft_cfg.get("allow_empty_partial_model", False)):
+                    raise ValueError(
+                        "Fine-tune partial_model_state loaded zero tensors. "
+                        "Check that source and target predictors share parameter names."
+                    )
+                print(
+                    "Fine-tune partial model warm start: "
+                    f"loaded={partial_model_summary['loaded_count']}, "
+                    f"skipped_shape={partial_model_summary['skipped_shape_count']}, "
+                    f"skipped_missing={partial_model_summary['skipped_missing_count']}"
+                )
+            else:
+                assert source_model is not None
+                for k in range(K):
+                    src_k = int(target_to_source_k[k].item())
+                    load_finetune_model_cluster_state(k, src_k)
 
         source_penalty_names = list(meta.get("penalty_names", []))
         same_penalties = source_penalty_names == penalty_names
@@ -3673,17 +6225,25 @@ def main():
             "cluster_map": map_mode,
             "target_to_source_cluster": [int(v) for v in target_to_source_k.detach().cpu().tolist()],
             "cluster_corr": None if corr_map is None else corr_map.detach().cpu().tolist(),
+            "partial_model_state": partial_model_state,
+            "partial_model_load": partial_model_summary,
         }
         print(f"Fine-tune warm start loaded from: {ckpt_path}")
         print(f"Fine-tune target->source cluster map: {finetune_summary['target_to_source_cluster']}")
 
     apply_finetune_warm_start()
 
+    freeze_backbone = bool(moe_cfg.get("freeze_backbone", cfg.get("train", {}).get("freeze_backbone", False)))
+    frozen_backbone_params = 0
+    if freeze_backbone:
+        frozen_backbone_params = _freeze_module_params(model)
+        print(f"Backbone frozen for MoE training: params={frozen_backbone_params}")
+
     cluster_params = []
     for k in range(K):
-        params_k = [
-            *model.get_cluster_params(k),
-        ]
+        params_k = []
+        if not freeze_backbone:
+            params_k.extend(model.get_cluster_params(k))
         if not (bilevel_enable and bilevel_optimize_gate):
             params_k.extend([gate.W1[k], gate.b1[k], gate.W2[k], gate.b2[k]])
         if pred_residual is not None:
@@ -3702,7 +6262,14 @@ def main():
         )
         for params_k in cluster_params
     ]
+    for opt_k in optimizers:
+        for group in opt_k.param_groups:
+            group.setdefault("initial_lr", float(group["lr"]))
     sched_cfg = cfg["train"].get("lr_scheduler", {"name": "none"})
+    lr_warmup_epochs = int(sched_cfg.get("warmup_epochs", cfg["train"].get("lr_warmup_epochs", 0)))
+    lr_warmup_start_factor = float(
+        sched_cfg.get("warmup_start_factor", cfg["train"].get("lr_warmup_start_factor", 0.1))
+    )
     sched_name = str(sched_cfg.get("name", "none")).lower()
     if sched_name in {"plateau", "reduce", "reduce_on_plateau"}:
         schedulers = [
@@ -3752,6 +6319,65 @@ def main():
                 weight_decay=0.0,
             )
 
+    swa_cfg = cfg["train"].get("swa", {}) or {}
+    if isinstance(swa_cfg, bool):
+        swa_cfg = {"enable": bool(swa_cfg)}
+    swa_enable = bool(swa_cfg.get("enable", False))
+    swa_start_epoch = int(
+        swa_cfg.get(
+            "start_epoch",
+            max(1, int(math.ceil(float(epochs) * float(swa_cfg.get("start_fraction", 0.75))))),
+        )
+    )
+    swa_update_every = max(1, int(swa_cfg.get("update_every", 1)))
+    swa_selection_metric = str(swa_cfg.get("selection_metric", "val_mse")).lower()
+    if swa_selection_metric not in {"val_loss", "val_mse", "val_mae"}:
+        raise ValueError("train.swa.selection_metric must be val_loss, val_mse, or val_mae.")
+    swa_min_delta = float(swa_cfg.get("min_delta", 0.0))
+    swa_averagers = {}
+    swa_updates = 0
+    swa_summary = {
+        "enable": bool(swa_enable),
+        "selected": False,
+        "updates": 0,
+        "start_epoch": int(swa_start_epoch),
+        "update_every": int(swa_update_every),
+        "selection_metric": str(swa_selection_metric),
+    }
+    if swa_enable:
+        swa_averagers["model"] = torch.optim.swa_utils.AveragedModel(model)
+        swa_averagers["gate"] = torch.optim.swa_utils.AveragedModel(gate)
+        if pred_residual is not None:
+            swa_averagers["pred_residual"] = torch.optim.swa_utils.AveragedModel(pred_residual)
+        if dynamic_lambda is not None:
+            swa_averagers["dynamic_lambda"] = torch.optim.swa_utils.AveragedModel(dynamic_lambda)
+        if learnable_lambda is not None:
+            swa_averagers["learnable_lambda"] = torch.optim.swa_utils.AveragedModel(learnable_lambda)
+
+    def update_swa_averagers(epoch_idx: int) -> None:
+        nonlocal swa_updates
+        if not swa_enable or not _should_update_swa(epoch_idx, swa_start_epoch, swa_update_every):
+            return
+        swa_averagers["model"].update_parameters(model)
+        swa_averagers["gate"].update_parameters(gate)
+        if pred_residual is not None and "pred_residual" in swa_averagers:
+            swa_averagers["pred_residual"].update_parameters(pred_residual)
+        if dynamic_lambda is not None and "dynamic_lambda" in swa_averagers:
+            swa_averagers["dynamic_lambda"].update_parameters(dynamic_lambda)
+        if learnable_lambda is not None and "learnable_lambda" in swa_averagers:
+            swa_averagers["learnable_lambda"].update_parameters(learnable_lambda)
+        swa_updates += 1
+
+    def load_swa_averagers() -> None:
+        model.load_state_dict(swa_averagers["model"].module.state_dict())
+        gate.load_state_dict(swa_averagers["gate"].module.state_dict())
+        if pred_residual is not None and "pred_residual" in swa_averagers:
+            pred_residual.load_state_dict(swa_averagers["pred_residual"].module.state_dict())
+        if dynamic_lambda is not None and "dynamic_lambda" in swa_averagers:
+            dynamic_lambda.load_state_dict(swa_averagers["dynamic_lambda"].module.state_dict())
+        if learnable_lambda is not None and "learnable_lambda" in swa_averagers:
+            learnable_lambda.load_state_dict(swa_averagers["learnable_lambda"].module.state_dict())
+
     def _fit_knn_hybrid_bank(
         x_bank_ncl: torch.Tensor,
         y_bank_nch: torch.Tensor,
@@ -3773,6 +6399,7 @@ def main():
             cfg=knn_cfg,
             start_offsets_n=start_offsets_n,
             base_bank_pred_nch=base_bank_pred,
+            observed_history_tc=data_window_tc,
         )
 
     def _make_knn_bank_windows(start: int, end: int, label: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3869,6 +6496,7 @@ def main():
                 cfg=eval_knn_cfg,
                 start_offsets_n=start_offsets_n,
                 base_bank_pred_nch=base_bank_pred,
+                observed_history_tc=data_window_tc,
             )
 
         x_bank_val = xtr
@@ -3945,6 +6573,23 @@ def main():
         if monitor_metric == "train_mse":
             return train_mse_k
         return train_mae_k
+
+    def _aggregate_val_metric(
+        val_loss_k: torch.Tensor,
+        val_mse_k: torch.Tensor,
+        val_mae_k: torch.Tensor,
+        metric: str,
+    ) -> float:
+        metric = str(metric).lower()
+        if metric == "val_loss":
+            value_k = val_loss_k
+        elif metric == "val_mae":
+            value_k = val_mae_k
+        elif metric == "val_mse":
+            value_k = val_mse_k
+        else:
+            raise ValueError("SWA selection metric must be val_loss, val_mse, or val_mae.")
+        return float(reduce_cluster_metric(value_k, cluster_weight_k).item())
 
     early_stop_start_epoch = max(1, penalty_warmup_epochs + 1)
     selection_start_epoch = int(cfg["train"].get("model_selection_start_epoch", early_stop_start_epoch))
@@ -4316,6 +6961,7 @@ def main():
     def compute_batch_terms(
         x: torch.Tensor,
         y: torch.Tensor,
+        idx: torch.Tensor,
         base_lambda_kp: torch.Tensor,
         model_params: Optional[Dict[str, torch.Tensor]] = None,
         gate_params: Optional[Dict[str, torch.Tensor]] = None,
@@ -4324,7 +6970,30 @@ def main():
         straight_through: bool = True,
         mae_objective_weight: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
-        yhat_base = _module_call(model, model_params, x, cluster_id_c)
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=idx,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        yhat_base_raw = _module_call(model, model_params, x_model, cluster_id_c)
+        yhat_base = apply_history_anchor_adapter(
+            yhat_base_raw,
+            base_pred_bch=yhat_base_raw,
+            observed_history_tc=data_window_tc,
+            query_start_abs_b=idx,
+            input_len=L,
+            cfg=history_anchor_cfg,
+        )
+        yhat_base = apply_train_stat_anchor_expert(
+            yhat_base,
+            base_pred_bch=yhat_base,
+            x_bcl=x,
+            query_start_abs_b=idx,
+            input_len=L,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
         feat_bcf = extract_gate_features(x)
         feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
         series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)
@@ -4440,7 +7109,6 @@ def main():
             lam_bkp = pen_bkp
             penalty_loss_bk = torch.zeros_like(mse_bk)
 
-        objective_loss_bk = (mse_weight * mse_bk) + (float(mae_objective_weight) * mae_objective_bk) + penalty_loss_bk
         pred_loss_terms = _pred_residual_loss_terms(
             pred_out=pred_out,
             y_base=yhat_base,
@@ -4455,7 +7123,21 @@ def main():
             norm_weight=pred_residual_norm_weight,
             intervention_weight=pred_residual_intervention_weight,
         )
-        objective_loss_bk = objective_loss_bk + pred_loss_terms["total_bk"]
+        loss_terms_bk, _ = _normalize_loss_terms(
+            {
+                "mse": mse_bk,
+                "mae_objective": mae_objective_bk,
+                "penalty": penalty_loss_bk,
+                "pred_residual": pred_loss_terms["total_bk"],
+            },
+            loss_normalization_cfg,
+        )
+        objective_loss_bk = (
+            (mse_weight * loss_terms_bk["mse"])
+            + (float(mae_objective_weight) * loss_terms_bk["mae_objective"])
+            + loss_terms_bk["penalty"]
+            + loss_terms_bk["pred_residual"]
+        )
         return {
             "mse_bk": mse_bk,
             "mae_bk": mae_bk,
@@ -4485,7 +7167,9 @@ def main():
         return batch
 
     inner_named = []
-    inner_modules = [("model", model)]
+    inner_modules = []
+    if not freeze_backbone:
+        inner_modules.append(("model", model))
     if not (bilevel_enable and bilevel_optimize_gate):
         inner_modules.append(("gate", gate))
     if pred_residual is not None:
@@ -4500,16 +7184,18 @@ def main():
 
         train_batch = next_outer_batch(dl_tr, outer_train_state)
         val_batch = next_outer_batch(dl_va, outer_val_state)
-        x_tr, y_tr, _ = train_batch
-        x_va, y_va, _ = val_batch
+        x_tr, y_tr, idx_tr = train_batch
+        x_va, y_va, idx_va = val_batch
         x_tr = x_tr.to(device, non_blocking=True)
         y_tr = y_tr.to(device, non_blocking=True)
+        idx_tr = idx_tr.to(device=device, dtype=torch.long, non_blocking=True)
         x_va = x_va.to(device, non_blocking=True)
         y_va = y_va.to(device, non_blocking=True)
+        idx_va = idx_va.to(device=device, dtype=torch.long, non_blocking=True)
 
         base_lambda_kp = lambda_kp_at(epoch_idx, detach=False) * warmup_scale
         train_terms = compute_batch_terms(
-            x_tr, y_tr,
+            x_tr, y_tr, idx_tr,
             base_lambda_kp=base_lambda_kp,
             straight_through=(not bool(moe_cfg["detach_penalty_grad"])),
             mae_objective_weight=mae_objective_weight_at(epoch_idx),
@@ -4555,7 +7241,7 @@ def main():
         if dynamic_lambda is not None:
             dynamic_lambda.eval()
         val_terms = compute_batch_terms(
-            x_va, y_va,
+            x_va, y_va, idx_va,
             base_lambda_kp=base_lambda_kp,
             model_params=fast_model_params,
             gate_params=fast_gate_params if len(fast_gate_params) > 0 else None,
@@ -4613,6 +7299,11 @@ def main():
 
     for ep in range(1, epochs + 1):
         t_ep0 = time.perf_counter()
+        if lr_warmup_epochs > 0 and ep <= lr_warmup_epochs:
+            _set_optimizer_lr_scale(
+                optimizers,
+                _lr_warmup_scale(ep, lr_warmup_epochs, lr_warmup_start_factor),
+            )
         if penalty_warmup_epochs > 0:
             warmup_scale = min(1.0, float(ep) / float(penalty_warmup_epochs))
         else:
@@ -4647,7 +7338,30 @@ def main():
                 train_window = torch.cat([x, y], dim=-1)
                 cluster_memory_bank.update(train_window, idx, cluster_id_c)
 
-            yhat_base = model(x, cluster_id_c)
+            x_model = apply_train_stat_input_centering(
+                x,
+                query_start_abs_b=idx,
+                stat_anchor_pc=model_train_stat_adapter_pc,
+                cfg=model_train_stat_adapter_cfg,
+            )
+            yhat_base_raw = model(x_model, cluster_id_c)
+            yhat_base = apply_history_anchor_adapter(
+                yhat_base_raw,
+                base_pred_bch=yhat_base_raw,
+                observed_history_tc=data_window_tc,
+                query_start_abs_b=idx,
+                input_len=L,
+                cfg=history_anchor_cfg,
+            )
+            yhat_base = apply_train_stat_anchor_expert(
+                yhat_base,
+                base_pred_bch=yhat_base,
+                x_bcl=x,
+                query_start_abs_b=idx,
+                input_len=L,
+                stat_anchor_pc=model_train_stat_adapter_pc,
+                cfg=model_train_stat_adapter_cfg,
+            )
             feat_bcf = extract_gate_features(x)  # [B,C,F]
             feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
             series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
@@ -4771,7 +7485,7 @@ def main():
                     skip_bk=skip_bk if allow_skip else None,
                     skip_cost=skip_cost,
                 )
-                objective_loss_bk = (
+                raw_objective_loss_bk = (
                     (mse_weight * mse_bk)
                     + (float(mae_objective_weight_ep) * mae_objective_bk)
                     + penalty_loss_bk
@@ -4790,7 +7504,21 @@ def main():
                     norm_weight=pred_residual_norm_weight,
                     intervention_weight=pred_residual_intervention_weight,
                 )
-                loss_bk = objective_loss_bk + pred_loss_terms["total_bk"]
+                loss_terms_bk, _ = _normalize_loss_terms(
+                    {
+                        "mse": mse_bk,
+                        "mae_objective": mae_objective_bk,
+                        "penalty": penalty_loss_bk,
+                        "pred_residual": pred_loss_terms["total_bk"],
+                    },
+                    loss_normalization_cfg,
+                )
+                objective_loss_bk = (
+                    (mse_weight * loss_terms_bk["mse"])
+                    + (float(mae_objective_weight_ep) * loss_terms_bk["mae_objective"])
+                    + loss_terms_bk["penalty"]
+                )
+                loss_bk = objective_loss_bk + loss_terms_bk["pred_residual"]
                 if (
                     allow_skip
                     and skip_supervision_weight > 0.0
@@ -4834,11 +7562,24 @@ def main():
                         gate_balance_target_kp=gate_balance_target_kp,
                     )
             else:
-                objective_loss_bk = (mse_weight * mse_bk) + (float(mae_objective_weight_ep) * mae_objective_bk)
+                raw_objective_loss_bk = (mse_weight * mse_bk) + (float(mae_objective_weight_ep) * mae_objective_bk)
+                loss_terms_bk, _ = _normalize_loss_terms(
+                    {
+                        "mse": mse_bk,
+                        "mae_objective": mae_objective_bk,
+                        "penalty": torch.zeros_like(mse_bk),
+                        "pred_residual": torch.zeros_like(mse_bk),
+                    },
+                    loss_normalization_cfg,
+                )
+                objective_loss_bk = (
+                    (mse_weight * loss_terms_bk["mse"])
+                    + (float(mae_objective_weight_ep) * loss_terms_bk["mae_objective"])
+                )
                 loss_bk = objective_loss_bk
-            train_loss_sum_k += objective_loss_bk.sum(dim=0)
-            train_mse_sum_k += mse_bk.sum(dim=0)
-            train_mae_sum_k += mae_bk.sum(dim=0)
+            _accumulate_detached_sum_(train_loss_sum_k, raw_objective_loss_bk)
+            _accumulate_detached_sum_(train_mse_sum_k, mse_bk)
+            _accumulate_detached_sum_(train_mae_sum_k, mae_bk)
             train_cnt += int(loss_bk.shape[0])
             loss = reduce_cluster_metric(loss_bk, cluster_weight_k).mean()
 
@@ -4894,7 +7635,7 @@ def main():
                 suffix=f"epoch={ep}/{epochs} loss={running / max(n_batches, 1):.6f} validating",
                 force=True,
             )
-        val_loss_k, val_mse_k, val_mae_k, _, _, _, _, _ = eval_loop(
+        val_loss_k, val_mse_k, val_mae_k, _, _, _, _, _ = eval_loop_with_history(
             model, gate, lambda_kp_at(ep, detach=True),
             penalty_names, penalty_fns,
             dl_va, cluster_id_c, K, moe_cfg, device,
@@ -4920,6 +7661,7 @@ def main():
         train_mae_k = train_mae_sum_k / max(train_cnt, 1)
         train_mse_hist.append(train_mse_k.detach().cpu())
         val_mse_hist.append(val_mse_k.detach().cpu())
+        update_swa_averagers(ep)
 
         monitor_k = _select_monitor_k(train_loss_k, train_mse_k, train_mae_k, val_loss_k, val_mse_k, val_mae_k)
         selection_active = ep >= selection_start_epoch
@@ -4938,7 +7680,7 @@ def main():
                 if bad_cnt[k] >= patience:
                     stopped[k] = True
 
-        if schedulers is not None:
+        if schedulers is not None and ep > lr_warmup_epochs:
             for k, sched in enumerate(schedulers):
                 if stopped[k]:
                     continue
@@ -4989,8 +7731,396 @@ def main():
         print(f"Saved MSE curves to: {loss_dir}")
 
     load_best_all()
+    swa_summary["updates"] = int(swa_updates)
+    if swa_enable and swa_updates <= 0:
+        swa_summary["reason"] = "no_swa_updates"
+    if swa_enable and swa_updates > 0:
+        swa_mae_eval_weight = mae_objective_weight_final if mae_objective_enable else 0.0
+        lam_kp_for_swa_eval = lambda_kp_from_epochs(best_epoch)
+        best_val_loss_k, best_val_mse_k, best_val_mae_k, _, _, _, _, _ = eval_loop_with_history(
+            model, gate, lam_kp_for_swa_eval,
+            penalty_names, penalty_fns,
+            dl_va, cluster_id_c, K, moe_cfg, device,
+            select_ranks=select_ranks,
+            collect_plot=False, channel_count=C,
+            mse_weight=mse_weight,
+            gate_entropy_weight=gate_entropy_weight,
+            gate_balance_weight=gate_balance_weight,
+            gate_soft_weight=gate_soft_weight,
+            gate_entropy_target_frac=gate_entropy_target_frac,
+            penalty_scale=penalty_scale,
+            dynamic_lambda=dynamic_lambda,
+            lambda_min_kp=lambda_min_kp,
+            mae_objective_weight=swa_mae_eval_weight,
+            mae_objective_kind=mae_objective_kind,
+            mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
+            knn_hybrid=knn_hybrid_val if knn_cfg.use_for_model_selection else None,
+            eval_start=val_eval_start,
+        )
+        best_swa_metric = _aggregate_val_metric(
+            best_val_loss_k,
+            best_val_mse_k,
+            best_val_mae_k,
+            swa_selection_metric,
+        )
+        load_swa_averagers()
+        swa_val_loss_k, swa_val_mse_k, swa_val_mae_k, _, _, _, _, _ = eval_loop_with_history(
+            model, gate, lam_kp_for_swa_eval,
+            penalty_names, penalty_fns,
+            dl_va, cluster_id_c, K, moe_cfg, device,
+            select_ranks=select_ranks,
+            collect_plot=False, channel_count=C,
+            mse_weight=mse_weight,
+            gate_entropy_weight=gate_entropy_weight,
+            gate_balance_weight=gate_balance_weight,
+            gate_soft_weight=gate_soft_weight,
+            gate_entropy_target_frac=gate_entropy_target_frac,
+            penalty_scale=penalty_scale,
+            dynamic_lambda=dynamic_lambda,
+            lambda_min_kp=lambda_min_kp,
+            mae_objective_weight=swa_mae_eval_weight,
+            mae_objective_kind=mae_objective_kind,
+            mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
+            knn_hybrid=knn_hybrid_val if knn_cfg.use_for_model_selection else None,
+            eval_start=val_eval_start,
+        )
+        swa_metric = _aggregate_val_metric(
+            swa_val_loss_k,
+            swa_val_mse_k,
+            swa_val_mae_k,
+            swa_selection_metric,
+        )
+        use_swa = (best_swa_metric - swa_metric) > swa_min_delta
+        if not use_swa:
+            load_best_all()
+        swa_summary.update(
+            {
+                "selected": bool(use_swa),
+                "best_metric": float(best_swa_metric),
+                "swa_metric": float(swa_metric),
+                "min_delta": float(swa_min_delta),
+            }
+        )
+        print(
+            "SWA selection: "
+            f"updates={swa_updates}, metric={swa_selection_metric}, "
+            f"best={best_swa_metric:.6f}, swa={swa_metric:.6f}, "
+            f"selected={bool(use_swa)}"
+        )
     if knn_cfg.enable and knn_requires_base_bank:
         _refresh_knn_hybrids()
+
+    def _run_train_stat_anchor_scale_selection() -> bool:
+        train_stat_scale_selection_cfg = train_stat_anchor_cfg.get("scale_selection", {}) or {}
+        if not (
+            bool(train_stat_anchor_cfg.get("enable", False))
+            and bool(train_stat_scale_selection_cfg.get("enable", False))
+            and train_stat_anchor_pc is not None
+        ):
+            return False
+        horizon_segments = int(train_stat_scale_selection_cfg.get("horizon_segments", 1))
+        scales_c, scores_c, selection_count = select_train_stat_anchor_scales_from_loader(
+            model=model,
+            loader=dl_va,
+            cluster_id_c=cluster_id_c,
+            device=device,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=data_window_tc,
+            input_len=L,
+            eval_start=val_eval_start,
+            stat_anchor_pc=train_stat_anchor_pc,
+            train_stat_anchor_cfg=train_stat_anchor_cfg,
+            metric=str(train_stat_scale_selection_cfg.get("metric", "mse")),
+            max_scale=float(train_stat_scale_selection_cfg.get("max_scale", 0.3)),
+            steps=int(train_stat_scale_selection_cfg.get("steps", 13)),
+            horizon_segments=horizon_segments,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+        )
+        if int(scales_c.ndim) == 2:
+            alpha_values = [[float(v) for v in row] for row in scales_c.tolist()]
+            train_stat_anchor_cfg["alpha_by_channel_horizon"] = alpha_values
+            train_stat_anchor_cfg["alpha_horizon_segments"] = int(horizon_segments)
+            alpha_key = "alpha_by_channel_horizon"
+        else:
+            alpha_values = [float(v) for v in scales_c.tolist()]
+            train_stat_anchor_cfg["alpha_by_channel"] = alpha_values
+            alpha_key = "alpha_by_channel"
+        train_stat_anchor_summary["scale_selection"] = {
+            "enable": True,
+            "source_split": "val",
+            "metric": str(train_stat_scale_selection_cfg.get("metric", "mse")),
+            "max_scale": float(train_stat_scale_selection_cfg.get("max_scale", 0.3)),
+            "steps": int(train_stat_scale_selection_cfg.get("steps", 13)),
+            "horizon_segments": int(horizon_segments),
+            "num_windows": int(selection_count),
+            alpha_key: alpha_values,
+            "score": [[float(v) for v in row] for row in scores_c.tolist()]
+            if int(scores_c.ndim) == 2
+            else [float(v) for v in scores_c.tolist()],
+            "mean_alpha": float(scales_c.mean().item()) if int(scales_c.numel()) > 0 else 0.0,
+        }
+        print(
+            "Train-stat anchor scale selection: "
+            f"metric={train_stat_anchor_summary['scale_selection']['metric']}, "
+            f"mean_alpha={train_stat_anchor_summary['scale_selection']['mean_alpha']:.4f}, "
+            f"horizon_segments={int(horizon_segments)}, channels={int(scales_c.shape[0])}"
+        )
+        return True
+
+    def _run_model_train_stat_adapter_scale_selection() -> bool:
+        model_train_stat_scale_selection_cfg = model_train_stat_adapter_cfg.get("scale_selection", {}) or {}
+        if not (
+            bool(model_train_stat_adapter_cfg.get("enable", False))
+            and bool(model_train_stat_scale_selection_cfg.get("enable", False))
+            and model_train_stat_adapter_pc is not None
+        ):
+            return False
+        horizon_segments = int(model_train_stat_scale_selection_cfg.get("horizon_segments", 1))
+        scales_c, scores_c, selection_count = select_train_stat_anchor_scales_from_loader(
+            model=model,
+            loader=dl_va,
+            cluster_id_c=cluster_id_c,
+            device=device,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=data_window_tc,
+            input_len=L,
+            eval_start=val_eval_start,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            train_stat_anchor_cfg=model_train_stat_adapter_cfg,
+            metric=str(model_train_stat_scale_selection_cfg.get("metric", "mse")),
+            max_scale=float(model_train_stat_scale_selection_cfg.get("max_scale", 0.3)),
+            steps=int(model_train_stat_scale_selection_cfg.get("steps", 13)),
+            horizon_segments=horizon_segments,
+        )
+        if int(scales_c.ndim) == 2:
+            alpha_values = [[float(v) for v in row] for row in scales_c.tolist()]
+            model_train_stat_adapter_cfg["alpha_by_channel_horizon"] = alpha_values
+            model_train_stat_adapter_cfg["alpha_horizon_segments"] = int(horizon_segments)
+            alpha_key = "alpha_by_channel_horizon"
+        else:
+            alpha_values = [float(v) for v in scales_c.tolist()]
+            model_train_stat_adapter_cfg["alpha_by_channel"] = alpha_values
+            alpha_key = "alpha_by_channel"
+        model_train_stat_adapter_summary["scale_selection"] = {
+            "enable": True,
+            "source_split": "val",
+            "metric": str(model_train_stat_scale_selection_cfg.get("metric", "mse")),
+            "max_scale": float(model_train_stat_scale_selection_cfg.get("max_scale", 0.3)),
+            "steps": int(model_train_stat_scale_selection_cfg.get("steps", 13)),
+            "horizon_segments": int(horizon_segments),
+            "num_windows": int(selection_count),
+            alpha_key: alpha_values,
+            "score": [[float(v) for v in row] for row in scores_c.tolist()]
+            if int(scores_c.ndim) == 2
+            else [float(v) for v in scores_c.tolist()],
+            "mean_alpha": float(scales_c.mean().item()) if int(scales_c.numel()) > 0 else 0.0,
+        }
+        print(
+            "Model train-stat adapter scale selection: "
+            f"metric={model_train_stat_adapter_summary['scale_selection']['metric']}, "
+            f"mean_alpha={model_train_stat_adapter_summary['scale_selection']['mean_alpha']:.4f}, "
+            f"horizon_segments={int(horizon_segments)}, channels={int(scales_c.shape[0])}"
+        )
+        return True
+
+    _run_model_train_stat_adapter_scale_selection()
+    train_stat_scale_selection_done = _run_train_stat_anchor_scale_selection()
+
+    train_residual_scale_selection_cfg = train_residual_anchor_cfg.get("scale_selection", {}) or {}
+    if bool(train_residual_anchor_cfg.get("enable", False)):
+        train_residual_anchor_period = int(train_residual_anchor_cfg.get("period", 96))
+        train_residual_anchor_phc, train_residual_anchor_counts, residual_train_count = (
+            build_train_residual_anchor_table_from_loader(
+                model=model,
+                loader=dl_tr,
+                cluster_id_c=cluster_id_c,
+                device=device,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                input_len=L,
+                eval_start=0,
+                period=train_residual_anchor_period,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_stat_anchor_cfg=train_stat_anchor_cfg,
+            )
+        )
+        train_residual_anchor_summary.update(
+            {
+                "period": int(train_residual_anchor_period),
+                "source_split": "train",
+                "train_windows": int(residual_train_count),
+                "min_count": int(train_residual_anchor_counts.min().item()),
+                "max_count": int(train_residual_anchor_counts.max().item()),
+                "alpha": float(train_residual_anchor_cfg.get("alpha", 0.0) or 0.0),
+                "blend_target": str(train_residual_anchor_cfg.get("blend_target", "prediction")),
+            }
+        )
+        print(
+            "Train residual anchor expert enabled: "
+            f"period={train_residual_anchor_period}, "
+            f"alpha={float(train_residual_anchor_cfg.get('alpha', 0.0) or 0.0):.3f}, "
+            f"train_windows={int(residual_train_count)}"
+        )
+    if (
+        bool(train_residual_anchor_cfg.get("enable", False))
+        and bool(train_residual_scale_selection_cfg.get("enable", False))
+        and train_residual_anchor_phc is not None
+    ):
+        horizon_segments = int(train_residual_scale_selection_cfg.get("horizon_segments", 1))
+        scales_c, scores_c, selection_count = select_train_residual_anchor_scales_from_loader(
+            model=model,
+            loader=dl_va,
+            cluster_id_c=cluster_id_c,
+            device=device,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=data_window_tc,
+            input_len=L,
+            eval_start=val_eval_start,
+            residual_anchor_phc=train_residual_anchor_phc,
+            train_residual_anchor_cfg=train_residual_anchor_cfg,
+            metric=str(train_residual_scale_selection_cfg.get("metric", "mse")),
+            max_scale=float(train_residual_scale_selection_cfg.get("max_scale", 0.5)),
+            steps=int(train_residual_scale_selection_cfg.get("steps", 21)),
+            horizon_segments=horizon_segments,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_stat_anchor_cfg=train_stat_anchor_cfg,
+        )
+        if int(scales_c.ndim) == 2:
+            alpha_values = [[float(v) for v in row] for row in scales_c.tolist()]
+            train_residual_anchor_cfg["alpha_by_channel_horizon"] = alpha_values
+            train_residual_anchor_cfg["alpha_horizon_segments"] = int(horizon_segments)
+            alpha_key = "alpha_by_channel_horizon"
+        else:
+            alpha_values = [float(v) for v in scales_c.tolist()]
+            train_residual_anchor_cfg["alpha_by_channel"] = alpha_values
+            alpha_key = "alpha_by_channel"
+        train_residual_anchor_summary["scale_selection"] = {
+            "enable": True,
+            "source_split": "val",
+            "metric": str(train_residual_scale_selection_cfg.get("metric", "mse")),
+            "max_scale": float(train_residual_scale_selection_cfg.get("max_scale", 0.5)),
+            "steps": int(train_residual_scale_selection_cfg.get("steps", 21)),
+            "horizon_segments": int(horizon_segments),
+            "num_windows": int(selection_count),
+            alpha_key: alpha_values,
+            "score_by_channel": scores_c.detach().cpu().tolist(),
+            "mean_alpha": float(scales_c.mean().item()),
+        }
+        print(
+            "Train residual anchor scale selection: "
+            f"metric={train_residual_anchor_summary['scale_selection']['metric']}, "
+            f"mean_alpha={train_residual_anchor_summary['scale_selection']['mean_alpha']:.4f}, "
+            f"windows={int(selection_count)}"
+        )
+
+    train_stat_scale_selection_cfg = train_stat_anchor_cfg.get("scale_selection", {}) or {}
+    if (
+        not train_stat_scale_selection_done
+        and bool(train_stat_anchor_cfg.get("enable", False))
+        and bool(train_stat_scale_selection_cfg.get("enable", False))
+        and train_stat_anchor_pc is not None
+    ):
+        horizon_segments = int(train_stat_scale_selection_cfg.get("horizon_segments", 1))
+        scales_c, scores_c, selection_count = select_train_stat_anchor_scales_from_loader(
+            model=model,
+            loader=dl_va,
+            cluster_id_c=cluster_id_c,
+            device=device,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=data_window_tc,
+            input_len=L,
+            eval_start=val_eval_start,
+            stat_anchor_pc=train_stat_anchor_pc,
+            train_stat_anchor_cfg=train_stat_anchor_cfg,
+            metric=str(train_stat_scale_selection_cfg.get("metric", "mse")),
+            max_scale=float(train_stat_scale_selection_cfg.get("max_scale", 0.3)),
+            steps=int(train_stat_scale_selection_cfg.get("steps", 13)),
+            horizon_segments=horizon_segments,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+        )
+        if int(scales_c.ndim) == 2:
+            alpha_values = [[float(v) for v in row] for row in scales_c.tolist()]
+            train_stat_anchor_cfg["alpha_by_channel_horizon"] = alpha_values
+            train_stat_anchor_cfg["alpha_horizon_segments"] = int(horizon_segments)
+            alpha_key = "alpha_by_channel_horizon"
+        else:
+            alpha_values = [float(v) for v in scales_c.tolist()]
+            train_stat_anchor_cfg["alpha_by_channel"] = alpha_values
+            alpha_key = "alpha_by_channel"
+        train_stat_anchor_summary["scale_selection"] = {
+            "enable": True,
+            "source_split": "val",
+            "metric": str(train_stat_scale_selection_cfg.get("metric", "mse")),
+            "max_scale": float(train_stat_scale_selection_cfg.get("max_scale", 0.3)),
+            "steps": int(train_stat_scale_selection_cfg.get("steps", 13)),
+            "horizon_segments": int(horizon_segments),
+            "num_windows": int(selection_count),
+            alpha_key: alpha_values,
+            "score": [[float(v) for v in row] for row in scores_c.tolist()]
+            if int(scores_c.ndim) == 2
+            else [float(v) for v in scores_c.tolist()],
+            "mean_alpha": float(scales_c.mean().item()) if int(scales_c.numel()) > 0 else 0.0,
+        }
+        print(
+            "Train-stat anchor scale selection: "
+            f"metric={train_stat_anchor_summary['scale_selection']['metric']}, "
+            f"mean_alpha={train_stat_anchor_summary['scale_selection']['mean_alpha']:.4f}, "
+            f"horizon_segments={int(horizon_segments)}, channels={int(scales_c.shape[0])}"
+        )
+
+    if bool(calendar_residual_cfg.get("enable", False)):
+        source_split = str(calendar_residual_cfg.get("source_split", "train")).lower()
+        if source_split not in {"train", "training"}:
+            raise ValueError("calendar_residual.source_split must be 'train' for strict input96 experiments.")
+        calendar_fit_target = str(calendar_residual_cfg.get("fit_target", "base_path")).lower()
+        if calendar_fit_target in {"base", "base_path", "backbone"}:
+            calendar_fit_loader = DataLoader(
+                dtr,
+                batch_size=int(cfg["train"]["batch_size"]),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            calendar_residual_coef_cf, calendar_fit_summary = fit_calendar_residual_correction(
+                model=model,
+                loader=calendar_fit_loader,
+                cluster_id_c=cluster_id_c,
+                device=device,
+                calendar_feature_tf=calendar_feature_tf,
+                input_len=L,
+                eval_start=0,
+                cfg=calendar_residual_cfg,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            )
+            calendar_residual_summary.update(calendar_fit_summary)
+            calendar_residual_summary["feature_names"] = list(calendar_feature_names)
+            calendar_residual_summary["train_only"] = True
+            if calendar_residual_coef_cf is not None:
+                print(
+                    "Calendar residual fitted: "
+                    f"target=base_path, features={len(calendar_feature_names)}, "
+                    f"fit_windows={calendar_residual_summary.get('fit_windows')}, "
+                    f"coef_mean_abs={float(calendar_residual_summary.get('coef_mean_abs', 0.0)):.6f}"
+                )
+        elif calendar_fit_target in {"final", "final_eval", "final_eval_path", "eval_path"}:
+            calendar_residual_summary["fit_target"] = "final_eval_path"
+            calendar_residual_summary["pending_final_eval_path_fit"] = True
+        else:
+            raise ValueError(
+                "calendar_residual.fit_target must be base_path or final_eval_path "
+                f"(got {calendar_fit_target!r})."
+            )
 
     if memory_enable:
         if cluster_memory_bank is not None and cluster_memory_bank.total_updates > 0:
@@ -5118,6 +8248,8 @@ def main():
     pred_residual_channel_scale_c = None
     pred_residual_gate_model = None
     pred_residual_gate_summary = None
+    pred_residual_selector_model = None
+    pred_residual_selector_summary = None
     pred_residual_selection_summary = None
     moe_gate_penalty_hit_summary = None
     penalty_explainability_summary = None
@@ -5164,7 +8296,7 @@ def main():
                 if residual_correction_hybrid_ch is not None:
                     calibration_summary["hybrid_mean_abs"] = float(residual_correction_hybrid_ch.abs().mean().item())
                 knn_hybrid_val.reset_confidence_stats()
-        val_loss_best_k, val_mse_best_k, val_mae_best_k, val_mse_c_base, val_mae_c_base, _, _, _ = eval_loop(
+        val_loss_best_k, val_mse_best_k, val_mae_best_k, val_mse_c_base, val_mae_c_base, _, _, _ = eval_loop_with_history(
             model, gate, lam_kp_best,
             penalty_names, penalty_fns,
             val_loader_summary, cluster_id_c, K, moe_cfg, device,
@@ -5193,19 +8325,39 @@ def main():
             "per_cluster_loss": [float(v) for v in val_loss_best_k.detach().cpu().tolist()],
             "per_cluster_mse": [float(v) for v in val_mse_best_k.detach().cpu().tolist()],
             "per_cluster_mae": [float(v) for v in val_mae_best_k.detach().cpu().tolist()],
+            "per_channel_mse": [float(v) for v in val_mse_c_base.detach().cpu().tolist()],
+            "per_channel_mae": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
         }
         residual_selection_policy = str(pred_residual_cfg.get("selection_policy", "none")).lower()
         if residual_selection_policy in {"false", "off", "disable", "disabled"}:
             residual_selection_policy = "none"
-        if residual_selection_policy not in {"none", "val_mse_channel", "val_mse_scale", "val_mse_gate", "val_mse_gate_guarded"}:
+        if residual_selection_policy not in {"none", "val_mse_channel", "val_mse_scale", "val_mse_scale_holdout", "val_mse_gate", "val_mse_gate_guarded"}:
             raise ValueError(
                 "Unsupported moe.pred_side_residual.selection_policy="
                 f"'{residual_selection_policy}'. Expected none, val_mse_channel, val_mse_scale, "
-                "val_mse_gate, or val_mse_gate_guarded."
+                "val_mse_scale_holdout, val_mse_gate, or val_mse_gate_guarded."
             )
-        if pred_residual is not None and residual_selection_policy in {"val_mse_channel", "val_mse_scale", "val_mse_gate", "val_mse_gate_guarded"}:
+        if pred_residual is not None and residual_selection_policy in {"val_mse_channel", "val_mse_scale", "val_mse_scale_holdout", "val_mse_gate", "val_mse_gate_guarded"}:
             zero_residual_scale_c = torch.zeros(C, device=device, dtype=torch.float32)
             residual_scale_mean_value = 0.0
+            selection_max_residual_channels = int(pred_residual_cfg.get("selection_max_residual_channels", 0))
+            selection_eval_segments = int(pred_residual_cfg.get("selection_eval_segments", 1))
+            selection_min_positive_segments = int(pred_residual_cfg.get("selection_min_positive_segments", 0))
+            selection_max_segment_rel_degradation = float(
+                pred_residual_cfg.get("selection_max_segment_rel_degradation", 0.0)
+            )
+            selection_max_segment_abs_degradation = float(
+                pred_residual_cfg.get("selection_max_segment_abs_degradation", 0.0)
+            )
+            selection_segment_improvement_mse_sc = None
+            selection_segment_keep_c = None
+            selection_eval_split = "val"
+            selection_select_windows = len(dva)
+            selection_eval_windows = len(dva)
+            selection_eval_base_mse_c = None
+            selection_eval_base_mae_c = None
+            val_scaled_full_mse_c = None
+            val_scaled_full_mae_c = None
             (
                 val_loss_pred_base_k,
                 val_mse_pred_base_k,
@@ -5215,7 +8367,7 @@ def main():
                 _,
                 _,
                 _,
-            ) = eval_loop(
+            ) = eval_loop_with_history(
                 model, gate, lam_kp_best,
                 penalty_names, penalty_fns,
                 val_loader_summary, cluster_id_c, K, moe_cfg, device,
@@ -5240,12 +8392,78 @@ def main():
             )
             val_scaled_mse_c = val_mse_c_base
             val_scaled_mae_c = val_mae_c_base
-            if residual_selection_policy == "val_mse_scale":
+            if residual_selection_policy in {"val_mse_scale", "val_mse_scale_holdout"}:
                 scale_min = float(pred_residual_cfg.get("selection_scale_min", 0.0))
                 scale_max = float(pred_residual_cfg.get("selection_scale_max", 1.0))
                 scale_steps = int(pred_residual_cfg.get("selection_scale_steps", 21))
                 if scale_steps < 2:
                     raise ValueError("moe.pred_side_residual.selection_scale_steps must be >= 2")
+                scale_select_loader = val_loader_summary
+                scale_eval_loader = val_loader_summary
+                scale_eval_start = val_eval_start
+                scale_eval_base_mse_c = val_mse_c_pred_base
+                scale_eval_base_mae_c = val_mae_c_pred_base
+                if residual_selection_policy == "val_mse_scale_holdout":
+                    holdout_fraction = float(pred_residual_cfg.get("selection_holdout_fraction", 0.4))
+                    holdout_min_windows = int(pred_residual_cfg.get("selection_holdout_min_windows", 256))
+                    select_n, holdout_n = _validation_holdout_split_counts(
+                        len(dva),
+                        holdout_fraction=holdout_fraction,
+                        min_holdout=holdout_min_windows,
+                    )
+                    if holdout_n > 0:
+                        scale_select_loader = DataLoader(
+                            Subset(dva, range(0, select_n)),
+                            batch_size=int(cfg["train"]["batch_size"]),
+                            shuffle=False,
+                            num_workers=0,
+                            pin_memory=pin_mem,
+                        )
+                        scale_eval_loader = DataLoader(
+                            Subset(dva, range(select_n, select_n + holdout_n)),
+                            batch_size=int(cfg["train"]["batch_size"]),
+                            shuffle=False,
+                            num_workers=0,
+                            pin_memory=pin_mem,
+                        )
+                        scale_eval_start = val_eval_start + select_n
+                        selection_eval_split = "val_holdout"
+                        selection_select_windows = select_n
+                        selection_eval_windows = holdout_n
+                        (
+                            _,
+                            _,
+                            _,
+                            scale_eval_base_mse_c,
+                            scale_eval_base_mae_c,
+                            _,
+                            _,
+                            _,
+                        ) = eval_loop_with_history(
+                            model, gate, lam_kp_best,
+                            penalty_names, penalty_fns,
+                            scale_eval_loader, cluster_id_c, K, moe_cfg, device,
+                            select_ranks=select_ranks,
+                            collect_plot=False, channel_count=C,
+                            mse_weight=mse_weight,
+                            gate_entropy_weight=gate_entropy_weight,
+                            gate_balance_weight=gate_balance_weight,
+                            gate_soft_weight=gate_soft_weight,
+                            gate_entropy_target_frac=gate_entropy_target_frac,
+                            penalty_scale=penalty_scale,
+                            dynamic_lambda=dynamic_lambda,
+                            lambda_min_kp=lambda_min_kp,
+                            mae_objective_weight=mae_eval_weight,
+                            mae_objective_kind=mae_objective_kind,
+                            mae_objective_beta=mae_objective_beta,
+                            pred_residual=pred_residual,
+                            pred_residual_scale_c=zero_residual_scale_c,
+                            residual_correction_ch=residual_correction_base_ch,
+                            knn_hybrid=None,
+                            eval_start=scale_eval_start,
+                        )
+                selection_eval_base_mse_c = scale_eval_base_mse_c
+                selection_eval_base_mae_c = scale_eval_base_mae_c
                 scale_grid = torch.linspace(scale_min, scale_max, scale_steps, device=device, dtype=torch.float32)
                 best_mse_c = torch.full((C,), float("inf"), dtype=val_mse_c_pred_base.dtype)
                 best_mae_c = torch.full((C,), float("inf"), dtype=val_mae_c_pred_base.dtype)
@@ -5261,10 +8479,10 @@ def main():
                         _,
                         _,
                         _,
-                    ) = eval_loop(
+                    ) = eval_loop_with_history(
                         model, gate, lam_kp_best,
                         penalty_names, penalty_fns,
-                        val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                        scale_select_loader, cluster_id_c, K, moe_cfg, device,
                         select_ranks=select_ranks,
                         collect_plot=False, channel_count=C,
                         mse_weight=mse_weight,
@@ -5295,6 +8513,231 @@ def main():
                 pred_residual_channel_scale_c = best_scale_c.to(device=device, dtype=torch.float32)
                 val_scaled_mse_c = best_mse_c
                 val_scaled_mae_c = best_mae_c
+                if residual_selection_policy == "val_mse_scale_holdout" and selection_eval_split == "val_holdout":
+                    (
+                        _,
+                        _,
+                        _,
+                        holdout_scaled_mse_c,
+                        holdout_scaled_mae_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop_with_history(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        scale_eval_loader, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        pred_residual_scale_c=pred_residual_channel_scale_c,
+                        residual_correction_ch=residual_correction_base_ch,
+                        knn_hybrid=None,
+                        eval_start=scale_eval_start,
+                    )
+                    min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
+                    min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
+                    required = torch.maximum(
+                        torch.full_like(scale_eval_base_mse_c, min_abs),
+                        min_rel * scale_eval_base_mse_c.abs().clamp_min(1.0e-12),
+                    )
+                    use_residual_device_c = (scale_eval_base_mse_c - holdout_scaled_mse_c) > required
+                    segment_ranges = _contiguous_segment_ranges(selection_eval_windows, selection_eval_segments)
+                    if len(segment_ranges) > 1:
+                        segment_base_parts = []
+                        segment_scaled_parts = []
+                        for segment_start, segment_end in segment_ranges:
+                            segment_loader = DataLoader(
+                                Subset(dva, range(select_n + segment_start, select_n + segment_end)),
+                                batch_size=int(cfg["train"]["batch_size"]),
+                                shuffle=False,
+                                num_workers=0,
+                                pin_memory=pin_mem,
+                            )
+                            segment_eval_start = val_eval_start + select_n + segment_start
+                            (
+                                _,
+                                _,
+                                _,
+                                segment_base_mse_c,
+                                _,
+                                _,
+                                _,
+                                _,
+                            ) = eval_loop_with_history(
+                                model, gate, lam_kp_best,
+                                penalty_names, penalty_fns,
+                                segment_loader, cluster_id_c, K, moe_cfg, device,
+                                select_ranks=select_ranks,
+                                collect_plot=False, channel_count=C,
+                                mse_weight=mse_weight,
+                                gate_entropy_weight=gate_entropy_weight,
+                                gate_balance_weight=gate_balance_weight,
+                                gate_soft_weight=gate_soft_weight,
+                                gate_entropy_target_frac=gate_entropy_target_frac,
+                                penalty_scale=penalty_scale,
+                                dynamic_lambda=dynamic_lambda,
+                                lambda_min_kp=lambda_min_kp,
+                                mae_objective_weight=mae_eval_weight,
+                                mae_objective_kind=mae_objective_kind,
+                                mae_objective_beta=mae_objective_beta,
+                                pred_residual=pred_residual,
+                                pred_residual_scale_c=zero_residual_scale_c,
+                                residual_correction_ch=residual_correction_base_ch,
+                                knn_hybrid=None,
+                                eval_start=segment_eval_start,
+                            )
+                            (
+                                _,
+                                _,
+                                _,
+                                segment_scaled_mse_c,
+                                _,
+                                _,
+                                _,
+                                _,
+                            ) = eval_loop_with_history(
+                                model, gate, lam_kp_best,
+                                penalty_names, penalty_fns,
+                                segment_loader, cluster_id_c, K, moe_cfg, device,
+                                select_ranks=select_ranks,
+                                collect_plot=False, channel_count=C,
+                                mse_weight=mse_weight,
+                                gate_entropy_weight=gate_entropy_weight,
+                                gate_balance_weight=gate_balance_weight,
+                                gate_soft_weight=gate_soft_weight,
+                                gate_entropy_target_frac=gate_entropy_target_frac,
+                                penalty_scale=penalty_scale,
+                                dynamic_lambda=dynamic_lambda,
+                                lambda_min_kp=lambda_min_kp,
+                                mae_objective_weight=mae_eval_weight,
+                                mae_objective_kind=mae_objective_kind,
+                                mae_objective_beta=mae_objective_beta,
+                                pred_residual=pred_residual,
+                                pred_residual_scale_c=pred_residual_channel_scale_c,
+                                residual_correction_ch=residual_correction_base_ch,
+                                knn_hybrid=None,
+                                eval_start=segment_eval_start,
+                            )
+                            segment_base_parts.append(segment_base_mse_c.detach().cpu())
+                            segment_scaled_parts.append(segment_scaled_mse_c.detach().cpu())
+                        segment_base_sc = torch.stack(segment_base_parts, dim=0)
+                        segment_scaled_sc = torch.stack(segment_scaled_parts, dim=0)
+                        selection_segment_improvement_mse_sc = segment_base_sc - segment_scaled_sc
+                        segment_required_sc = torch.maximum(
+                            torch.full_like(segment_base_sc, min_abs),
+                            min_rel * segment_base_sc.abs().clamp_min(1.0e-12),
+                        )
+                        segment_keep_c = torch.ones(C, dtype=torch.bool)
+                        if selection_min_positive_segments > 0:
+                            positive_counts_c = (selection_segment_improvement_mse_sc > segment_required_sc).sum(dim=0)
+                            segment_keep_c &= positive_counts_c >= int(selection_min_positive_segments)
+                        allowed_degradation_sc = torch.maximum(
+                            torch.full_like(segment_base_sc, max(0.0, selection_max_segment_abs_degradation)),
+                            max(0.0, selection_max_segment_rel_degradation)
+                            * segment_base_sc.abs().clamp_min(1.0e-12),
+                        )
+                        segment_keep_c &= (selection_segment_improvement_mse_sc >= -allowed_degradation_sc).all(dim=0)
+                        selection_segment_keep_c = segment_keep_c
+                        use_residual_device_c &= segment_keep_c.to(device=use_residual_device_c.device)
+                    pred_residual_channel_scale_c = torch.where(
+                        use_residual_device_c.to(device=device),
+                        pred_residual_channel_scale_c,
+                        zero_residual_scale_c,
+                    )
+                    val_scaled_mse_c = torch.where(use_residual_device_c, holdout_scaled_mse_c, scale_eval_base_mse_c)
+                    val_scaled_mae_c = torch.where(use_residual_device_c, holdout_scaled_mae_c, scale_eval_base_mae_c)
+                    (
+                        _,
+                        _,
+                        _,
+                        val_scaled_full_mse_c,
+                        val_scaled_full_mae_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop_with_history(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        pred_residual_scale_c=pred_residual_channel_scale_c,
+                        residual_correction_ch=residual_correction_base_ch,
+                        knn_hybrid=None,
+                        eval_start=val_eval_start,
+                    )
+                if selection_max_residual_channels > 0:
+                    improvement_c = selection_eval_base_mse_c.detach().cpu() - val_scaled_mse_c.detach().cpu()
+                    limit_c = _top_positive_improvement_mask(improvement_c, selection_max_residual_channels)
+                    active_c = pred_residual_channel_scale_c.detach().cpu() > 1.0e-8
+                    keep_c = active_c & limit_c
+                    keep_scale_c = keep_c.to(device=pred_residual_channel_scale_c.device)
+                    keep_mse_c = keep_c.to(device=val_scaled_mse_c.device)
+                    keep_mae_c = keep_c.to(device=val_scaled_mae_c.device)
+                    pred_residual_channel_scale_c = torch.where(
+                        keep_scale_c,
+                        pred_residual_channel_scale_c,
+                        zero_residual_scale_c,
+                    )
+                    val_scaled_mse_c = torch.where(
+                        keep_mse_c,
+                        val_scaled_mse_c,
+                        selection_eval_base_mse_c.to(
+                            device=val_scaled_mse_c.device,
+                            dtype=val_scaled_mse_c.dtype,
+                        ),
+                    )
+                    val_scaled_mae_c = torch.where(
+                        keep_mae_c,
+                        val_scaled_mae_c,
+                        selection_eval_base_mae_c.to(
+                            device=val_scaled_mae_c.device,
+                            dtype=val_scaled_mae_c.dtype,
+                        ),
+                    )
+                    if val_scaled_full_mse_c is not None and val_scaled_full_mae_c is not None:
+                        keep_full_mse_c = keep_c.to(device=val_scaled_full_mse_c.device)
+                        keep_full_mae_c = keep_c.to(device=val_scaled_full_mae_c.device)
+                        val_scaled_full_mse_c = torch.where(
+                            keep_full_mse_c,
+                            val_scaled_full_mse_c,
+                            val_mse_c_pred_base.to(
+                                device=val_scaled_full_mse_c.device,
+                                dtype=val_scaled_full_mse_c.dtype,
+                            ),
+                        )
+                        val_scaled_full_mae_c = torch.where(
+                            keep_full_mae_c,
+                            val_scaled_full_mae_c,
+                            val_mae_c_pred_base.to(
+                                device=val_scaled_full_mae_c.device,
+                                dtype=val_scaled_full_mae_c.dtype,
+                            ),
+                        )
                 use_residual_c = pred_residual_channel_scale_c.detach().cpu() > 1.0e-8
                 scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
@@ -5310,9 +8753,11 @@ def main():
                         pin_memory=pin_mem,
                     )
                     gate_calib_source_split = "train"
+                    gate_calib_eval_start = 0
                 elif gate_calib_source_split in {"val", "validation"}:
                     gate_calib_loader = val_loader_summary
                     gate_calib_source_split = "val"
+                    gate_calib_eval_start = val_eval_start
                 else:
                     raise ValueError(
                         "moe.pred_side_residual.gate_calibrator.source_split must be train or val "
@@ -5334,6 +8779,10 @@ def main():
                     gate_soft_weight=gate_soft_weight,
                     channel_names=channel_names,
                     cfg=gate_calib_cfg,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=gate_calib_eval_start,
                 )
                 if pred_residual_gate_summary is not None:
                     pred_residual_gate_summary["source_split"] = gate_calib_source_split
@@ -5355,7 +8804,7 @@ def main():
                         _,
                         _,
                         _,
-                    ) = eval_loop(
+                    ) = eval_loop_with_history(
                         model, gate, lam_kp_best,
                         penalty_names, penalty_fns,
                         val_loader_summary, cluster_id_c, K, moe_cfg, device,
@@ -5392,6 +8841,10 @@ def main():
                         penalty_scale=penalty_scale,
                         select_ranks=select_ranks,
                         gate_soft_weight=gate_soft_weight,
+                        history_anchor_cfg=history_anchor_cfg,
+                        observed_history_tc=data_window_tc,
+                        input_len=L,
+                        eval_start=val_eval_start,
                     )
                     pred_residual_gate_summary["val_activation"] = _pred_residual_gate_activation_metrics_from_tensors(
                         tensors=val_gate_tensors,
@@ -5445,7 +8898,7 @@ def main():
                             _,
                             _,
                             _,
-                        ) = eval_loop(
+                        ) = eval_loop_with_history(
                             model, gate, lam_kp_best,
                             penalty_names, penalty_fns,
                             val_loader_summary, cluster_id_c, K, moe_cfg, device,
@@ -5492,6 +8945,14 @@ def main():
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
             pred_residual_selection_summary = {
                 "policy": residual_selection_policy,
+                "eval_split": selection_eval_split,
+                "selection_windows": int(selection_select_windows),
+                "eval_windows": int(selection_eval_windows),
+                "max_residual_channels": int(selection_max_residual_channels),
+                "eval_segments": int(selection_eval_segments),
+                "min_positive_segments": int(selection_min_positive_segments),
+                "max_segment_rel_degradation": float(selection_max_segment_rel_degradation),
+                "max_segment_abs_degradation": float(selection_max_segment_abs_degradation),
                 "min_abs_improvement": float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0)),
                 "min_rel_improvement": float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0)),
                 "scale_values": scale_values,
@@ -5517,15 +8978,152 @@ def main():
                 "val_scaled_mae_per_channel": [float(v) for v in val_scaled_mae_c.detach().cpu().tolist()],
                 "gate_calibrator": pred_residual_gate_summary,
             }
+            if val_scaled_full_mse_c is not None and val_scaled_full_mae_c is not None:
+                pred_residual_selection_summary.update(
+                    {
+                        "val_scaled_full_avg_mse": float(val_scaled_full_mse_c.mean().item()),
+                        "val_scaled_full_avg_mae": float(val_scaled_full_mae_c.mean().item()),
+                        "val_scaled_full_mse_per_channel": [
+                            float(v) for v in val_scaled_full_mse_c.detach().cpu().tolist()
+                        ],
+                        "val_scaled_full_mae_per_channel": [
+                            float(v) for v in val_scaled_full_mae_c.detach().cpu().tolist()
+                        ],
+                    }
+                )
+            if selection_segment_improvement_mse_sc is not None:
+                pred_residual_selection_summary.update(
+                    {
+                        "segment_improvement_mse_per_channel": [
+                            [float(v) for v in row]
+                            for row in selection_segment_improvement_mse_sc.detach().cpu().tolist()
+                        ],
+                        "segment_keep_channels": [
+                            bool(v) for v in selection_segment_keep_c.detach().cpu().tolist()
+                        ]
+                        if selection_segment_keep_c is not None
+                        else [],
+                    }
+                )
+            if selection_eval_base_mse_c is not None and selection_eval_base_mae_c is not None:
+                pred_residual_selection_summary.update(
+                    {
+                        "eval_pred_base_avg_mse": float(selection_eval_base_mse_c.mean().item()),
+                        "eval_pred_base_avg_mae": float(selection_eval_base_mae_c.mean().item()),
+                        "eval_pred_base_mse_per_channel": [
+                            float(v) for v in selection_eval_base_mse_c.detach().cpu().tolist()
+                        ],
+                        "eval_pred_base_mae_per_channel": [
+                            float(v) for v in selection_eval_base_mae_c.detach().cpu().tolist()
+                        ],
+                    }
+                )
             print(
                 "Prediction residual selection: "
                 f"policy={residual_selection_policy}, "
+                f"eval_split={selection_eval_split}, "
                 f"residual_channels={pred_residual_selection_summary['num_residual_channels']}/{C}, "
                 f"val_base_MSE={pred_residual_selection_summary['val_pred_base_avg_mse']:.6f}, "
                 f"val_residual_MSE={pred_residual_selection_summary['val_residual_avg_mse']:.6f}, "
                 f"val_scaled_MSE={pred_residual_selection_summary['val_scaled_avg_mse']:.6f}, "
                 f"mean_scale={pred_residual_selection_summary['mean_scale']:.3f}"
             )
+        selector_cfg = pred_residual_cfg.get("candidate_selector", {}) or {}
+        if pred_residual is not None and moe_enable and P > 0 and bool(selector_cfg.get("enable", False)):
+            selector_source_split = str(selector_cfg.get("source_split", "val")).lower()
+            if selector_source_split in {"train", "training"}:
+                selector_loader = DataLoader(
+                    dtr,
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+                selector_source_split = "train"
+                selector_eval_start = 0
+            elif selector_source_split in {"val", "validation"}:
+                selector_loader = val_loader_summary
+                selector_source_split = "val"
+                selector_eval_start = val_eval_start
+            else:
+                raise ValueError(
+                    "moe.pred_side_residual.candidate_selector.source_split must be train or val "
+                    f"(got {selector_source_split!r})."
+                )
+            pred_residual_selector_model, pred_residual_selector_summary = train_pred_residual_candidate_selector(
+                model=model,
+                pred_residual=pred_residual,
+                loader=selector_loader,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                moe_cfg=moe_cfg,
+                device=device,
+                penalty_names=penalty_names,
+                channel_names=channel_names,
+                cfg=selector_cfg,
+                pred_residual_scale_c=pred_residual_channel_scale_c,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                input_len=L,
+                eval_start=selector_eval_start,
+            )
+            if pred_residual_selector_summary is not None:
+                pred_residual_selector_summary["source_split"] = selector_source_split
+            if pred_residual_selector_model is not None:
+                (
+                    val_selector_loss_k,
+                    val_selector_mse_k,
+                    val_selector_mae_k,
+                    val_selector_mse_c,
+                    val_selector_mae_c,
+                    _,
+                    _,
+                    _,
+                ) = eval_loop_with_history(
+                    model, gate, lam_kp_best,
+                    penalty_names, penalty_fns,
+                    val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    pred_residual_selector=pred_residual_selector_model,
+                    pred_residual_scale_c=pred_residual_channel_scale_c,
+                    residual_correction_ch=residual_correction_base_ch,
+                    knn_hybrid=None,
+                    eval_start=val_eval_start,
+                )
+                val_mse_c_base = val_selector_mse_c
+                val_mae_c_base = val_selector_mae_c
+                val_summary = {
+                    "avg_loss": float(reduce_cluster_metric(val_selector_loss_k, cluster_weight_k).item()),
+                    "avg_mse": float(reduce_cluster_metric(val_selector_mse_k, cluster_weight_k).item()),
+                    "avg_mae": float(reduce_cluster_metric(val_selector_mae_k, cluster_weight_k).item()),
+                    "per_cluster_loss": [float(v) for v in val_selector_loss_k.detach().cpu().tolist()],
+                    "per_cluster_mse": [float(v) for v in val_selector_mse_k.detach().cpu().tolist()],
+                    "per_cluster_mae": [float(v) for v in val_selector_mae_k.detach().cpu().tolist()],
+                }
+                if pred_residual_selection_summary is None:
+                    pred_residual_selection_summary = {"policy": residual_selection_policy}
+                pred_residual_selection_summary["candidate_selector"] = pred_residual_selector_summary
+                pred_residual_selection_summary["val_selector_avg_mse"] = float(val_selector_mse_c.mean().item())
+                pred_residual_selection_summary["val_selector_avg_mae"] = float(val_selector_mae_c.mean().item())
+                print(
+                    "Prediction residual candidate selector: "
+                    f"source={selector_source_split}, "
+                    f"val_MSE={val_summary['avg_mse']:.6f}, "
+                    f"holdout_gain={((pred_residual_selector_summary or {}).get('holdout') or {}).get('selected_gain_pct_vs_base')}"
+                )
         if pred_residual is not None and moe_enable and P > 0:
             val_penalty_hit = evaluate_gate_penalty_hit_metrics(
                 model=model,
@@ -5547,6 +9145,10 @@ def main():
                         pred_residual_cfg.get("selection_min_abs_improvement", 0.0),
                     )
                 ),
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                input_len=L,
+                eval_start=val_eval_start,
             )
             moe_gate_penalty_hit_summary = {"val": val_penalty_hit, "test": None}
             if val_penalty_hit is not None:
@@ -5558,7 +9160,7 @@ def main():
                 )
         if knn_hybrid_val is not None:
             knn_hybrid_val.reset_confidence_stats()
-            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop(
+            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop_with_history(
                 model, gate, lam_kp_best,
                 penalty_names, penalty_fns,
                 val_loader_summary, cluster_id_c, K, moe_cfg, device,
@@ -5590,6 +9192,71 @@ def main():
             }
             val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
 
+    if (
+        bool(calendar_residual_cfg.get("enable", False))
+        and str(calendar_residual_cfg.get("fit_target", "base_path")).lower()
+        in {"final", "final_eval", "final_eval_path", "eval_path"}
+    ):
+        calendar_fit_loader = DataLoader(
+            dtr,
+            batch_size=int(cfg["train"]["batch_size"]),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_mem,
+        )
+        calendar_residual_coef_cf, calendar_fit_summary = fit_calendar_residual_correction_from_eval_path(
+            model=model,
+            gate=gate,
+            lambda_kp=lam_kp_best,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            loader=calendar_fit_loader,
+            cluster_id_c=cluster_id_c,
+            K=K,
+            moe_cfg=moe_cfg,
+            device=device,
+            calendar_feature_tf=calendar_feature_tf,
+            input_len=L,
+            cfg=calendar_residual_cfg,
+            channel_count=C,
+            select_ranks=select_ranks,
+            mse_weight=mse_weight,
+            gate_entropy_weight=gate_entropy_weight,
+            gate_balance_weight=gate_balance_weight,
+            gate_soft_weight=gate_soft_weight,
+            gate_entropy_target_frac=gate_entropy_target_frac,
+            penalty_scale=penalty_scale,
+            dynamic_lambda=dynamic_lambda,
+            lambda_min_kp=lambda_min_kp,
+            mae_objective_weight=mae_eval_weight,
+            mae_objective_kind=mae_objective_kind,
+            mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
+            pred_residual_gate=pred_residual_gate_model,
+            pred_residual_selector=pred_residual_selector_model,
+            pred_residual_scale_c=pred_residual_channel_scale_c,
+            residual_correction_ch=residual_correction_base_ch,
+            knn_hybrid=None,
+            eval_start=0,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=data_window_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        calendar_residual_summary.update(calendar_fit_summary)
+        calendar_residual_summary["feature_names"] = list(calendar_feature_names)
+        calendar_residual_summary["train_only"] = True
+        calendar_residual_summary.pop("pending_final_eval_path_fit", None)
+        if calendar_residual_coef_cf is not None:
+            print(
+                "Calendar residual fitted: "
+                f"target=final_eval_path, features={len(calendar_feature_names)}, "
+                f"fit_windows={calendar_residual_summary.get('fit_windows')}, "
+                f"coef_mean_abs={float(calendar_residual_summary.get('coef_mean_abs', 0.0)):.6f}"
+            )
+
     lam_kp_test = lam_kp_best
     test_loss_k = test_mse_k = test_mae_k = None
     mse_c = mae_c = None
@@ -5598,13 +9265,28 @@ def main():
     worst_sample = {}
     diagnostics_cfg = cfg.get("diagnostics", {}) or {}
     prediction_diag = bool(diagnostics_cfg.get("save_prediction_intermediates", False))
-    prediction_diag_collector = (
-        {"limit": int(diagnostics_cfg.get("prediction_sample_count", 32)), "count": 0, "parts": {}}
-        if prediction_diag
-        else None
-    )
+    prediction_diag_collector = None
+    if prediction_diag:
+        prediction_sample_count = int(diagnostics_cfg.get("prediction_sample_count", 32))
+        prediction_sample_strategy = str(diagnostics_cfg.get("prediction_sample_strategy", "first"))
+        prediction_sample_seed = int(diagnostics_cfg.get("prediction_sample_seed", 0))
+        prediction_sample_indices = select_prediction_sample_indices(
+            total=len(dte),
+            sample_count=prediction_sample_count,
+            strategy=prediction_sample_strategy,
+            seed=prediction_sample_seed,
+        )
+        prediction_diag_collector = {
+            "limit": len(prediction_sample_indices),
+            "count": 0,
+            "parts": {},
+            "indices": torch.as_tensor(prediction_sample_indices, dtype=torch.long),
+            "strategy": prediction_sample_strategy,
+            "seed": prediction_sample_seed,
+            "relative_indices": prediction_sample_indices,
+        }
     if not skip_test:
-        test_loss_k, test_mse_k, test_mae_k, mse_c, mae_c, plot_cache, best_sample, worst_sample = eval_loop(
+        test_loss_k, test_mse_k, test_mae_k, mse_c, mae_c, plot_cache, best_sample, worst_sample = eval_loop_with_history(
             model, gate, lam_kp_test,
             penalty_names, penalty_fns,
             dl_te, cluster_id_c, K, moe_cfg, device,
@@ -5623,6 +9305,7 @@ def main():
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
             pred_residual_gate=pred_residual_gate_model,
+            pred_residual_selector=pred_residual_selector_model,
             pred_residual_scale_c=pred_residual_channel_scale_c,
             residual_correction_ch=residual_correction_base_ch,
             knn_hybrid=None,
@@ -5644,6 +9327,10 @@ def main():
                 penalty_scale=penalty_scale,
                 select_ranks=select_ranks,
                 gate_soft_weight=gate_soft_weight,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                input_len=L,
+                eval_start=test_eval_start,
             )
             gate_calib_cfg_for_report = pred_residual_cfg.get("gate_calibrator", {}) or {}
             pred_residual_gate_summary["test_activation"] = _pred_residual_gate_activation_metrics_from_tensors(
@@ -5699,6 +9386,10 @@ def main():
                         pred_residual_cfg.get("selection_min_abs_improvement", 0.0),
                     )
                 ),
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                input_len=L,
+                eval_start=test_eval_start,
             )
             if moe_gate_penalty_hit_summary is None:
                 moe_gate_penalty_hit_summary = {"val": None, "test": test_penalty_hit}
@@ -5804,7 +9495,7 @@ def main():
     test_hybrid_confidence = None
     if knn_hybrid_test is not None and not skip_test:
         knn_hybrid_test.reset_confidence_stats()
-        test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
+        test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop_with_history(
             model, gate, lam_kp_test,
             penalty_names, penalty_fns,
             dl_te, cluster_id_c, K, moe_cfg, device,
@@ -5851,7 +9542,7 @@ def main():
             cand_val_hybrid, cand_test_hybrid, cand_bank_windows = _build_knn_hybrids_for(cand_knn_cfg)
 
             cand_val_hybrid.reset_confidence_stats()
-            cand_val_loss_k, cand_val_mse_k, cand_val_mae_k, cand_val_mse_c, cand_val_mae_c, _, _, _ = eval_loop(
+            cand_val_loss_k, cand_val_mse_k, cand_val_mae_k, cand_val_mse_c, cand_val_mae_c, _, _, _ = eval_loop_with_history(
                 model, gate, lam_kp_best,
                 penalty_names, penalty_fns,
                 val_loader_sweep, cluster_id_c, K, moe_cfg, device,
@@ -5876,7 +9567,7 @@ def main():
             cand_val_confidence = cand_val_hybrid.get_confidence_stats()
 
             cand_test_hybrid.reset_confidence_stats()
-            cand_test_loss_k, cand_test_mse_k, cand_test_mae_k, cand_mse_c, cand_mae_c, _, _, _ = eval_loop(
+            cand_test_loss_k, cand_test_mse_k, cand_test_mae_k, cand_mse_c, cand_mae_c, _, _, _ = eval_loop_with_history(
                 model, gate, lam_kp_test,
                 penalty_names, penalty_fns,
                 dl_te, cluster_id_c, K, moe_cfg, device,
@@ -5994,7 +9685,7 @@ def main():
             )
 
             knn_hybrid_val.reset_confidence_stats()
-            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop(
+            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop_with_history(
                 model, gate, lam_kp_best,
                 penalty_names, penalty_fns,
                 val_loader_fusion, cluster_id_c, K, moe_cfg, device,
@@ -6029,7 +9720,7 @@ def main():
 
             if knn_hybrid_test is not None and not skip_test:
                 knn_hybrid_test.reset_confidence_stats()
-                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
+                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop_with_history(
                     model, gate, lam_kp_test,
                     penalty_names, penalty_fns,
                     dl_te, cluster_id_c, K, moe_cfg, device,
@@ -6077,7 +9768,7 @@ def main():
             )
 
             knn_hybrid_val.reset_confidence_stats()
-            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop(
+            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop_with_history(
                 model, gate, lam_kp_best,
                 penalty_names, penalty_fns,
                 val_loader_gate, cluster_id_c, K, moe_cfg, device,
@@ -6112,7 +9803,7 @@ def main():
 
             if knn_hybrid_test is not None and not skip_test:
                 knn_hybrid_test.reset_confidence_stats()
-                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop(
+                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop_with_history(
                     model, gate, lam_kp_test,
                     penalty_names, penalty_fns,
                     dl_te, cluster_id_c, K, moe_cfg, device,
@@ -6407,6 +10098,9 @@ def main():
                 "sample_count": int(prediction_diag_collector.get("count", 0)),
                 "channel_names": list(channel_names),
                 "penalty_names": list(penalty_names),
+                "sample_strategy": str(prediction_diag_collector.get("strategy", "first")),
+                "sample_seed": int(prediction_diag_collector.get("seed", 0)),
+                "relative_indices": [int(v) for v in prediction_diag_collector.get("relative_indices", [])],
                 "note": "Rows are test windows; y_residual_raw is before residual gate scaling, y_final is after selected residual/calibration before optional KNN.",
             }
             with open(os.path.join(out_dir, "prediction_intermediates_meta.json"), "w", encoding="utf-8") as f:
@@ -6461,13 +10155,27 @@ def main():
             "warmup_epochs": int(mae_objective_warmup_epochs),
             "beta": float(mae_objective_beta),
         },
+        "training_stability": {
+            "shuffle_seed": None if shuffle_seed is None else int(shuffle_seed),
+            "freeze_backbone": bool(freeze_backbone),
+            "frozen_backbone_params": int(frozen_backbone_params),
+            "loss_normalization": dict(loss_normalization_cfg),
+            "lr_warmup_epochs": int(lr_warmup_epochs),
+            "lr_warmup_start_factor": float(lr_warmup_start_factor),
+            "swa": dict(swa_summary),
+        },
         "eval": {
             "skip_test": bool(skip_test),
         },
         "calibration": calibration_summary,
+        "calendar_residual": calendar_residual_summary,
         "moe_residual": moe_residual_summary,
         "moe_residual_selection": pred_residual_selection_summary,
         "moe_residual_gate_calibrator": pred_residual_gate_summary,
+        "moe_residual_candidate_selector": pred_residual_selector_summary,
+        "model_train_stat_adapter": model_train_stat_adapter_summary,
+        "train_stat_anchor_expert": train_stat_anchor_summary,
+        "train_residual_anchor_expert": train_residual_anchor_summary,
         "moe_gate_penalty_hit": moe_gate_penalty_hit_summary,
         "penalty_explainability": penalty_explainability_summary,
         "moe_router": {
@@ -6488,6 +10196,8 @@ def main():
             "per_cluster_loss": [float(v) for v in test_loss_k.detach().cpu().tolist()],
             "per_cluster_mse": [float(v) for v in test_mse_k.detach().cpu().tolist()],
             "per_cluster_mae": [float(v) for v in test_mae_k.detach().cpu().tolist()],
+            "per_channel_mse": [float(v) for v in mse_c.detach().cpu().tolist()],
+            "per_channel_mae": [float(v) for v in mae_c.detach().cpu().tolist()],
         },
         "selected": {
             "variant": selected_variant,

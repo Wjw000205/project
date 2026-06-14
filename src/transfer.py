@@ -152,6 +152,17 @@ def _build_moe_modules(
             residual_clip=float(pred_cfg.get("residual_clip", 0.0)),
             intervention_enable=bool(pred_cfg.get("intervention_enable", False)),
             intervention_init=float(pred_cfg.get("intervention_init", -2.0)),
+            penalty_selector_enable=bool(pred_cfg.get("penalty_selector_enable", False)),
+            selector_temperature=float(pred_cfg.get("selector_temperature", 1.0)),
+            selector_use_cluster_context=bool(pred_cfg.get("selector_use_cluster_context", True)),
+            fusion_gate_enable=bool(pred_cfg.get("fusion_gate_enable", False)),
+            fusion_init=float(pred_cfg.get("fusion_init", 0.0)),
+            fusion_use_cluster_context=bool(pred_cfg.get("fusion_use_cluster_context", True)),
+            penalty_names=penalty_names,
+            seasonal_anchor_names=list(pred_cfg.get("seasonal_anchor_names", [])),
+            seasonal_anchor_period=int(pred_cfg.get("seasonal_anchor_period", 96)),
+            seasonal_anchor_num_periods=int(pred_cfg.get("seasonal_anchor_num_periods", 1)),
+            seasonal_anchor_scale=float(pred_cfg.get("seasonal_anchor_scale", 1.0)),
         ).to(device)
         pred_residual.load_state_dict(pred_state, strict=True)
         pred_residual.eval()
@@ -490,6 +501,7 @@ def main():
             cluster_id_c=cluster_id_c,
             cfg=knn_cfg,
             base_bank_pred_nch=base_bank_pred,
+            observed_history_tc=data_tc,
         )
         info = knn_hybrid.describe()
         print(
@@ -628,6 +640,8 @@ def main():
         "source_checkpoint": ckpt_path,
         "source_memory": memory_path,
         "penalty_names": penalty_names,
+        "cluster_id": [int(v) for v in cluster_id_c.detach().cpu().tolist()],
+        "corr_max": [float(v) for v in corr_max],
     }
     if fixed_cluster_id_cfg is not None:
         summary["fixed_cluster_id"] = [int(v) for v in fixed_cluster_id_cfg]

@@ -38,11 +38,43 @@ class KNNShapeConfig:
     distance_weight: str = "inverse"
     anchor_mode: str = "last"
     bank_chunk_size: int = 8192
+    time_feature_mode: str = "none"
+    time_periods: Tuple[int, ...] = ()
+    time_feature_weight: float = 0.0
+    history_anchor_enable: bool = False
+    history_anchor_lags: Tuple[int, ...] = ()
+    history_anchor_alpha: float = 0.0
+    history_anchor_blend_target: str = "prediction"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "KNNShapeConfig":
         cfg = {} if cfg is None else dict(cfg)
         raw_alpha = float(cfg.get("alpha", 0.1))
+        raw_periods = cfg.get("time_periods", cfg.get("time_period", ()))
+        raw_history = cfg.get("history_anchor", {}) or {}
+        if not isinstance(raw_history, dict):
+            raw_history = {}
+        if isinstance(raw_periods, str):
+            periods = tuple(
+                int(part.strip())
+                for part in raw_periods.split(",")
+                if part.strip() and int(part.strip()) > 0
+            )
+        elif isinstance(raw_periods, (int, float)):
+            periods = (int(raw_periods),) if int(raw_periods) > 0 else ()
+        else:
+            periods = tuple(int(v) for v in raw_periods if int(v) > 0)
+        raw_lags = cfg.get("history_anchor_lags", raw_history.get("lags", ()))
+        if isinstance(raw_lags, str):
+            history_lags = tuple(
+                int(part.strip())
+                for part in raw_lags.split(",")
+                if part.strip() and int(part.strip()) > 0
+            )
+        elif isinstance(raw_lags, (int, float)):
+            history_lags = (int(raw_lags),) if int(raw_lags) > 0 else ()
+        else:
+            history_lags = tuple(int(v) for v in raw_lags if int(v) > 0)
         return cls(
             enable=bool(cfg.get("enable", False)),
             mode=str(cfg.get("mode", "fixed")).lower(),
@@ -67,6 +99,18 @@ class KNNShapeConfig:
             distance_weight=str(cfg.get("distance_weight", "inverse")).lower(),
             anchor_mode=str(cfg.get("anchor_mode", "last")).lower(),
             bank_chunk_size=max(128, int(cfg.get("bank_chunk_size", 8192))),
+            time_feature_mode=str(cfg.get("time_feature_mode", "none")).lower(),
+            time_periods=periods,
+            time_feature_weight=max(0.0, float(cfg.get("time_feature_weight", 0.0))),
+            history_anchor_enable=bool(cfg.get("history_anchor_enable", raw_history.get("enable", False))),
+            history_anchor_lags=history_lags,
+            history_anchor_alpha=max(
+                0.0,
+                float(cfg.get("history_anchor_alpha", raw_history.get("alpha", 0.0)) or 0.0),
+            ),
+            history_anchor_blend_target=str(
+                cfg.get("history_anchor_blend_target", raw_history.get("blend_target", "prediction"))
+            ).lower(),
         )
 
     def resolved_for_horizon(self, pred_len: int) -> "KNNShapeConfig":
@@ -80,6 +124,20 @@ class KNNShapeConfig:
 
     def needs_base_bank_prediction(self) -> bool:
         return (self.feature_mode == "joint") or (self.template_mode == "residual")
+
+    def uses_time_features(self) -> bool:
+        return (
+            self.time_feature_mode != "none"
+            and len(self.time_periods) > 0
+            and float(self.time_feature_weight) > 0.0
+        )
+
+    def uses_history_anchor(self) -> bool:
+        return (
+            bool(self.history_anchor_enable)
+            and len(self.history_anchor_lags) > 0
+            and float(self.history_anchor_alpha) > 0.0
+        )
 
 
 @dataclass
@@ -123,6 +181,43 @@ def build_shape_features(
     range_n1 = z_nl.max(dim=-1, keepdim=True).values - z_nl.min(dim=-1, keepdim=True).values
     feat_parts.extend([slope_n1, last_n1, range_n1])
     return torch.cat(feat_parts, dim=-1)
+
+
+def build_time_phase_features(
+    start_offsets_n: torch.Tensor | np.ndarray,
+    hist_len: int,
+    row_count: int,
+    cfg: KNNShapeConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if not cfg.uses_time_features():
+        return torch.empty((int(row_count), 0), device=device, dtype=dtype)
+    if start_offsets_n is None:
+        raise ValueError("KNN time features require absolute start offsets.")
+    if isinstance(start_offsets_n, torch.Tensor):
+        starts = start_offsets_n.detach().to(device=device, dtype=dtype).reshape(-1)
+    else:
+        starts = torch.as_tensor(np.asarray(start_offsets_n), device=device, dtype=dtype).reshape(-1)
+    if int(starts.numel()) != int(row_count):
+        raise ValueError("time feature start_offsets length must match feature rows.")
+
+    mode = str(cfg.time_feature_mode).lower()
+    if mode in {"forecast_phase", "input_end", "label_start"}:
+        phase_base = starts + float(hist_len)
+    elif mode in {"input_start", "start"}:
+        phase_base = starts
+    else:
+        raise ValueError(f"Unsupported knn_hybrid.time_feature_mode={cfg.time_feature_mode}")
+
+    parts = []
+    for period in cfg.time_periods:
+        p = max(float(period), 1.0)
+        angle = 2.0 * np.pi * torch.remainder(phase_base, p) / p
+        parts.extend([torch.sin(angle), torch.cos(angle)])
+    if not parts:
+        return torch.empty((int(row_count), 0), device=device, dtype=dtype)
+    return float(cfg.time_feature_weight) * torch.stack(parts, dim=-1).to(dtype=dtype)
 
 
 def build_future_template(
@@ -239,18 +334,33 @@ def _build_feature_tensor(
     hist_nl: torch.Tensor,
     cfg: KNNShapeConfig,
     base_nh: torch.Tensor | None = None,
+    start_offsets_n: torch.Tensor | np.ndarray | None = None,
 ) -> torch.Tensor:
     hist_feat = build_shape_features(hist_nl, cfg.shape_bins, cfg.diff_bins)
+    feat_parts = [hist_feat]
     if cfg.feature_mode == "hist":
-        return hist_feat
-    if cfg.feature_mode != "joint":
+        pass
+    elif cfg.feature_mode == "joint":
+        if base_nh is None:
+            raise ValueError("feature_mode=joint requires base predictions.")
+        if base_nh.device != hist_nl.device:
+            base_nh = base_nh.to(hist_nl.device)
+        pred_feat = build_shape_features(base_nh, cfg.pred_shape_bins, cfg.pred_diff_bins)
+        feat_parts.append(pred_feat)
+    else:
         raise ValueError(f"Unsupported knn_hybrid.feature_mode={cfg.feature_mode}")
-    if base_nh is None:
-        raise ValueError("feature_mode=joint requires base predictions.")
-    if base_nh.device != hist_nl.device:
-        base_nh = base_nh.to(hist_nl.device)
-    pred_feat = build_shape_features(base_nh, cfg.pred_shape_bins, cfg.pred_diff_bins)
-    return torch.cat([hist_feat, pred_feat], dim=-1)
+    if cfg.uses_time_features():
+        feat_parts.append(
+            build_time_phase_features(
+                start_offsets_n=start_offsets_n,
+                hist_len=int(hist_nl.shape[-1]),
+                row_count=int(hist_nl.shape[0]),
+                cfg=cfg,
+                device=hist_nl.device,
+                dtype=hist_nl.dtype,
+            )
+        )
+    return torch.cat(feat_parts, dim=-1)
 
 
 def _build_template_tensor(
@@ -357,9 +467,15 @@ def _blend_prediction(
 
 
 class ShapeKNNHybrid:
-    def __init__(self, cfg: KNNShapeConfig, banks: Dict[int, _RetrievalBank]):
+    def __init__(
+        self,
+        cfg: KNNShapeConfig,
+        banks: Dict[int, _RetrievalBank],
+        observed_history_tc: torch.Tensor | np.ndarray | None = None,
+    ):
         self.cfg = cfg
         self.banks = banks
+        self.observed_history_tc = self._coerce_observed_history(observed_history_tc)
         self.reset_confidence_stats()
 
     @classmethod
@@ -371,6 +487,7 @@ class ShapeKNNHybrid:
         cfg: KNNShapeConfig,
         start_offsets_n: torch.Tensor | np.ndarray | None = None,
         base_bank_pred_nch: torch.Tensor | None = None,
+        observed_history_tc: torch.Tensor | np.ndarray | None = None,
     ) -> "ShapeKNNHybrid":
         if not cfg.enable:
             raise ValueError("KNN shape hybrid is disabled.")
@@ -392,6 +509,14 @@ class ShapeKNNHybrid:
             raise ValueError(f"Unsupported knn_hybrid.template_mode={cfg.template_mode}")
         if cfg.adaptive_alpha not in {"none", "agreement", "distance", "confidence", "distance_agreement"}:
             raise ValueError(f"Unsupported knn_hybrid.adaptive_alpha={cfg.adaptive_alpha}")
+        if cfg.time_feature_mode not in {"none", "forecast_phase", "input_end", "label_start", "input_start", "start"}:
+            raise ValueError(f"Unsupported knn_hybrid.time_feature_mode={cfg.time_feature_mode}")
+        if cfg.uses_time_features() and start_offsets_n is None:
+            raise ValueError("knn_hybrid time features require start_offsets_n when fitting the bank.")
+        if cfg.history_anchor_blend_target not in {"prediction", "base"}:
+            raise ValueError(f"Unsupported knn_hybrid.history_anchor_blend_target={cfg.history_anchor_blend_target}")
+        if cfg.uses_history_anchor() and observed_history_tc is None:
+            raise ValueError("knn_hybrid history_anchor requires observed_history_tc.")
         if cfg.needs_base_bank_prediction():
             if base_bank_pred_nch is None:
                 raise ValueError(
@@ -431,7 +556,12 @@ class ShapeKNNHybrid:
                 else:
                     members = (cluster_id_bank == key).nonzero(as_tuple=False).view(-1)
                     starts_n = np.tile(start_offsets_n[::cfg.bank_stride], reps=int(members.numel()))
-            features_nd = _build_feature_tensor(hist_nl, cfg, base_nh=base_nh).detach().cpu().numpy().astype(np.float32)
+            features_nd = _build_feature_tensor(
+                hist_nl,
+                cfg,
+                base_nh=base_nh,
+                start_offsets_n=starts_n,
+            ).detach().cpu().numpy().astype(np.float32)
             template_nh = _build_template_tensor(hist_nl, fut_nh, cfg, base_nh=base_nh).detach().cpu().numpy().astype(np.float32)
             order = np.argsort(starts_n, kind="stable")
             features_nd = features_nd[order]
@@ -457,7 +587,7 @@ class ShapeKNNHybrid:
 
         if len(banks) == 0:
             raise ValueError("KNN shape bank is empty. Check bank_split, bank_stride, and input_len/pred_len.")
-        return cls(cfg=cfg, banks=banks)
+        return cls(cfg=cfg, banks=banks, observed_history_tc=observed_history_tc)
 
     def describe(self) -> dict:
         return {
@@ -485,6 +615,13 @@ class ShapeKNNHybrid:
             "distance_weight": self.cfg.distance_weight,
             "anchor_mode": self.cfg.anchor_mode,
             "bank_chunk_size": int(self.cfg.bank_chunk_size),
+            "time_feature_mode": self.cfg.time_feature_mode,
+            "time_periods": [int(v) for v in self.cfg.time_periods],
+            "time_feature_weight": float(self.cfg.time_feature_weight),
+            "history_anchor_enable": bool(self.cfg.history_anchor_enable),
+            "history_anchor_lags": [int(v) for v in self.cfg.history_anchor_lags],
+            "history_anchor_alpha": float(self.cfg.history_anchor_alpha),
+            "history_anchor_blend_target": self.cfg.history_anchor_blend_target,
             "bank_sizes": {str(k): int(v.size) for k, v in self.banks.items()},
         }
 
@@ -547,6 +684,95 @@ class ShapeKNNHybrid:
             return int(channel_idx)
         return int(cluster_id_c[channel_idx].item())
 
+    @staticmethod
+    def _coerce_observed_history(
+        observed_history_tc: torch.Tensor | np.ndarray | None,
+    ) -> torch.Tensor | None:
+        if observed_history_tc is None:
+            return None
+        if isinstance(observed_history_tc, torch.Tensor):
+            out = observed_history_tc.detach().cpu()
+        else:
+            out = torch.as_tensor(np.asarray(observed_history_tc))
+        if out.ndim != 2:
+            raise ValueError("observed_history_tc must have shape [time, channel].")
+        return out.contiguous()
+
+    @staticmethod
+    def _normalize_query_starts(
+        query_start_abs_b: torch.Tensor | np.ndarray | int | None,
+        batch_size: int,
+    ) -> np.ndarray:
+        if query_start_abs_b is None:
+            raise ValueError("KNN hybrid requires query_start_abs_b for this configuration.")
+        if isinstance(query_start_abs_b, torch.Tensor):
+            query_start_abs_b = query_start_abs_b.detach().cpu().numpy()
+        query_start_abs_b = np.asarray(query_start_abs_b, dtype=np.int64).reshape(-1)
+        if int(query_start_abs_b.shape[0]) != int(batch_size):
+            raise ValueError("query_start_abs_b length must match batch size.")
+        return query_start_abs_b
+
+    def _history_anchor(
+        self,
+        query_start_abs_b: np.ndarray,
+        input_len: int,
+        pred_len: int,
+        channel_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.observed_history_tc is None:
+            raise ValueError("history_anchor requires observed_history_tc.")
+        observed = self.observed_history_tc.to(device=device, dtype=dtype)
+        if int(observed.shape[1]) != int(channel_count):
+            raise ValueError("observed_history_tc channel count must match predictions.")
+
+        starts = torch.as_tensor(query_start_abs_b, device=device, dtype=torch.long).view(1, -1, 1)
+        steps = torch.arange(int(pred_len), device=device, dtype=torch.long).view(1, 1, -1)
+        lags = torch.as_tensor(self.cfg.history_anchor_lags, device=device, dtype=torch.long).view(-1, 1, 1)
+        forecast_start = starts + int(input_len)
+        idx_lbh = forecast_start + steps - lags
+        valid_lbh = (
+            (idx_lbh >= 0)
+            & (idx_lbh < forecast_start)
+            & (idx_lbh < int(observed.shape[0]))
+        )
+        idx_lbh = idx_lbh.clamp(min=0, max=max(int(observed.shape[0]) - 1, 0))
+        values_lbhc = observed.index_select(0, idx_lbh.reshape(-1)).view(
+            int(lags.shape[0]),
+            int(query_start_abs_b.shape[0]),
+            int(pred_len),
+            int(channel_count),
+        )
+        values_bchl = values_lbhc.permute(1, 3, 2, 0)
+        valid_bh1l = valid_lbh.permute(1, 2, 0).unsqueeze(2).to(dtype=dtype)
+        count_b1h = valid_bh1l.sum(dim=-1).permute(0, 2, 1).clamp_min(1.0)
+        anchor_bch = (values_bchl * valid_bh1l.permute(0, 2, 1, 3)).sum(dim=-1) / count_b1h
+        mask_b1h = (valid_bh1l.sum(dim=-1).permute(0, 2, 1) > 0)
+        return anchor_bch, mask_b1h
+
+    def _apply_history_anchor(
+        self,
+        out_bch: torch.Tensor,
+        base_pred_bch: torch.Tensor,
+        query_start_abs_b: np.ndarray,
+        input_len: int,
+    ) -> torch.Tensor:
+        anchor_bch, mask_b1h = self._history_anchor(
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            pred_len=int(out_bch.shape[-1]),
+            channel_count=int(out_bch.shape[1]),
+            device=out_bch.device,
+            dtype=out_bch.dtype,
+        )
+        alpha = float(self.cfg.history_anchor_alpha)
+        if self.cfg.history_anchor_blend_target == "prediction":
+            blended = out_bch + alpha * (anchor_bch - out_bch)
+        else:
+            blended = out_bch + alpha * (anchor_bch - base_pred_bch)
+        return torch.where(mask_b1h.to(device=out_bch.device), blended, out_bch)
+
     def hybridize_batch(
         self,
         hist_bcl: torch.Tensor,
@@ -554,20 +780,20 @@ class ShapeKNNHybrid:
         cluster_id_c: torch.Tensor,
         query_start_abs_b: torch.Tensor | np.ndarray | None = None,
     ) -> torch.Tensor:
-        if len(self.banks) == 0:
-            return base_pred_bch
-
         out = base_pred_bch.clone()
-        if float(self.cfg.alpha) <= 0.0:
+        query_start_abs_np = None
+        if self.cfg.mode == "rolling" or self.cfg.uses_time_features() or self.cfg.uses_history_anchor():
+            query_start_abs_np = self._normalize_query_starts(query_start_abs_b, int(hist_bcl.shape[0]))
+
+        if len(self.banks) == 0 or float(self.cfg.alpha) <= 0.0:
+            if self.cfg.uses_history_anchor():
+                out = self._apply_history_anchor(
+                    out,
+                    base_pred_bch,
+                    query_start_abs_np,
+                    input_len=int(hist_bcl.shape[-1]),
+                )
             return out
-        if self.cfg.mode == "rolling":
-            if query_start_abs_b is None:
-                raise ValueError("Rolling KNN hybrid requires query_start_abs_b.")
-            if isinstance(query_start_abs_b, torch.Tensor):
-                query_start_abs_b = query_start_abs_b.detach().cpu().numpy()
-            query_start_abs_b = np.asarray(query_start_abs_b, dtype=np.int64).reshape(-1)
-            if int(query_start_abs_b.shape[0]) != int(hist_bcl.shape[0]):
-                raise ValueError("query_start_abs_b length must match batch size.")
 
         for c in range(hist_bcl.shape[1]):
             bank_key = self._resolve_bank_key(c, cluster_id_c)
@@ -577,7 +803,12 @@ class ShapeKNNHybrid:
 
             hist_bl = hist_bcl[:, c, :]
             base_bl = base_pred_bch[:, c, :]
-            feat_bd = _build_feature_tensor(hist_bl, self.cfg, base_nh=base_bl).detach().cpu().numpy().astype(np.float32)
+            feat_bd = _build_feature_tensor(
+                hist_bl,
+                self.cfg,
+                base_nh=base_bl,
+                start_offsets_n=query_start_abs_np,
+            ).detach().cpu().numpy().astype(np.float32)
             if self.cfg.mode == "fixed":
                 k_eff = min(int(self.cfg.k), bank.size)
                 dist_bd, idx_bd = bank.nn.kneighbors(feat_bd, n_neighbors=k_eff, return_distance=True)
@@ -594,7 +825,7 @@ class ShapeKNNHybrid:
                 out[:, c, :] = torch.from_numpy(pred_bh).to(device=out.device, dtype=out.dtype)
                 continue
 
-            valid_limit_b = query_start_abs_b - int(base_pred_bch.shape[-1])
+            valid_limit_b = query_start_abs_np - int(base_pred_bch.shape[-1])
             allowed_count_b = np.searchsorted(bank.starts_n, valid_limit_b, side="right").astype(np.int64)
             if allowed_count_b.size == 0 or int(allowed_count_b.max()) <= 0:
                 continue
@@ -642,6 +873,13 @@ class ShapeKNNHybrid:
                 pred_row = pred_row[0]
                 row_preds.append(pred_row)
             out[:, c, :] = torch.from_numpy(np.stack(row_preds, axis=0)).to(device=out.device, dtype=out.dtype)
+        if self.cfg.uses_history_anchor():
+            out = self._apply_history_anchor(
+                out,
+                base_pred_bch,
+                query_start_abs_np,
+                input_len=int(hist_bcl.shape[-1]),
+            )
         return out
 
 
