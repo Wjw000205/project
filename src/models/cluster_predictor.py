@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Optional
 import torch
 from torch import nn
@@ -35,6 +36,8 @@ class ClusterwiseRevIN(_ClusterPredictorBase):
         super().__init__(num_clusters=base.K)
         self.base = base
         self.eps = float(eps)
+        self.L = int(base.L)
+        self.H = int(base.H)
 
     def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
         mean = x_bcl.mean(dim=-1, keepdim=True)
@@ -75,6 +78,31 @@ class ClusterwiseInputTail(_ClusterPredictorBase):
                 f"Input length {int(x_bcl.shape[-1])} is shorter than predictor tail length {self.tail_len}."
             )
         return self.base(x_bcl[..., -self.tail_len :], cluster_id_c)
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        return self.base.get_cluster_params(k)
+
+    def get_cluster_state(self, k: int):
+        return self.base.get_cluster_state(k)
+
+    def load_cluster_state(self, k: int, state):
+        self.base.load_cluster_state(k, state)
+
+
+class ClusterwiseResidualAnchor(_ClusterPredictorBase):
+    """Predict a residual around the last observed value and add that value back."""
+
+    def __init__(self, base: _ClusterPredictorBase, center_input: bool = True):
+        super().__init__(num_clusters=base.K)
+        self.base = base
+        self.center_input = bool(center_input)
+        self.L = int(base.L)
+        self.H = int(base.H)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        last = x_bcl[..., -1:]
+        x_in = x_bcl - last if self.center_input else x_bcl
+        return self.base(x_in, cluster_id_c) + last
 
     def get_cluster_params(self, k: int) -> List[nn.Parameter]:
         return self.base.get_cluster_params(k)
@@ -151,6 +179,65 @@ class ClusterwiseSeasonalAnchor(ClusterwiseSeasonalResidual):
         base_pred = self.base(x_bcl, cluster_id_c)
         last = x_bcl[..., -1:]
         return seasonal + self.delta_scale * (base_pred - last)
+
+
+class ClusterwiseSeasonalBlendAdapter(ClusterwiseSeasonalResidual):
+    def __init__(
+        self,
+        base: _ClusterPredictorBase,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        period: int,
+        num_periods: int = 1,
+        max_mix: float = 0.5,
+        init_mix: float = 0.02,
+    ):
+        super().__init__(base=base, period=period, num_periods=num_periods)
+        self.num_channels = int(num_channels)
+        self.max_mix = max(float(max_mix), 0.0)
+
+        cluster_id_c = cluster_id_c.detach().cpu().to(torch.long)
+        if int(cluster_id_c.numel()) != self.num_channels:
+            raise ValueError("seasonal_blend_adapter requires cluster_id_c length to match num_channels.")
+        self.register_buffer("cluster_id_c", cluster_id_c, persistent=False)
+
+        self.mix_logit = nn.ParameterList()
+        p = 1.0e-4 if self.max_mix <= 0.0 else min(max(float(init_mix) / self.max_mix, 1.0e-4), 1.0 - 1.0e-4)
+        init_logit = math.log(p / (1.0 - p))
+        for k in range(self.K):
+            idx = (cluster_id_c == k).nonzero(as_tuple=False).view(-1)
+            self.register_buffer(f"channel_idx_{k}", idx, persistent=False)
+            self.mix_logit.append(nn.Parameter(torch.full((int(idx.numel()),), float(init_logit))))
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        base_y = self.base(x_bcl, cluster_id_c)
+        if self.max_mix <= 0.0:
+            return base_y
+        seasonal = self._seasonal_baseline(x_bcl)
+        y = base_y
+        for k in range(self.K):
+            idx = getattr(self, f"channel_idx_{k}").to(device=x_bcl.device)
+            if idx.numel() == 0:
+                continue
+            mix = torch.sigmoid(self.mix_logit[k]).to(device=x_bcl.device, dtype=x_bcl.dtype)
+            mix = (self.max_mix * mix).view(1, -1, 1)
+            base_part = base_y.index_select(1, idx)
+            seasonal_part = seasonal.index_select(1, idx)
+            y = y.index_copy(1, idx, base_part + mix * (seasonal_part - base_part))
+        return y
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        return self.base.get_cluster_params(k) + [self.mix_logit[k]]
+
+    def get_cluster_state(self, k: int):
+        return {
+            "base": self.base.get_cluster_state(k),
+            "mix_logit": self.mix_logit[k].detach().cpu(),
+        }
+
+    def load_cluster_state(self, k: int, state):
+        self.base.load_cluster_state(k, state["base"])
+        self.mix_logit[k].data.copy_(state["mix_logit"].to(self.mix_logit[k].device))
 
 
 class ClusterwiseRecursiveRollout(_ClusterPredictorBase):
@@ -2203,6 +2290,183 @@ class ClusterwiseChannelResidualAdapter(_ClusterPredictorBase):
         self.bias[k].data.copy_(state["bias"].to(device))
 
 
+class ClusterwiseHorizonBiasAdapter(_ClusterPredictorBase):
+    """Learn a per-channel, per-horizon correction grouped by cluster."""
+
+    def __init__(
+        self,
+        base: _ClusterPredictorBase,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        init_bias: float = 0.0,
+        scale: float = 1.0,
+        freeze_base: bool = False,
+    ):
+        super().__init__(num_clusters=base.K)
+        self.base = base
+        self.L = int(base.L)
+        self.H = int(base.H)
+        self.num_channels = int(num_channels)
+        self.scale = float(scale)
+        self.freeze_base = bool(freeze_base)
+        if self.freeze_base:
+            for p in self.base.parameters():
+                p.requires_grad_(False)
+
+        cluster_id_c = cluster_id_c.detach().cpu().to(torch.long)
+        if int(cluster_id_c.numel()) != self.num_channels:
+            raise ValueError("horizon_bias_adapter requires cluster_id_c length to match num_channels.")
+        self.register_buffer("cluster_id_c", cluster_id_c, persistent=False)
+
+        self.horizon_bias = nn.ParameterList()
+        for k in range(self.K):
+            idx = (cluster_id_c == k).nonzero(as_tuple=False).view(-1)
+            self.register_buffer(f"channel_idx_{k}", idx, persistent=False)
+            n = int(idx.numel())
+            bias = torch.full((n, self.H), float(init_bias), dtype=torch.float32)
+            self.horizon_bias.append(nn.Parameter(bias))
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        y = self.base(x_bcl, cluster_id_c)
+        if self.scale == 0.0:
+            return y
+        for k in range(self.K):
+            idx = getattr(self, f"channel_idx_{k}").to(device=x_bcl.device)
+            if idx.numel() == 0:
+                continue
+            bias = self.horizon_bias[k].to(device=x_bcl.device, dtype=x_bcl.dtype).unsqueeze(0)
+            y = y.index_copy(1, idx, y.index_select(1, idx) + self.scale * bias)
+        return y
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        params = [] if self.freeze_base else self.base.get_cluster_params(k)
+        return params + [self.horizon_bias[k]]
+
+    def get_cluster_state(self, k: int):
+        return {
+            "base": self.base.get_cluster_state(k),
+            "horizon_bias": self.horizon_bias[k].detach().cpu(),
+        }
+
+    def load_cluster_state(self, k: int, state):
+        if isinstance(state, dict) and "base" in state and "horizon_bias" in state:
+            self.base.load_cluster_state(k, state["base"])
+            self.horizon_bias[k].data.copy_(state["horizon_bias"].to(self.horizon_bias[k].device))
+        else:
+            self.base.load_cluster_state(k, state)
+
+
+class ClusterwiseSelectedChannelResidualAdapter(_ClusterPredictorBase):
+    def __init__(
+        self,
+        base: _ClusterPredictorBase,
+        num_channels: int,
+        cluster_id_c: torch.Tensor,
+        channel_indices: List[int],
+        rank: int,
+        init: str = "zero_delta",
+        scale: float = 1.0,
+    ):
+        super().__init__(num_clusters=base.K)
+        self.base = base
+        self.L = int(base.L)
+        self.H = int(base.H)
+        self.num_channels = int(num_channels)
+        self.rank = max(int(rank), 1)
+        self.scale = float(scale)
+
+        cluster_id_c = cluster_id_c.detach().cpu().to(torch.long)
+        if int(cluster_id_c.numel()) != self.num_channels:
+            raise ValueError("selected_channel_adapter requires cluster_id_c length to match num_channels.")
+        unique_channels = sorted({int(c) for c in channel_indices if 0 <= int(c) < self.num_channels})
+        if len(unique_channels) == 0:
+            raise ValueError("selected_channel_adapter.channel_indices must contain at least one valid channel index.")
+        self.register_buffer("cluster_id_c", cluster_id_c, persistent=False)
+        self.register_buffer("selected_idx", torch.tensor(unique_channels, dtype=torch.long), persistent=False)
+
+        self.down = nn.ParameterList([nn.Parameter(torch.empty(self.L, self.rank)) for _ in unique_channels])
+        self.up = nn.ParameterList([nn.Parameter(torch.empty(self.rank, self.H)) for _ in unique_channels])
+        self.bias = nn.ParameterList([nn.Parameter(torch.zeros(self.H)) for _ in unique_channels])
+        self.reset_parameters(init=init)
+
+    def reset_parameters(self, init: str = "zero_delta") -> None:
+        init = str(init).lower()
+        for down, up, bias in zip(self.down, self.up, self.bias):
+            nn.init.xavier_uniform_(down)
+            if init == "zero_delta":
+                nn.init.zeros_(up)
+            elif init == "xavier":
+                nn.init.xavier_uniform_(up)
+            else:
+                raise ValueError(f"Unsupported selected_channel_adapter.init='{init}'.")
+            nn.init.zeros_(bias)
+
+    def _selected_positions_for_cluster(self, k: int) -> torch.Tensor:
+        selected = self.selected_idx.detach().cpu()
+        cluster_id_c = self.cluster_id_c.detach().cpu()
+        mask = cluster_id_c.index_select(0, selected) == int(k)
+        return mask.nonzero(as_tuple=False).view(-1)
+
+    def forward(self, x_bcl: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        y = self.base(x_bcl, cluster_id_c)
+        if self.scale == 0.0:
+            return y
+        selected = self.selected_idx.to(device=x_bcl.device)
+        for pos in range(int(selected.numel())):
+            c = int(selected[pos].item())
+            x_bl = x_bcl[:, c, :]
+            x_center = x_bl - x_bl[:, -1:]
+            h_br = torch.matmul(x_center, self.down[pos].to(device=x_bcl.device, dtype=x_bcl.dtype))
+            delta_bh = torch.matmul(h_br, self.up[pos].to(device=x_bcl.device, dtype=x_bcl.dtype))
+            delta_bh = delta_bh + self.bias[pos].to(device=x_bcl.device, dtype=x_bcl.dtype).unsqueeze(0)
+            y[:, c, :] = y[:, c, :] + self.scale * delta_bh
+        return y
+
+    def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        params = self.base.get_cluster_params(k)
+        positions = self._selected_positions_for_cluster(k)
+        for pos_t in positions:
+            pos = int(pos_t.item())
+            params.extend([self.down[pos], self.up[pos], self.bias[pos]])
+        return params
+
+    def get_cluster_state(self, k: int):
+        positions = self._selected_positions_for_cluster(k)
+        channel_idx = self.selected_idx.detach().cpu().index_select(0, positions)
+        if positions.numel() > 0:
+            down = torch.stack([self.down[int(pos.item())].detach().cpu() for pos in positions], dim=0)
+            up = torch.stack([self.up[int(pos.item())].detach().cpu() for pos in positions], dim=0)
+            bias = torch.stack([self.bias[int(pos.item())].detach().cpu() for pos in positions], dim=0)
+        else:
+            down = torch.empty(0, self.L, self.rank)
+            up = torch.empty(0, self.rank, self.H)
+            bias = torch.empty(0, self.H)
+        return {
+            "base": self.base.get_cluster_state(k),
+            "channel_idx": channel_idx,
+            "down": down,
+            "up": up,
+            "bias": bias,
+        }
+
+    def load_cluster_state(self, k: int, state):
+        self.base.load_cluster_state(k, state["base"])
+        positions = self._selected_positions_for_cluster(k)
+        channel_idx = self.selected_idx.detach().cpu().index_select(0, positions)
+        saved_idx = state.get("channel_idx", channel_idx)
+        if saved_idx.numel() != channel_idx.numel() or not torch.equal(saved_idx.cpu(), channel_idx):
+            raise ValueError(f"selected_channel_adapter cluster {k} channel indices do not match checkpoint state.")
+        device = self.down[0].device
+        down = state["down"].to(device)
+        up = state["up"].to(device)
+        bias = state["bias"].to(device)
+        for j, pos_t in enumerate(positions):
+            pos = int(pos_t.item())
+            self.down[pos].data.copy_(down[j])
+            self.up[pos].data.copy_(up[j])
+            self.bias[pos].data.copy_(bias[j])
+
+
 def build_cluster_predictor(
     num_clusters: int,
     input_len: int,
@@ -2478,6 +2742,13 @@ def build_cluster_predictor(
         )
     if recursive_enable:
         base_predictor = ClusterwiseRecursiveRollout(base=base_predictor, pred_len=pred_len)
+    if predictor in {"mlp", "cluster_mlp"} and bool(
+        model_cfg.get("mlp_residual_anchor", model_cfg.get("residual_anchor", False))
+    ):
+        base_predictor = ClusterwiseResidualAnchor(
+            base=base_predictor,
+            center_input=bool(model_cfg.get("mlp_center_input", model_cfg.get("residual_anchor_center_input", True))),
+        )
     if bool(model_cfg.get("seasonal_residual", False)):
         base_predictor = ClusterwiseSeasonalResidual(
             base=base_predictor,
@@ -2502,6 +2773,21 @@ def build_cluster_predictor(
             init=str(dict(basis_cfg).get("init", "zero_delta")),
             freeze_base=bool(dict(basis_cfg).get("freeze_base", False)),
         )
+    seasonal_blend_cfg = model_cfg.get("seasonal_blend_adapter", {})
+    if seasonal_blend_cfg is None:
+        seasonal_blend_cfg = {}
+    if bool(dict(seasonal_blend_cfg).get("enable", False)):
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.seasonal_blend_adapter requires num_channels and cluster_id_c.")
+        base_predictor = ClusterwiseSeasonalBlendAdapter(
+            base=base_predictor,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            period=int(dict(seasonal_blend_cfg).get("period", model_cfg.get("seasonal_period", 96))),
+            num_periods=int(dict(seasonal_blend_cfg).get("num_periods", model_cfg.get("seasonal_num_periods", 1))),
+            max_mix=float(dict(seasonal_blend_cfg).get("max_mix", 0.5)),
+            init_mix=float(dict(seasonal_blend_cfg).get("init_mix", 0.02)),
+        )
     adapter_cfg = model_cfg.get("channel_adapter", {})
     if adapter_cfg is None:
         adapter_cfg = {}
@@ -2515,5 +2801,34 @@ def build_cluster_predictor(
             rank=int(dict(adapter_cfg).get("rank", 8)),
             init=str(dict(adapter_cfg).get("init", "zero_delta")),
             scale=float(dict(adapter_cfg).get("scale", 1.0)),
+        )
+    horizon_bias_cfg = model_cfg.get("horizon_bias_adapter", {})
+    if horizon_bias_cfg is None:
+        horizon_bias_cfg = {}
+    if bool(dict(horizon_bias_cfg).get("enable", False)):
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.horizon_bias_adapter requires num_channels and cluster_id_c.")
+        base_predictor = ClusterwiseHorizonBiasAdapter(
+            base=base_predictor,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            init_bias=float(dict(horizon_bias_cfg).get("init_bias", 0.0)),
+            scale=float(dict(horizon_bias_cfg).get("scale", 1.0)),
+            freeze_base=bool(dict(horizon_bias_cfg).get("freeze_base", False)),
+        )
+    selected_adapter_cfg = model_cfg.get("selected_channel_adapter", {})
+    if selected_adapter_cfg is None:
+        selected_adapter_cfg = {}
+    if bool(dict(selected_adapter_cfg).get("enable", False)):
+        if num_channels is None or cluster_id_c is None:
+            raise ValueError("model.selected_channel_adapter requires num_channels and cluster_id_c.")
+        base_predictor = ClusterwiseSelectedChannelResidualAdapter(
+            base=base_predictor,
+            num_channels=int(num_channels),
+            cluster_id_c=cluster_id_c,
+            channel_indices=list(dict(selected_adapter_cfg).get("channel_indices", [])),
+            rank=int(dict(selected_adapter_cfg).get("rank", 8)),
+            init=str(dict(selected_adapter_cfg).get("init", "zero_delta")),
+            scale=float(dict(selected_adapter_cfg).get("scale", 1.0)),
         )
     return base_predictor

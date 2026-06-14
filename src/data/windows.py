@@ -58,6 +58,67 @@ def make_label_range_windows(
     x, y = make_strict_windows(data, input_len, pred_len, first_start, int(label_end))
     return x, y, first_start
 
+
+class LazyWindowDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        data: torch.Tensor,
+        input_len: int,
+        pred_len: int,
+        start_offsets: torch.Tensor,
+    ):
+        if data.dim() != 2:
+            raise ValueError(f"data must be [T, C], got {tuple(data.shape)}")
+        self.data = data
+        self.input_len = int(input_len)
+        self.pred_len = int(pred_len)
+        self.start_offsets = start_offsets.to(dtype=torch.long, device="cpu")
+
+    def __len__(self):
+        return int(self.start_offsets.numel())
+
+    def __getitem__(self, idx: int):
+        rel_idx = int(idx)
+        start = int(self.start_offsets[rel_idx].item())
+        input_end = start + self.input_len
+        label_end = input_end + self.pred_len
+        x = self.data[start:input_end].transpose(0, 1).contiguous()
+        y = self.data[input_end:label_end].transpose(0, 1).contiguous()
+        return x, y, rel_idx
+
+
+def _strict_window_count(data: torch.Tensor, input_len: int, pred_len: int, start: int, end: int) -> int:
+    total = int(input_len) + int(pred_len)
+    seg_len = int(data[int(start):int(end)].shape[0])
+    if seg_len < total:
+        return 0
+    return seg_len - total + 1
+
+
+def make_lazy_strict_window_dataset(
+    data: torch.Tensor,
+    input_len: int,
+    pred_len: int,
+    start: int,
+    end: int,
+) -> LazyWindowDataset:
+    n_windows = _strict_window_count(data, input_len, pred_len, start, end)
+    start_offsets = torch.arange(int(start), int(start) + n_windows, dtype=torch.long)
+    return LazyWindowDataset(data, input_len, pred_len, start_offsets)
+
+
+def make_lazy_label_range_window_dataset(
+    data: torch.Tensor,
+    input_len: int,
+    pred_len: int,
+    label_start: int,
+    label_end: int,
+) -> Tuple[LazyWindowDataset, int]:
+    first_start = max(0, int(label_start) - int(input_len))
+    dataset = make_lazy_strict_window_dataset(data, input_len, pred_len, first_start, int(label_end))
+    return dataset, first_start
+
+
 class WindowTensorDataset(torch.utils.data.Dataset):
     def __init__(self, x: torch.Tensor, y: torch.Tensor):
         self.x = x

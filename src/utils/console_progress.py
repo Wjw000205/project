@@ -38,6 +38,8 @@ class PurpleProgressBar:
         self.leave = bool(leave)
 
     def _is_interactive(self) -> bool:
+        if os.environ.get("MOELOSS_PROGRESS_FORCE") == "1":
+            return True
         if os.environ.get("NO_COLOR"):
             return False
         isatty = getattr(self.stream, "isatty", None)

@@ -10,6 +10,7 @@ from run_input96_h96_targeted_tuning import (
     Candidate,
     DATASET_CONFIGS,
     REPO_ROOT,
+    deep_update,
     load_yaml,
     model_candidates,
     resolve,
@@ -136,6 +137,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--device", default=None)
     ap.add_argument("--reference-csv", default="outputs/ett_horizon_sweep/results.csv")
+    ap.add_argument("--save-checkpoint", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -151,10 +153,13 @@ def main() -> None:
         for dataset in args.datasets:
             base_cfg = load_yaml(resolve(DATASET_CONFIGS[dataset]))
             set_moe_off(base_cfg)
+            patch = copy.deepcopy(cand.patch)
+            if args.save_checkpoint:
+                deep_update(patch, {"memory": {"save_checkpoint": True}})
             row, _ = run_candidate(
                 dataset=dataset,
                 base_cfg=base_cfg,
-                cand=Candidate("common_backbone_h96", cand.variant, copy.deepcopy(cand.patch)),
+                cand=Candidate("common_backbone_h96", cand.variant, patch),
                 out_root=out_root,
                 device=args.device,
                 epochs=args.epochs,

@@ -18,6 +18,22 @@ def _abs_md(path: Path) -> str:
     return path.resolve().as_posix()
 
 
+def _path_label(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _report_intro(best_results: Path) -> str:
+    label = _path_label(best_results)
+    return (
+        "This report summarizes the existing ETT best-run artifacts without refitting models. "
+        f"It uses `{label}` to locate the selected ETTh1/ETTh2/ETTm1/ETTm2 runs."
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -371,7 +387,7 @@ def summarize(best_results: Path, out_root: Path) -> None:
     md_lines = [
         "# ETT Interpretability Report",
         "",
-        "This report summarizes the existing ETT best-run artifacts without refitting models. It uses `outputs/ett_horizon_specific_moe_tune/best_results.csv` to locate the selected ETTh1/ETTh2/ETTm1/ETTm2 runs.",
+        _report_intro(best_results),
         "",
         "Protocol notes:",
         "- Cluster-penalty affinity is the average gate probability from `cluster_penalty_probs.csv`; it should be read as learned routing affinity, not as a causal Pearson coefficient.",

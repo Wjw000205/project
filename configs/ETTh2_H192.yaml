@@ -12,7 +12,7 @@ data:
   val_ratio: 0.2
   test_ratio: 0.2
 window:
-  input_len: 336
+  input_len: 96
   pred_len: 192
   past_context: true
 normalize:
@@ -160,12 +160,29 @@ train:
   selection_metric: val_mse
   weight_decay: 0.001
   grad_clip: 1.0
+  shuffle_seed: 2026
+  loss_normalization:
+    enable: true
+    mode: std
+    eps: 0.001
+    terms:
+    - mse
+    - mae_objective
+    - penalty
+    - pred_residual
   lr_scheduler:
-    name: plateau
-    factor: 0.5
-    patience: 3
+    name: cosine
+    t_max: 95
     min_lr: 1.0e-06
+    warmup_epochs: 5
+    warmup_start_factor: 0.2
   penalty_warmup_epochs: 15
+  swa:
+    enable: true
+    start_epoch: 15
+    update_every: 1
+    selection_metric: val_mse
+    min_delta: 0.0
 early_stop:
   patience: 10
   min_delta: 1.0e-06

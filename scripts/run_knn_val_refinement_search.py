@@ -48,6 +48,13 @@ CSV_FIELDS = [
     "diff_bins",
     "pred_shape_bins",
     "pred_diff_bins",
+    "time_feature_mode",
+    "time_periods",
+    "time_feature_weight",
+    "history_anchor_enable",
+    "history_anchor_lags",
+    "history_anchor_alpha",
+    "history_anchor_blend_target",
     "k",
     "alpha",
     "adaptive_alpha",
@@ -423,6 +430,13 @@ def make_knn_config(base_cfg: dict[str, Any], args: argparse.Namespace, cand: Ca
             "diff_bins": int(args.diff_bins),
             "pred_shape_bins": int(args.pred_shape_bins),
             "pred_diff_bins": int(args.pred_diff_bins),
+            "time_feature_mode": str(args.time_feature_mode),
+            "time_periods": str(args.time_periods),
+            "time_feature_weight": float(args.time_feature_weight),
+            "history_anchor_enable": bool(args.history_anchor_enable),
+            "history_anchor_lags": str(args.history_anchor_lags),
+            "history_anchor_alpha": float(args.history_anchor_alpha),
+            "history_anchor_blend_target": str(args.history_anchor_blend_target),
             "k": int(cand.k),
             "alpha": float(cand.alpha),
             "alpha_horizon_ref": 0,
@@ -448,6 +462,13 @@ def bank_signature(split: str, cfg: KNNShapeConfig) -> tuple[Any, ...]:
         int(cfg.diff_bins),
         int(cfg.pred_shape_bins),
         int(cfg.pred_diff_bins),
+        cfg.time_feature_mode,
+        tuple(int(v) for v in cfg.time_periods),
+        float(cfg.time_feature_weight),
+        bool(cfg.history_anchor_enable),
+        tuple(int(v) for v in cfg.history_anchor_lags),
+        float(cfg.history_anchor_alpha),
+        cfg.history_anchor_blend_target,
         cfg.anchor_mode,
     )
 
@@ -643,6 +664,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--diff-bins", type=int, default=12)
     ap.add_argument("--pred-shape-bins", type=int, default=16)
     ap.add_argument("--pred-diff-bins", type=int, default=8)
+    ap.add_argument(
+        "--time-feature-mode",
+        choices=["none", "forecast_phase", "input_end", "label_start", "input_start", "start"],
+        default="none",
+    )
+    ap.add_argument("--time-periods", default="")
+    ap.add_argument("--time-feature-weight", type=float, default=0.0)
+    ap.add_argument("--history-anchor-enable", action="store_true")
+    ap.add_argument("--history-anchor-lags", default="")
+    ap.add_argument("--history-anchor-alpha", type=float, default=0.0)
+    ap.add_argument("--history-anchor-blend-target", choices=["prediction", "base"], default="prediction")
 
     ap.add_argument("--coarse-k", default="16,48,96,160")
     ap.add_argument("--coarse-alpha", default="0.0,0.3,0.6,1.0,1.4,1.8")
@@ -795,8 +827,9 @@ def main() -> None:
                 cfg=knn_cfg,
                 start_offsets_n=starts,
                 base_bank_pred_nch=base_bank_pred,
+                observed_history_tc=context.norm_data_tc,
             )
-        return ShapeKNNHybrid(cfg=knn_cfg, banks=bank_cache[sig].banks)
+        return ShapeKNNHybrid(cfg=knn_cfg, banks=bank_cache[sig].banks, observed_history_tc=context.norm_data_tc)
 
     def evaluate_candidate(cand: Candidate, stage: str) -> dict[str, Any]:
         row = {field: "" for field in CSV_FIELDS}
@@ -827,6 +860,13 @@ def main() -> None:
                 "diff_bins": int(knn_cfg.diff_bins),
                 "pred_shape_bins": int(knn_cfg.pred_shape_bins),
                 "pred_diff_bins": int(knn_cfg.pred_diff_bins),
+                "time_feature_mode": knn_cfg.time_feature_mode,
+                "time_periods": ",".join(str(int(v)) for v in knn_cfg.time_periods),
+                "time_feature_weight": float(knn_cfg.time_feature_weight),
+                "history_anchor_enable": bool(knn_cfg.history_anchor_enable),
+                "history_anchor_lags": ",".join(str(int(v)) for v in knn_cfg.history_anchor_lags),
+                "history_anchor_alpha": float(knn_cfg.history_anchor_alpha),
+                "history_anchor_blend_target": knn_cfg.history_anchor_blend_target,
             }
         )
         t0 = time.perf_counter()

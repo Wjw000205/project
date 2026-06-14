@@ -166,6 +166,54 @@ best_checkpoint.pt
 cluster_memory.pt
 ```
 
+## Web Visualization
+
+Start the local visualization page from the repository root:
+
+```powershell
+python -m src.web_visualizer --host 127.0.0.1 --port 8765
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765
+```
+
+The web page is a display and orchestration layer only. It does not change the
+model or training logic. Existing runs are read from `outputs/`, including
+`run_summary.json`, `cluster_penalty_probs.csv`, and optional
+`prediction_intermediates.npz`.
+
+The page can also launch training through the existing entry point. By default
+it runs:
+
+```powershell
+F:\Anaconda3\condabin\conda.bat run --no-capture-output -n my_fram python -m src.train --config <generated-config>
+```
+
+The generated config is written under `outputs/web_visualizer/runs/<run_id>/`,
+keeps CUDA as the default device (`cuda:0`), enables prediction intermediates,
+and sets `eval.skip_test=false` so the inference replay data can be produced.
+Replay samples use `diagnostics.prediction_sample_strategy=stratified_random`:
+the test windows are split into `prediction_sample_count` ranges and one sample
+is selected from each range, avoiding a block of nearly identical consecutive
+windows.
+The web launcher also sets `MOELOSS_PROGRESS_FORCE=1` and `PYTHONUNBUFFERED=1`
+for that subprocess only, so the training log streams epoch, batch, loss, and
+the current epoch progress bar into `train.log` and the browser progress panel.
+After training finishes, refresh the page or result list to inspect MoE
+participation and prediction replay.
+
+If the Conda path or environment name differs, override them before starting the
+web service:
+
+```powershell
+$env:MOE_VIS_CONDA_BAT = "F:\Anaconda3\condabin\conda.bat"
+$env:MOE_VIS_CONDA_ENV = "my_fram"
+python -m src.web_visualizer --host 127.0.0.1 --port 8765
+```
+
 ## PKR-MoE Configuration
 
 A typical residual MoE section:
