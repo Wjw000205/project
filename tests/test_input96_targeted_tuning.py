@@ -433,6 +433,29 @@ def test_model_candidates_include_current_low_hd_options() -> None:
     assert h128.patch["model"] == {"hidden_dim": 128}
 
 
+def test_model_candidates_include_pems_context_backbone_anchor() -> None:
+    candidates = {cand.variant: cand for cand in model_candidates()}
+
+    cand = candidates["pems_cch_h128_do0_l001_mse050_mae150_bs64_valmae"].patch
+
+    assert cand["model"] == {
+        "predictor": "context_channel_head_mlp",
+        "hidden_dim": 128,
+        "dropout": 0.0,
+    }
+    assert cand["train"]["batch_size"] == 64
+    assert cand["train"]["lr"] == 0.001
+    assert cand["train"]["weight_decay"] == 1.0e-4
+    assert cand["train"]["mse_weight"] == 0.5
+    assert cand["train"]["selection_metric"] == "val_mae"
+    assert cand["train"]["mae_objective"] == {
+        "enable": True,
+        "kind": "l1",
+        "weight": 1.5,
+        "warmup_epochs": 3,
+    }
+
+
 def test_model_candidates_include_general_backbone_options() -> None:
     candidates = {cand.variant: cand for cand in model_candidates()}
 
@@ -1105,6 +1128,22 @@ def test_activation_candidates_include_etth1_h336_fine_train_stat_residual_combo
 def test_activation_candidates_include_boundary_train_stat_residual_combo() -> None:
     candidates = {cand.variant: cand for cand in activation_candidates({"penalties": {"enabled": ["level", "delta"]}})}
 
+    ultra = candidates["trainstatresid_mean_p96_stat005_resid020_seg4"].patch
+    assert ultra["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.05
+    assert ultra["moe"]["train_stat_anchor_expert"]["scale_selection"]["steps"] == 6
+    assert ultra["moe"]["train_residual_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": "mse",
+        "max_scale": 0.2,
+        "steps": 11,
+        "horizon_segments": 4,
+    }
+
+    tiny = candidates["trainstatresid_mean_p96_stat010_resid040_seg4"].patch
+    assert tiny["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.1
+    assert tiny["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 0.4
+    assert tiny["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 17
+
     patch = candidates["trainstatresid_mean_p96_stat020_resid120_seg4"].patch
     stat = patch["moe"]["train_stat_anchor_expert"]
     residual = patch["moe"]["train_residual_anchor_expert"]
@@ -1129,6 +1168,54 @@ def test_dataset_configs_include_pems_input96_targets() -> None:
 def test_activation_candidates_include_daily_train_stat_residual_combo() -> None:
     candidates = {cand.variant: cand for cand in activation_candidates({"penalties": {"enabled": ["level", "delta"]}})}
 
+    ultra = candidates["trainstatresid_mean_p288_stat005_resid020_seg4"].patch
+    assert ultra["moe"]["train_stat_anchor_expert"]["period"] == 288
+    assert ultra["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.05
+    assert ultra["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 0.2
+    assert ultra["moe"]["train_residual_anchor_expert"]["scale_selection"]["horizon_segments"] == 4
+
+    tiny = candidates["trainstatresid_mean_p288_stat010_resid040_seg4"].patch
+    assert tiny["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.1
+    assert tiny["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 0.4
+    assert tiny["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 17
+
+    conservative = candidates["trainstatresid_mean_p288_stat015_resid060_seg4"].patch
+    assert conservative["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.15
+    assert conservative["moe"]["train_stat_anchor_expert"]["scale_selection"]["steps"] == 7
+    assert conservative["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 0.6
+    assert conservative["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 25
+
+    resid070 = candidates["trainstatresid_mean_p288_stat020_resid070_seg4"].patch
+    assert resid070["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.2
+    assert resid070["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 0.7
+    assert resid070["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 29
+
+    stat018_resid140 = candidates["trainstatresid_mean_p288_stat018_resid140_seg4"].patch
+    assert stat018_resid140["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.18
+    assert stat018_resid140["moe"]["train_stat_anchor_expert"]["scale_selection"]["steps"] == 10
+    assert stat018_resid140["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.4
+    assert stat018_resid140["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 57
+
+    stat016_resid180 = candidates["trainstatresid_mean_p288_stat016_resid180_seg4"].patch
+    assert stat016_resid180["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.16
+    assert stat016_resid180["moe"]["train_stat_anchor_expert"]["scale_selection"]["steps"] == 9
+    assert stat016_resid180["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.8
+    assert stat016_resid180["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 73
+
+    stat017_resid160 = candidates["trainstatresid_mean_p288_stat017_resid160_seg4"].patch
+    assert stat017_resid160["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.17
+    assert stat017_resid160["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.6
+    assert stat017_resid160["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 65
+
+    stat018_resid200 = candidates["trainstatresid_mean_p288_stat018_resid200_seg4"].patch
+    assert stat018_resid200["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.18
+    assert stat018_resid200["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 2.0
+    assert stat018_resid200["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 81
+
+    stat020_resid110 = candidates["trainstatresid_mean_p288_stat020_resid110_seg4"].patch
+    assert stat020_resid110["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.1
+    assert stat020_resid110["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 45
+
     patch = candidates["trainstatresid_mean_p288_stat020_resid120_seg4"].patch
     stat = patch["moe"]["train_stat_anchor_expert"]
     residual = patch["moe"]["train_residual_anchor_expert"]
@@ -1136,6 +1223,15 @@ def test_activation_candidates_include_daily_train_stat_residual_combo() -> None
     assert stat["period"] == 288
     assert residual["period"] == 288
     assert residual["scale_selection"]["horizon_segments"] == 4
+
+    stat020_resid130 = candidates["trainstatresid_mean_p288_stat020_resid130_seg4"].patch
+    assert stat020_resid130["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.3
+    assert stat020_resid130["moe"]["train_residual_anchor_expert"]["scale_selection"]["steps"] == 53
+
+    stat0225_resid120 = candidates["trainstatresid_mean_p288_stat0225_resid120_seg4"].patch
+    assert stat0225_resid120["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.225
+    assert stat0225_resid120["moe"]["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.2
+    assert stat0225_resid120["moe"]["train_residual_anchor_expert"]["scale_selection"]["horizon_segments"] == 4
 
     stat050 = candidates["trainstatresid_mean_p288_stat050_resid200_seg4"].patch
     assert stat050["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.5

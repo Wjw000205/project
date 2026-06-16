@@ -184,6 +184,87 @@ def test_pems_batch_tune_config_can_finetune_from_backbone_checkpoint(tmp_path) 
     assert cfg["finetune"]["load_gate"] is False
 
 
+def test_pems_batch_tune_config_can_enable_calibration_and_override_lr(tmp_path) -> None:
+    cfg = configure(
+        {},
+        dataset="PEMS07",
+        horizon=12,
+        cand=candidates()[0],
+        phase="final",
+        out_dir=tmp_path / "run",
+        epochs=1,
+        skip_test=False,
+        device="cuda:0",
+        calibration_cfg={"enable": True, "method": "median", "shrink": 1.0, "max_abs": 0.0},
+        lr_override=0.0,
+    )
+
+    assert cfg["calibration"] == {"enable": True, "method": "median", "shrink": 1.0, "max_abs": 0.0}
+    assert cfg["train"]["lr"] == 0.0
+
+
+def test_pems_batch_tune_config_can_freeze_backbone_for_moe_stage(tmp_path) -> None:
+    cfg = configure(
+        {"moe": {"enable": True}},
+        dataset="PEMS04",
+        horizon=12,
+        cand=candidates()[0],
+        phase="final",
+        out_dir=tmp_path / "run",
+        epochs=3,
+        skip_test=False,
+        device="cuda:0",
+        freeze_backbone=True,
+    )
+
+    assert cfg["moe"]["enable"] is True
+    assert cfg["moe"]["freeze_backbone"] is True
+
+
+def test_pems_batch_tune_config_applies_moe_overrides(tmp_path) -> None:
+    cand = dict(candidates()[0])
+    cand["moe_overrides"] = {
+        "train_stat_anchor_expert": {
+            "enable": True,
+            "period": 288,
+            "scale_selection": {"enable": True, "metric": "mse", "max_scale": 0.3, "steps": 13},
+        },
+        "train_residual_anchor_expert": {
+            "enable": True,
+            "period": 288,
+            "scale_selection": {"enable": True, "metric": "mae", "max_scale": 1.2, "steps": 49},
+        },
+    }
+
+    cfg = configure(
+        {"moe": {"enable": True}},
+        dataset="PEMS07",
+        horizon=24,
+        cand=cand,
+        phase="final",
+        out_dir=tmp_path / "run",
+        epochs=3,
+        skip_test=False,
+        device="cuda:0",
+    )
+
+    assert cfg["moe"]["train_stat_anchor_expert"]["period"] == 288
+    assert cfg["moe"]["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.3
+    assert cfg["moe"]["train_residual_anchor_expert"]["period"] == 288
+    assert cfg["moe"]["train_residual_anchor_expert"]["scale_selection"]["metric"] == "mae"
+
+
+def test_pems_batch_tune_includes_anchor_moe_candidates() -> None:
+    by_name = {cand["name"]: cand for cand in candidates()}
+
+    mse_anchor = by_name["bs64_cch_h128_do000_l001_mse050_mae150_valmae_anchor_p288"]
+    mae_anchor = by_name["bs64_cch_h128_do000_l001_mse050_mae150_valmae_anchor_p288_residmae"]
+
+    assert mse_anchor["moe_overrides"]["train_stat_anchor_expert"]["period"] == 288
+    assert mse_anchor["moe_overrides"]["train_residual_anchor_expert"]["scale_selection"]["metric"] == "mse"
+    assert mae_anchor["moe_overrides"]["train_residual_anchor_expert"]["scale_selection"]["metric"] == "mae"
+
+
 def test_pems_batch_tune_includes_low_memory_h128_context_candidate() -> None:
     by_name = {cand["name"]: cand for cand in candidates()}
 

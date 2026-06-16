@@ -496,6 +496,43 @@ def build_topk_penalty_mask(prior_kp: Optional[torch.Tensor], topk: int) -> Opti
     mask.scatter_(-1, idx, 1.0)
     return mask
 
+
+def build_named_penalty_mask(
+    allowed_by_cluster,
+    penalty_names: List[str],
+    K: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if allowed_by_cluster is None:
+        return None
+    name_to_idx = {str(name): i for i, name in enumerate(penalty_names)}
+    mask = torch.zeros((int(K), len(penalty_names)), device=device, dtype=torch.float32)
+    if isinstance(allowed_by_cluster, dict):
+        iterator = allowed_by_cluster.items()
+    else:
+        iterator = enumerate(allowed_by_cluster)
+    for raw_k, raw_names in iterator:
+        k = int(raw_k)
+        if k < 0 or k >= int(K):
+            raise ValueError(f"cluster_penalty_prior.allowed_by_cluster has invalid cluster id {k}.")
+        if isinstance(raw_names, str):
+            names = [raw_names]
+        else:
+            names = list(raw_names or [])
+        for raw_name in names:
+            name = str(raw_name)
+            if name not in name_to_idx:
+                raise ValueError(
+                    "cluster_penalty_prior.allowed_by_cluster contains unknown penalty "
+                    f"{name!r}; available={penalty_names}"
+                )
+            mask[k, name_to_idx[name]] = 1.0
+    empty = mask.sum(dim=-1, keepdim=True) <= 0.0
+    if bool(empty.any().item()):
+        mask = torch.where(empty, torch.ones_like(mask), mask)
+    return mask
+
+
 @torch.no_grad()
 def compute_cluster_penalty_portrait(
     loader: DataLoader,
@@ -744,6 +781,40 @@ def _mae_objective_bc_from_abs(
         )
         return loss_bch.mean(dim=-1)
     raise ValueError(f"Unsupported train.mae_objective.kind='{kind}'. Expected l1 or smooth_l1.")
+
+
+def _pred_residual_channel_keep_mask(
+    policy: str,
+    base_mse_c: torch.Tensor,
+    cand_mse_c: torch.Tensor,
+    base_mae_c: torch.Tensor,
+    cand_mae_c: torch.Tensor,
+    *,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    max_abs_mse_regression: float = 0.0,
+    max_rel_mse_regression: float = 0.0,
+) -> torch.Tensor:
+    policy = str(policy).lower()
+    if policy in {"val_mse_channel", "val_mse_scale", "val_mse_scale_holdout", "val_mse_gate", "val_mse_gate_guarded"}:
+        required = torch.maximum(
+            torch.full_like(base_mse_c, float(min_abs_improvement)),
+            float(min_rel_improvement) * base_mse_c.abs().clamp_min(1.0e-12),
+        )
+        return (base_mse_c - cand_mse_c) > required
+    if policy == "val_mae_gate_guarded":
+        required_mae = torch.maximum(
+            torch.full_like(base_mae_c, float(min_abs_improvement)),
+            float(min_rel_improvement) * base_mae_c.abs().clamp_min(1.0e-12),
+        )
+        allowed_mse_regression = torch.maximum(
+            torch.full_like(base_mse_c, max(0.0, float(max_abs_mse_regression))),
+            max(0.0, float(max_rel_mse_regression)) * base_mse_c.abs().clamp_min(1.0e-12),
+        )
+        improves_mae = (base_mae_c - cand_mae_c) > required_mae
+        respects_mse = (cand_mse_c - base_mse_c) <= allowed_mse_regression
+        return improves_mae & respects_mse
+    raise ValueError(f"Unsupported residual selection policy for channel keep mask: {policy}")
 
 
 def _gate_regularization(
@@ -1481,6 +1552,8 @@ def select_channel_horizon_anchor_scales(
     steps: int = 21,
     segments: int = 4,
     channel_chunk_size: int = 8,
+    sample_chunk_size: int = 256,
+    scale_chunk_size: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if base_bch.shape != anchor_bch.shape or base_bch.shape != target_bch.shape:
         raise ValueError("base, anchor, and target tensors must have the same [batch, channel, horizon] shape.")
@@ -1501,6 +1574,8 @@ def select_channel_horizon_anchor_scales(
     scores_cs = torch.zeros_like(scales_cs)
     channel_count = int(base_bch.shape[1])
     chunk_size = max(1, min(channel_count, int(channel_chunk_size))) if channel_count > 0 else 1
+    sample_chunk = max(1, int(sample_chunk_size))
+    scale_chunk = max(1, int(scale_chunk_size))
     for segment in range(segments):
         start = (segment * horizon) // segments
         end = ((segment + 1) * horizon) // segments
@@ -1508,20 +1583,37 @@ def select_channel_horizon_anchor_scales(
             end = min(horizon, start + 1)
         for c0 in range(0, channel_count, chunk_size):
             c1 = min(channel_count, c0 + chunk_size)
-            base_seg = base_bch[:, c0:c1, start:end]
-            anchor_seg = anchor_bch[:, c0:c1, start:end]
-            target_seg = target_bch[:, c0:c1, start:end]
-            cand_sbch = base_seg.unsqueeze(0) + scale_grid.view(-1, 1, 1, 1) * (
-                anchor_seg - base_seg
-            ).unsqueeze(0)
-            err_sbch = cand_sbch - target_seg.unsqueeze(0)
-            if metric == "mae":
-                score_sc = err_sbch.abs().mean(dim=(1, 3))
-            else:
-                score_sc = err_sbch.pow(2).mean(dim=(1, 3))
-            best_idx_c = score_sc.argmin(dim=0)
-            scales_cs[c0:c1, segment] = scale_grid.index_select(0, best_idx_c)
-            scores_cs[c0:c1, segment] = score_sc.gather(0, best_idx_c.view(1, -1)).squeeze(0)
+            width = int(c1 - c0)
+            best_score_c = torch.full((width,), float("inf"), device=base_bch.device, dtype=base_bch.dtype)
+            best_scale_c = torch.zeros((width,), device=base_bch.device, dtype=base_bch.dtype)
+            for s0 in range(0, int(scale_grid.numel()), scale_chunk):
+                s1 = min(int(scale_grid.numel()), s0 + scale_chunk)
+                local_grid = scale_grid[s0:s1]
+                score_sum_sc = torch.zeros((int(local_grid.numel()), width), device=base_bch.device, dtype=base_bch.dtype)
+                total_count = 0
+                for b0 in range(0, int(base_bch.shape[0]), sample_chunk):
+                    b1 = min(int(base_bch.shape[0]), b0 + sample_chunk)
+                    base_seg = base_bch[b0:b1, c0:c1, start:end]
+                    anchor_seg = anchor_bch[b0:b1, c0:c1, start:end]
+                    target_seg = target_bch[b0:b1, c0:c1, start:end]
+                    cand_sbch = base_seg.unsqueeze(0) + local_grid.view(-1, 1, 1, 1) * (
+                        anchor_seg - base_seg
+                    ).unsqueeze(0)
+                    err_sbch = cand_sbch - target_seg.unsqueeze(0)
+                    if metric == "mae":
+                        score_sum_sc += err_sbch.abs().sum(dim=(1, 3))
+                    else:
+                        score_sum_sc += err_sbch.pow(2).sum(dim=(1, 3))
+                    total_count += int(b1 - b0) * int(end - start)
+                score_sc = score_sum_sc / max(float(total_count), 1.0)
+                local_best_idx_c = score_sc.argmin(dim=0)
+                local_score_c = score_sc.gather(0, local_best_idx_c.view(1, -1)).squeeze(0)
+                local_scale_c = local_grid.index_select(0, local_best_idx_c)
+                update_c = local_score_c < best_score_c
+                best_score_c = torch.where(update_c, local_score_c, best_score_c)
+                best_scale_c = torch.where(update_c, local_scale_c, best_scale_c)
+            scales_cs[c0:c1, segment] = best_scale_c
+            scores_cs[c0:c1, segment] = best_score_c
     return scales_cs.detach(), scores_cs.detach()
 
 
@@ -1753,14 +1845,20 @@ def select_train_residual_anchor_scales_from_loader(
     if len(loader) == 0:
         raise ValueError("train_residual_anchor_expert.scale_selection requires a non-empty validation loader.")
     model.eval()
-    base_parts: List[torch.Tensor] = []
-    anchor_parts: List[torch.Tensor] = []
-    target_parts: List[torch.Tensor] = []
     unit_cfg = dict(train_residual_anchor_cfg)
     unit_cfg["enable"] = True
     unit_cfg["alpha"] = 1.0
     unit_cfg.pop("alpha_by_channel", None)
     unit_cfg.pop("alpha_by_channel_horizon", None)
+    metric = str(metric).lower()
+    if metric not in {"mse", "mae"}:
+        raise ValueError("train_residual_anchor_expert.scale_selection.metric must be mse or mae.")
+    steps = max(2, int(steps))
+    segments = max(1, int(horizon_segments))
+    scale_grid: Optional[torch.Tensor] = None
+    score_sum_scs: Optional[torch.Tensor] = None
+    total_count_s: Optional[torch.Tensor] = None
+    n_windows = 0
     for x, y, idx in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -1807,32 +1905,51 @@ def select_train_residual_anchor_scales_from_loader(
             residual_anchor_phc=residual_anchor_phc,
             cfg=unit_cfg,
         )
-        base_parts.append(y_base.detach().cpu())
-        anchor_parts.append(y_anchor.detach().cpu())
-        target_parts.append(y.detach().cpu())
-    base_bch = torch.cat(base_parts, dim=0)
-    anchor_bch = torch.cat(anchor_parts, dim=0)
-    target_bch = torch.cat(target_parts, dim=0)
-    if int(horizon_segments) > 1:
-        scales, scores = select_channel_horizon_anchor_scales(
-            base_bch,
-            anchor_bch,
-            target_bch,
-            metric=metric,
-            max_scale=float(max_scale),
-            steps=int(steps),
-            segments=int(horizon_segments),
-        )
-    else:
-        scales, scores = select_channel_anchor_scales(
-            base_bch,
-            anchor_bch,
-            target_bch,
-            metric=metric,
-            max_scale=float(max_scale),
-            steps=int(steps),
-        )
-    return scales, scores, int(base_bch.shape[0])
+        base_cpu = y_base.detach().cpu()
+        anchor_cpu = y_anchor.detach().cpu()
+        target_cpu = y.detach().cpu()
+        batch_size = int(base_cpu.shape[0])
+        horizon = int(base_cpu.shape[-1])
+        channel_count = int(base_cpu.shape[1])
+        if score_sum_scs is None:
+            scale_grid = torch.linspace(0.0, float(max_scale), steps, dtype=base_cpu.dtype)
+            score_sum_scs = torch.zeros(steps, channel_count, segments, dtype=base_cpu.dtype)
+            total_count_s = torch.zeros(segments, dtype=base_cpu.dtype)
+        assert scale_grid is not None and score_sum_scs is not None and total_count_s is not None
+        if int(score_sum_scs.shape[1]) != channel_count:
+            raise ValueError(
+                "train_residual_anchor_expert.scale_selection saw inconsistent channel counts: "
+                f"{int(score_sum_scs.shape[1])} vs {channel_count}"
+            )
+        diff_cpu = anchor_cpu - base_cpu
+        for segment in range(segments):
+            start = (segment * horizon) // segments
+            end = ((segment + 1) * horizon) // segments
+            if end <= start:
+                end = min(horizon, start + 1)
+            base_seg = base_cpu[:, :, start:end]
+            diff_seg = diff_cpu[:, :, start:end]
+            target_seg = target_cpu[:, :, start:end]
+            for s0 in range(0, steps, 32):
+                s1 = min(steps, s0 + 32)
+                local_grid = scale_grid[s0:s1]
+                pred_sbch = base_seg.unsqueeze(0) + local_grid.view(-1, 1, 1, 1) * diff_seg.unsqueeze(0)
+                err_sbch = pred_sbch - target_seg.unsqueeze(0)
+                if metric == "mae":
+                    score_sum_scs[s0:s1, :, segment] += err_sbch.abs().sum(dim=(1, 3))
+                else:
+                    score_sum_scs[s0:s1, :, segment] += err_sbch.pow(2).sum(dim=(1, 3))
+            total_count_s[segment] += float(batch_size * int(end - start))
+        n_windows += batch_size
+    if score_sum_scs is None or total_count_s is None or scale_grid is None or n_windows <= 0:
+        raise ValueError("train_residual_anchor_expert.scale_selection requires at least one validation window.")
+    score_scs = score_sum_scs / total_count_s.view(1, 1, segments).clamp_min(1.0)
+    best_idx_cs = score_scs.argmin(dim=0)
+    scales_cs = scale_grid.index_select(0, best_idx_cs.reshape(-1)).reshape(best_idx_cs.shape)
+    scores_cs = score_scs.gather(0, best_idx_cs.unsqueeze(0)).squeeze(0)
+    if segments <= 1:
+        return scales_cs[:, 0].detach(), scores_cs[:, 0].detach(), int(n_windows)
+    return scales_cs.detach(), scores_cs.detach(), int(n_windows)
 
 
 @torch.no_grad()
@@ -2280,6 +2397,63 @@ def estimate_residual_correction(
     if max_abs and float(max_abs) > 0.0:
         corr_ch = corr_ch.clamp(min=-float(max_abs), max=float(max_abs))
     return corr_ch.detach().cpu()
+
+
+@torch.no_grad()
+def estimate_per_channel_guarded_shrink_correction(
+    model: nn.Module,
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    device: torch.device,
+    grid: List[float],
+    max_rel_mse_regression: float = 0.01,
+    max_abs: float = 0.0,
+    eval_start: int = 0,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Per-channel median-offset calibration with a per-channel MSE-regression cap.
+
+    Builds the unit (shrink=1) median residual offset per (channel, horizon) on
+    `loader`, then for each CHANNEL picks the largest shrink from `grid` whose
+    val MSE regression on that channel stays within `max_rel_mse_regression`
+    (relative to the uncalibrated MSE), while minimizing that channel's MAE.
+
+    The offset only shifts predictions by a constant per (c, h), so for residual
+    r = y - yhat the calibrated residual is r - s * unit[c, h]; per-channel MAE/MSE
+    over a shrink grid are evaluated analytically from the collected residuals —
+    no extra forward passes. Returns (corr_ch [C, H], chosen_shrink_c [C]).
+    """
+    if len(loader) == 0:
+        return None
+    model.eval()
+    residuals = []
+    for x, y, idx in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        residuals.append((y - model(x, cluster_id_c)).detach().cpu())
+    if len(residuals) == 0:
+        return None
+    r_nch = torch.cat(residuals, dim=0)                       # [N, C, H]
+    unit_ch = r_nch.median(dim=0).values                      # [C, H]
+    grid_t = torch.as_tensor(sorted(set(float(g) for g in grid)), dtype=r_nch.dtype)
+    if float(grid_t.min()) > 0.0:                             # always allow s=0 (no change)
+        grid_t = torch.cat([torch.zeros(1, dtype=r_nch.dtype), grid_t])
+    C = r_nch.shape[1]
+    # residual under shrink s: r - s*unit  -> per (s, channel) MAE/MSE over n,h
+    # shapes: r_nch [N,C,H], unit_ch [C,H], grid_t [S]
+    shifted = r_nch.unsqueeze(0) - grid_t.view(-1, 1, 1, 1) * unit_ch.unsqueeze(0).unsqueeze(0)  # [S,N,C,H]
+    mse_sc = shifted.pow(2).mean(dim=(1, 3))                  # [S, C]
+    mae_sc = shifted.abs().mean(dim=(1, 3))                   # [S, C]
+    base_mse_c = mse_sc[0]                                    # s=0 row (uncalibrated)
+    cap_c = (1.0 + float(max_rel_mse_regression)) * base_mse_c
+    allowed = mse_sc <= cap_c.unsqueeze(0)                    # [S, C]
+    big = mae_sc.max() + 1.0
+    mae_masked = torch.where(allowed, mae_sc, mae_sc + big)   # forbid disallowed shrinks
+    best_s_idx = mae_masked.argmin(dim=0)                     # [C]
+    chosen_shrink_c = grid_t[best_s_idx]                      # [C]
+    corr_ch = chosen_shrink_c.view(C, 1) * unit_ch           # [C, H]
+    if max_abs and float(max_abs) > 0.0:
+        corr_ch = corr_ch.clamp(min=-float(max_abs), max=float(max_abs))
+    return corr_ch.detach().cpu(), chosen_shrink_c.detach().cpu()
 
 
 def _calendar_features_from_datetime(
@@ -2807,6 +2981,52 @@ def _candidate_selector_targets(
         max(0.0, float(min_rel_improvement)) * base_err_bc.abs().clamp_min(1.0e-12),
     )
     return torch.where(gain_bc > required_bc, best_p_bc.to(dtype=torch.long) + 1, torch.zeros_like(best_p_bc))
+
+
+def _mse_utility_gate_supervision_loss(
+    *,
+    probs_bkp: Optional[torch.Tensor],
+    allowed_mask_kp: Optional[torch.Tensor],
+    y_base_bch: torch.Tensor,
+    pred_out: Optional[Dict[str, torch.Tensor]],
+    y_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    temperature: float = 1.0,
+    min_gain: float = 0.0,
+    target_power: float = 1.0,
+    eps: float = 1.0e-8,
+) -> Optional[torch.Tensor]:
+    if probs_bkp is None or pred_out is None or probs_bkp.numel() == 0:
+        return None
+    cand_bcpH = _pred_residual_candidate_predictions(y_base_bch, pred_out)
+    if cand_bcpH is None or cand_bcpH.numel() == 0:
+        return None
+    with torch.no_grad():
+        base_err_bc = (y_base_bch - y_bch).pow(2).mean(dim=-1)
+        cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
+        gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
+        utility_bcp = (gain_bcp - float(min_gain)).clamp_min(0.0)
+        if allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
+            allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
+            allowed_bkp = allowed.unsqueeze(0).expand_as(probs_bkp).to(dtype=utility_bcp.dtype)
+        else:
+            allowed_bkp = (probs_bkp.detach() > 0.0).to(dtype=utility_bcp.dtype)
+        utility_bkp = scatter_mean_bcf_to_bkf(utility_bcp, cluster_id_c, K) * allowed_bkp
+        if float(target_power) != 1.0:
+            utility_bkp = utility_bkp.clamp_min(0.0).pow(float(target_power))
+        valid_bk = utility_bkp.sum(dim=-1) > 0.0
+        if not bool(valid_bk.any().item()):
+            return None
+        temp = max(float(temperature), 1.0e-6)
+        target_bkp = utility_bkp.clamp_min(eps).log() / temp
+        target_bkp = target_bkp.masked_fill(~valid_bk.unsqueeze(-1), 0.0)
+        target_bkp = torch.softmax(target_bkp, dim=-1) * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
+        target_bkp = target_bkp * allowed_bkp
+        target_bkp = target_bkp / target_bkp.sum(dim=-1, keepdim=True).clamp_min(eps)
+    log_probs = probs_bkp.clamp_min(eps).log()
+    loss_bk = -(target_bkp * log_probs).sum(dim=-1)
+    return torch.where(valid_bk, loss_bk, torch.zeros_like(loss_bk))
 
 
 class PredResidualCandidateSelector(nn.Module):
@@ -5510,6 +5730,23 @@ def main():
     calibration_method = str(calibration_cfg.get("method", "median")).lower()
     calibration_shrink = float(calibration_cfg.get("shrink", 1.0))
     calibration_max_abs = float(calibration_cfg.get("max_abs", 0.0))
+    # Optional post-hoc shrink sweep. Calibration is an eval-only operation, so a
+    # single trained model can be evaluated at many shrink values without
+    # retraining. The unit (shrink=1) correction is estimated once on val and
+    # then linearly rescaled per shrink — identical results to separate runs at
+    # ~1/N the cost and with zero cross-run nondeterminism.
+    calibration_shrink_sweep = [float(s) for s in (calibration_cfg.get("shrink_sweep", []) or [])]
+    if any(s < 0.0 for s in calibration_shrink_sweep):
+        raise ValueError("calibration.shrink_sweep values must be non-negative.")
+    # Optional per-channel guarded shrink: each channel picks its own shrink under
+    # a per-channel val MSE-regression cap (richer than one global shrink, still
+    # MSE-safe by construction). Evaluated post-hoc on the single trained model.
+    per_channel_shrink_cfg = calibration_cfg.get("per_channel_shrink", {}) or {}
+    per_channel_shrink_enable = bool(per_channel_shrink_cfg.get("enable", False))
+    per_channel_shrink_grid = [float(s) for s in (per_channel_shrink_cfg.get("grid", [0.0, 0.3, 0.5, 0.7, 0.85, 1.0]) or [])]
+    per_channel_shrink_max_rel_mse = float(per_channel_shrink_cfg.get("max_rel_mse_regression", 0.01))
+    if any(s < 0.0 for s in per_channel_shrink_grid):
+        raise ValueError("calibration.per_channel_shrink.grid values must be non-negative.")
     if calibration_method not in {"median", "mean"}:
         raise ValueError(f"Unsupported calibration.method='{calibration_method}'. Expected median or mean.")
     if calibration_shrink < 0.0:
@@ -5723,6 +5960,17 @@ def main():
     skip_init_bias = float(moe_cfg.get("skip_init_bias", -2.0))
     skip_supervision_weight = float(moe_cfg.get("skip_supervision_weight", 0.0)) if allow_skip else 0.0
     skip_supervision_margin = float(moe_cfg.get("skip_supervision_margin", 0.0))
+    mse_utility_gate_cfg = moe_cfg.get("mse_utility_gate_supervision", {}) or {}
+    mse_utility_gate_enable = (
+        bool(mse_utility_gate_cfg.get("enable", False))
+        and moe_enable
+        and pred_residual_enable
+        and P > 0
+    )
+    mse_utility_gate_weight = float(mse_utility_gate_cfg.get("weight", 0.0)) if mse_utility_gate_enable else 0.0
+    mse_utility_gate_temperature = float(mse_utility_gate_cfg.get("temperature", 1.0))
+    mse_utility_gate_min_gain = float(mse_utility_gate_cfg.get("min_gain", 0.0))
+    mse_utility_gate_target_power = float(mse_utility_gate_cfg.get("target_power", 1.0))
     raw_ranks = moe_cfg.get("select_ranks", None)
     if raw_ranks is None:
         select_ranks = [1, 2]
@@ -5879,8 +6127,40 @@ def main():
         if logit_strength > 0.0:
             gate.set_penalty_prior(cluster_penalty_prior_prob_kp, strength=logit_strength)
         topk = int(cluster_penalty_prior_cfg.get("topk", 0))
-        if topk > 0 and bool(cluster_penalty_prior_cfg.get("hard_topk", True)):
+        manual_allowed = build_named_penalty_mask(
+            cluster_penalty_prior_cfg.get("allowed_by_cluster", None),
+            penalty_names,
+            K,
+            device,
+        )
+        if manual_allowed is not None:
+            cluster_penalty_allowed_mask_kp = manual_allowed
+            gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+        elif topk > 0 and bool(cluster_penalty_prior_cfg.get("hard_topk", True)):
             cluster_penalty_allowed_mask_kp = build_topk_penalty_mask(cluster_penalty_prior_prob_kp, topk=topk)
+            gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+        always_include = cluster_penalty_prior_cfg.get("always_include", []) or []
+        if isinstance(always_include, str):
+            always_include = [always_include]
+        if len(always_include) > 0:
+            if cluster_penalty_allowed_mask_kp is None:
+                cluster_penalty_allowed_mask_kp = torch.zeros((K, P), device=device, dtype=torch.float32)
+            name_to_idx = {str(name): i for i, name in enumerate(penalty_names)}
+            for raw_name in always_include:
+                name = str(raw_name)
+                if name not in name_to_idx:
+                    raise ValueError(
+                        "cluster_penalty_prior.always_include contains unknown penalty "
+                        f"{name!r}; available={penalty_names}"
+                    )
+                cluster_penalty_allowed_mask_kp[:, name_to_idx[name]] = 1.0
+            empty = cluster_penalty_allowed_mask_kp.sum(dim=-1, keepdim=True) <= 0.0
+            if bool(empty.any().item()):
+                cluster_penalty_allowed_mask_kp = torch.where(
+                    empty,
+                    torch.ones_like(cluster_penalty_allowed_mask_kp),
+                    cluster_penalty_allowed_mask_kp,
+                )
             gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
         if bool(cluster_penalty_prior_cfg.get("use_as_balance_target", False)):
             gate_balance_target_kp = cluster_penalty_prior_prob_kp
@@ -7138,6 +7418,21 @@ def main():
             + loss_terms_bk["penalty"]
             + loss_terms_bk["pred_residual"]
         )
+        if mse_utility_gate_weight > 0.0:
+            mse_gate_loss_bk = _mse_utility_gate_supervision_loss(
+                probs_bkp=probs_bkp,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                y_base_bch=yhat_base,
+                pred_out=pred_out,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                temperature=mse_utility_gate_temperature,
+                min_gain=mse_utility_gate_min_gain,
+                target_power=mse_utility_gate_target_power,
+            )
+            if mse_gate_loss_bk is not None:
+                objective_loss_bk = objective_loss_bk + mse_utility_gate_weight * mse_gate_loss_bk
         return {
             "mse_bk": mse_bk,
             "mae_bk": mae_bk,
@@ -7547,6 +7842,21 @@ def main():
                         + (1.0 - skip_label_bk) * (1.0 - skip_prob_clamped).log()
                     )
                     loss_bk = loss_bk + skip_supervision_weight * skip_bce_bk
+                if mse_utility_gate_weight > 0.0:
+                    mse_gate_loss_bk = _mse_utility_gate_supervision_loss(
+                        probs_bkp=probs_bkp,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        y_base_bch=yhat_base,
+                        pred_out=pred_out,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        temperature=mse_utility_gate_temperature,
+                        min_gain=mse_utility_gate_min_gain,
+                        target_power=mse_utility_gate_target_power,
+                    )
+                    if mse_gate_loss_bk is not None:
+                        loss_bk = loss_bk + mse_utility_gate_weight * mse_gate_loss_bk
                 if (not bilevel_enable) and learnable_lambda is not None and learnable_lambda_reg_weight > 0.0:
                     loss_bk = loss_bk + learnable_lambda_reg_weight * learnable_lambda.regularization().unsqueeze(0)
                 if (not bilevel_enable) and dynamic_lambda is not None and dynamic_lambda_reg_weight > 0.0:
@@ -8331,13 +8641,28 @@ def main():
         residual_selection_policy = str(pred_residual_cfg.get("selection_policy", "none")).lower()
         if residual_selection_policy in {"false", "off", "disable", "disabled"}:
             residual_selection_policy = "none"
-        if residual_selection_policy not in {"none", "val_mse_channel", "val_mse_scale", "val_mse_scale_holdout", "val_mse_gate", "val_mse_gate_guarded"}:
+        if residual_selection_policy not in {
+            "none",
+            "val_mse_channel",
+            "val_mse_scale",
+            "val_mse_scale_holdout",
+            "val_mse_gate",
+            "val_mse_gate_guarded",
+            "val_mae_gate_guarded",
+        }:
             raise ValueError(
                 "Unsupported moe.pred_side_residual.selection_policy="
                 f"'{residual_selection_policy}'. Expected none, val_mse_channel, val_mse_scale, "
-                "val_mse_scale_holdout, val_mse_gate, or val_mse_gate_guarded."
+                "val_mse_scale_holdout, val_mse_gate, val_mse_gate_guarded, or val_mae_gate_guarded."
             )
-        if pred_residual is not None and residual_selection_policy in {"val_mse_channel", "val_mse_scale", "val_mse_scale_holdout", "val_mse_gate", "val_mse_gate_guarded"}:
+        if pred_residual is not None and residual_selection_policy in {
+            "val_mse_channel",
+            "val_mse_scale",
+            "val_mse_scale_holdout",
+            "val_mse_gate",
+            "val_mse_gate_guarded",
+            "val_mae_gate_guarded",
+        }:
             zero_residual_scale_c = torch.zeros(C, device=device, dtype=torch.float32)
             residual_scale_mean_value = 0.0
             selection_max_residual_channels = int(pred_residual_cfg.get("selection_max_residual_channels", 0))
@@ -8741,7 +9066,7 @@ def main():
                 use_residual_c = pred_residual_channel_scale_c.detach().cpu() > 1.0e-8
                 scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
-            elif residual_selection_policy in {"val_mse_gate", "val_mse_gate_guarded"}:
+            elif residual_selection_policy in {"val_mse_gate", "val_mse_gate_guarded", "val_mae_gate_guarded"}:
                 gate_calib_cfg = pred_residual_cfg.get("gate_calibrator", {}) or {}
                 gate_calib_source_split = str(gate_calib_cfg.get("source_split", "val")).lower()
                 if gate_calib_source_split in {"train", "training"}:
@@ -8882,12 +9207,20 @@ def main():
                     hold_scales = pred_residual_gate_summary.get("holdout_mean_scale", [])
                     min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
                     min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
-                    required = torch.maximum(
-                        torch.full_like(val_mse_c_pred_base, min_abs),
-                        min_rel * val_mse_c_pred_base.abs().clamp_min(1.0e-12),
+                    max_abs_mse_regression = float(pred_residual_cfg.get("selection_max_abs_mse_regression", 0.0))
+                    max_rel_mse_regression = float(pred_residual_cfg.get("selection_max_rel_mse_regression", 0.0))
+                    use_residual_c = _pred_residual_channel_keep_mask(
+                        residual_selection_policy,
+                        val_mse_c_pred_base,
+                        val_scaled_mse_c,
+                        val_mae_c_pred_base,
+                        val_scaled_mae_c,
+                        min_abs_improvement=min_abs,
+                        min_rel_improvement=min_rel,
+                        max_abs_mse_regression=max_abs_mse_regression,
+                        max_rel_mse_regression=max_rel_mse_regression,
                     )
-                    use_residual_c = (val_mse_c_pred_base - val_scaled_mse_c) > required
-                    if residual_selection_policy == "val_mse_gate_guarded":
+                    if residual_selection_policy in {"val_mse_gate_guarded", "val_mae_gate_guarded"}:
                         pred_residual_channel_scale_c = use_residual_c.to(device=device, dtype=torch.float32)
                         (
                             _,
@@ -8955,6 +9288,8 @@ def main():
                 "max_segment_abs_degradation": float(selection_max_segment_abs_degradation),
                 "min_abs_improvement": float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0)),
                 "min_rel_improvement": float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0)),
+                "max_abs_mse_regression": float(pred_residual_cfg.get("selection_max_abs_mse_regression", 0.0)),
+                "max_rel_mse_regression": float(pred_residual_cfg.get("selection_max_rel_mse_regression", 0.0)),
                 "scale_values": scale_values,
                 "mean_scale": float(residual_scale_mean_value),
                 "num_residual_channels": int(use_residual_c.sum().item()),
@@ -9124,7 +9459,9 @@ def main():
                     f"val_MSE={val_summary['avg_mse']:.6f}, "
                     f"holdout_gain={((pred_residual_selector_summary or {}).get('holdout') or {}).get('selected_gain_pct_vs_base')}"
                 )
-        if pred_residual is not None and moe_enable and P > 0:
+        gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
+        gate_penalty_hit_enable = bool(gate_penalty_hit_cfg.get("enable", True))
+        if gate_penalty_hit_enable and pred_residual is not None and moe_enable and P > 0:
             val_penalty_hit = evaluate_gate_penalty_hit_metrics(
                 model=model,
                 gate=gate,
@@ -9365,7 +9702,9 @@ def main():
                 channel_names=channel_names,
                 cluster_id_c=cluster_id_c,
             )
-        if pred_residual is not None and moe_enable and P > 0:
+        gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
+        gate_penalty_hit_enable = bool(gate_penalty_hit_cfg.get("enable", True))
+        if gate_penalty_hit_enable and pred_residual is not None and moe_enable and P > 0:
             test_penalty_hit = evaluate_gate_penalty_hit_metrics(
                 model=model,
                 gate=gate,
@@ -9849,6 +10188,123 @@ def main():
             avg_mae_hybrid = float(df["MAE_hybrid"].mean())
             avg_mse_hybrid = float(reduce_cluster_metric(test_mse_hybrid_k, cluster_weight_k).item())
 
+    # --- Post-hoc calibration shrink sweep (single model, no retraining) ---
+    # Calibration is eval-only, so all shrink values share the same trained model
+    # and the same unit (shrink=1) median residual. We estimate that unit once on
+    # val, then linearly rescale per shrink and re-run val/test evaluation. This
+    # mirrors the per-split metric conventions of the reported val/test blocks
+    # (val: cluster-reduced; test: per-channel-mean MAE) so numbers are directly
+    # comparable, at ~1/N the cost of N separate runs.
+    if (
+        calibration_enable
+        and calibration_method == "median"
+        and not skip_test
+        and len(calibration_shrink_sweep) > 0
+        and len(dva) > 0
+    ):
+        sweep_val_loader = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
+        unit_corr_ch = estimate_residual_correction(
+            model, sweep_val_loader, cluster_id_c, device,
+            method=calibration_method, shrink=1.0, max_abs=0.0,
+            knn_hybrid=None, eval_start=val_eval_start,
+        )
+        if unit_corr_ch is not None:
+            common_sweep_kwargs = dict(
+                select_ranks=select_ranks, collect_plot=False, channel_count=C,
+                mse_weight=mse_weight, gate_entropy_weight=gate_entropy_weight,
+                gate_balance_weight=gate_balance_weight, gate_soft_weight=gate_soft_weight,
+                gate_entropy_target_frac=gate_entropy_target_frac, penalty_scale=penalty_scale,
+                dynamic_lambda=dynamic_lambda, lambda_min_kp=lambda_min_kp,
+                mae_objective_weight=mae_eval_weight, mae_objective_kind=mae_objective_kind,
+                mae_objective_beta=mae_objective_beta, pred_residual=pred_residual,
+                knn_hybrid=None,
+            )
+            sweep_rows = []
+            for s in calibration_shrink_sweep:
+                corr_s = unit_corr_ch * float(s)
+                if calibration_max_abs and float(calibration_max_abs) > 0.0:
+                    corr_s = corr_s.clamp(min=-float(calibration_max_abs), max=float(calibration_max_abs))
+                # val mirrors the reported val eval (no pred_residual gate/selector/scale)
+                _, v_mse_k, v_mae_k, _, _, _, _, _ = eval_loop_with_history(
+                    model, gate, lam_kp_best, penalty_names, penalty_fns,
+                    sweep_val_loader, cluster_id_c, K, moe_cfg, device,
+                    residual_correction_ch=corr_s, eval_start=val_eval_start,
+                    **common_sweep_kwargs,
+                )
+                # test mirrors the reported test eval (includes gate/selector/scale)
+                _, t_mse_k, _, _, t_mae_c, _, _, _ = eval_loop_with_history(
+                    model, gate, lam_kp_test, penalty_names, penalty_fns,
+                    dl_te, cluster_id_c, K, moe_cfg, device,
+                    pred_residual_gate=pred_residual_gate_model,
+                    pred_residual_selector=pred_residual_selector_model,
+                    pred_residual_scale_c=pred_residual_channel_scale_c,
+                    residual_correction_ch=corr_s, eval_start=test_eval_start,
+                    **common_sweep_kwargs,
+                )
+                sweep_rows.append({
+                    "shrink": float(s),
+                    "val_mse": float(reduce_cluster_metric(v_mse_k, cluster_weight_k).item()),
+                    "val_mae": float(reduce_cluster_metric(v_mae_k, cluster_weight_k).item()),
+                    "test_mse": float(reduce_cluster_metric(t_mse_k, cluster_weight_k).item()),
+                    "test_mae": float(t_mae_c.mean().item()),
+                })
+            calibration_summary["shrink_sweep"] = sweep_rows
+            calibration_summary["shrink_sweep_unit_mean_abs"] = float(unit_corr_ch.abs().mean().item())
+            # Leakage-free pick: lowest val_mae, MSE-primary tiebreak on val_mse.
+            best_sweep = min(sweep_rows, key=lambda r: (r["val_mae"], r["val_mse"]))
+            calibration_summary["shrink_sweep_best_by_val_mae"] = float(best_sweep["shrink"])
+            print("\nCalibration shrink sweep (single model, post-hoc):")
+            print(f"  {'shrink':>7} {'val_mse':>10} {'val_mae':>10} {'test_mse':>10} {'test_mae':>10}")
+            for r in sweep_rows:
+                print(
+                    f"  {r['shrink']:>7.3f} {r['val_mse']:>10.6f} {r['val_mae']:>10.6f} "
+                    f"{r['test_mse']:>10.6f} {r['test_mae']:>10.6f}"
+                )
+            print(f"  -> best shrink by val_mae (val_mse tiebreak): {best_sweep['shrink']:.3f}")
+
+            # --- Per-channel guarded shrink (richer, still MSE-capped) ---
+            if per_channel_shrink_enable:
+                pc = estimate_per_channel_guarded_shrink_correction(
+                    model, sweep_val_loader, cluster_id_c, device,
+                    grid=per_channel_shrink_grid,
+                    max_rel_mse_regression=per_channel_shrink_max_rel_mse,
+                    max_abs=calibration_max_abs,
+                    eval_start=val_eval_start,
+                )
+                if pc is not None:
+                    corr_pc_ch, chosen_shrink_c = pc
+                    _, vpc_mse_k, vpc_mae_k, _, _, _, _, _ = eval_loop_with_history(
+                        model, gate, lam_kp_best, penalty_names, penalty_fns,
+                        sweep_val_loader, cluster_id_c, K, moe_cfg, device,
+                        residual_correction_ch=corr_pc_ch, eval_start=val_eval_start,
+                        **common_sweep_kwargs,
+                    )
+                    _, tpc_mse_k, _, _, tpc_mae_c, _, _, _ = eval_loop_with_history(
+                        model, gate, lam_kp_test, penalty_names, penalty_fns,
+                        dl_te, cluster_id_c, K, moe_cfg, device,
+                        pred_residual_gate=pred_residual_gate_model,
+                        pred_residual_selector=pred_residual_selector_model,
+                        pred_residual_scale_c=pred_residual_channel_scale_c,
+                        residual_correction_ch=corr_pc_ch, eval_start=test_eval_start,
+                        **common_sweep_kwargs,
+                    )
+                    pc_summary = {
+                        "val_mse": float(reduce_cluster_metric(vpc_mse_k, cluster_weight_k).item()),
+                        "val_mae": float(reduce_cluster_metric(vpc_mae_k, cluster_weight_k).item()),
+                        "test_mse": float(reduce_cluster_metric(tpc_mse_k, cluster_weight_k).item()),
+                        "test_mae": float(tpc_mae_c.mean().item()),
+                        "grid": [float(g) for g in per_channel_shrink_grid],
+                        "max_rel_mse_regression": float(per_channel_shrink_max_rel_mse),
+                        "chosen_shrink_per_channel": [float(s) for s in chosen_shrink_c.tolist()],
+                        "mean_shrink": float(chosen_shrink_c.mean().item()),
+                    }
+                    calibration_summary["per_channel_shrink"] = pc_summary
+                    print("Per-channel guarded shrink (cap on val MSE regression "
+                          f"<= {per_channel_shrink_max_rel_mse:.3%}):")
+                    print(f"  mean_shrink={pc_summary['mean_shrink']:.3f}  "
+                          f"val_mse={pc_summary['val_mse']:.6f}  val_mae={pc_summary['val_mae']:.6f}  "
+                          f"test_mse={pc_summary['test_mse']:.6f}  test_mae={pc_summary['test_mae']:.6f}")
+
     channel_selection_summary = None
     channel_selected_avg_mae = None
     channel_selected_avg_mse = None
@@ -10188,6 +10644,13 @@ def main():
             "skip_cost": float(skip_cost),
             "skip_supervision_weight": float(skip_supervision_weight),
             "skip_supervision_margin": float(skip_supervision_margin),
+            "mse_utility_gate_supervision": {
+                "enable": bool(mse_utility_gate_enable),
+                "weight": float(mse_utility_gate_weight),
+                "temperature": float(mse_utility_gate_temperature),
+                "min_gain": float(mse_utility_gate_min_gain),
+                "target_power": float(mse_utility_gate_target_power),
+            },
         },
         "val": val_summary,
         "test": None if skip_test else {

@@ -338,6 +338,30 @@ def model_candidates() -> list[Candidate]:
         Candidate("model", "current_h128", {"model": {"hidden_dim": 128}}),
         Candidate(
             "model",
+            "pems_cch_h128_do0_l001_mse050_mae150_bs64_valmae",
+            {
+                "model": {
+                    "predictor": "context_channel_head_mlp",
+                    "hidden_dim": 128,
+                    "dropout": 0.0,
+                },
+                "train": {
+                    "batch_size": 64,
+                    "lr": 0.001,
+                    "weight_decay": 1.0e-4,
+                    "mse_weight": 0.5,
+                    "selection_metric": "val_mae",
+                    "mae_objective": {
+                        "enable": True,
+                        "kind": "l1",
+                        "weight": 1.5,
+                        "warmup_epochs": 3,
+                    },
+                },
+            },
+        ),
+        Candidate(
+            "model",
             "electric_current_h192",
             {"model": {"predictor": "mlp", "hidden_dim": 192, "dropout": 0.0468935703282562}},
         ),

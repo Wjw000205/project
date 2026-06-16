@@ -73,6 +73,15 @@ def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({field: row.get(field, "") for field in FIELDS})
 
 
+def deep_update(dst: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            deep_update(dst[key], value)
+        else:
+            dst[key] = copy.deepcopy(value)
+    return dst
+
+
 def candidates() -> list[dict[str, Any]]:
     return [
         {
@@ -436,6 +445,88 @@ def candidates() -> list[dict[str, Any]]:
             "lr": 1.0e-3,
         },
         {
+            "name": "bs64_cch_h128_do000_l001_mse050_mae150_valmae_anchor_p288",
+            "predictor": "context_channel_head_mlp",
+            "batch_size": 64,
+            "hidden_dim": 128,
+            "dropout": 0.0,
+            "lambda_scale": 0.01,
+            "mse_weight": 0.50,
+            "mae_weight": 1.50,
+            "selection_metric": "val_mae",
+            "lr": 1.0e-3,
+            "moe_overrides": {
+                "train_stat_anchor_expert": {
+                    "enable": True,
+                    "period": 288,
+                    "alpha": 0.0,
+                    "mode": "phase_mean",
+                    "reference": "last",
+                    "blend_target": "prediction",
+                    "scale_selection": {
+                        "enable": True,
+                        "metric": "mse",
+                        "max_scale": 0.3,
+                        "steps": 13,
+                    },
+                },
+                "train_residual_anchor_expert": {
+                    "enable": True,
+                    "period": 288,
+                    "alpha": 0.0,
+                    "blend_target": "prediction",
+                    "scale_selection": {
+                        "enable": True,
+                        "metric": "mse",
+                        "max_scale": 1.2,
+                        "steps": 49,
+                        "horizon_segments": 4,
+                    },
+                },
+            },
+        },
+        {
+            "name": "bs64_cch_h128_do000_l001_mse050_mae150_valmae_anchor_p288_residmae",
+            "predictor": "context_channel_head_mlp",
+            "batch_size": 64,
+            "hidden_dim": 128,
+            "dropout": 0.0,
+            "lambda_scale": 0.01,
+            "mse_weight": 0.50,
+            "mae_weight": 1.50,
+            "selection_metric": "val_mae",
+            "lr": 1.0e-3,
+            "moe_overrides": {
+                "train_stat_anchor_expert": {
+                    "enable": True,
+                    "period": 288,
+                    "alpha": 0.0,
+                    "mode": "phase_mean",
+                    "reference": "last",
+                    "blend_target": "prediction",
+                    "scale_selection": {
+                        "enable": True,
+                        "metric": "mse",
+                        "max_scale": 0.3,
+                        "steps": 13,
+                    },
+                },
+                "train_residual_anchor_expert": {
+                    "enable": True,
+                    "period": 288,
+                    "alpha": 0.0,
+                    "blend_target": "prediction",
+                    "scale_selection": {
+                        "enable": True,
+                        "metric": "mae",
+                        "max_scale": 1.2,
+                        "steps": 49,
+                        "horizon_segments": 4,
+                    },
+                },
+            },
+        },
+        {
             "name": "bs64_cch_h128_do000_l001_mse050_mae150_valmae_s2031",
             "predictor": "context_channel_head_mlp",
             "batch_size": 64,
@@ -518,7 +609,10 @@ def configure(
     device: str,
     save_checkpoint: bool = False,
     backbone_only: bool = False,
+    freeze_backbone: bool = False,
     finetune_checkpoint: Path | str | None = None,
+    calibration_cfg: dict[str, Any] | None = None,
+    lr_override: float | None = None,
 ) -> dict[str, Any]:
     cfg = copy.deepcopy(base_cfg)
     run_name = f"{dataset}_H{horizon}_{cand['name']}_{phase}"
@@ -579,11 +673,14 @@ def configure(
     cfg["moe"].setdefault("dynamic_lambda", {})["enable"] = False
     cfg["moe"].setdefault("learnable_lambda", {})["enable"] = False
     cfg["moe"].setdefault("pred_side_residual", {})["enable"] = False
+    deep_update(cfg["moe"], dict(cand.get("moe_overrides", {}) or {}))
+    if freeze_backbone and not backbone_only:
+        cfg["moe"]["freeze_backbone"] = True
 
     cfg.setdefault("train", {})
     cfg["train"]["epochs"] = int(epochs)
     cfg["train"]["batch_size"] = int(cand["batch_size"])
-    cfg["train"]["lr"] = float(cand["lr"])
+    cfg["train"]["lr"] = float(cand["lr"] if lr_override is None else lr_override)
     if "mse_weight" in cand:
         cfg["train"]["mse_weight"] = float(cand["mse_weight"])
     cfg["train"]["selection_metric"] = str(cand.get("selection_metric", "val_mse"))
@@ -614,7 +711,7 @@ def configure(
     cfg.setdefault("knn_hybrid", {})
     cfg["knn_hybrid"]["enable"] = False
     cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg["calibration"] = {"enable": False}
+    cfg["calibration"] = dict(calibration_cfg) if calibration_cfg is not None else {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": bool(save_checkpoint),
@@ -743,6 +840,7 @@ def main() -> None:
     ap.add_argument("--input-len", type=int, default=96)
     ap.add_argument("--save-checkpoint", action="store_true")
     ap.add_argument("--backbone-only", action="store_true", help="Disable MoE and train/evaluate the backbone path first.")
+    ap.add_argument("--freeze-backbone", action="store_true", help="Freeze the warm-started backbone during the MoE stage.")
     ap.add_argument(
         "--finetune-root",
         type=Path,
@@ -754,6 +852,10 @@ def main() -> None:
         default="",
         help="Candidate directory name under --finetune-root; empty uses the active candidate name.",
     )
+    ap.add_argument("--calibration", choices=["", "median", "mean"], default="")
+    ap.add_argument("--calibration-shrink", type=float, default=1.0)
+    ap.add_argument("--calibration-max-abs", type=float, default=0.0)
+    ap.add_argument("--lr-override", type=float, default=None)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--rerun", action="store_true")
@@ -830,7 +932,19 @@ def main() -> None:
                     device=args.device,
                     save_checkpoint=bool(args.save_checkpoint),
                     backbone_only=bool(args.backbone_only),
+                    freeze_backbone=bool(args.freeze_backbone),
                     finetune_checkpoint=finetune_checkpoint,
+                    calibration_cfg=(
+                        None
+                        if not args.calibration
+                        else {
+                            "enable": True,
+                            "method": str(args.calibration),
+                            "shrink": float(args.calibration_shrink),
+                            "max_abs": float(args.calibration_max_abs),
+                        }
+                    ),
+                    lr_override=args.lr_override,
                 )
                 write_yaml(cfg_path, cfg)
                 print(f"[run] {dataset} H{horizon} {cand['name']} {args.phase}", flush=True)

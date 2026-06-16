@@ -236,8 +236,11 @@ class ClusterwiseSeasonalBlendAdapter(ClusterwiseSeasonalResidual):
         }
 
     def load_cluster_state(self, k: int, state):
-        self.base.load_cluster_state(k, state["base"])
-        self.mix_logit[k].data.copy_(state["mix_logit"].to(self.mix_logit[k].device))
+        if isinstance(state, dict) and "base" in state and "mix_logit" in state:
+            self.base.load_cluster_state(k, state["base"])
+            self.mix_logit[k].data.copy_(state["mix_logit"].to(self.mix_logit[k].device))
+        else:
+            self.base.load_cluster_state(k, state)
 
 
 class ClusterwiseRecursiveRollout(_ClusterPredictorBase):
@@ -2214,6 +2217,7 @@ class ClusterwiseChannelResidualAdapter(_ClusterPredictorBase):
         rank: int,
         init: str = "zero_delta",
         scale: float = 1.0,
+        freeze_base: bool = False,
     ):
         super().__init__(num_clusters=base.K)
         self.base = base
@@ -2222,6 +2226,10 @@ class ClusterwiseChannelResidualAdapter(_ClusterPredictorBase):
         self.num_channels = int(num_channels)
         self.rank = max(int(rank), 1)
         self.scale = float(scale)
+        self.freeze_base = bool(freeze_base)
+        if self.freeze_base:
+            for p in self.base.parameters():
+                p.requires_grad_(False)
 
         cluster_id_c = cluster_id_c.detach().cpu().to(torch.long)
         if int(cluster_id_c.numel()) != self.num_channels:
@@ -2272,7 +2280,8 @@ class ClusterwiseChannelResidualAdapter(_ClusterPredictorBase):
         return y
 
     def get_cluster_params(self, k: int) -> List[nn.Parameter]:
-        return self.base.get_cluster_params(k) + [self.down[k], self.up[k], self.bias[k]]
+        params = [] if self.freeze_base else self.base.get_cluster_params(k)
+        return params + [self.down[k], self.up[k], self.bias[k]]
 
     def get_cluster_state(self, k: int):
         return {
@@ -2283,11 +2292,14 @@ class ClusterwiseChannelResidualAdapter(_ClusterPredictorBase):
         }
 
     def load_cluster_state(self, k: int, state):
-        self.base.load_cluster_state(k, state["base"])
-        device = self.down[k].device
-        self.down[k].data.copy_(state["down"].to(device))
-        self.up[k].data.copy_(state["up"].to(device))
-        self.bias[k].data.copy_(state["bias"].to(device))
+        if isinstance(state, dict) and "base" in state and "down" in state and "up" in state and "bias" in state:
+            self.base.load_cluster_state(k, state["base"])
+            device = self.down[k].device
+            self.down[k].data.copy_(state["down"].to(device))
+            self.up[k].data.copy_(state["up"].to(device))
+            self.bias[k].data.copy_(state["bias"].to(device))
+        else:
+            self.base.load_cluster_state(k, state)
 
 
 class ClusterwiseHorizonBiasAdapter(_ClusterPredictorBase):
@@ -2801,6 +2813,7 @@ def build_cluster_predictor(
             rank=int(dict(adapter_cfg).get("rank", 8)),
             init=str(dict(adapter_cfg).get("init", "zero_delta")),
             scale=float(dict(adapter_cfg).get("scale", 1.0)),
+            freeze_base=bool(dict(adapter_cfg).get("freeze_base", False)),
         )
     horizon_bias_cfg = model_cfg.get("horizon_bias_adapter", {})
     if horizon_bias_cfg is None:

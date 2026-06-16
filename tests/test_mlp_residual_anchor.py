@@ -150,6 +150,45 @@ def test_seasonal_blend_adapter_mixes_same_phase_history():
     assert torch.allclose(y, expected, atol=1.0e-6)
 
 
+def test_seasonal_blend_adapter_loads_legacy_base_cluster_state():
+    cluster_id = torch.tensor([0, 0, 1])
+    base = build_cluster_predictor(
+        num_clusters=2,
+        input_len=4,
+        pred_len=3,
+        model_cfg={"predictor": "mlp", "hidden_dim": 5, "dropout": 0.0},
+    )
+    adapted = build_cluster_predictor(
+        num_clusters=2,
+        input_len=4,
+        pred_len=3,
+        model_cfg={
+            "predictor": "mlp",
+            "hidden_dim": 5,
+            "dropout": 0.0,
+            "seasonal_blend_adapter": {
+                "enable": True,
+                "period": 4,
+                "num_periods": 1,
+                "max_mix": 0.0,
+                "init_mix": 0.0,
+            },
+        },
+        num_channels=3,
+        cluster_id_c=cluster_id,
+    )
+    for param in base.parameters():
+        param.data.uniform_(-0.1, 0.1)
+    for param in adapted.parameters():
+        param.data.zero_()
+    for k in range(2):
+        adapted.load_cluster_state(k, base.get_cluster_state(k))
+
+    x = torch.randn(2, 3, 4)
+
+    assert torch.allclose(adapted(x, cluster_id), base(x, cluster_id))
+
+
 def test_selected_channel_adapter_only_updates_configured_channels():
     cluster_id = torch.tensor([0, 0, 1])
     model = build_cluster_predictor(
@@ -187,6 +226,71 @@ def test_selected_channel_adapter_only_updates_configured_channels():
     assert torch.allclose(y[:, 0, :], torch.zeros_like(y[:, 0, :]))
     assert torch.allclose(y[:, 2, :], torch.zeros_like(y[:, 2, :]))
     assert torch.max(torch.abs(y[:, 1, :])).item() > 1.0e-6
+
+
+def test_channel_adapter_loads_legacy_base_cluster_state():
+    cluster_id = torch.tensor([0, 0, 1])
+    base = build_cluster_predictor(
+        num_clusters=2,
+        input_len=4,
+        pred_len=3,
+        model_cfg={"predictor": "mlp", "hidden_dim": 5, "dropout": 0.0},
+    )
+    adapted = build_cluster_predictor(
+        num_clusters=2,
+        input_len=4,
+        pred_len=3,
+        model_cfg={
+            "predictor": "mlp",
+            "hidden_dim": 5,
+            "dropout": 0.0,
+            "channel_adapter": {
+                "enable": True,
+                "rank": 2,
+                "scale": 0.5,
+                "init": "zero_delta",
+            },
+        },
+        num_channels=3,
+        cluster_id_c=cluster_id,
+    )
+    for param in base.parameters():
+        param.data.uniform_(-0.1, 0.1)
+    for param in adapted.parameters():
+        param.data.zero_()
+    adapted.reset_parameters(init="zero_delta")
+    for k in range(2):
+        adapted.load_cluster_state(k, base.get_cluster_state(k))
+
+    x = torch.randn(2, 3, 4)
+
+    assert torch.allclose(adapted(x, cluster_id), base(x, cluster_id))
+
+
+def test_channel_adapter_freeze_base_excludes_base_params():
+    cluster_id = torch.tensor([0, 0, 1])
+    model = build_cluster_predictor(
+        num_clusters=2,
+        input_len=4,
+        pred_len=3,
+        model_cfg={
+            "predictor": "mlp",
+            "hidden_dim": 5,
+            "dropout": 0.0,
+            "channel_adapter": {
+                "enable": True,
+                "rank": 2,
+                "scale": 0.5,
+                "init": "zero_delta",
+                "freeze_base": True,
+            },
+        },
+        num_channels=3,
+        cluster_id_c=cluster_id,
+    )
+
+    assert all(not p.requires_grad for p in model.base.parameters())
+    assert any(p.requires_grad for p in model.get_cluster_params(0))
 
 
 def test_horizon_bias_adapter_zero_init_preserves_base_output():
