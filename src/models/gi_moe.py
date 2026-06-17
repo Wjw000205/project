@@ -67,15 +67,29 @@ class ClusterMLPBaseWithFeatures(nn.Module):
     forward(x, return_features=True) -> (y, h) with h [B,C,D].
     """
 
-    def __init__(self, num_clusters: int, input_len: int, pred_len: int,
-                 hidden_dim: int = 256, dropout: float = 0.2):
+    def __init__(
+        self,
+        num_clusters: int,
+        input_len: int,
+        pred_len: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.2,
+        cluster_embedding_cfg: Optional[Dict[str, object]] = None,
+    ):
         super().__init__()
         from .cluster_mlp import ClusterwiseMLP
         self.K = int(num_clusters)
         self.L = int(input_len)
         self.H = int(pred_len)
         self.D = int(hidden_dim)
-        self.inner = ClusterwiseMLP(self.K, self.L, self.H, self.D, dropout)
+        self.inner = ClusterwiseMLP(
+            self.K,
+            self.L,
+            self.H,
+            self.D,
+            dropout,
+            cluster_embedding_cfg=cluster_embedding_cfg,
+        )
         # NLinear-style "subtract last" trick, applied OUTSIDE ClusterwiseMLP
         # to stay consistent with SimpleBasePredictor's behavior.
         self._last_anchor = None
@@ -84,23 +98,12 @@ class ClusterMLPBaseWithFeatures(nn.Module):
         # NLinear: subtract last value before encoding.
         last = x_bcl[..., -1:]
         x_c = x_bcl - last
-        m = self.inner
-        W1 = torch.stack(list(m.W1), dim=0).index_select(0, cluster_id_c)   # [C,L,D]
-        b1 = torch.stack(list(m.b1), dim=0).index_select(0, cluster_id_c)   # [C,D]
-        h = torch.einsum("bcl,cld->bcd", x_c, W1) + b1.unsqueeze(0)
-        h = m.drop(m.act(h))
         self._last_anchor = last
-        return h
+        return self.inner.encode(x_c, cluster_id_c)
 
     def decode(self, h: torch.Tensor, cluster_id_c: torch.Tensor,
                detach_weights: bool = False) -> torch.Tensor:
-        m = self.inner
-        W2 = torch.stack(list(m.W2), dim=0).index_select(0, cluster_id_c)   # [C,D,H]
-        b2 = torch.stack(list(m.b2), dim=0).index_select(0, cluster_id_c)   # [C,H]
-        if detach_weights:
-            W2 = W2.detach()
-            b2 = b2.detach()
-        y = torch.einsum("bcd,cdh->bch", h, W2) + b2.unsqueeze(0)
+        y = self.inner.decode(h, cluster_id_c, detach_weights=detach_weights)
         if self._last_anchor is not None:
             y = y + self._last_anchor
         return y

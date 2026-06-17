@@ -783,6 +783,221 @@ def _mae_objective_bc_from_abs(
     raise ValueError(f"Unsupported train.mae_objective.kind='{kind}'. Expected l1 or smooth_l1.")
 
 
+def _mae_objective_weight_is_nonzero(weight) -> bool:
+    if torch.is_tensor(weight):
+        if weight.numel() == 0:
+            return False
+        return bool(weight.detach().abs().max().item() != 0.0)
+    return bool(float(weight) != 0.0)
+
+
+def _apply_mae_objective_weight(mae_objective_bk: torch.Tensor, weight) -> torch.Tensor:
+    if torch.is_tensor(weight):
+        weight_k = weight.detach().to(device=mae_objective_bk.device, dtype=mae_objective_bk.dtype)
+        if weight_k.dim() != 1 or int(weight_k.numel()) != int(mae_objective_bk.shape[1]):
+            raise ValueError(
+                "Per-cluster mae_objective weight must be a [K] tensor matching loss_bk clusters."
+            )
+        return mae_objective_bk * weight_k.view(1, -1)
+    return float(weight) * mae_objective_bk
+
+
+def _scale_mae_objective_weight(base_weight: float, multiplier_k: Optional[torch.Tensor]):
+    if multiplier_k is None:
+        return float(base_weight)
+    return multiplier_k.detach().to(dtype=torch.float32) * float(base_weight)
+
+
+def _cluster_target_stats_from_targets(
+    targets_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+) -> List[Dict[str, float]]:
+    targets_bch = targets_bch.detach().cpu().to(dtype=torch.float32)
+    cluster_id_c = cluster_id_c.detach().cpu().to(dtype=torch.long)
+    rows: List[Dict[str, float]] = []
+    for k in range(int(K)):
+        idx = (cluster_id_c == k).nonzero(as_tuple=False).view(-1)
+        if int(idx.numel()) == 0:
+            rows.append(
+                {
+                    "cluster_id": int(k),
+                    "channels": 0,
+                    "mean": 0.0,
+                    "median": 0.0,
+                    "std": 0.0,
+                    "gap": 0.0,
+                }
+            )
+            continue
+        values = targets_bch.index_select(1, idx).reshape(-1)
+        mean = values.mean()
+        median = values.median()
+        std = values.std(unbiased=False).clamp_min(1.0e-6)
+        gap = (mean - median).abs() / std
+        rows.append(
+            {
+                "cluster_id": int(k),
+                "channels": int(idx.numel()),
+                "mean": float(mean.item()),
+                "median": float(median.item()),
+                "std": float(std.item()),
+                "gap": float(gap.item()),
+            }
+        )
+    return rows
+
+
+def _gap_multiplier_from_rows(
+    rows: List[Dict[str, float]],
+    cfg: Dict[str, object],
+) -> torch.Tensor:
+    gaps = torch.tensor([float(row["gap"]) for row in rows], dtype=torch.float32)
+    min_multiplier = float(cfg.get("min_multiplier", 1.0))
+    max_multiplier = float(cfg.get("max_multiplier", 1.25))
+    if max_multiplier < min_multiplier:
+        raise ValueError("train.mae_objective.per_cluster.max_multiplier must be >= min_multiplier.")
+    pivot_cfg = cfg.get("pivot", "median")
+    if isinstance(pivot_cfg, str):
+        pivot_mode = pivot_cfg.lower()
+        if pivot_mode == "median":
+            pivot = gaps.median()
+        elif pivot_mode in {"mean", "avg"}:
+            pivot = gaps.mean()
+        elif pivot_mode in {"zero", "none"}:
+            pivot = torch.tensor(0.0, dtype=gaps.dtype)
+        else:
+            raise ValueError("train.mae_objective.per_cluster.pivot must be median, mean, zero, or a number.")
+    else:
+        pivot = torch.tensor(float(pivot_cfg), dtype=gaps.dtype)
+    excess = (gaps - pivot).clamp_min(0.0)
+    denom = excess.max().clamp_min(1.0e-12)
+    normalized = torch.where(denom > 0.0, excess / denom, torch.zeros_like(excess))
+    multiplier = 1.0 + (max_multiplier - 1.0) * normalized
+    multiplier = multiplier.clamp(min=min_multiplier, max=max_multiplier)
+    multiplier = torch.where(excess > 0.0, multiplier, torch.ones_like(multiplier).clamp(min=min_multiplier))
+    return multiplier.detach()
+
+
+def _build_mae_per_cluster_diagnostics_from_targets(
+    targets_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    base_weight: float,
+    cfg: Dict[str, object],
+) -> Dict[str, object]:
+    if str(cfg.get("diagnostic", "mean_median_gap")).lower() != "mean_median_gap":
+        raise ValueError("train.mae_objective.per_cluster.diagnostic currently supports mean_median_gap only.")
+    if str(cfg.get("source", "train_targets")).lower() != "train_targets":
+        raise ValueError("train.mae_objective.per_cluster.source currently supports train_targets only.")
+    if str(cfg.get("normalize", "std")).lower() != "std":
+        raise ValueError("train.mae_objective.per_cluster.normalize currently supports std only.")
+    rows = _cluster_target_stats_from_targets(targets_bch, cluster_id_c, K)
+    multiplier_k = _gap_multiplier_from_rows(rows, cfg)
+    effective_weight_k = multiplier_k * float(base_weight)
+    for k, row in enumerate(rows):
+        row["multiplier"] = float(multiplier_k[k].item())
+        row["base_weight"] = float(base_weight)
+        row["effective_weight"] = float(effective_weight_k[k].item())
+    return {
+        "rows": rows,
+        "multiplier_k": multiplier_k.detach(),
+        "effective_weight_k": effective_weight_k.detach(),
+    }
+
+
+def _collect_train_targets_bch(loader: DataLoader, max_windows: int = 0) -> torch.Tensor:
+    parts = []
+    seen = 0
+    limit = int(max_windows or 0)
+    for _, y, _ in loader:
+        if limit > 0:
+            remaining = max(0, limit - seen)
+            if remaining <= 0:
+                break
+            y = y[:remaining]
+        parts.append(y.detach().cpu())
+        seen += int(y.shape[0])
+        if limit > 0 and seen >= limit:
+            break
+    if len(parts) == 0:
+        raise ValueError("Cannot build per-cluster MAE diagnostics from an empty train loader.")
+    return torch.cat(parts, dim=0)
+
+
+def _save_mae_per_cluster_diagnostics_csv(rows: List[Dict[str, float]], path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _cosine_similarity_matrix(x: torch.Tensor) -> torch.Tensor:
+    x = x.detach().cpu().to(dtype=torch.float32)
+    denom = x.norm(dim=1, keepdim=True).clamp_min(1.0e-12)
+    x_norm = x / denom
+    return x_norm @ x_norm.t()
+
+
+def _write_matrix_csv(matrix: torch.Tensor, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    matrix = matrix.detach().cpu()
+    columns = ["cluster_id"] + [f"cluster_{i}" for i in range(int(matrix.shape[1]))]
+    rows = []
+    for i in range(int(matrix.shape[0])):
+        rows.append([i] + [float(v) for v in matrix[i].tolist()])
+    pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
+
+
+def _save_cluster_embedding_artifacts(model: nn.Module, out_dir: str) -> Dict[str, object]:
+    for module in model.modules():
+        diag_fn = getattr(module, "cluster_embedding_diagnostics", None)
+        if diag_fn is None:
+            continue
+        diag = diag_fn()
+        if diag is None:
+            continue
+        embedding = diag["embedding"].detach().cpu().to(dtype=torch.float32)
+        gamma = diag["gamma"].detach().cpu().to(dtype=torch.float32)
+        beta = diag["beta"].detach().cpu().to(dtype=torch.float32)
+
+        embedding_path = os.path.join(out_dir, "cluster_embedding.csv")
+        embedding_sim_path = os.path.join(out_dir, "cluster_embedding_similarity.csv")
+        film_norm_path = os.path.join(out_dir, "cluster_film_norms.csv")
+        gamma_sim_path = os.path.join(out_dir, "cluster_film_gamma_similarity.csv")
+        beta_sim_path = os.path.join(out_dir, "cluster_film_beta_similarity.csv")
+
+        emb_rows = []
+        for k in range(int(embedding.shape[0])):
+            row = {"cluster_id": int(k)}
+            row.update({f"e{i}": float(v) for i, v in enumerate(embedding[k].tolist())})
+            emb_rows.append(row)
+        pd.DataFrame(emb_rows).to_csv(embedding_path, index=False)
+        _write_matrix_csv(_cosine_similarity_matrix(embedding), embedding_sim_path)
+
+        norm_rows = []
+        for k in range(int(gamma.shape[0])):
+            norm_rows.append(
+                {
+                    "cluster_id": int(k),
+                    "gamma_norm": float(gamma[k].norm().item()),
+                    "beta_norm": float(beta[k].norm().item()),
+                    "gamma_mean_abs": float(gamma[k].abs().mean().item()),
+                    "beta_mean_abs": float(beta[k].abs().mean().item()),
+                }
+            )
+        pd.DataFrame(norm_rows).to_csv(film_norm_path, index=False)
+        _write_matrix_csv(_cosine_similarity_matrix(gamma), gamma_sim_path)
+        _write_matrix_csv(_cosine_similarity_matrix(beta), beta_sim_path)
+        return {
+            "enable": True,
+            "cluster_embedding": embedding_path,
+            "cluster_embedding_similarity": embedding_sim_path,
+            "cluster_film_norms": film_norm_path,
+            "cluster_film_gamma_similarity": gamma_sim_path,
+            "cluster_film_beta_similarity": beta_sim_path,
+        }
+    return {"enable": False}
+
+
 def _pred_residual_channel_keep_mask(
     policy: str,
     base_mse_c: torch.Tensor,
@@ -1976,7 +2191,7 @@ def eval_loop(
     penalty_scale: torch.Tensor = None,
     dynamic_lambda: ClusterwiseDynamicLambda = None,
     lambda_min_kp: torch.Tensor = None,
-    mae_objective_weight: float = 0.0,
+    mae_objective_weight=0.0,
     mae_objective_kind: str = "l1",
     mae_objective_beta: float = 1.0,
     pred_residual: Optional[ClusterwisePredResidualMoE] = None,
@@ -2295,7 +2510,7 @@ def eval_loop(
             skip_bk=skip_bk if allow_skip else None,
             skip_cost=0.0,
         )
-        if mae_objective_weight != 0.0:
+        if _mae_objective_weight_is_nonzero(mae_objective_weight):
             mae_objective_bc = _mae_objective_bc_from_abs(
                 abs_err_bch,
                 kind=mae_objective_kind,
@@ -2304,7 +2519,7 @@ def eval_loop(
             mae_objective_bk = scatter_mean_bc_to_bk(mae_objective_bc, cluster_id_c, K)
         else:
             mae_objective_bk = torch.zeros_like(mse_bk)
-        loss_bk = (mse_weight * mse_bk) + (float(mae_objective_weight) * mae_objective_bk) + penalty_loss_bk  # [B,K]
+        loss_bk = (mse_weight * mse_bk) + _apply_mae_objective_weight(mae_objective_bk, mae_objective_weight) + penalty_loss_bk  # [B,K]
         total_loss_sum += loss_bk.sum(dim=0)
         total_cnt += torch.tensor([x.shape[0]], device=device).expand_as(total_cnt)
 
@@ -2739,7 +2954,7 @@ def fit_calendar_residual_correction_from_eval_path(
     penalty_scale: Optional[torch.Tensor] = None,
     dynamic_lambda: Optional[ClusterwiseDynamicLambda] = None,
     lambda_min_kp: Optional[torch.Tensor] = None,
-    mae_objective_weight: float = 0.0,
+    mae_objective_weight=0.0,
     mae_objective_kind: str = "l1",
     mae_objective_beta: float = 1.0,
     pred_residual: Optional[ClusterwisePredResidualMoE] = None,
@@ -5716,14 +5931,65 @@ def main():
     mae_objective_beta = float(mae_objective_cfg.get("beta", 1.0))
     if mae_objective_beta <= 0.0:
         raise ValueError("train.mae_objective.beta must be positive.")
+    mae_objective_per_cluster_cfg = mae_objective_cfg.get("per_cluster", {}) or {}
+    mae_objective_per_cluster_enable = (
+        bool(mae_objective_enable)
+        and bool(mae_objective_per_cluster_cfg.get("enable", False))
+        and mae_objective_weight_final != 0.0
+    )
+    mae_objective_multiplier_k: Optional[torch.Tensor] = None
+    mae_objective_per_cluster_summary: Dict[str, object] = {
+        "enable": bool(mae_objective_per_cluster_enable),
+    }
 
-    def mae_objective_weight_at(epoch_idx: int) -> float:
+    def mae_objective_weight_at(epoch_idx: int):
         if (not mae_objective_enable) or mae_objective_weight_final == 0.0:
             return 0.0
         if mae_objective_warmup_epochs <= 0:
-            return mae_objective_weight_final
-        scale = min(1.0, max(0.0, float(epoch_idx) / float(mae_objective_warmup_epochs)))
-        return mae_objective_weight_final * scale
+            base_weight = mae_objective_weight_final
+        else:
+            scale = min(1.0, max(0.0, float(epoch_idx) / float(mae_objective_warmup_epochs)))
+            base_weight = mae_objective_weight_final * scale
+        return _scale_mae_objective_weight(base_weight, mae_objective_multiplier_k)
+
+    if mae_objective_per_cluster_enable:
+        diagnostic_loader = DataLoader(
+            dtr,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
+        target_bch = _collect_train_targets_bch(
+            diagnostic_loader,
+            max_windows=int(mae_objective_per_cluster_cfg.get("max_windows", 0) or 0),
+        )
+        per_cluster_diag = _build_mae_per_cluster_diagnostics_from_targets(
+            targets_bch=target_bch,
+            cluster_id_c=cluster_id_c,
+            K=K,
+            base_weight=mae_objective_weight_final,
+            cfg=mae_objective_per_cluster_cfg,
+        )
+        mae_objective_multiplier_k = per_cluster_diag["multiplier_k"].to(device=device, dtype=torch.float32).detach()
+        artifact_name = str(mae_objective_per_cluster_cfg.get("artifact", "cluster_mae_weights.csv"))
+        artifact_path = artifact_name if os.path.isabs(artifact_name) else os.path.join(out_dir, artifact_name)
+        _save_mae_per_cluster_diagnostics_csv(per_cluster_diag["rows"], artifact_path)
+        mae_objective_per_cluster_summary = {
+            "enable": True,
+            "diagnostic": str(mae_objective_per_cluster_cfg.get("diagnostic", "mean_median_gap")),
+            "source": str(mae_objective_per_cluster_cfg.get("source", "train_targets")),
+            "normalize": str(mae_objective_per_cluster_cfg.get("normalize", "std")),
+            "pivot": mae_objective_per_cluster_cfg.get("pivot", "median"),
+            "min_multiplier": float(mae_objective_per_cluster_cfg.get("min_multiplier", 1.0)),
+            "max_multiplier": float(mae_objective_per_cluster_cfg.get("max_multiplier", 1.25)),
+            "artifact": artifact_path,
+            "multiplier": [float(v) for v in mae_objective_multiplier_k.detach().cpu().tolist()],
+            "effective_weight": [
+                float(v) for v in per_cluster_diag["effective_weight_k"].detach().cpu().tolist()
+            ],
+        }
+        print(f"Saved per-cluster MAE objective weights to: {artifact_path}")
 
     calibration_cfg = cfg.get("calibration", {}) or {}
     calibration_enable = bool(calibration_cfg.get("enable", False))
@@ -7248,7 +7514,7 @@ def main():
         pred_residual_params: Optional[Dict[str, torch.Tensor]] = None,
         dynamic_lambda_params: Optional[Dict[str, torch.Tensor]] = None,
         straight_through: bool = True,
-        mae_objective_weight: float = 0.0,
+        mae_objective_weight=0.0,
     ) -> Dict[str, torch.Tensor]:
         x_model = apply_train_stat_input_centering(
             x,
@@ -7339,7 +7605,7 @@ def main():
         mae_bc = abs_err_bch.mean(dim=-1)
         mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)
         mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)
-        if mae_objective_weight != 0.0:
+        if _mae_objective_weight_is_nonzero(mae_objective_weight):
             mae_objective_bc = _mae_objective_bc_from_abs(
                 abs_err_bch,
                 kind=mae_objective_kind,
@@ -7414,7 +7680,7 @@ def main():
         )
         objective_loss_bk = (
             (mse_weight * loss_terms_bk["mse"])
-            + (float(mae_objective_weight) * loss_terms_bk["mae_objective"])
+            + _apply_mae_objective_weight(loss_terms_bk["mae_objective"], mae_objective_weight)
             + loss_terms_bk["penalty"]
             + loss_terms_bk["pred_residual"]
         )
@@ -7731,7 +7997,7 @@ def main():
             mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)  # [B,K]
             mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)  # [B,K]
             mae_objective_weight_ep = mae_objective_weight_at(ep)
-            if mae_objective_weight_ep != 0.0:
+            if _mae_objective_weight_is_nonzero(mae_objective_weight_ep):
                 mae_objective_bc = _mae_objective_bc_from_abs(
                     abs_err_bch,
                     kind=mae_objective_kind,
@@ -7782,7 +8048,7 @@ def main():
                 )
                 raw_objective_loss_bk = (
                     (mse_weight * mse_bk)
-                    + (float(mae_objective_weight_ep) * mae_objective_bk)
+                    + _apply_mae_objective_weight(mae_objective_bk, mae_objective_weight_ep)
                     + penalty_loss_bk
                 )  # [B,K]
                 pred_loss_terms = _pred_residual_loss_terms(
@@ -7810,7 +8076,7 @@ def main():
                 )
                 objective_loss_bk = (
                     (mse_weight * loss_terms_bk["mse"])
-                    + (float(mae_objective_weight_ep) * loss_terms_bk["mae_objective"])
+                    + _apply_mae_objective_weight(loss_terms_bk["mae_objective"], mae_objective_weight_ep)
                     + loss_terms_bk["penalty"]
                 )
                 loss_bk = objective_loss_bk + loss_terms_bk["pred_residual"]
@@ -7872,7 +8138,10 @@ def main():
                         gate_balance_target_kp=gate_balance_target_kp,
                     )
             else:
-                raw_objective_loss_bk = (mse_weight * mse_bk) + (float(mae_objective_weight_ep) * mae_objective_bk)
+                raw_objective_loss_bk = (
+                    (mse_weight * mse_bk)
+                    + _apply_mae_objective_weight(mae_objective_bk, mae_objective_weight_ep)
+                )
                 loss_terms_bk, _ = _normalize_loss_terms(
                     {
                         "mse": mse_bk,
@@ -7884,7 +8153,7 @@ def main():
                 )
                 objective_loss_bk = (
                     (mse_weight * loss_terms_bk["mse"])
-                    + (float(mae_objective_weight_ep) * loss_terms_bk["mae_objective"])
+                    + _apply_mae_objective_weight(loss_terms_bk["mae_objective"], mae_objective_weight_ep)
                 )
                 loss_bk = objective_loss_bk
             _accumulate_detached_sum_(train_loss_sum_k, raw_objective_loss_bk)
@@ -8045,7 +8314,10 @@ def main():
     if swa_enable and swa_updates <= 0:
         swa_summary["reason"] = "no_swa_updates"
     if swa_enable and swa_updates > 0:
-        swa_mae_eval_weight = mae_objective_weight_final if mae_objective_enable else 0.0
+        swa_mae_eval_weight = _scale_mae_objective_weight(
+            mae_objective_weight_final if mae_objective_enable else 0.0,
+            mae_objective_multiplier_k,
+        )
         lam_kp_for_swa_eval = lambda_kp_from_epochs(best_epoch)
         best_val_loss_k, best_val_mse_k, best_val_mae_k, _, _, _, _, _ = eval_loop_with_history(
             model, gate, lam_kp_for_swa_eval,
@@ -8571,7 +8843,10 @@ def main():
         "base_mean_abs": None,
         "hybrid_mean_abs": None,
     }
-    mae_eval_weight = mae_objective_weight_final if mae_objective_enable else 0.0
+    mae_eval_weight = _scale_mae_objective_weight(
+        mae_objective_weight_final if mae_objective_enable else 0.0,
+        mae_objective_multiplier_k,
+    )
     if skip_test:
         print("eval.skip_test=true: test split windows, evaluation, and metrics are disabled.")
     if len(dva) > 0:
@@ -10585,6 +10860,7 @@ def main():
         gpu_alloc_mb = float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
         gpu_reserved_mb = float(torch.cuda.max_memory_reserved()) / (1024.0 * 1024.0)
     out_dir_mb = _dir_size_mb(out_dir)
+    cluster_embedding_summary = _save_cluster_embedding_artifacts(model, out_dir)
 
     summary = {
         "config_path": args.config,
@@ -10610,7 +10886,9 @@ def main():
             "weight": float(mae_objective_weight_final),
             "warmup_epochs": int(mae_objective_warmup_epochs),
             "beta": float(mae_objective_beta),
+            "per_cluster": mae_objective_per_cluster_summary,
         },
+        "cluster_embedding": cluster_embedding_summary,
         "training_stability": {
             "shuffle_seed": None if shuffle_seed is None else int(shuffle_seed),
             "freeze_backbone": bool(freeze_backbone),

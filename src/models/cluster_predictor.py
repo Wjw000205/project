@@ -731,6 +731,11 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
         dropout: float = 0.0,
         residual: bool = True,
         include_delta: bool = True,
+        cluster_embedding_cfg: Optional[Dict[str, object]] = None,
+        residual_blocks: int = 0,
+        residual_block_scale: float = 0.5,
+        residual_block_dropout: Optional[float] = None,
+        residual_block_init: str = "zero_out",
     ):
         super().__init__(num_clusters=num_clusters)
         self.L = int(input_len)
@@ -740,6 +745,8 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
         self.residual = bool(residual)
         self.include_delta = bool(include_delta)
         self.input_dim = self.L * (3 if self.include_delta else 2)
+        self.cluster_embedding_enabled = False
+        self.context_residual_blocks = 0
         if cluster_id_c.numel() != self.C:
             raise ValueError(
                 f"context_channel_head_mlp expected cluster_id_c length {self.C}, got {int(cluster_id_c.numel())}."
@@ -760,13 +767,146 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
         )
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self._setup_context_residual_blocks(
+            residual_blocks=residual_blocks,
+            residual_block_scale=residual_block_scale,
+            residual_block_dropout=dropout if residual_block_dropout is None else residual_block_dropout,
+            residual_block_init=residual_block_init,
+        )
         self.reset_parameters()
+        self._setup_cluster_embedding(cluster_embedding_cfg)
 
     def reset_parameters(self):
         for w in self.W1:
             nn.init.xavier_uniform_(w)
         for w in self.W2:
             nn.init.xavier_uniform_(w)
+        if self.context_residual_blocks > 0:
+            self.reset_context_residual_block_parameters()
+        if self.cluster_embedding_enabled:
+            self.reset_cluster_embedding_parameters()
+
+    def _setup_context_residual_blocks(
+        self,
+        *,
+        residual_blocks: int,
+        residual_block_scale: float,
+        residual_block_dropout: float,
+        residual_block_init: str,
+    ) -> None:
+        blocks = int(residual_blocks or 0)
+        if blocks <= 0:
+            return
+        self.context_residual_blocks = blocks
+        self.context_residual_block_scale = float(residual_block_scale)
+        self.context_residual_block_init = str(residual_block_init or "zero_out").lower()
+        self.context_block_drop = (
+            nn.Dropout(float(residual_block_dropout)) if float(residual_block_dropout) > 0.0 else nn.Identity()
+        )
+        total = self.context_residual_blocks * self.K
+        self.context_block_w1 = nn.ParameterList(
+            [nn.Parameter(torch.empty(self.D, self.D)) for _ in range(total)]
+        )
+        self.context_block_b1 = nn.ParameterList(
+            [nn.Parameter(torch.zeros(self.D)) for _ in range(total)]
+        )
+        self.context_block_w2 = nn.ParameterList(
+            [nn.Parameter(torch.empty(self.D, self.D)) for _ in range(total)]
+        )
+        self.context_block_b2 = nn.ParameterList(
+            [nn.Parameter(torch.zeros(self.D)) for _ in range(total)]
+        )
+
+    def _context_block_offset(self, block_idx: int, cluster_idx: int) -> int:
+        return int(block_idx) * self.K + int(cluster_idx)
+
+    def reset_context_residual_block_parameters(self):
+        if self.context_residual_block_init not in {"zero_out", "xavier"}:
+            raise ValueError("model.context_channel_head_block_init must be 'zero_out' or 'xavier'.")
+        for block_idx in range(self.context_residual_blocks):
+            for k in range(self.K):
+                offset = self._context_block_offset(block_idx, k)
+                nn.init.xavier_uniform_(self.context_block_w1[offset])
+                nn.init.zeros_(self.context_block_b1[offset])
+                if self.context_residual_block_init == "zero_out":
+                    nn.init.zeros_(self.context_block_w2[offset])
+                else:
+                    nn.init.xavier_uniform_(self.context_block_w2[offset])
+                nn.init.zeros_(self.context_block_b2[offset])
+
+    def _apply_context_residual_blocks(self, h_bcd: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        if self.context_residual_blocks <= 0:
+            return h_bcd
+        h = h_bcd
+        scale = float(self.context_residual_block_scale)
+        for block_idx in range(self.context_residual_blocks):
+            start = block_idx * self.K
+            end = start + self.K
+            w1 = torch.stack(list(self.context_block_w1[start:end]), dim=0).index_select(0, cluster_id_c)
+            b1 = torch.stack(list(self.context_block_b1[start:end]), dim=0).index_select(0, cluster_id_c)
+            w2 = torch.stack(list(self.context_block_w2[start:end]), dim=0).index_select(0, cluster_id_c)
+            b2 = torch.stack(list(self.context_block_b2[start:end]), dim=0).index_select(0, cluster_id_c)
+            z = torch.einsum("bcd,cde->bce", h, w1) + b1.unsqueeze(0)
+            z = self.context_block_drop(self.act(z))
+            z = torch.einsum("bcd,cde->bce", z, w2) + b2.unsqueeze(0)
+            h = h + scale * z
+        return h
+
+    def _setup_cluster_embedding(self, cfg: Optional[Dict[str, object]]) -> None:
+        cfg = dict(cfg or {})
+        if not bool(cfg.get("enable", False)):
+            return
+        mode = str(cfg.get("mode", "film")).lower()
+        if mode != "film":
+            raise ValueError("model.cluster_embedding.mode currently supports only 'film'.")
+        dim = int(cfg.get("dim", 8))
+        if dim <= 0:
+            raise ValueError("model.cluster_embedding.dim must be positive.")
+        self.cluster_embedding_enabled = True
+        self.cluster_embedding_dim = dim
+        self.cluster_embedding_film_scale = float(cfg.get("film_scale", 0.1))
+        self.cluster_embedding_init_std = float(cfg.get("init_std", 0.02))
+        self.cluster_embedding_film_init = str(cfg.get("film_init", "zero")).lower()
+        self.cluster_embedding = nn.ParameterList(
+            [nn.Parameter(torch.empty(dim)) for _ in range(self.K)]
+        )
+        self.film_weight = nn.ParameterList(
+            [nn.Parameter(torch.empty(dim, 2 * self.D)) for _ in range(self.K)]
+        )
+        self.film_bias = nn.ParameterList(
+            [nn.Parameter(torch.empty(2 * self.D)) for _ in range(self.K)]
+        )
+        self.reset_cluster_embedding_parameters()
+
+    def reset_cluster_embedding_parameters(self):
+        for emb in self.cluster_embedding:
+            nn.init.normal_(emb, mean=0.0, std=self.cluster_embedding_init_std)
+        if self.cluster_embedding_film_init == "zero":
+            for w in self.film_weight:
+                nn.init.zeros_(w)
+            for b in self.film_bias:
+                nn.init.zeros_(b)
+            return
+        if self.cluster_embedding_film_init not in {"xavier", "default"}:
+            raise ValueError("model.cluster_embedding.film_init must be 'zero' or 'xavier'.")
+        for w in self.film_weight:
+            nn.init.xavier_uniform_(w)
+        for b in self.film_bias:
+            nn.init.zeros_(b)
+
+    def _film_gamma_beta_for_clusters(self, cluster_id_c: torch.Tensor):
+        emb = torch.stack(list(self.cluster_embedding), dim=0).index_select(0, cluster_id_c)
+        weight = torch.stack(list(self.film_weight), dim=0).index_select(0, cluster_id_c)
+        bias = torch.stack(list(self.film_bias), dim=0).index_select(0, cluster_id_c)
+        film = torch.einsum("ce,ced->cd", emb, weight) + bias
+        return film.split(self.D, dim=-1)
+
+    def _apply_cluster_film(self, h_bcd: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
+        gamma_cd, beta_cd = self._film_gamma_beta_for_clusters(cluster_id_c)
+        gamma_cd = gamma_cd.to(device=h_bcd.device, dtype=h_bcd.dtype)
+        beta_cd = beta_cd.to(device=h_bcd.device, dtype=h_bcd.dtype)
+        scale = float(self.cluster_embedding_film_scale)
+        return h_bcd * (1.0 + scale * gamma_cd.unsqueeze(0)) + scale * beta_cd.unsqueeze(0)
 
     def _cluster_channel_idx(self, k: int) -> torch.Tensor:
         return (self.cluster_id_c == int(k)).nonzero(as_tuple=False).view(-1)
@@ -792,6 +932,9 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
 
         h = torch.einsum("bcl,cld->bcd", feat_bcf, W1) + b1.unsqueeze(0)
         h = self.drop(self.act(h))
+        if self.cluster_embedding_enabled:
+            h = self._apply_cluster_film(h, cluster_id_c)
+        h = self._apply_context_residual_blocks(h, cluster_id_c)
         y = torch.einsum("bcd,cdh->bch", h, W2) + b2.unsqueeze(0)
         return y + last if self.residual else y
 
@@ -800,6 +943,18 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
         idx = self._cluster_channel_idx(k)
         params.extend(self.W2[int(i.item())] for i in idx)
         params.extend(self.b2[int(i.item())] for i in idx)
+        for block_idx in range(self.context_residual_blocks):
+            offset = self._context_block_offset(block_idx, k)
+            params.extend(
+                [
+                    self.context_block_w1[offset],
+                    self.context_block_b1[offset],
+                    self.context_block_w2[offset],
+                    self.context_block_b2[offset],
+                ]
+            )
+        if self.cluster_embedding_enabled:
+            params.extend([self.cluster_embedding[k], self.film_weight[k], self.film_bias[k]])
         return params
 
     def get_cluster_state(self, k: int):
@@ -810,13 +965,32 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
         else:
             w2 = torch.empty(0, self.D, self.H)
             b2 = torch.empty(0, self.H)
-        return {
+        state = {
             "W1": self.W1[k].detach().cpu(),
             "b1": self.b1[k].detach().cpu(),
             "channel_idx": idx.detach().cpu(),
             "W2": w2,
             "b2": b2,
         }
+        if self.cluster_embedding_enabled:
+            state.update(
+                {
+                    "cluster_embedding": self.cluster_embedding[k].detach().cpu().clone(),
+                    "film_weight": self.film_weight[k].detach().cpu().clone(),
+                    "film_bias": self.film_bias[k].detach().cpu().clone(),
+                }
+            )
+        if self.context_residual_blocks > 0:
+            state["context_residual_blocks"] = [
+                {
+                    "W1": self.context_block_w1[self._context_block_offset(block_idx, k)].detach().cpu().clone(),
+                    "b1": self.context_block_b1[self._context_block_offset(block_idx, k)].detach().cpu().clone(),
+                    "W2": self.context_block_w2[self._context_block_offset(block_idx, k)].detach().cpu().clone(),
+                    "b2": self.context_block_b2[self._context_block_offset(block_idx, k)].detach().cpu().clone(),
+                }
+                for block_idx in range(self.context_residual_blocks)
+            ]
+        return state
 
     def load_cluster_state(self, k: int, state):
         device = self.W1[k].device
@@ -832,6 +1006,35 @@ class ClusterwiseContextChannelHeadMLP(_ClusterPredictorBase):
             c = int(i.item())
             self.W2[c].data.copy_(w2[j])
             self.b2[c].data.copy_(b2[j])
+        if self.cluster_embedding_enabled and "cluster_embedding" in state:
+            self.cluster_embedding[k].data.copy_(state["cluster_embedding"].to(device))
+            self.film_weight[k].data.copy_(state["film_weight"].to(device))
+            self.film_bias[k].data.copy_(state["film_bias"].to(device))
+        block_state = state.get("context_residual_blocks", None) if isinstance(state, dict) else None
+        if self.context_residual_blocks > 0 and block_state is not None:
+            if len(block_state) != self.context_residual_blocks:
+                raise ValueError(
+                    f"context_channel_head_mlp cluster {k} residual block count does not match checkpoint state."
+                )
+            for block_idx, saved in enumerate(block_state):
+                offset = self._context_block_offset(block_idx, k)
+                self.context_block_w1[offset].data.copy_(saved["W1"].to(device))
+                self.context_block_b1[offset].data.copy_(saved["b1"].to(device))
+                self.context_block_w2[offset].data.copy_(saved["W2"].to(device))
+                self.context_block_b2[offset].data.copy_(saved["b2"].to(device))
+
+    @torch.no_grad()
+    def cluster_embedding_diagnostics(self):
+        if not self.cluster_embedding_enabled:
+            return None
+        cluster_id = torch.arange(self.K, device=self.cluster_embedding[0].device, dtype=torch.long)
+        emb = torch.stack(list(self.cluster_embedding), dim=0).detach().cpu()
+        gamma, beta = self._film_gamma_beta_for_clusters(cluster_id)
+        return {
+            "embedding": emb,
+            "gamma": gamma.detach().cpu(),
+            "beta": beta.detach().cpu(),
+        }
 
 
 class ClusterwiseLongContextChannelHeadMLP(_ClusterPredictorBase):
@@ -2518,7 +2721,14 @@ def build_cluster_predictor(
 
     base_predictor: nn.Module
     if predictor in {"mlp", "cluster_mlp"}:
-        base_predictor = ClusterwiseMLP(num_clusters, base_input_len, base_pred_len, hidden_dim, dropout)
+        base_predictor = ClusterwiseMLP(
+            num_clusters,
+            base_input_len,
+            base_pred_len,
+            hidden_dim,
+            dropout,
+            cluster_embedding_cfg=model_cfg.get("cluster_embedding", {}),
+        )
     elif predictor in {"segment_mlp", "seg_mlp", "chunk_mlp"}:
         base_predictor = ClusterwiseSegmentMLP(
             num_clusters=num_clusters,
@@ -2567,6 +2777,11 @@ def build_cluster_predictor(
             dropout=dropout,
             residual=bool(model_cfg.get("context_channel_head_residual", True)),
             include_delta=bool(model_cfg.get("context_channel_head_include_delta", True)),
+            cluster_embedding_cfg=model_cfg.get("cluster_embedding", {}),
+            residual_blocks=int(model_cfg.get("context_channel_head_blocks", 0)),
+            residual_block_scale=float(model_cfg.get("context_channel_head_block_scale", 0.5)),
+            residual_block_dropout=model_cfg.get("context_channel_head_block_dropout", None),
+            residual_block_init=str(model_cfg.get("context_channel_head_block_init", "zero_out")),
         )
     elif predictor in {
         "long_context_channel_head_mlp",
