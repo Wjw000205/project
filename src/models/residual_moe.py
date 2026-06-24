@@ -46,6 +46,8 @@ class ClusterwisePredResidualMoE(nn.Module):
         seasonal_anchor_period: int = 96,
         seasonal_anchor_num_periods: int = 1,
         seasonal_anchor_scale: float = 1.0,
+        phase_residual_candidate_names: Optional[List[str]] = None,
+        phase_residual_candidate_scale: float = 1.0,
     ):
         super().__init__()
         self.K = int(num_clusters)
@@ -99,8 +101,14 @@ class ClusterwisePredResidualMoE(nn.Module):
         self.seasonal_anchor_period = max(int(seasonal_anchor_period), 1)
         self.seasonal_anchor_num_periods = max(int(seasonal_anchor_num_periods), 1)
         self.seasonal_anchor_scale = float(seasonal_anchor_scale)
+        phase_residual_name_set = {str(name) for name in (phase_residual_candidate_names or [])}
+        self.phase_residual_candidate_scale = float(phase_residual_candidate_scale)
         seasonal_mask = torch.tensor(
             [name in anchor_name_set for name in self.penalty_names],
+            dtype=torch.float32,
+        )
+        phase_residual_mask = torch.tensor(
+            [name in phase_residual_name_set for name in self.penalty_names],
             dtype=torch.float32,
         )
         seasonal_index = torch.zeros(
@@ -210,6 +218,11 @@ class ClusterwisePredResidualMoE(nn.Module):
         self.register_buffer("seasonal_anchor_mask_p", seasonal_mask, persistent=False)
         self.register_buffer("seasonal_anchor_index_hp", seasonal_index, persistent=False)
         self.register_buffer("seasonal_anchor_valid_hp", seasonal_valid, persistent=False)
+        self.register_buffer("phase_residual_candidate_mask_p", phase_residual_mask, persistent=False)
+        self.register_buffer("phase_residual_candidate_table_phc", torch.empty(0), persistent=False)
+        self.register_buffer("confidence_threshold_kp", torch.empty(0), persistent=False)
+        self.register_buffer("confidence_skip_threshold_k", torch.empty(0), persistent=False)
+        self.confidence_gate_enable = False
         self.reset_parameters()
 
     def _idx(self, k: int, p: int) -> int:
@@ -219,7 +232,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         return int(c) * self.P + int(p)
 
     def set_channel_penalty_allowed_mask(self, mask_cp: Optional[torch.Tensor]) -> None:
-        if mask_cp is None:
+        if mask_cp is None or int(mask_cp.numel()) == 0:
             self.channel_penalty_allowed_mask_cp = torch.empty(0, device=self.channel_penalty_allowed_mask_cp.device)
             return
         if mask_cp.ndim != 2 or int(mask_cp.shape[1]) != self.P:
@@ -227,6 +240,50 @@ class ClusterwisePredResidualMoE(nn.Module):
                 f"channel penalty mask must have shape [C,{self.P}], got {tuple(mask_cp.shape)}"
             )
         self.channel_penalty_allowed_mask_cp = mask_cp.detach().to(dtype=torch.float32)
+
+    def set_allowed_penalty_mask(self, mask_cp: Optional[torch.Tensor]) -> None:
+        self.set_channel_penalty_allowed_mask(mask_cp)
+
+    def set_phase_residual_candidate_table(self, table_phc: Optional[torch.Tensor]) -> None:
+        device = self.phase_residual_candidate_mask_p.device
+        if table_phc is None or int(table_phc.numel()) == 0:
+            self.phase_residual_candidate_table_phc = torch.empty(0, device=device)
+            return
+        table = table_phc.detach().to(device=device, dtype=torch.float32)
+        if table.ndim != 3 or int(table.shape[1]) != self.H:
+            raise ValueError(
+                "phase residual candidate table must have shape [period,H,C], "
+                f"got {tuple(table.shape)} with H={self.H}"
+            )
+        self.phase_residual_candidate_table_phc = table
+
+    def set_confidence_gate(
+        self,
+        penalty_threshold_kp: Optional[torch.Tensor] = None,
+        skip_threshold_k: Optional[torch.Tensor] = None,
+        enable: bool = True,
+    ) -> None:
+        self.confidence_gate_enable = bool(enable)
+        device = self.seasonal_anchor_mask_p.device
+        if penalty_threshold_kp is None:
+            self.confidence_threshold_kp = torch.empty(0, device=device)
+        else:
+            threshold = penalty_threshold_kp.detach().to(device=device, dtype=torch.float32)
+            if threshold.shape != (self.K, self.P):
+                raise ValueError(
+                    "confidence penalty threshold must have shape "
+                    f"[{self.K},{self.P}], got {tuple(threshold.shape)}"
+                )
+            self.confidence_threshold_kp = threshold.clamp_min(0.0)
+        if skip_threshold_k is None:
+            self.confidence_skip_threshold_k = torch.empty(0, device=device)
+        else:
+            skip_threshold = skip_threshold_k.detach().to(device=device, dtype=torch.float32).view(-1)
+            if int(skip_threshold.numel()) != self.K:
+                raise ValueError(
+                    f"confidence skip threshold must have length {self.K}, got {int(skip_threshold.numel())}"
+                )
+            self.confidence_skip_threshold_k = skip_threshold.clamp(0.0, 1.0)
 
     def reset_parameters(self):
         for w in self.W1:
@@ -272,6 +329,28 @@ class ClusterwisePredResidualMoE(nn.Module):
         fallback = x_bcl[..., -1:].expand_as(anchors)
         has_anchor = valid.any(dim=-1).view(1, 1, self.H)
         return torch.where(has_anchor, anchors, fallback)
+
+    def _phase_residual_candidate_forecast(
+        self,
+        query_start_abs_b: torch.Tensor,
+        *,
+        channel_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        table = self.phase_residual_candidate_table_phc
+        if int(table.numel()) == 0:
+            raise ValueError("phase residual candidate table is required when phase_residual_candidate_names is non-empty.")
+        if table.ndim != 3 or int(table.shape[1]) != self.H or int(table.shape[2]) != int(channel_count):
+            raise ValueError(
+                "phase residual candidate table must have shape [period,H,C], "
+                f"got {tuple(table.shape)} for H={self.H}, C={int(channel_count)}"
+            )
+        phases_b = (query_start_abs_b.detach().to(device=device, dtype=torch.long).reshape(-1) + self.L) % int(table.shape[0])
+        if int(phases_b.numel()) == 0:
+            return table.new_zeros((0, int(channel_count), self.H), dtype=dtype, device=device)
+        residual_bhc = table.to(device=device, dtype=dtype).index_select(0, phases_b)
+        return residual_bhc.permute(0, 2, 1).contiguous()
 
     def _safe_augmented_features(self, x_bcl: torch.Tensor, y_base_bch: torch.Tensor) -> torch.Tensor:
         eps = 1.0e-6
@@ -361,6 +440,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         cluster_id_c: torch.Tensor,
         mask_bkp: torch.Tensor,
         skip_bk: Optional[torch.Tensor] = None,
+        query_start_abs_b: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns:
@@ -416,6 +496,25 @@ class ClusterwisePredResidualMoE(nn.Module):
                 float(self.seasonal_anchor_scale)
                 * mask_p.view(1, 1, self.P, 1)
                 * anchor_residual.unsqueeze(2)
+            )
+        if (
+            self.phase_residual_candidate_scale != 0.0
+            and self.phase_residual_candidate_mask_p.numel() == self.P
+            and bool((self.phase_residual_candidate_mask_p > 0).any().item())
+        ):
+            if query_start_abs_b is None:
+                raise ValueError("query_start_abs_b is required when phase_residual_candidate_names is non-empty.")
+            phase_residual = self._phase_residual_candidate_forecast(
+                query_start_abs_b,
+                channel_count=int(y_base_bch.shape[1]),
+                device=x_bcl.device,
+                dtype=residuals.dtype,
+            )
+            mask_p = self.phase_residual_candidate_mask_p.to(device=x_bcl.device, dtype=residuals.dtype)
+            residuals = residuals + (
+                float(self.phase_residual_candidate_scale)
+                * mask_p.view(1, 1, self.P, 1)
+                * phase_residual.unsqueeze(2)
             )
         if self.channel_expert_enable:
             if self.C_channel != int(feat_bcd.shape[1]):
@@ -489,7 +588,30 @@ class ClusterwisePredResidualMoE(nn.Module):
             selector_bcp = torch.sigmoid(selector_logits / self.selector_temperature)
         else:
             selector_bcp = torch.ones_like(route_bcp)
-        effective_route_bcp = route_bcp * intervention_bcp * selector_bcp
+        confidence_active_bcp = torch.ones_like(route_bcp)
+        skip_confidence_bc = torch.zeros_like(route_bcp[..., 0])
+        if bool(self.confidence_gate_enable):
+            if int(self.confidence_threshold_kp.numel()) > 0:
+                threshold_cp = self.confidence_threshold_kp.to(
+                    device=x_bcl.device,
+                    dtype=intervention_bcp.dtype,
+                ).index_select(0, cluster_id_c)
+                confidence_active_bcp = (intervention_bcp >= threshold_cp.unsqueeze(0)).to(dtype=route_bcp.dtype)
+            if int(self.confidence_skip_threshold_k.numel()) > 0:
+                selected_conf_bcp = torch.where(
+                    route_bcp > 0.0,
+                    intervention_bcp,
+                    torch.zeros_like(intervention_bcp),
+                )
+                max_conf_bc = selected_conf_bcp.max(dim=-1).values
+                skip_confidence_bc = 1.0 - max_conf_bc
+                skip_threshold_c = self.confidence_skip_threshold_k.to(
+                    device=x_bcl.device,
+                    dtype=skip_confidence_bc.dtype,
+                ).index_select(0, cluster_id_c)
+                skip_active_bc = skip_confidence_bc >= skip_threshold_c.unsqueeze(0)
+                confidence_active_bcp = confidence_active_bcp * (~skip_active_bc).unsqueeze(-1).to(dtype=route_bcp.dtype)
+        effective_route_bcp = route_bcp * intervention_bcp * selector_bcp * confidence_active_bcp
         scale_bcp = effective_route_bcp * alpha_cp.unsqueeze(0)
         branches = scale_bcp.unsqueeze(-1) * residuals
         branch_sum_bch = branches.sum(dim=2)
@@ -513,6 +635,8 @@ class ClusterwisePredResidualMoE(nn.Module):
             "route_bcp": route_bcp,
             "intervention_bcp": intervention_bcp,
             "selector_bcp": selector_bcp,
+            "confidence_active_bcp": confidence_active_bcp,
+            "skip_confidence_bc": skip_confidence_bc,
             "effective_route_bcp": effective_route_bcp,
             "fusion_bc": fusion_bc,
             "alpha_cp": alpha_cp,

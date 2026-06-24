@@ -122,7 +122,6 @@ def set_path_fields(cfg: dict[str, Any], run_dir: Path) -> None:
     cfg["exp"]["out_dir"] = rel(run_dir)
     cfg["corr"]["save_path"] = rel(run_dir / "corr.npy")
     cfg["portrait"]["out_dir"] = rel(run_dir / "cluster_portraits")
-    cfg["knn_hybrid"]["path"] = rel(run_dir / "knn_shape_bank.pt")
     cfg["memory"]["path"] = rel(run_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = rel(run_dir / "best_checkpoint.pt")
 

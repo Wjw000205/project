@@ -65,7 +65,6 @@ def evaluate_split(
     loss_k, mse_k, _, _, mae_c, *_ = eval_loop(
         loader=loader,
         eval_start=int(eval_start),
-        knn_hybrid=None,
         history_anchor_cfg=history_anchor_cfg,
         **common_kwargs,
     )
@@ -81,7 +80,6 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
     lines = [
         "# Input-96 Main History Anchor Evaluation",
         "",
-        "KNN is disabled for all rows (`knn_hybrid.enable=false`, `knn_hybrid=None`).",
         "",
         "| Variant | Val MSE | Val MAE | Test MSE | Test MAE |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -106,7 +104,7 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate input-96 main-model history-anchor adapter with KNN off.")
+    parser = argparse.ArgumentParser(description="Evaluate input-96 main-model history-anchor adapter.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", default=None)
     parser.add_argument("--out-dir", default="outputs/input96_history_anchor_eval")
@@ -119,7 +117,6 @@ def main() -> None:
 
     config_path = resolve_path(args.config)
     cfg = load_yaml(config_path)
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
     cfg.setdefault("model", {})["history_anchor"] = {
         "enable": True,
         "lags": parse_lags(args.lags),
@@ -228,7 +225,6 @@ def main() -> None:
         "device": str(device),
         "input_len": int(context.L),
         "pred_len": int(context.H),
-        "knn_hybrid_enable": False,
         "history_anchor": cfg["model"]["history_anchor"],
         "rows": rows,
     }

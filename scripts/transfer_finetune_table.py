@@ -272,7 +272,7 @@ def build_markdown_rows(
             _fmt_gain(ft_gain_vs_zero),
             _fmt_gain(ft_gain_vs_target),
             zero_shot_degradation_note(source, target, horizon),
-            "train-only route/norm/cluster; calib=False; KNN=False",
+            "train-only route/norm/cluster",
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return lines

@@ -95,41 +95,6 @@ def test_run_candidate_keeps_horizon_in_dry_run_paths(tmp_path) -> None:
     assert "H336" in row["out_dir"]
 
 
-def test_ettm1_backbone_search_cli_accepts_non_h96_horizon(tmp_path) -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    out_root = tmp_path / "ettm1_h192"
-
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_input96_ettm1_no_knn_backbone_search.py",
-            "--out-root",
-            str(out_root),
-            "--variants",
-            "patchtst_d96_p8s4_l2_do005_wd5e5_mae04",
-            "--horizon",
-            "192",
-            "--epochs",
-            "1",
-            "--skip-test",
-            "--dry-run",
-            "--device",
-            "cpu",
-        ],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-    assert "ETTm1 H192" in proc.stdout
-    with (out_root / "backbone_rows.csv").open(newline="", encoding="utf-8") as f:
-        row = next(csv.DictReader(f))
-    assert row["pred_len"] == "192"
-    assert "H192" in row["config_path"]
-    assert "H192" in row["out_dir"]
-
-
 def test_model_candidates_include_small_capacity_etth2_options() -> None:
     variants = {cand.variant for cand in model_candidates()}
 
@@ -528,7 +493,6 @@ def test_moe_candidates_include_weak_guarded_positive_options() -> None:
     cand = variants["current_guard_l005_a03_ms035"]
     patch = cand.patch
     residual = patch["moe"]["pred_side_residual"]
-    gate = residual["gate_calibrator"]
 
     assert patch["moe"]["dynamic_lambda"]["enable"] is False
     assert patch["penalties"]["enabled"] == ["jump", "amp_under", "level", "delta"]
@@ -538,12 +502,10 @@ def test_moe_candidates_include_weak_guarded_positive_options() -> None:
         "level": 0.005,
         "delta": 0.005,
     }
-    assert residual["selection_policy"] == "val_mse_gate_guarded"
+    assert residual["selection_policy"] == "val_mse_candidate_channel"
     assert residual["selection_min_rel_improvement"] == 0.0005
     assert residual["alpha_scale"] == 0.3
     assert residual["residual_clip"] == 2.0
-    assert gate["max_scale"] == 0.35
-    assert gate["init_scale"] == 0.2
 
 
 def test_moe_candidates_include_penalty_prior_activation_options() -> None:
@@ -617,8 +579,8 @@ def test_apply_moe_training_controls_sets_warm_start_and_freeze() -> None:
     }
 
 
-def test_apply_history_anchor_controls_disables_knn_and_sets_model_anchor() -> None:
-    cfg = {"model": {}, "knn_hybrid": {"enable": True}}
+def test_apply_history_anchor_controls_sets_model_anchor() -> None:
+    cfg = {"model": {}}
 
     apply_history_anchor_controls(
         cfg,
@@ -627,7 +589,6 @@ def test_apply_history_anchor_controls_disables_knn_and_sets_model_anchor() -> N
         blend_target="prediction",
     )
 
-    assert cfg["knn_hybrid"]["enable"] is False
     assert cfg["model"]["history_anchor"] == {
         "enable": True,
         "lags": [96, 192, 288],
@@ -637,21 +598,6 @@ def test_apply_history_anchor_controls_disables_knn_and_sets_model_anchor() -> N
     }
 
 
-def test_activation_candidates_enable_activation_head_gate() -> None:
-    candidates = {cand.variant: cand for cand in activation_candidates({"penalties": {"enabled": ["level", "delta"]}})}
-
-    patch = candidates["act_train_a1_ms1_bce02"].patch
-    residual = patch["moe"]["pred_side_residual"]
-    gate = residual["gate_calibrator"]
-
-    assert patch["moe"]["dynamic_lambda"]["enable"] is False
-    assert residual["selection_policy"] == "val_mse_gate_guarded"
-    assert gate["source_split"] == "train"
-    assert gate["activation_head_enable"] is True
-    assert gate["apply_activation_threshold"] is True
-    assert gate["activation_threshold"] == "auto"
-
-
 def test_activation_candidates_include_candidate_selector_variants() -> None:
     candidates = {cand.variant: cand for cand in activation_candidates({"penalties": {"enabled": ["level", "delta"]}})}
 
@@ -659,7 +605,7 @@ def test_activation_candidates_include_candidate_selector_variants() -> None:
     residual = patch["moe"]["pred_side_residual"]
     selector = residual["candidate_selector"]
 
-    assert residual["selection_policy"] == "val_mse_gate_guarded"
+    assert residual["selection_policy"] == "val_mse_candidate_channel"
     assert selector["enable"] is True
     assert selector["source_split"] == "val"
     assert selector["positive_sample_weight"] == 2.0

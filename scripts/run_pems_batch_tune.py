@@ -611,7 +611,6 @@ def configure(
     backbone_only: bool = False,
     freeze_backbone: bool = False,
     finetune_checkpoint: Path | str | None = None,
-    calibration_cfg: dict[str, Any] | None = None,
     lr_override: float | None = None,
 ) -> dict[str, Any]:
     cfg = copy.deepcopy(base_cfg)
@@ -708,10 +707,6 @@ def configure(
     cfg["eval"] = {"skip_test": bool(skip_test)}
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg["calibration"] = dict(calibration_cfg) if calibration_cfg is not None else {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": bool(save_checkpoint),
@@ -852,9 +847,6 @@ def main() -> None:
         default="",
         help="Candidate directory name under --finetune-root; empty uses the active candidate name.",
     )
-    ap.add_argument("--calibration", choices=["", "median", "mean"], default="")
-    ap.add_argument("--calibration-shrink", type=float, default=1.0)
-    ap.add_argument("--calibration-max-abs", type=float, default=0.0)
     ap.add_argument("--lr-override", type=float, default=None)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--python", default=sys.executable)
@@ -934,16 +926,6 @@ def main() -> None:
                     backbone_only=bool(args.backbone_only),
                     freeze_backbone=bool(args.freeze_backbone),
                     finetune_checkpoint=finetune_checkpoint,
-                    calibration_cfg=(
-                        None
-                        if not args.calibration
-                        else {
-                            "enable": True,
-                            "method": str(args.calibration),
-                            "shrink": float(args.calibration_shrink),
-                            "max_abs": float(args.calibration_max_abs),
-                        }
-                    ),
                     lr_override=args.lr_override,
                 )
                 write_yaml(cfg_path, cfg)

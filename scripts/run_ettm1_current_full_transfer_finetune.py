@@ -220,9 +220,6 @@ def prepare_source_config(horizon: int, out_root: Path, device: str, source_epoc
     cfg.setdefault("eval", {})["skip_test"] = False
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["calibration"] = {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": True,
@@ -310,7 +307,6 @@ def build_zero_config(
             "fallback_topk": 2,
             "fallback_temp": 1.0,
             "resample": {"enable": resample_enable, "target_step_minutes": TARGET_STEP_MINUTES, "method": resample_method.lower()},
-            "knn_hybrid": {"enable": False, "scope": "same_cluster", "bank_split": "train", "use_for_model_selection": False},
             "save_corr": True,
         },
         "eval": {"batch_size": int(batch_size), "split": "test"},
@@ -362,9 +358,6 @@ def build_finetune_config(
     cfg["eval"] = {"skip_test": False}
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["calibration"] = {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": True,

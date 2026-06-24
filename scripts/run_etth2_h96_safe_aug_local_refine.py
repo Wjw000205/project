@@ -137,7 +137,6 @@ def configure(base: dict[str, Any], variant: dict[str, Any], out_root: Path, dev
     cfg["exp"]["device"] = device
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["path"] = str(out_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
 
@@ -146,7 +145,6 @@ def configure(base: dict[str, Any], variant: dict[str, Any], out_root: Path, dev
     residual["residual_clip"] = float(variant["residual_clip"])
     residual["selection_scale_max"] = float(variant["selection_scale_max"])
 
-    gate = residual.setdefault("gate_calibrator", {})
     gate["max_scale"] = float(variant["gate_max_scale"])
     gate["init_scale"] = float(variant["gate_init_scale"])
     gate["scale_reg"] = float(variant["gate_scale_reg"])

@@ -45,22 +45,6 @@ transfer:
     target_step_minutes: 15
     method: "linear"   # 杩欎釜鍦烘櫙涓嶈鏀?last/ffill
 
-  knn_hybrid:
-    enable: false
-    scope: "same_cluster"
-    bank_split: "train"
-    use_for_model_selection: false
-    k: 16
-    alpha: 0.1
-    adaptive_alpha: "confidence"
-    confidence_floor: 0.0
-    distance_sharpness: 1.0
-    shape_bins: 24
-    diff_bins: 12
-    bank_stride: 4
-    distance_weight: "inverse"
-    anchor_mode: "last"
-
   save_corr: true
 
 eval:

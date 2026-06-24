@@ -133,8 +133,6 @@ def configure_candidate(
     cfg.setdefault("normalize", {})["train_only"] = True
     cfg.setdefault("cluster", {})["train_only"] = True
     cfg.setdefault("eval", {})["skip_test"] = False
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
     cfg.setdefault("train", {})["epochs"] = int(epochs)
 
     penalties = list(cand.penalties)
@@ -146,7 +144,7 @@ def configure_candidate(
     moe_cfg["lambda_schedule"] = {name: str(cand.lambda_schedule) for name in penalties}
     moe_cfg.setdefault("dynamic_lambda", {})["enable"] = True
     moe_cfg.setdefault("pred_side_residual", {})["enable"] = True
-    moe_cfg["pred_side_residual"].setdefault("selection_policy", "val_mse_gate")
+    moe_cfg["pred_side_residual"].setdefault("selection_policy", "val_mse_candidate_channel")
     return cfg
 
 
@@ -395,7 +393,7 @@ def write_markdown(path: Path, summary_rows: list[dict[str, Any]]) -> None:
         "best_lambda_test_mse_ref",
     ]
     lines = ["# ETT H96 Penalty/Lambda Val Search", ""]
-    lines.append("KNN is disabled. Selection uses validation MSE; test MSE is reference only.")
+    lines.append("Selection uses validation MSE; test MSE is reference only.")
     lines.extend(["", "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"])
     for row in summary_rows:
         vals = []

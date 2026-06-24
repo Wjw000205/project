@@ -66,7 +66,7 @@ class Candidate:
     alpha_scale: float
     feature_mode: str = "legacy"
     residual_clip: float = 0.0
-    selection_policy: str = "val_mse_gate"
+    selection_policy: str = "val_mse_candidate_channel"
     gate_max_scale: float = 1.0
     gate_init_scale: float = 0.8
     gate_scale_reg: float = 1.0e-5
@@ -159,10 +159,6 @@ def fixed_protocol(cfg: dict[str, Any], out_dir: Path, device: str | None, epoch
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg.setdefault("eval", {})["skip_test"] = False
 
 
@@ -257,7 +253,6 @@ def configure_staged_moe(
             "diagnostics": {"enable": True},
         }
     )
-    gate = residual.setdefault("gate_calibrator", {})
     gate.update(
         {
             "loss": "mse",
@@ -319,9 +314,9 @@ def candidate_grid(base_penalties: tuple[str, ...]) -> list[Candidate]:
     ]
     presets = [
         {"lambda_init": 0.0, "alpha_scale": 0.8, "selection_policy": "none", "gate_max_scale": 1.0, "gate_init_scale": 0.8, "penalty_guard_allow_multi": False},
-        {"lambda_init": 0.0, "alpha_scale": 1.4, "selection_policy": "val_mse_gate", "gate_max_scale": 1.5, "gate_init_scale": 1.0, "penalty_guard_allow_multi": False},
-        {"lambda_init": 0.005, "alpha_scale": 1.8, "selection_policy": "val_mse_gate", "gate_max_scale": 1.75, "gate_init_scale": 1.0, "penalty_guard_allow_multi": False},
-        {"lambda_init": 0.01, "alpha_scale": 2.2, "selection_policy": "val_mse_gate", "gate_max_scale": 2.0, "gate_init_scale": 1.2, "penalty_guard_allow_multi": True},
+        {"lambda_init": 0.0, "alpha_scale": 1.4, "selection_policy": "val_mse_candidate_channel", "gate_max_scale": 1.5, "gate_init_scale": 1.0, "penalty_guard_allow_multi": False},
+        {"lambda_init": 0.005, "alpha_scale": 1.8, "selection_policy": "val_mse_candidate_channel", "gate_max_scale": 1.75, "gate_init_scale": 1.0, "penalty_guard_allow_multi": False},
+        {"lambda_init": 0.01, "alpha_scale": 2.2, "selection_policy": "val_mse_candidate_channel", "gate_max_scale": 2.0, "gate_init_scale": 1.2, "penalty_guard_allow_multi": True},
         {"lambda_init": 0.02, "alpha_scale": 2.5, "selection_policy": "val_mse_scale", "gate_max_scale": 2.0, "gate_init_scale": 1.2, "penalty_guard_allow_multi": False},
     ]
     cands: list[Candidate] = []

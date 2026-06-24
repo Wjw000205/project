@@ -104,10 +104,7 @@ moe:
     enable: false
     corrector_hidden: 16
     alpha_scale: 0.6
-    selection_policy: val_mse_gate
-    gate_calibrator:
-      epochs: 10
-      batch_size: 128
+    selection_policy: val_mse_candidate_channel
 penalties:
   enabled:
   - amp_under
@@ -137,34 +134,8 @@ plot:
 portrait:
   enable: false
   out_dir: outputs/weather_H336/cluster_portraits
-knn_hybrid:
-  enable: false
-  mode: rolling
-  scope: same_channel
-  bank_split: history
-  use_for_model_selection: false
-  k: 96
-  alpha: 1.8
-  shape_bins: 24
-  diff_bins: 12
-  pred_shape_bins: 16
-  pred_diff_bins: 8
-  feature_mode: joint
-  template_mode: residual
-  adaptive_alpha: confidence
-  confidence_floor: 0.0
-  distance_sharpness: 1.0
-  selection_policy: val_mse_margin
-  selection_min_rel_improvement: 0.0
-  bank_stride: 2
-  distance_weight: inverse
-  anchor_mode: last
-  bank_chunk_size: 8192
-  path: outputs/weather_H336/knn_shape_bank.pt
 eval:
   skip_test: false
-calibration:
-  enable: false
 memory:
   enable: false
   save_checkpoint: false

@@ -53,9 +53,6 @@ def set_run_paths(cfg: dict[str, Any], out_dir: Path, name: str) -> None:
     cfg["memory"]["path"] = str(out_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
 
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
 
 
 def candidates() -> list[dict[str, Any]]:

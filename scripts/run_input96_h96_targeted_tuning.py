@@ -74,8 +74,6 @@ FIELDS = [
     "residual_clip",
     "selection_policy",
     "selection_min_rel_improvement",
-    "gate_max_scale",
-    "gate_init_scale",
     "residual_mean_scale",
     "residual_num_channels",
     "config_path",
@@ -156,8 +154,6 @@ def common_prepare(
     cfg.setdefault("normalize", {})["train_only"] = True
     cfg.setdefault("cluster", {})["train_only"] = True
     cfg.setdefault("eval", {})["skip_test"] = bool(skip_test)
-    cfg.setdefault("calibration", {})["enable"] = False
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
     cfg.setdefault("memory", {})["enable"] = False
@@ -171,11 +167,6 @@ def common_prepare(
         out_dir=out_dir,
         run_name=run_name,
         keep_artifacts=False,
-        disable_knn_hybrid=True,
-        knn_adaptive_alpha=None,
-        knn_selection_policy=None,
-        knn_selection_min_rel_improvement=None,
-        knn_selection_min_abs_improvement=None,
     )
     if save_checkpoint:
         cfg.setdefault("memory", {})["save_checkpoint"] = True
@@ -1754,8 +1745,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": None,
             "dyn": True,
             "alpha": None,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
         {
             "name": "current_guard_l005_a03_ms035",
@@ -1763,17 +1753,9 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.005,
             "dyn": False,
             "alpha": 0.3,
-            "policy": "val_mse_gate_guarded",
+            "policy": "val_mse_candidate_channel",
             "min_rel": 0.0005,
             "residual_clip": 2.0,
-            "gate": {
-                "epochs": 30,
-                "batch_size": 256,
-                "max_scale": 0.35,
-                "init_scale": 0.2,
-                "scale_reg": 0.001,
-                "standardize_features": True,
-            },
         },
         {
             "name": "current_guard_l01_a05_ms05",
@@ -1781,17 +1763,9 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.01,
             "dyn": False,
             "alpha": 0.5,
-            "policy": "val_mse_gate_guarded",
+            "policy": "val_mse_candidate_channel",
             "min_rel": 0.0005,
             "residual_clip": 2.0,
-            "gate": {
-                "epochs": 30,
-                "batch_size": 256,
-                "max_scale": 0.5,
-                "init_scale": 0.3,
-                "scale_reg": 0.0005,
-                "standardize_features": True,
-            },
         },
         {
             "name": "current_guard_l0_a025_ms025",
@@ -1799,17 +1773,9 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.0,
             "dyn": False,
             "alpha": 0.25,
-            "policy": "val_mse_gate_guarded",
+            "policy": "val_mse_candidate_channel",
             "min_rel": 0.0005,
             "residual_clip": 2.0,
-            "gate": {
-                "epochs": 30,
-                "batch_size": 256,
-                "max_scale": 0.25,
-                "init_scale": 0.15,
-                "scale_reg": 0.001,
-                "standardize_features": True,
-            },
         },
         {
             "name": "current_prior_l0_a025_ms025_top1",
@@ -1817,17 +1783,9 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.0,
             "dyn": False,
             "alpha": 0.25,
-            "policy": "val_mse_gate_guarded",
+            "policy": "val_mse_candidate_channel",
             "min_rel": 0.0005,
             "residual_clip": 2.0,
-            "gate": {
-                "epochs": 30,
-                "batch_size": 256,
-                "max_scale": 0.25,
-                "init_scale": 0.15,
-                "scale_reg": 0.001,
-                "standardize_features": True,
-            },
             "cluster_penalty_prior": {
                 "enable": True,
                 "topk": 1,
@@ -1970,8 +1928,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.015,
             "dyn": True,
             "alpha": 0.8,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
         {
             "name": "level_delta_diff_l015",
@@ -1979,8 +1936,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.015,
             "dyn": True,
             "alpha": 0.8,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
         {
             "name": "level_delta_diff_l05",
@@ -1988,8 +1944,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.05,
             "dyn": True,
             "alpha": 1.1,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
         {
             "name": "level_delta_d2_diff_l05",
@@ -1997,8 +1952,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.05,
             "dyn": True,
             "alpha": 1.1,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
         {
             "name": "amp_delta_diff_dir_l01",
@@ -2006,8 +1960,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.01,
             "dyn": False,
             "alpha": 0.6,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
         {
             "name": "trend_direction_l02",
@@ -2015,8 +1968,7 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
             "lam": 0.02,
             "dyn": True,
             "alpha": 0.8,
-            "policy": "val_mse_gate",
-            "gate": {"epochs": 20, "batch_size": 256},
+            "policy": "val_mse_candidate_channel",
         },
     ]
     candidates: list[Candidate] = []
@@ -2025,11 +1977,10 @@ def moe_candidates(base_cfg: dict[str, Any], budget: str) -> list[Candidate]:
         lam = pool["lam"]
         residual: dict[str, Any] = {
             "enable": True,
-            "selection_policy": str(pool.get("policy", "val_mse_gate")),
+            "selection_policy": str(pool.get("policy", "val_mse_candidate_channel")),
             "alpha_scale": float(pool["alpha"]) if pool.get("alpha") is not None else float(base_alpha),
             "selection_min_rel_improvement": float(pool.get("min_rel", 0.0)),
             "selection_min_abs_improvement": float(pool.get("min_abs", 0.0)),
-            "gate_calibrator": dict(pool.get("gate", {"epochs": 20, "batch_size": 256})),
         }
         if pool.get("residual_clip") is not None:
             residual["residual_clip"] = float(pool["residual_clip"])
@@ -2103,7 +2054,6 @@ def row_from_summary(
     test = summary.get("test") or {}
     moe = cfg.get("moe", {}) or {}
     psr = moe.get("pred_side_residual", {}) or {}
-    gate_cal = psr.get("gate_calibrator", {}) or {}
     residual_selection = summary.get("moe_residual_selection", {}) or {}
     train = cfg.get("train", {}) or {}
     mae_obj = train.get("mae_objective", {}) or {}
@@ -2131,8 +2081,6 @@ def row_from_summary(
         "residual_clip": psr.get("residual_clip", ""),
         "selection_policy": psr.get("selection_policy", ""),
         "selection_min_rel_improvement": psr.get("selection_min_rel_improvement", ""),
-        "gate_max_scale": gate_cal.get("max_scale", ""),
-        "gate_init_scale": gate_cal.get("init_scale", ""),
         "residual_mean_scale": residual_selection.get("mean_scale", ""),
         "residual_num_channels": residual_selection.get("num_residual_channels", ""),
         "config_path": str(config_path),

@@ -57,8 +57,6 @@ FIELDS = [
     "test_ratio",
     "normalize_train_only",
     "cluster_train_only",
-    "calibration_enable",
-    "knn_hybrid_enable",
     "resample_enable",
     "resample_method",
     "zero_shot_mse",
@@ -357,14 +355,6 @@ def build_zero_shot_config(
                 "target_step_minutes": TARGET_STEP_MINUTES,
                 "method": resample_method.lower(),
             },
-            "knn_hybrid": {
-                "enable": False,
-                "scope": "same_cluster",
-                "bank_split": "train",
-                "use_for_model_selection": False,
-                "k": 16,
-                "alpha": 0.1,
-            },
             "save_corr": True,
         },
         "eval": {
@@ -434,11 +424,6 @@ def build_finetune_config(
         "enable": False,
         "out_dir": str(out_dir / "cluster_portraits"),
     }
-    cfg["knn_hybrid"] = copy.deepcopy(cfg.get("knn_hybrid", {}))
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg["calibration"] = {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": True,
@@ -491,7 +476,6 @@ def row_base(
         "target": target,
         "pred_len": horizon,
         "input_len": int(source_summary.get("windowing", {}).get("input_len", 336)),
-        "protocol": "finetune_from_source_init_no_calibration",
         "source_config": str(source_config_path(horizon)),
         "source_checkpoint": str(checkpoint_path),
         "source_memory": str(memory_path),
@@ -512,8 +496,6 @@ def row_base(
         "test_ratio": target_cfg["data"].get("test_ratio", 0.2),
         "normalize_train_only": True,
         "cluster_train_only": True,
-        "calibration_enable": False,
-        "knn_hybrid_enable": False,
         "resample_enable": resample_enable,
         "resample_method": resample_method,
     }

@@ -90,7 +90,6 @@ def configure_variant(dataset: str, source_cfg: Dict[str, object], variant: str)
     cfg["memory"]["checkpoint_path"] = str(run_dir / "best_checkpoint.pt")
 
     cfg.setdefault("portrait", {})["out_dir"] = str(run_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(run_dir / "knn_shape_bank.pt")
 
     cluster_embedding = dict(CLUSTER_EMBEDDING_DEFAULT)
     cluster_embedding["enable"] = bool(enable_a)

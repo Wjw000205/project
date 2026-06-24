@@ -228,7 +228,6 @@ def load_residual_scales(channel_names: List[str], device: torch.device) -> torc
     with SOURCE_SUMMARY.open("r", encoding="utf-8") as f:
         summary = json.load(f)
     selection = summary.get("moe_residual_selection", {}) or {}
-    source_channels = list(selection.get("gate_calibrator", {}).get("channel_names") or selection.get("residual_channels") or [])
     scale_values = list(selection.get("scale_values") or [])
     mean_scale = float(selection.get("mean_scale", 1.0) or 1.0)
     scale_by_name = {

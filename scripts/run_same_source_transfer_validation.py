@@ -211,20 +211,9 @@ def patch_train_cfg(
             "specialization_weight": 0.1,
             "norm_weight": 0.0,
             "use_y_base_input": True,
-            "selection_policy": "val_mse_gate",
+            "selection_policy": "val_mse_candidate_channel",
             "selection_min_abs_improvement": 0.0,
             "selection_min_rel_improvement": 0.0,
-            "gate_calibrator": {
-                "loss": "mse",
-                "selection_metric": "mse",
-                "epochs": 20,
-                "train_fraction": 0.7,
-                "hidden_dim": 32,
-                "batch_size": 256,
-                "max_scale": 1.0,
-                "init_scale": 0.8,
-                "scale_reg": 1.0e-4,
-            },
         }
     )
 
@@ -248,8 +237,6 @@ def patch_train_cfg(
     cfg["plot"]["enable"] = False
     cfg.setdefault("portrait", {})
     cfg["portrait"]["enable"] = False
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = False
 
@@ -316,22 +303,6 @@ def make_transfer_cfg(
                 "enable": False,
                 "target_step_minutes": None,
                 "method": "linear",
-            },
-            "knn_hybrid": {
-                "enable": False,
-                "scope": "same_cluster",
-                "bank_split": "train",
-                "use_for_model_selection": False,
-                "k": 16,
-                "alpha": 0.1,
-                "adaptive_alpha": "confidence",
-                "confidence_floor": 0.0,
-                "distance_sharpness": 1.0,
-                "shape_bins": 24,
-                "diff_bins": 12,
-                "bank_stride": 4,
-                "distance_weight": "inverse",
-                "anchor_mode": "last",
             },
             "save_corr": True,
         },

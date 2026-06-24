@@ -158,7 +158,7 @@ class Candidate:
     alpha_scale: float = 1.1
     feature_mode: str = "legacy"
     residual_clip: float = 0.0
-    selection_policy: str = "val_mse_gate"
+    selection_policy: str = "val_mse_candidate_channel"
     gate_max_scale: float = 1.0
     gate_init_scale: float = 0.8
     gate_scale_reg: float = 1.0e-4
@@ -247,10 +247,6 @@ def set_run_paths(cfg: dict[str, Any], out_dir: Path, *, skip_test: bool) -> Non
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,
@@ -345,7 +341,6 @@ def configure_gimoe(
             "selection_min_rel_improvement": 0.0,
         }
     )
-    gate = residual.setdefault("gate_calibrator", {})
     gate.update(
         {
             "loss": "mse",
@@ -669,7 +664,7 @@ def budget_values(budget: str) -> dict[str, Any]:
                 "alpha_scale": [1.1],
                 "feature_mode": ["legacy"],
                 "residual_clip": [0.0],
-                "selection_policy": ["val_mse_gate"],
+                "selection_policy": ["val_mse_candidate_channel"],
                 "gate_max_scale": [1.0],
                 "gate_init_scale": [0.8],
                 "gate_scale_reg": [1.0e-4],
@@ -693,7 +688,7 @@ def budget_values(budget: str) -> dict[str, Any]:
                 "alpha_scale": [0.8, 1.1, 1.4],
                 "feature_mode": ["legacy", "safe_augmented"],
                 "residual_clip": [0.0],
-                "selection_policy": ["val_mse_gate", "val_mse_scale"],
+                "selection_policy": ["val_mse_candidate_channel", "val_mse_scale"],
                 "gate_max_scale": [0.75, 1.0],
                 "gate_init_scale": [0.8],
                 "gate_scale_reg": [1.0e-4],
@@ -722,7 +717,7 @@ def budget_values(budget: str) -> dict[str, Any]:
                 "alpha_scale": [1.1, 1.3],
                 "feature_mode": ["legacy"],
                 "residual_clip": [0.0],
-                "selection_policy": ["val_mse_gate"],
+                "selection_policy": ["val_mse_candidate_channel"],
                 "gate_max_scale": [0.75, 1.0, 1.25],
                 "gate_init_scale": [0.8, 1.0],
                 "gate_scale_reg": [1.0e-4, 5.0e-4],
@@ -748,7 +743,7 @@ def budget_values(budget: str) -> dict[str, Any]:
                 "alpha_scale": [0.8, 1.1, 1.4],
                 "feature_mode": ["legacy", "safe_augmented"],
                 "residual_clip": [0.0, 6.0],
-                "selection_policy": ["val_mse_gate", "val_mse_scale"],
+                "selection_policy": ["val_mse_candidate_channel", "val_mse_scale"],
                 "gate_max_scale": [0.75, 1.0],
                 "gate_init_scale": [0.6, 0.8],
                 "gate_scale_reg": [1.0e-4],
@@ -773,7 +768,7 @@ def budget_values(budget: str) -> dict[str, Any]:
             "alpha_scale": [0.6, 0.8, 1.1, 1.4, 1.8],
             "feature_mode": ["legacy", "safe_augmented"],
             "residual_clip": [0.0, 4.0, 6.0],
-            "selection_policy": ["val_mse_gate", "val_mse_gate_guarded", "val_mse_scale"],
+            "selection_policy": ["val_mse_candidate_channel", "val_mse_candidate_channel", "val_mse_scale"],
             "gate_max_scale": [0.5, 0.75, 1.0, 1.25],
             "gate_init_scale": [0.4, 0.6, 0.8, 1.0],
             "gate_scale_reg": [1.0e-5, 1.0e-4, 5.0e-4],
@@ -1320,7 +1315,6 @@ def land_config(base_config: Path, cfg: dict[str, Any], cid: str) -> Path:
     landed["exp"]["out_dir"] = str(out_dir)
     landed.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     landed.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    landed.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     landed["memory"] = {
         "enable": False,
         "save_checkpoint": False,
@@ -1353,10 +1347,6 @@ def validate_generated_yaml(out_root: Path) -> int:
             problems.append("normalize.train_only is not true")
         if not bool(cfg.get("cluster", {}).get("train_only", False)):
             problems.append("cluster.train_only is not true")
-        if bool(cfg.get("knn_hybrid", {}).get("enable", True)):
-            problems.append("knn_hybrid.enable is not false")
-        if bool(cfg.get("calibration", {}).get("enable", True)):
-            problems.append("calibration.enable is not false")
         if bool(cfg.get("moe", {}).get("dynamic_lambda", {}).get("enable", False)):
             problems.append("moe.dynamic_lambda.enable is not false")
         if problems:

@@ -46,16 +46,6 @@ RESULT_FIELDS = [
     "mae_gain_pct",
     "residual_mean_scale",
     "residual_num_channels",
-    "gate_source_split",
-    "activation_head_enable",
-    "activation_train_soft_gating",
-    "test_activation_scaled_gain_pct",
-    "test_activation_precision",
-    "test_activation_recall",
-    "test_activation_pred_positive_rate",
-    "test_activation_target_positive_rate",
-    "gate_selected_gain_pct",
-    "gate_oracle_gain_pct",
     "selector_holdout_gain_pct",
     "selector_holdout_accuracy",
     "selector_target_gain_pct",
@@ -75,40 +65,6 @@ def _lambda_dict(names: list[str], value: float) -> dict[str, float]:
 def _schedule_dict(names: list[str], value: str = "none") -> dict[str, str]:
     return {name: value for name in names}
 
-
-def _base_gate(
-    *,
-    source_split: str,
-    max_scale: float,
-    init_scale: float,
-    bce_weight: float,
-    inactive_scale_weight: float,
-    train_soft_gating: bool = False,
-    activation_metric: str = "mse",
-) -> dict[str, Any]:
-    return {
-        "source_split": str(source_split),
-        "loss": "mse",
-        "selection_metric": "mse",
-        "epochs": 40,
-        "train_fraction": 0.75,
-        "hidden_dim": 64,
-        "batch_size": 256,
-        "max_scale": float(max_scale),
-        "init_scale": float(init_scale),
-        "scale_reg": 5.0e-4,
-        "standardize_features": True,
-        "activation_head_enable": True,
-        "apply_activation_threshold": True,
-        "activation_threshold": "auto",
-        "activation_threshold_selection_metric": str(activation_metric),
-        "activation_threshold_scope": "channel",
-        "activation_bce_weight": float(bce_weight),
-        "activation_inactive_scale_weight": float(inactive_scale_weight),
-        "activation_pos_weight": "auto",
-        "activation_pos_weight_scope": "channel",
-        "activation_train_soft_gating": bool(train_soft_gating),
-    }
 
 
 def _selector_cfg(
@@ -163,7 +119,7 @@ def activation_candidates(base_cfg: dict[str, Any]) -> list[Candidate]:
         residual = {
             "enable": True,
             "feature_mode": "legacy",
-            "selection_policy": "val_mse_gate_guarded",
+            "selection_policy": "val_mse_candidate_channel",
             "selection_min_abs_improvement": 0.0,
             "selection_min_rel_improvement": float(min_rel),
             "residual_clip": 4.0,
@@ -172,15 +128,6 @@ def activation_candidates(base_cfg: dict[str, Any]) -> list[Candidate]:
             "alpha_scale": float(alpha),
             "specialization_weight": 0.1,
             "norm_weight": 1.0e-5,
-            "gate_calibrator": _base_gate(
-                source_split=source_split,
-                max_scale=max_scale,
-                init_scale=init_scale,
-                bce_weight=bce_weight,
-                inactive_scale_weight=inactive_scale_weight,
-                train_soft_gating=train_soft_gating,
-                activation_metric=activation_metric,
-            ),
         }
         patch = {
             "penalties": {"enabled": penalties},
@@ -214,12 +161,11 @@ def activation_candidates(base_cfg: dict[str, Any]) -> list[Candidate]:
         selector_skip_bias: float = 0.0,
         selector_min_rel: float = 0.0,
         selector_use_penalty_identity: bool = False,
-        gate_source_split: str = "val",
     ) -> Candidate:
         residual = {
             "enable": True,
             "feature_mode": "legacy",
-            "selection_policy": "val_mse_gate_guarded",
+            "selection_policy": "val_mse_candidate_channel",
             "selection_min_abs_improvement": 0.0,
             "selection_min_rel_improvement": 0.0,
             "residual_clip": 4.0,
@@ -228,13 +174,6 @@ def activation_candidates(base_cfg: dict[str, Any]) -> list[Candidate]:
             "alpha_scale": float(alpha),
             "specialization_weight": 0.1,
             "norm_weight": 1.0e-5,
-            "gate_calibrator": _base_gate(
-                source_split=gate_source_split,
-                max_scale=1.0,
-                init_scale=0.3,
-                bce_weight=0.2,
-                inactive_scale_weight=0.05,
-            ),
             "candidate_selector": _selector_cfg(
                 source_split=source_split,
                 positive_sample_weight=selector_positive_weight,
@@ -278,7 +217,7 @@ def activation_candidates(base_cfg: dict[str, Any]) -> list[Candidate]:
         residual = {
             "enable": True,
             "feature_mode": "legacy",
-            "selection_policy": "val_mse_gate_guarded",
+            "selection_policy": "val_mse_candidate_channel",
             "selection_min_abs_improvement": 0.0,
             "selection_min_rel_improvement": 0.0,
             "residual_clip": 4.0,
@@ -291,13 +230,6 @@ def activation_candidates(base_cfg: dict[str, Any]) -> list[Candidate]:
             "seasonal_anchor_period": 96,
             "seasonal_anchor_num_periods": 1,
             "seasonal_anchor_scale": float(seasonal_scale),
-            "gate_calibrator": _base_gate(
-                source_split="val",
-                max_scale=1.0,
-                init_scale=0.3,
-                bce_weight=0.2,
-                inactive_scale_weight=0.05,
-            ),
             "candidate_selector": _selector_cfg(
                 source_split=source_split,
                 positive_sample_weight=1.0,
@@ -2787,29 +2719,13 @@ def enrich_row(row: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     row = dict(row)
     summary = read_summary(Path(str(row.get("out_dir", ""))) / "run_summary.json")
     selection = summary.get("moe_residual_selection") or {}
-    gate_summary = selection.get("gate_calibrator") or summary.get("moe_residual_gate_calibrator") or {}
     selector_summary = summary.get("moe_residual_candidate_selector") or selection.get("candidate_selector") or {}
-    test_activation = gate_summary.get("test_activation") or {}
     gate_hit = (summary.get("moe_gate_penalty_hit") or {}).get("test") or {}
     residual_cfg = ((cfg.get("moe") or {}).get("pred_side_residual") or {})
-    gate_cfg = residual_cfg.get("gate_calibrator") or {}
     row.update(
         {
             "residual_mean_scale": selection.get("mean_scale", ""),
             "residual_num_channels": selection.get("num_residual_channels", ""),
-            "gate_source_split": gate_summary.get("source_split", gate_cfg.get("source_split", "")),
-            "activation_head_enable": gate_summary.get("activation_head_enable", gate_cfg.get("activation_head_enable", "")),
-            "activation_train_soft_gating": gate_summary.get(
-                "activation_train_soft_gating",
-                gate_cfg.get("activation_train_soft_gating", ""),
-            ),
-            "test_activation_scaled_gain_pct": test_activation.get("scaled_gain_pct_vs_base", ""),
-            "test_activation_precision": test_activation.get("precision", ""),
-            "test_activation_recall": test_activation.get("recall", ""),
-            "test_activation_pred_positive_rate": test_activation.get("pred_positive_rate", ""),
-            "test_activation_target_positive_rate": test_activation.get("target_positive_rate", ""),
-            "gate_selected_gain_pct": gate_hit.get("selected_top1_gain_pct_vs_base", ""),
-            "gate_oracle_gain_pct": gate_hit.get("oracle_gain_pct_vs_base", ""),
             "selector_holdout_gain_pct": (selector_summary.get("holdout") or {}).get("selected_gain_pct_vs_base", ""),
             "selector_holdout_accuracy": (selector_summary.get("holdout") or {}).get("accuracy", ""),
             "selector_target_gain_pct": (selector_summary.get("holdout") or {}).get("target_gain_pct_vs_base", ""),
@@ -2837,7 +2753,7 @@ def best_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run no-KNN input-96 activation-head MoE candidates.")
+    ap = argparse.ArgumentParser(description="Run input-96 activation-head MoE candidates.")
     ap.add_argument("--base-config", required=True)
     ap.add_argument("--dataset", required=True, choices=list(DATASET_CONFIGS.keys()))
     ap.add_argument("--horizon", type=int, default=96)
@@ -2904,9 +2820,7 @@ def main() -> None:
         write_rows(out_root / "activation_results.csv", rows)
         print(
             f"[{args.dataset} H{args.horizon} {cand.variant}] {row.get('status')} "
-            f"test_mse={row.get('test_mse')} gain_pct={row.get('mse_gain_pct')} "
-            f"act_gain={row.get('test_activation_scaled_gain_pct')} "
-            f"selected_gain={row.get('gate_selected_gain_pct')}",
+            f"test_mse={row.get('test_mse')} gain_pct={row.get('mse_gain_pct')} ",
             flush=True,
         )
 

@@ -35,7 +35,6 @@ FIELDS = [
     "normalize_train_only",
     "cluster_train_only",
     "skip_test",
-    "knn_enable",
     "plot_enable",
     "portrait_enable",
     "val_mse",
@@ -390,8 +389,7 @@ def apply_candidate(
     res["enable"] = bool(cand["residual_enable"])
     res["corrector_hidden"] = 16
     res["alpha_scale"] = float(cand["alpha_scale"])
-    res["selection_policy"] = "val_mse_gate"
-    cal = res.setdefault("gate_calibrator", {})
+    res["selection_policy"] = "val_mse_candidate_channel"
     cal["epochs"] = 10
     cal["batch_size"] = 128
 
@@ -410,11 +408,6 @@ def apply_candidate(
     cfg["eval"] = {"skip_test": True}
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg["knn_hybrid"] = copy.deepcopy(cfg.get("knn_hybrid", {}))
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg["calibration"] = {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,
@@ -477,7 +470,6 @@ def run_candidate(
         "normalize_train_only": True,
         "cluster_train_only": True,
         "skip_test": True,
-        "knn_enable": False,
         "plot_enable": False,
         "portrait_enable": False,
         "config_path": str(cfg_path),

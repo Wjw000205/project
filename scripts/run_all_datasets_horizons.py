@@ -169,32 +169,6 @@ def apply_etth1_paper_norm_96(cfg: Dict[str, Any]) -> None:
         "scale": 1.0,
     }
 
-    cfg.setdefault("knn_hybrid", {})
-    knn_cfg = cfg["knn_hybrid"]
-    knn_cfg["enable"] = True
-    knn_cfg["mode"] = "rolling"
-    knn_cfg["scope"] = "same_cluster"
-    knn_cfg["bank_split"] = "history"
-    knn_cfg["use_for_model_selection"] = False
-    knn_cfg["k"] = 512
-    knn_cfg["alpha"] = 1.8
-    knn_cfg["alpha_horizon_ref"] = 96
-    knn_cfg["alpha_horizon_power"] = 0.0
-    knn_cfg["shape_bins"] = 24
-    knn_cfg["diff_bins"] = 12
-    knn_cfg["pred_shape_bins"] = 16
-    knn_cfg["pred_diff_bins"] = 8
-    knn_cfg["feature_mode"] = "joint"
-    knn_cfg["template_mode"] = "residual"
-    knn_cfg["adaptive_alpha"] = "none"
-    knn_cfg["selection_policy"] = "val_mae_guarded"
-    knn_cfg["selection_min_rel_improvement"] = 0.0
-    knn_cfg["selection_max_rel_mse_regression"] = 0.03
-    knn_cfg["bank_stride"] = 1
-    knn_cfg["distance_weight"] = "inverse"
-    knn_cfg["anchor_mode"] = "last"
-
-
 def apply_tsl_alignment(cfg: Dict[str, Any], dataset: str) -> None:
     """Apply the data protocol used by the TSL-aligned main tables."""
     cfg.setdefault("data", {})
@@ -232,11 +206,6 @@ def ensure_local_output_paths(
     out_dir: Path,
     run_name: str,
     keep_artifacts: bool,
-    disable_knn_hybrid: bool,
-    knn_adaptive_alpha: str | None,
-    knn_selection_policy: str | None,
-    knn_selection_min_rel_improvement: float | None,
-    knn_selection_min_abs_improvement: float | None,
 ) -> None:
     cfg.setdefault("exp", {})
     cfg["exp"]["name"] = run_name
@@ -261,20 +230,6 @@ def ensure_local_output_paths(
         cfg["memory"]["enable"] = False
         cfg["memory"]["save_checkpoint"] = False
 
-    if "knn_hybrid" in cfg:
-        cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-        if disable_knn_hybrid:
-            cfg["knn_hybrid"]["enable"] = False
-        if knn_adaptive_alpha:
-            cfg["knn_hybrid"]["adaptive_alpha"] = str(knn_adaptive_alpha).lower()
-        if knn_selection_policy:
-            cfg["knn_hybrid"]["selection_policy"] = str(knn_selection_policy).lower()
-        if knn_selection_min_rel_improvement is not None:
-            cfg["knn_hybrid"]["selection_min_rel_improvement"] = float(knn_selection_min_rel_improvement)
-        if knn_selection_min_abs_improvement is not None:
-            cfg["knn_hybrid"]["selection_min_abs_improvement"] = float(knn_selection_min_abs_improvement)
-
-
 def make_run_config(
     base_cfg: Dict[str, Any],
     dataset: str,
@@ -291,11 +246,6 @@ def make_run_config(
     mae_objective_weight: float | None,
     device: str | None,
     keep_artifacts: bool,
-    disable_knn_hybrid: bool,
-    knn_adaptive_alpha: str | None,
-    knn_selection_policy: str | None,
-    knn_selection_min_rel_improvement: float | None,
-    knn_selection_min_abs_improvement: float | None,
     etth1_paper_norm_96: bool,
     tsl_align: bool,
 ) -> tuple[Dict[str, Any], Path]:
@@ -343,11 +293,6 @@ def make_run_config(
         out_dir=out_dir,
         run_name=run_name,
         keep_artifacts=keep_artifacts,
-        disable_knn_hybrid=disable_knn_hybrid,
-        knn_adaptive_alpha=knn_adaptive_alpha,
-        knn_selection_policy=knn_selection_policy,
-        knn_selection_min_rel_improvement=knn_selection_min_rel_improvement,
-        knn_selection_min_abs_improvement=knn_selection_min_abs_improvement,
     )
     return cfg, out_dir
 
@@ -561,8 +506,6 @@ def summary_matches_generated_config(summary_path: Path, cfg: Dict[str, Any]) ->
         return False
 
     train_cfg = cfg.get("train", {}) or {}
-    knn_cfg = cfg.get("knn_hybrid", {}) or {}
-    calibration_cfg = cfg.get("calibration", {}) or {}
     summary_mae = summary.get("mae_objective")
     cfg_mae = train_cfg.get("mae_objective", {}) or {}
     cfg_mae_enabled = _norm_bool(cfg_mae.get("enable", False))
@@ -573,29 +516,6 @@ def summary_matches_generated_config(summary_path: Path, cfg: Dict[str, Any]) ->
         if _norm_str((summary_mae or {}).get("kind", "l1"), "l1") != _norm_str(cfg_mae.get("kind", "l1"), "l1"):
             return False
         if abs(_norm_float((summary_mae or {}).get("weight", 0.0)) - _norm_float(cfg_mae.get("weight", 0.0))) > 1.0e-12:
-            return False
-
-    selected = summary.get("selected") or {}
-    expected_policy = normalize_selection_policy(knn_cfg.get("selection_policy", "hybrid"))
-    actual_policy = normalize_selection_policy(selected.get("selection_policy", "hybrid"))
-    if expected_policy != actual_policy:
-        return False
-
-    if expected_policy == "val_mae_guarded":
-        val_info = summary.get("val") or {}
-        val_hybrid_info = summary.get("val_hybrid") or {}
-        if "avg_mae" not in val_info or "avg_mae" not in val_hybrid_info:
-            return False
-
-    cfg_cal_enabled = _norm_bool(calibration_cfg.get("enable", False))
-    summary_cal = summary.get("calibration")
-    summary_cal_enabled = _norm_bool((summary_cal or {}).get("enable", False)) if summary_cal is not None else False
-    if cfg_cal_enabled != summary_cal_enabled:
-        return False
-    if cfg_cal_enabled:
-        if _norm_str((summary_cal or {}).get("method", "median"), "median") != _norm_str(calibration_cfg.get("method", "median"), "median"):
-            return False
-        if abs(_norm_float((summary_cal or {}).get("shrink", 1.0), 1.0) - _norm_float(calibration_cfg.get("shrink", 1.0), 1.0)) > 1.0e-12:
             return False
 
     return True
@@ -807,7 +727,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-preserve-results", action="store_true", help="Rebuild results CSVs from only the runs in this invocation.")
     ap.add_argument("--stop-on-error", action="store_true", help="Stop after the first failed training run.")
     ap.add_argument("--keep-artifacts", action="store_true", help="Keep plot, portrait, memory and checkpoint outputs enabled.")
-    ap.add_argument("--disable-knn-hybrid", action="store_true", help="Disable knn_hybrid in generated configs.")
     ap.add_argument(
         "--tsl-align",
         action="store_true",
@@ -826,27 +745,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
-        "--knn-adaptive-alpha",
         type=str,
         default=None,
         choices=["none", "agreement", "distance", "confidence", "distance_agreement"],
-        help="Override knn_hybrid.adaptive_alpha in generated configs.",
     )
     ap.add_argument(
-        "--knn-selection-policy",
         type=str,
         default=None,
         choices=["hybrid", "val_mse_margin", "val_mae_guarded", "val_mse", "base"],
-        help="Override knn_hybrid.selection_policy. When omitted, inherit each config.",
     )
     ap.add_argument(
-        "--knn-selection-min-rel-improvement",
         type=float,
         default=None,
         help="Require this relative validation improvement before selecting hybrid, e.g. 0.01 for 1%%.",
     )
     ap.add_argument(
-        "--knn-selection-min-abs-improvement",
         type=float,
         default=None,
         help="Require this absolute validation improvement before selecting hybrid.",
@@ -918,11 +831,6 @@ def main() -> None:
                 mae_objective_weight=args.mae_objective_weight,
                 device=args.device,
                 keep_artifacts=keep_artifacts_for_run,
-                disable_knn_hybrid=bool(args.disable_knn_hybrid),
-                knn_adaptive_alpha=args.knn_adaptive_alpha,
-                knn_selection_policy=args.knn_selection_policy,
-                knn_selection_min_rel_improvement=args.knn_selection_min_rel_improvement,
-                knn_selection_min_abs_improvement=args.knn_selection_min_abs_improvement,
                 etth1_paper_norm_96=bool(args.etth1_paper_norm_96),
                 tsl_align=bool(args.tsl_align),
             )
@@ -951,7 +859,6 @@ def main() -> None:
                     out_dir=out_dir,
                     wrapper_sec=0.0,
                     returncode=0,
-                    selection_policy=args.knn_selection_policy,
                 )
             elif args.reuse_existing and summary_matches_generated_config(summary_path, cfg):
                 row = summary_to_row(
@@ -965,7 +872,6 @@ def main() -> None:
                     out_dir=out_dir,
                     wrapper_sec=0.0,
                     returncode=0,
-                    selection_policy=args.knn_selection_policy,
                 )
             else:
                 returncode = run_train(config_path, out_dir, show_child_progress=show_child_progress)
@@ -990,7 +896,6 @@ def main() -> None:
                     out_dir=out_dir,
                     wrapper_sec=wrapper_sec,
                     returncode=returncode,
-                    selection_policy=args.knn_selection_policy,
                     error=error,
                 )
 

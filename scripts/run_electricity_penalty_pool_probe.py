@@ -140,12 +140,7 @@ class PoolCandidate:
     residual_corrector_hidden: int = 64
     residual_specialization_weight: float = 0.1
     residual_norm_weight: float = 1.0e-5
-    selection_policy: str = "val_mse_gate_guarded"
-    gate_calibrator_epochs: int = 40
-    gate_calibrator_max_scale: float = 1.0
-    gate_calibrator_init_scale: float = 0.3
-    gate_calibrator_apply_activation_threshold: bool = True
-    gate_calibrator_activation_bce_weight: float = 0.2
+    selection_policy: str = "val_mse_candidate_channel"
     train_residual_anchor_max_scale: float | None = None
     explainability_enable: bool = False
 
@@ -474,8 +469,6 @@ POOL_CANDIDATES = [
         seasonal_anchor_scale=0.6,
         residual_init_alpha=-2.0,
         residual_alpha_scale=1.5,
-        gate_calibrator_max_scale=1.5,
-        gate_calibrator_init_scale=0.5,
         train_residual_anchor_max_scale=30.0,
     ),
     PoolCandidate(
@@ -486,10 +479,6 @@ POOL_CANDIDATES = [
         seasonal_anchor_scale=0.6,
         residual_init_alpha=-2.0,
         residual_alpha_scale=1.25,
-        gate_calibrator_max_scale=1.25,
-        gate_calibrator_init_scale=0.5,
-        gate_calibrator_apply_activation_threshold=False,
-        gate_calibrator_activation_bce_weight=0.05,
     ),
     PoolCandidate(
         "load_shape_seasonal_p24_w05_ctx",
@@ -679,9 +668,6 @@ def localize_paths(cfg: dict[str, Any], out_dir: Path) -> None:
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["enable"] = False
     cfg["memory"]["save_checkpoint"] = False
     cfg["memory"]["path"] = str(out_dir / "cluster_memory.pt")
@@ -712,33 +698,6 @@ def selector_cfg() -> dict[str, Any]:
         "negative_sample_weight": 1.0,
         "label_min_abs_improvement": 0.0,
         "label_min_rel_improvement": 0.0,
-    }
-
-
-def gate_calibrator_cfg(cand: PoolCandidate | None = None) -> dict[str, Any]:
-    cand = cand or PoolCandidate("_default", tuple())
-    return {
-        "source_split": "val",
-        "loss": "mse",
-        "selection_metric": "mse",
-        "epochs": int(cand.gate_calibrator_epochs),
-        "train_fraction": 0.75,
-        "hidden_dim": 64,
-        "batch_size": 256,
-        "max_scale": float(cand.gate_calibrator_max_scale),
-        "init_scale": float(cand.gate_calibrator_init_scale),
-        "scale_reg": 5.0e-4,
-        "standardize_features": True,
-        "activation_head_enable": True,
-        "apply_activation_threshold": bool(cand.gate_calibrator_apply_activation_threshold),
-        "activation_threshold": "auto",
-        "activation_threshold_selection_metric": "mse",
-        "activation_threshold_scope": "channel",
-        "activation_bce_weight": float(cand.gate_calibrator_activation_bce_weight),
-        "activation_inactive_scale_weight": 0.05,
-        "activation_pos_weight": "auto",
-        "activation_pos_weight_scope": "channel",
-        "activation_train_soft_gating": False,
     }
 
 
@@ -875,7 +834,6 @@ def build_config(
         "specialization_weight": float(cand.residual_specialization_weight),
         "norm_weight": float(cand.residual_norm_weight),
         "use_y_base_input": True,
-        "gate_calibrator": gate_calibrator_cfg(cand),
     }
     if enable_candidate_selector:
         residual["candidate_selector"] = selector_cfg()

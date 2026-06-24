@@ -457,9 +457,6 @@ def localize_paths(cfg: dict[str, Any], out_dir: Path) -> None:
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["enable"] = False
     cfg["memory"]["save_checkpoint"] = True
     cfg["memory"]["path"] = str(out_dir / "cluster_memory.pt")

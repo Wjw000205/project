@@ -227,7 +227,6 @@ def test_materialize_training_config_redirects_output_artifact_paths(tmp_path: P
             "window": {"input_len": 336, "pred_len": 96},
             "corr": {"compute": True, "save_path": f"{old_run}/corr.npy"},
             "portrait": {"enable": False, "out_dir": f"{old_run}/cluster_portraits"},
-            "knn_hybrid": {"enable": False, "path": f"{old_run}/knn_shape_bank.pt"},
             "memory": {
                 "enable": False,
                 "save_checkpoint": False,
@@ -250,7 +249,6 @@ def test_materialize_training_config_redirects_output_artifact_paths(tmp_path: P
     generated = yaml.safe_load(Path(result["config_path"]).read_text(encoding="utf-8"))
     assert generated["corr"]["save_path"] == f"{run_dir}/corr.npy"
     assert generated["portrait"]["out_dir"] == f"{run_dir}/cluster_portraits"
-    assert generated["knn_hybrid"]["path"] == f"{run_dir}/knn_shape_bank.pt"
     assert generated["memory"]["path"] == f"{run_dir}/cluster_memory.pt"
     assert generated["memory"]["checkpoint_path"] == f"{run_dir}/best_checkpoint.pt"
     assert old_run not in Path(result["config_path"]).read_text(encoding="utf-8")

@@ -26,7 +26,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_guard_rel0",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.6,
         "fusion_init": -1.5,
@@ -36,7 +36,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_guard_rel002",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.002,
         "alpha_scale": 1.6,
         "fusion_init": -1.5,
@@ -46,7 +46,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_guard_soft_alpha08",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 0.8,
         "fusion_init": -2.0,
@@ -56,7 +56,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_guard_alpha06_fusion25",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 0.6,
         "fusion_init": -2.5,
@@ -66,7 +66,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_guard_gate_max05",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.6,
         "fusion_init": -1.5,
@@ -89,7 +89,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_soft_prior_guard",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -101,7 +101,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "current_soft_prior_alpha06",
         "penalties": ["jump", "amp_under", "level", "delta"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 0.6,
         "fusion_init": -2.5,
@@ -113,7 +113,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_guard",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -125,7 +125,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_alpha06",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 0.6,
         "fusion_init": -2.5,
@@ -165,7 +165,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_gate_max05",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -178,7 +178,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_minrel02",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.02,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -190,7 +190,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_minrel05",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.05,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -202,7 +202,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_train_calib",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -215,7 +215,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_soft_prior_train_calib_minrel02",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.02,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -228,7 +228,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "delta_trend_soft_prior_guard",
         "penalties": ["delta", "trend", "direction"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.2,
         "fusion_init": -2.0,
@@ -251,7 +251,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "lddf_guard_rel0",
         "penalties": ["level", "delta", "d2_match", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.6,
         "fusion_init": -1.5,
@@ -261,7 +261,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "delta_trend_guard_rel0",
         "penalties": ["delta", "trend", "direction"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.6,
         "fusion_init": -1.5,
@@ -271,7 +271,7 @@ VARIANTS: list[dict[str, Any]] = [
     {
         "label": "no_level_guard_rel0",
         "penalties": ["jump", "amp_under", "delta", "diff_amp"],
-        "selection_policy": "val_mse_gate_guarded",
+        "selection_policy": "val_mse_candidate_channel",
         "min_rel": 0.0,
         "alpha_scale": 1.6,
         "fusion_init": -1.5,
@@ -315,7 +315,6 @@ def set_paths(cfg: dict[str, Any], run_dir: Path) -> None:
     cfg["exp"]["out_dir"] = rel(run_dir)
     cfg["corr"]["save_path"] = rel(run_dir / "corr.npy")
     cfg["portrait"]["out_dir"] = rel(run_dir / "cluster_portraits")
-    cfg["knn_hybrid"]["path"] = rel(run_dir / "knn_shape_bank.pt")
     cfg["memory"]["path"] = rel(run_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = rel(run_dir / "best_checkpoint.pt")
 
@@ -340,14 +339,12 @@ def apply_variant(cfg: dict[str, Any], variant: dict[str, Any]) -> None:
     pred_res["selection_min_abs_improvement"] = 0.0
     pred_res["alpha_scale"] = float(variant["alpha_scale"])
     pred_res["fusion_init"] = float(variant["fusion_init"])
-    gate_calib = pred_res.get("gate_calibrator", {})
     if "gate_max_scale" in variant:
         gate_calib["max_scale"] = float(variant["gate_max_scale"])
     if "gate_scale_reg" in variant:
         gate_calib["scale_reg"] = float(variant["gate_scale_reg"])
     if "gate_source_split" in variant:
         gate_calib["source_split"] = str(variant["gate_source_split"])
-    pred_res["gate_calibrator"] = gate_calib
     if "selection_scale_steps" in variant:
         pred_res["selection_scale_min"] = 0.0
         pred_res["selection_scale_max"] = float(variant.get("selection_scale_max", 1.0))

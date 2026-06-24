@@ -21,7 +21,6 @@ def deep_set_paths(cfg: dict[str, Any], out_dir: Path, name: str) -> None:
     cfg.setdefault("exp", {})["out_dir"] = str(out_dir)
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["path"] = str(out_dir / "cluster_memory.pt")
     cfg.setdefault("memory", {})["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
 
@@ -44,8 +43,6 @@ def make_config(base_cfg: dict[str, Any], input_len: int, out_root: Path, device
     cfg.setdefault("eval", {})["skip_test"] = False
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg.setdefault("memory", {})["enable"] = False
     cfg.setdefault("memory", {})["save_checkpoint"] = False
     cfg.setdefault("diagnostics", {})["save_prediction_intermediates"] = True

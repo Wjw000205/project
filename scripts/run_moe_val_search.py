@@ -48,10 +48,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
             "pred_side_residual": {
                 "feature_mode": "safe_augmented",
                 "residual_clip": 6.0,
-                "gate_calibrator": {
-                    "standardize_features": True,
-                    "max_scale": 1.0,
-                },
             },
         },
     }
@@ -60,30 +56,20 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
         "legacy_level_gate_guarded": {
             "moe": {
                 "pred_side_residual": {
-                    "selection_policy": "val_mse_gate_guarded",
+                    "selection_policy": "val_mse_candidate_channel",
                 },
             },
         },
         "legacy_level_gate_signed": {
             "moe": {
                 "pred_side_residual": {
-                    "gate_calibrator": {
-                        "scale_mode": "signed_tanh",
-                        "max_scale": 1.25,
-                        "init_scale": 0.8,
-                    },
                 },
             },
         },
         "legacy_level_gate_signed_guarded": {
             "moe": {
                 "pred_side_residual": {
-                    "selection_policy": "val_mse_gate_guarded",
-                    "gate_calibrator": {
-                        "scale_mode": "signed_tanh",
-                        "max_scale": 1.25,
-                        "init_scale": 0.8,
-                    },
+                    "selection_policy": "val_mse_candidate_channel",
                 },
             },
         },
@@ -124,7 +110,7 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                     "amp_under": "none",
                 },
                 "pred_side_residual": {
-                    "selection_policy": "val_mse_gate_guarded",
+                    "selection_policy": "val_mse_candidate_channel",
                 },
             },
             "penalties": {
@@ -177,12 +163,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                     "amp_under": "none",
                 },
                 "pred_side_residual": {
-                    "gate_calibrator": {
-                        "standardize_features": True,
-                        "max_scale": 1.25,
-                        "init_scale": 0.9,
-                        "scale_reg": 5.0e-5,
-                    },
                 },
             },
             "penalties": {
@@ -207,12 +187,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                     "amp_under": "none",
                 },
                 "pred_side_residual": {
-                    "gate_calibrator": {
-                        "standardize_features": True,
-                        "max_scale": 1.5,
-                        "init_scale": 1.0,
-                        "scale_reg": 1.0e-5,
-                    },
                 },
             },
             "penalties": {
@@ -237,13 +211,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                     "amp_under": "none",
                 },
                 "pred_side_residual": {
-                    "gate_calibrator": {
-                        "standardize_features": True,
-                        "max_scale": 1.25,
-                        "init_scale": 0.9,
-                        "scale_reg": 5.0e-5,
-                        "train_fraction": 0.85,
-                    },
                 },
             },
             "penalties": {
@@ -270,12 +237,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                 "pred_side_residual": {
                     "feature_mode": "safe_augmented",
                     "residual_clip": 6.0,
-                    "gate_calibrator": {
-                        "standardize_features": True,
-                        "max_scale": 1.25,
-                        "init_scale": 0.9,
-                        "scale_reg": 5.0e-5,
-                    },
                 },
             },
             "penalties": {
@@ -346,11 +307,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
             {
                 "moe": {
                     "pred_side_residual": {
-                        "gate_calibrator": {
-                            "max_scale": 1.25,
-                            "init_scale": 0.85,
-                            "scale_reg": 5.0e-4,
-                        },
                     },
                 },
             },
@@ -410,7 +366,7 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                     },
                     "pred_side_residual": {
                         "residual_clip": 0.0,
-                        "selection_policy": "val_mse_gate_guarded",
+                        "selection_policy": "val_mse_candidate_channel",
                     },
                 },
                 "penalties": {
@@ -429,12 +385,6 @@ def variant_overrides() -> Dict[str, Dict[str, Any]]:
                     },
                     "pred_side_residual": {
                         "residual_clip": 0.0,
-                        "gate_calibrator": {
-                            "scale_mode": "signed_tanh",
-                            "max_scale": 1.25,
-                            "init_scale": 0.8,
-                            "scale_reg": 5.0e-4,
-                        },
                     },
                 },
                 "penalties": {
@@ -461,10 +411,6 @@ def ensure_no_leak_paths(cfg: Dict[str, Any], out_dir: Path, skip_test: bool) ->
     cfg.setdefault("portrait", {})
     cfg["portrait"]["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("calibration", {})
-    cfg["calibration"]["enable"] = False
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
     cfg.setdefault("memory", {})
     cfg["memory"]["enable"] = False
     cfg["memory"]["save_checkpoint"] = False
@@ -490,10 +436,9 @@ def apply_moe_state(cfg: Dict[str, Any], enabled: bool) -> None:
     pred_cfg.setdefault("intervention_weight", 1.0e-3)
     pred_cfg.setdefault("detach_routed_penalty_pred", False)
     if enabled:
-        pred_cfg.setdefault("selection_policy", "val_mse_gate")
+        pred_cfg.setdefault("selection_policy", "val_mse_candidate_channel")
     else:
         pred_cfg["selection_policy"] = "none"
-    gate_cfg = pred_cfg.setdefault("gate_calibrator", {})
     gate_cfg.setdefault("loss", "mse")
     gate_cfg.setdefault("selection_metric", "mse")
     gate_cfg.setdefault("epochs", 30)
@@ -531,7 +476,6 @@ def read_val_metrics(run_dir: Path, require_no_test: bool) -> Dict[str, Any]:
         raise RuntimeError(f"Leak guard failed: eval.skip_test is not recorded true: {summary_path}")
     val = summary.get("val", {}) or {}
     residual = summary.get("moe_residual_selection", {}) or {}
-    gate_summary = summary.get("moe_residual_gate_calibrator", {}) or {}
     raw_val_mse = float(val.get("avg_mse", float("nan")))
     raw_val_mae = float(val.get("avg_mae", float("nan")))
     selected_val_mse = float(residual.get("val_scaled_avg_mse", raw_val_mse))

@@ -118,8 +118,42 @@ def test_seasonal_align_penalty_is_registered_and_computable() -> None:
     assert torch.allclose(pen, torch.zeros_like(pen))
 
 
+def test_phase_residual_candidate_adds_train_phase_table_to_named_branch_only() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=2,
+        hidden_dim=2,
+        init_alpha=20.0,
+        alpha_scale=1.0,
+        use_y_base_input=False,
+        intervention_enable=False,
+        penalty_names=["amp_under", "delta"],
+        phase_residual_candidate_names=["amp_under"],
+        phase_residual_candidate_scale=1.0,
+    )
+    _zero_learned_residuals(model)
+    table = torch.zeros(5, 2, 1)
+    table[1, :, 0] = torch.tensor([3.0, 4.0])
+    model.set_phase_residual_candidate_table(table)
+
+    x = torch.zeros(1, 1, 4)
+    y_base = torch.zeros(1, 1, 2)
+    cluster_id = torch.tensor([0], dtype=torch.long)
+    mask = torch.ones(1, 1, 2)
+
+    out = model(x, y_base, cluster_id, mask, query_start_abs_b=torch.tensor([2]))
+
+    expected_branch = torch.tensor([[[3.0, 4.0]]])
+    assert torch.allclose(out["residuals"][:, :, 0, :], expected_branch, atol=1.0e-5)
+    assert torch.allclose(out["residuals"][:, :, 1, :], torch.zeros_like(expected_branch), atol=1.0e-5)
+    assert torch.allclose(out["y_final"], expected_branch, atol=1.0e-4, rtol=1.0e-4)
+
+
 if __name__ == "__main__":
     test_seasonal_align_adapter_adds_previous_cycle_residual()
     test_nonseasonal_adapter_does_not_get_previous_cycle_residual()
     test_seasonal_anchor_averages_available_previous_cycles()
     test_seasonal_align_penalty_is_registered_and_computable()
+    test_phase_residual_candidate_adds_train_phase_table_to_named_branch_only()

@@ -88,7 +88,7 @@ moe:
     intervention_init: -2.0
     intervention_weight: 1.0e-3
     detach_routed_penalty_pred: false
-    selection_policy: val_mse_gate
+    selection_policy: val_mse_candidate_channel
     selection_min_abs_improvement: 0.0
     selection_min_rel_improvement: 0.0
     penalty_guard:
@@ -106,17 +106,6 @@ moe:
       min_rel_improvement: 0.002
     diagnostics:
       enable: true
-    gate_calibrator:
-      loss: mse
-      selection_metric: mse
-      epochs: 30
-      train_fraction: 0.7
-      hidden_dim: 32
-      batch_size: 256
-      max_scale: 1.0
-      init_scale: 0.8
-      scale_reg: 1.0e-4
-
   dynamic_lambda:
     enable: true
     mode: multiscale
@@ -201,32 +190,6 @@ train:
 early_stop:
   patience: 10
   min_delta: 1.0e-6
-
-knn_hybrid:
-  enable: false
-  mode: rolling
-  scope: same_channel
-  bank_split: history
-  use_for_model_selection: false
-  k: 96
-  alpha: 1.8
-  shape_bins: 24
-  diff_bins: 12
-  pred_shape_bins: 16
-  pred_diff_bins: 8
-  feature_mode: joint
-  template_mode: residual
-  adaptive_alpha: confidence
-  confidence_floor: 0.0
-  distance_sharpness: 1.0
-  selection_policy: val_mae_guarded
-  selection_min_rel_improvement: 0.0
-  selection_max_rel_mse_regression: 0.03
-  bank_stride: 2
-  distance_weight: inverse
-  anchor_mode: last
-  bank_chunk_size: 8192
-  path: outputs/ETTm1_moe_route_multi_shape_gatebias_norm0_alpha11/knn_shape_bank.pt
 
 eval:
   skip_test: false

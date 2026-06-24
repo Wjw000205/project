@@ -179,8 +179,6 @@ def summarize(best_results: Path, out_root: Path) -> None:
         selection = summary.get("moe_residual_selection", {}) or {}
         residual = summary.get("moe_residual", {}) or {}
         gate_hit = summary.get("moe_gate_penalty_hit", {}) or {}
-        test_act = _safe_get(summary, "moe_residual_gate_calibrator", "test_activation", default={}) or {}
-        val_act = _safe_get(summary, "moe_residual_gate_calibrator", "val_activation", default={}) or {}
 
         val_base = float(selection.get("val_pred_base_avg_mse", np.nan))
         val_resid = float(selection.get("val_residual_avg_mse", row.get("val_mse", np.nan)))
@@ -392,7 +390,6 @@ def summarize(best_results: Path, out_root: Path) -> None:
         "Protocol notes:",
         "- Cluster-penalty affinity is the average gate probability from `cluster_penalty_probs.csv`; it should be read as learned routing affinity, not as a causal Pearson coefficient.",
         "- Improvement is computed from the logged base-vs-residual MSE fields. Validation gain is the clean interpretation axis; test gain is reported as an aligned reference where available.",
-        "- KNN/hybrid and calibration are not used for these interpretation numbers.",
         "",
         "## Global Residual Improvement",
         "",

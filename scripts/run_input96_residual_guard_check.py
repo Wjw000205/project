@@ -35,7 +35,6 @@ def set_run_paths(cfg: dict[str, Any], out_dir: Path, name: str, device: str | N
         cfg["exp"]["device"] = str(device)
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["path"] = str(out_dir / "cluster_memory.pt")
     cfg.setdefault("memory", {})["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
 
@@ -47,8 +46,6 @@ def base_input96_cfg(base_cfg: dict[str, Any], out_dir: Path, name: str, device:
     cfg.setdefault("eval", {})["skip_test"] = False
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg.setdefault("memory", {})["enable"] = False
     cfg.setdefault("memory", {})["save_checkpoint"] = False
     cfg.pop("diagnostics", None)
@@ -59,7 +56,6 @@ def base_input96_cfg(base_cfg: dict[str, Any], out_dir: Path, name: str, device:
 def apply_variant(cfg: dict[str, Any], variant: str) -> None:
     moe = cfg.setdefault("moe", {})
     residual = moe.setdefault("pred_side_residual", {})
-    gate = residual.setdefault("gate_calibrator", {})
 
     def configure_channel_head_base() -> None:
         cfg.setdefault("model", {}).update(
@@ -85,9 +81,9 @@ def apply_variant(cfg: dict[str, Any], variant: str) -> None:
         moe["lambda_schedule"] = {name: "none" for name in names}
         moe.setdefault("dynamic_lambda", {})["enable"] = bool(dynamic)
     if variant == "current_gate":
-        residual["selection_policy"] = "val_mse_gate"
+        residual["selection_policy"] = "val_mse_candidate_channel"
     elif variant == "gate_guarded":
-        residual["selection_policy"] = "val_mse_gate_guarded"
+        residual["selection_policy"] = "val_mse_candidate_channel"
     elif variant == "scale_grid":
         residual["selection_policy"] = "val_mse_scale"
         residual["selection_scale_min"] = 0.0
@@ -96,7 +92,7 @@ def apply_variant(cfg: dict[str, Any], variant: str) -> None:
     elif variant == "channel_binary":
         residual["selection_policy"] = "val_mse_channel"
     elif variant == "activation_head_guarded":
-        residual["selection_policy"] = "val_mse_gate_guarded"
+        residual["selection_policy"] = "val_mse_candidate_channel"
         gate["activation_head_enable"] = True
         gate["apply_activation_threshold"] = True
         gate["activation_threshold"] = "auto"

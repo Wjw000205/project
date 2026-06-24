@@ -203,7 +203,6 @@ def make_fixed_cfg(base: dict[str, Any], route: tuple[int, ...], out_dir: Path, 
     cfg = json.loads(json.dumps(base))
     cfg.setdefault("exp", {})["out_dir"] = str(out_dir)
     cfg.setdefault("transfer", {})["fixed_cluster_id"] = [int(v) for v in route]
-    cfg["transfer"].setdefault("knn_hybrid", {})["enable"] = False
     cfg.setdefault("normalize", {})["train_only"] = True
     cfg.setdefault("eval", {})["split"] = eval_split
     cfg["eval"].setdefault("batch_size", 64)

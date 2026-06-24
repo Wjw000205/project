@@ -143,7 +143,6 @@ def patch_cfg(base: dict[str, Any], variant: dict[str, Any], out_dir: Path, eval
     transfer = cfg.setdefault("transfer", {})
     transfer["route_fit_scope"] = "train"
     transfer["save_corr"] = True
-    transfer.setdefault("knn_hybrid", {})["enable"] = False
     transfer.setdefault("resample", {})["enable"] = False
     for key in [
         "corr_mode",

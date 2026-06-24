@@ -103,15 +103,10 @@ def disable_leaky_or_external_paths(cfg: Dict[str, Any], out_dir: Path) -> None:
     cfg["portrait"]["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
 
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
 
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = False
 
-    cfg.setdefault("calibration", {})
-    cfg["calibration"]["enable"] = False
 
     cfg.setdefault("memory", {})
     cfg["memory"]["enable"] = False
@@ -212,19 +207,6 @@ def moe_variant(
                 "selection_scale_min": 0.0,
                 "selection_scale_max": float(selection_scale_max),
                 "selection_scale_steps": int(selection_scale_steps),
-                "gate_calibrator": {
-                    "loss": "mse",
-                    "selection_metric": "mse",
-                    "epochs": 30,
-                    "train_fraction": 0.7,
-                    "hidden_dim": 32,
-                    "batch_size": 256,
-                    "max_scale": float(gate_max_scale),
-                    "init_scale": 0.4,
-                    "scale_reg": float(scale_reg),
-                    "scale_mode": "signed_tanh",
-                    "standardize_features": True,
-                },
             },
             "dynamic_lambda": {
                 "enable": bool(dynamic_enable),
