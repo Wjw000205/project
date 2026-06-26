@@ -3959,3 +3959,248 @@ Hand back the report and STOP. Do not start a follow-up without me.
     dirs plus root `tmp_pytest` still cannot be read/deleted by the current Windows user
     (`Access denied`, including after attempted `takeown`/`icacls`). Guard validation still
     passes: `python -m pytest tests/test_removed_legacy_modules_guard.py -q`.
+  - Weather root-config recovery (2026-06-25): user corrected that the new 2026-06-25
+    Weather reruns are not the best configs. Root cause: the 2026-06-19 root-config
+    replacement and anchor-default migration explicitly left Weather out, so
+    `configs/weather_H96.yaml`, `weather_H192.yaml`, `weather_H336.yaml`, and
+    `weather_H720.yaml` remained the old generic `mlp_h128/dropout0.2` configs. Do not use
+    `outputs/weather_repro_check_20260625/` or `outputs/weather_resid_clean_20260625/`
+    as best-config evidence. The old per-run configs/run_summaries were removed by the
+    retention cleanup, so recovery used surviving `best_checkpoint.pt` metadata plus
+    `scripts/run_weather_limit_tune.py` and the H720 targeted candidate name.
+    Materialized root configs: H96 uses `h96_bias_freeze` structure
+    (`context_channel_head_mlp`, hid320, channel adapter r4 scale0.05, temporal basis r8
+    scale0.1, horizon bias adapter freeze-base true, finetune from
+    `outputs/fresh_input_len96_20260614_weather_h96_mae_arch_refine2/runs/r4_s005_mse03_mae20_valmae/best_checkpoint.pt`);
+    H192 uses `h192_mae25_wd1e4`; H336 uses `h336_mae20`; H720 uses
+    `mlp_h160_do005_wd5e4_mae07`. Anchor remains code-default, not YAML-controlled:
+    `src/train.py::default_moe_output_anchor_cfg()` now injects the Weather-H96 p144
+    stat/residual anchor defaults; Weather H192/H336/H720 remain anchor-free. Legacy
+    KNN/Calibration/gate-calibrator fields were not reintroduced.
+  - Weather root-config rerun validation (2026-06-25): reran
+    `configs/weather_H96.yaml`, `weather_H192.yaml`, `weather_H336.yaml`, and
+    `weather_H720.yaml` with `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`. Output summaries:
+    `outputs/weather_H96/run_summary.json`, `outputs/weather_H192/run_summary.json`,
+    `outputs/weather_H336/run_summary.json`, `outputs/weather_H720/run_summary.json`.
+    H96 confirmed code-default anchor injection and scale selection; H192/H336/H720 stayed
+    anchor-free. Results (test MSE/MAE) vs current main-table PKR-MoE Weather cells:
+    H96 `0.154163/0.198646` vs `0.152/0.217` (+1.42% MSE, -8.46% MAE);
+    H192 `0.203963/0.238703` vs `0.196/0.264` (+4.06% MSE, -9.58% MAE);
+    H336 `0.262469/0.283328` vs `0.251/0.291` (+4.57% MSE, -2.64% MAE);
+    H720 `0.340650/0.355269` vs `0.329/0.346` (+3.54% MSE, +2.68% MAE). H96 is much
+    better than the bad 2026-06-25 generic-config rerun (`0.172055/0.240463`), but the
+    recovered root configs do not reproduce the main-table MSE-best Weather cells for
+    H192/H336/H720. Classify as selection/provenance ambiguity caused by earlier output
+    pruning: checkpoint meta verifies architecture/window, but the deleted old configs and
+    run_summaries prevent strict recovery of the table-selected MSE winners. Do not update
+    the main table from these reruns without explicit user acceptance of the MAE-tilted
+    tradeoff; strict Weather table recovery needs rediscovering or locating the original
+    table-source configs/results.
+  - Weather all-anchor recovery and main-table update (2026-06-25): user asked to turn
+    anchor on for Weather and reproduce/update the main table. Root cause found during
+    rerun: `apply_moe_output_anchor_experts()` returned early when `moe.enable:false`, so
+    Weather H192/H336/H720 selected default anchors but did not apply them. Fixed the
+    eval-path wiring so output anchors apply independently of penalty-MoE enablement and
+    added regression coverage. Controlled checkpoint eval used retained best checkpoints
+    with `epochs:1`, `lr:0`, `PYTHONIOENCODING=utf-8`.
+    - p144/MSE all-horizon anchor was not the right long-horizon default: H192 improved to
+      `0.193517/0.258689`, but H336 `0.252144/0.311734` had bad MAE and H720
+      `0.378112/0.416497` collapsed. Classify H336/H720 failure as anchor period/metric
+      mismatch plus train-val/test shift.
+    - Restored the old long-horizon Weather period hypothesis from
+      `scripts/run_input96_main_table_anchor_rerun.py`: H336/H720 use period 96, not 144.
+      p96/MSE improved MSE but still hurt MAE; p96/MAE scale selection was the stable
+      double-win.
+    - Adopted code-default anchors (not YAML-controlled): H96 p144/MSE
+      stat `max_scale=0.5, steps=13` + residual `max_scale=1.0, steps=25, seg=8`; H192
+      p144/MAE with the same scales; H336/H720 p96/MAE stat `max_scale=0.2, steps=9` +
+      residual `max_scale=1.2, steps=49, seg=7`.
+    - Root configs now materialize retained best checkpoints for deterministic
+      reproduction: `configs/weather_H192.yaml` -> `h192_mae25_wd1e4`,
+      `configs/weather_H336.yaml` -> `h336_mae20`, `configs/weather_H720.yaml` ->
+      `cch_h128_do005_wd5e4_mae07_basis_r8`. No anchor/KNN/Calibration/gate-calibrator
+      settings are present in these YAMLs.
+    - Verified final root outputs: H192 `outputs/weather_H192/run_summary.json`
+      `test=0.194188/0.235485`; H336 `outputs/weather_H336/run_summary.json`
+      `test=0.249461/0.278477`; H720 `outputs/weather_H720/run_summary.json`
+      `test=0.326322/0.340035`. These improve over the previous main-table Weather
+      cells H192 `0.196/0.264`, H336 `0.251/0.291`, H720 `0.329/0.346`; updated
+      `outputs/codex_table_target_20260614/input96_olinear_filtered_comparison.md`
+      accordingly. H96 was left unchanged in the table because the current rerun
+      (`0.152911/0.218400`) does not beat the existing `0.152/0.217` cell.
+  - Weather-H96 MoE/anchor diagnosis (2026-06-25): checked whether the H96 mismatch was
+    caused by MoE being disabled. It was not: `configs/weather_H96.yaml` has
+    `moe.enable:true`, `outputs/weather_H96/run_summary.json` records
+    `penalty_names=[amp_under,delta,diff_amp,direction]`, and the learned router is present.
+    The confusing part is prediction-side scope: `moe.pred_side_residual.enable:false`, so
+    the final predictor correctly reports `selected.variant=base` and
+    `moe_residual_variant=none`; H96 predictions are backbone + output anchors, not the
+    residual-MoE branch. Controlled checkpoint evals from the retained
+    `weather_bias_probe/runs/H96/h96_bias_freeze/best_checkpoint.pt` reproduced the current
+    code-default p144/MSE anchor at `test=0.152911/0.218399`, matching the root H96 output
+    and missing the old table MAE `0.217` by about 0.001. Mixed anchor diagnostics found a
+    stronger test tradeoff but weaker val-MSE: stat p144/MSE `max_scale=0.5` plus residual
+    p144/MAE `max_scale=0.5` gives val `0.375169/0.254073` and test
+    `0.152494/0.210001`; pure p144/MAE gives val `0.383908/0.245545` and test
+    `0.154163/0.198645`. Diagnosis: the H96 issue is selection/metric tradeoff plus
+    historical-result provenance, not MoE-off wiring. Do not update H96 defaults or the
+    main table from these diagnostics without explicit acceptance, because the test-better
+    mixed setting is not val-MSE-best.
+  - Weather-H96 historical-config recovery (2026-06-25): user pointed out the old table
+    value almost certainly came from an explored config that was never materialized into
+    root configs. Confirmed. The surviving script clue was
+    `scripts/run_weather_limit_tune.py::h96_resid080_stat040`; the original
+    `weather_limits_utf8/configs/H96_h96_resid100_stat050.yaml` and upstream p144 probe
+    configs were deleted in the output cleanup, but the retained
+    `weather_bias_probe/runs/H96/h96_bias_freeze/best_checkpoint.pt` still reproduces the
+    family. Controlled reverse evals:
+    - Current code default p144/MSE stat `0.5`, residual `1.0` on `h96_bias_freeze`:
+      `0.152911/0.218399`.
+    - Old scripted p144/MSE stat `0.4`, residual `0.8` on `h96_bias_freeze`:
+      `0.152374/0.216072`; val `0.371409/0.257992`.
+    - Same scale on the closest selected-adapter checkpoint:
+      `0.152530/0.216228`.
+    Adopted the recovered H96 default in code (not YAML-controlled): Weather-H96 now uses
+    p144/MSE stat `max_scale=0.4, steps=13` + residual `max_scale=0.8, steps=25, seg=8`.
+    Root `configs/weather_H96.yaml` and alias `configs/weather.yaml` now deterministically
+    eval the retained `h96_bias_freeze` checkpoint with `epochs:1`, `lr:0`,
+    `strict_model:true`, and no anchor blocks. Verified root output:
+    `outputs/weather_H96/run_summary.json` -> `test=0.152374/0.216072`. This improves over
+    the current root `0.152911/0.218400` and explains the old main-table `0.152/0.217`
+    provenance; the current worktree main table displays Weather-H96 as `0.152/0.216`.
+  - Weather retained-checkpoint exploration (2026-06-25): user suspected another better
+    Weather config remained from earlier exploration. Controlled checkpoint-only evals under
+    the current code-default anchors checked surviving Weather H192/H336/H720 candidates
+    from `weather_bias_probe`, `weather_bias_unfreeze_probe`, `weather_limits_utf8`, depth
+    probes, and the 2026-06-14 CCH/backbone probes. Findings:
+    - H192 has a small exact double-win if root moves from `h192_mae25_wd1e4` to
+      `weather_bias_unfreeze_probe/runs/H192/h192_bias_unfreeze/best_checkpoint.pt`:
+      current root `0.194188/0.235485`, bias-unfreeze `0.193724/0.235129`; val MSE also
+      improves (`0.443846 -> 0.443387`) while val MAE is slightly worse
+      (`0.288209 -> 0.288324`). A follow-up scale diagnostic on this checkpoint rejected
+      copying the H96 lower scale: p144/MAE stat `0.4` + residual `0.8` gave
+      `0.194099/0.235720`, worse than the current H192 default p144/MAE `0.5/1.0`.
+    - H336 has only a MAE tradeoff, not a clean MSE win: current `h336_mae20`
+      `0.249461/0.278477`; `h336_bias_unfreeze` `0.249474/0.278232`. Keep current
+      `h336_mae20` if selecting by MSE or requiring no MSE regression.
+    - H720 current root remains best among completed candidates:
+      `cch_h128_do005_wd5e4_mae07_basis_r8` `0.326321/0.340035`; depth `Weather_H720_b2`
+      `0.326462/0.341141`; H720 CCH h192 `0.327735/0.342116`; MLP h160
+      `0.348634/0.370672`. The slow H720 CCH h256 probe did not finish before timeout and
+      produced no summary; completed larger CCH variants were already worse on H192/H336,
+      so treat it as low-priority unless exhaustive search is requested.
+    Verdict before applying: adopt H192 `h192_bias_unfreeze` only if exact-metric
+    improvement is desired; the 3-decimal main table would still display `0.194/0.235`.
+    H336/H720 should stay as currently materialized. H96 recovered `0.152374/0.216072`
+    remains the only Weather change that visibly improves the current table cell.
+  - DUET PEMS input96 setup (2026-06-26): cloned
+    `git@github.com:decisionintelligence/DUET.git` to `F:\Python program\DUET` at commit
+    `dcc6e6780a9138731b64b9b5398a94a1d97033f0`. DUET did not ship fixed-input-96 PEMS
+    scripts, so the runner `F:\Python program\DUET\codex_run_pems_input96.py` uses the
+    shipped PEMS04 H96 recipe for PEMS03/PEMS04/PEMS07 and the shipped PEMS08 H96 recipe
+    for PEMS08, forcing `seq_len=96` and horizons 12/24/48/96. Added local DUET
+    compatibility patches: `ts_benchmark/data/utils.py` accepts wide CSVs with a `date`
+    column when OTB `cols` is absent; `ts_benchmark/report/__init__.py` and
+    `ts_benchmark/utils/parallel/__init__.py` lazy-load optional Dash/Ray paths so CSV-only
+    local runs work in the `my_fram` env. PEMS03/04/07/08 CSVs are hardlinked into
+    `F:\Python program\DUET\dataset\forecasting` with a local `FORECAST_META.csv`.
+    User specified `train:val:test=7:1:2`; runner passes `tv_ratio=0.8` and
+    `train_ratio_in_tv=0.875`. Earlier default-split `6:2:2` and wrong-save-path attempts
+    were stopped and must not be used for the main table. Correct result root is
+    `F:\Python program\DUET\result\codex_duet_pems_input96_split712_20260626`; status is
+    `run_status.jsonl`, partial metrics go to `summary.csv`, and per-cell logs are under
+    `logs\`. First verified cell completed: PEMS03 H12 took `1967.0s`, report
+    `PEMS03\H12\test_report.1782451025.Wujiawei.31672.csv`, metrics
+    `mse_norm=0.0684332644607721`, `mae_norm=0.1694745216662814`, with report
+    `strategy_args` confirming `tv_ratio=0.8` and `train_ratio_in_tv=0.875`. Second cell
+    PEMS03 H24 also completed in `1205.7s`, report
+    `PEMS03\H24\test_report.1782452231.Wujiawei.6984.csv`, metrics
+    `mse_norm=0.0947947531448217`, `mae_norm=0.2048365801556487`. Third cell PEMS03 H48
+    completed in `1057.6s`, report `PEMS03\H48\test_report.1782453288.Wujiawei.29528.csv`,
+    metrics `mse_norm=0.1404076874727043`, `mae_norm=0.2542706299680293`. Fourth cell
+    PEMS03 H96 completed in `1587.1s`, report
+    `PEMS03\H96\test_report.1782454875.Wujiawei.15756.csv`, metrics
+    `mse_norm=0.180928854625864`, `mae_norm=0.2919321584009914`; PEMS03 average is
+    `0.121141139926041 / 0.230128472547738`. The first runner then started PEMS04 H12 but
+    later disappeared without stdout/stderr traceback and without a DUET report; the
+    PEMS04_H12 log only reached model scheduling, so classify as external/interrupted
+    process termination rather than a measured failure. Safe resume path is rerunning
+    `codex_run_pems_input96.py`, which skips existing reports and restarts at PEMS04 H12.
+    Because local long DUET runs proved unstable/interrupted, created a server-side script
+    `F:\Python program\DUET\server_run_pems_input96.py`. It is intended to be copied into a
+    fresh DUET checkout on the server and run from the DUET Python environment. The script
+    idempotently patches DUET for wide PEMS CSVs and optional Dash/Ray imports, registers
+    PEMS03/04/07/08 under `dataset/forecasting`, defaults to training PEMS04/PEMS07/PEMS08
+    at fixed `seq_len=96` for horizons 12/24/48/96 with `train:val:test=7:1:2`, skips any
+    existing `test_report*.csv` on resume, and writes a unified `summary.csv` with per-horizon
+    and Avg rows. Local verification only ran `py_compile`, `--help`, and
+    `--prepare-only --datasets PEMS04 PEMS07 PEMS08`; no additional training was started.
+    Server layout adjustment (same date): user showed the server DUET tree has PEMS CSVs in
+    `DUET/datasets` and wants the launcher under `DUET/scripts/server_run_pems_input96.py`.
+    Updated the script to detect DUET root whether placed in repo root or `scripts/`, to prefer
+    `DUET/datasets` as the default data source, while still linking/copying files into DUET's
+    required `dataset/forecasting` registry. Copied the updated script to
+    `F:\Python program\DUET\scripts\server_run_pems_input96.py`. Verified with
+    `py_compile`, `--help`, and a `--prepare-only` run from the `scripts/` path using the
+    local PEMS data source; it wrote metadata and a unified CSV header without starting
+    training.
+    Server script bugfix (same date): server run failed before training because
+    `write_summary()` found an existing/incomplete `test_report*.csv` whose metric value was
+    blank, causing `float('')`. Added a regression test
+    `F:\Python program\DUET\tests\test_server_run_pems_input96.py` and updated
+    `scripts/server_run_pems_input96.py` so `extract_metrics()` requires non-empty
+    `mse_norm`/`mae_norm`, while `latest_complete_report()` scans newest-to-oldest and skips
+    incomplete reports. `collect_summary_rows()` and `run_job()` now treat only complete reports
+    as resumable outputs; incomplete reports no longer block rerun. Verified with pytest
+    (`1 passed`), `py_compile`, and `--prepare-only`.
+    Server diagnostic update (same date): after the incomplete-report fix, the server rerun
+    successfully skipped old blank reports and launched PEMS04 H12, but DUET produced a new
+    `test_report*.csv` with blank `mse_norm` while the subprocess returned code 0. This means
+    the model/evaluation exception is being swallowed into DUET's record `log_info` rather than
+    surfacing as a process error. Added another regression test and updated
+    `F:\Python program\DUET\scripts\server_run_pems_input96.py` plus the root copy so failure
+    handling now reads latest DUET record files (`*.csv.tar.gz`/`*.csv`), extracts non-empty
+    `log_info`, appends the training log tail, writes
+    `result/<run-name>/logs/<DATASET>_H<HORIZON>_diagnostics.txt`, records that path in
+    `run_status.jsonl`, and prints the diagnostics before raising. Also treats `nan`/inf metric
+    values as incomplete. Verified with
+    `python -m pytest F:\Python program\DUET\tests\test_server_run_pems_input96.py -q`
+    (`2 passed`), `py_compile` for both script copies, and local `--prepare-only` using
+    `F:\Python program\DUET\dataset\forecasting`. Next server action: replace
+    `DUET/scripts/server_run_pems_input96.py` with the updated local file and rerun the same
+    command; if PEMS04 H12 still fails, use the printed `log_info` traceback/diagnostics file
+    to identify the actual DUET training failure.
+    Server NumPy-2 fix (same date): the diagnostic output identified the real PEMS04 H12
+    failure as DUET calling `np.Inf` in `ts_benchmark/baselines/utils.py`, which NumPy 2.x
+    removed (`AttributeError: np.Inf was removed in the NumPy 2.0 release. Use np.inf
+    instead.`). Added a regression test and updated `server_run_pems_input96.py` so
+    `patch_duet_sources()` now recursively replaces `np.Inf` with `np.inf` under
+    `ts_benchmark/baselines/**/*.py`. Local `--prepare-only` applied the patch to six DUET
+    files (`baselines/utils.py`, `dtaf/utils/tools.py`, `srsnet/utils/tools.py`,
+    `time_series_library/utils/tools.py`, `timekan/utils/tools.py`, `xpatch/utils/tools.py`);
+    `rg "np\.Inf" F:\Python program\DUET\ts_benchmark` now returns no matches. Verified with
+    pytest (`3 passed`), `py_compile` for both script copies, and local `--prepare-only`.
+    Next server action: replace `DUET/scripts/server_run_pems_input96.py` again and rerun the
+    same command. The old incomplete PEMS04 H12 reports can remain; the runner skips them and
+    should start a fresh PEMS04 H12 after applying the NumPy-2 patch.
+    Server GPU routing update (same date): user requested switching the DUET server run to
+    CUDA device 5 after `nvidia-smi` showed GPU 5 available. DUET's `run_benchmark.py` parses
+    `--gpus` as an integer list and the sequential backend sets `CUDA_VISIBLE_DEVICES` from
+    that list, so passing `--gpus 5` routes the run to physical GPU 5. Updated
+    `F:\Python program\DUET\scripts\server_run_pems_input96.py` (and root copy) so the default
+    `--gpus` value is now `"5"` instead of `"0"`; it can still be overridden explicitly.
+    Added `test_default_gpu_is_cuda5`. Verified with pytest (`4 passed`), `py_compile`, and a
+    local dry-run whose generated DUET command contained `--gpus 5`.
+    Partial main-table write (same date): user requested writing the available data first.
+    Updated `outputs/codex_table_target_20260614/input96_olinear_filtered_comparison.md`
+    with the completed fixed-input-96 DUET PEMS03 rows from
+    `F:\Python program\DUET\result\codex_duet_pems_input96_split712_20260626\summary.csv`:
+    H12 `0.068/0.169`, H24 `0.095/0.205`, H48 `0.140/0.254`, H96 `0.181/0.292`,
+    Avg `0.121/0.230` (3-decimal display). PEMS04/07/08 DUET cells remain `-` until the
+    server runs finish. Validation script confirmed the first/main markdown table still has
+    52 rows x 32 columns with no bad rows, PEMS03 DUET cells populated, and PEMS04/07/08
+    DUET cells unchanged as `-`.
+    After all 16 cells complete, update
+    `outputs/codex_table_target_20260614/input96_olinear_filtered_comparison.md` DUET
+    columns for PEMS03/04/07/08, recompute averages and red/blue rank counts, then record
+    final metrics here.

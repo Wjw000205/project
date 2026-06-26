@@ -1,25 +1,31 @@
 exp:
-  name: weather_H720
+  name: weather_H720_cch_h128_do005_wd5e4_mae07_basis_r8_bestckpt
   out_dir: outputs/weather_H720
   seed: 2026
   deterministic: true
   device: cuda:0
+
 data:
   csv_path: data/weather.csv
   date_col: 0
-  train_ratio: 0.7
-  val_ratio: 0.1
-  test_ratio: 0.2
+  train_ratio: 0.6999962046455139
+  val_ratio: 0.10000759070897222
+  test_ratio: 0.1999962046455139
   max_rows: 0
+
 window:
   input_len: 96
   pred_len: 720
+  past_context: true
+
 normalize:
   global_zscore: true
   train_only: true
+
 corr:
   compute: true
   save_path: outputs/weather_H720/corr.npy
+
 cluster:
   method: leader
   n_clusters: 3
@@ -36,17 +42,26 @@ cluster:
   merge_small_clusters: true
   no_merge_if_channels_lt: 7
   train_only: true
+
 model:
-  predictor: mlp
+  predictor: context_channel_head_mlp
   hidden_dim: 128
-  dropout: 0.2
+  dropout: 0.05
+  context_channel_head_residual: true
+  context_channel_head_include_delta: true
+  temporal_basis_adapter:
+    enable: true
+    rank: 8
+    scale: 0.1
+    init: zero_delta
+
 moe:
   topk: 1
-  enable: true
+  enable: false
   freeze_lambda: false
   gate_hidden_dim: 32
   select_ranks:
-  - 1
+    - 1
   detach_penalty_grad: false
   lambda_init:
     amp_under: 0.01
@@ -58,8 +73,8 @@ moe:
     mode: multiscale
     hidden_dim: 32
     segment_bins:
-    - 4
-    - 8
+      - 4
+      - 8
     max_factor: 1.5
     mix: 0.6
     dropout: 0.0
@@ -105,39 +120,59 @@ moe:
     corrector_hidden: 16
     alpha_scale: 0.6
     selection_policy: val_mse_candidate_channel
+
 penalties:
   enabled:
-  - amp_under
-  - delta
-  - diff_amp
-  - direction
+    - amp_under
+    - delta
+    - diff_amp
+    - direction
   jump_threshold: 0.6
+
 train:
-  epochs: 20
+  epochs: 1
   batch_size: 64
-  lr: 0.001
-  mse_weight: 0.9
+  lr: 0.0
+  mse_weight: 1.0
   selection_metric: val_mse
-  weight_decay: 0.0001
+  weight_decay: 0.0
   grad_clip: 1.0
   penalty_warmup_epochs: 3
+  mae_objective:
+    enable: false
   lr_scheduler:
     name: plateau
     factor: 0.5
     patience: 3
-    min_lr: 1.0e-06
+    min_lr: 1.0e-6
+
 early_stop:
-  patience: 5
-  min_delta: 1.0e-06
+  patience: 1
+  min_delta: 1.0e-6
+
+finetune:
+  enable: true
+  checkpoint_path: outputs/fresh_input_len96_20260614_weather_h720_cch_backbone_probe/runs/cch_h128_do005_wd5e4_mae07_basis_r8/best_checkpoint.pt
+  strict_window: true
+  strict_model: true
+  cluster_map: index
+  load_model: true
+  load_gate: false
+  load_dynamic_lambda: false
+  load_learnable_lambda: false
+
 plot:
   enable: false
+
 portrait:
   enable: false
   out_dir: outputs/weather_H720/cluster_portraits
+
 eval:
   skip_test: false
+
 memory:
   enable: false
-  save_checkpoint: false
+  save_checkpoint: true
   path: outputs/weather_H720/cluster_memory.pt
   checkpoint_path: outputs/weather_H720/best_checkpoint.pt

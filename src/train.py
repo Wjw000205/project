@@ -2422,6 +2422,22 @@ _MAIN_TABLE_MOE_OUTPUT_ANCHOR_DEFAULTS = {
         stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.18, steps=8),
         residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
     ),
+    ("weather", 96): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=144, metric="mse", max_scale=0.4, steps=13),
+        residual=_residual_anchor_default(period=144, metric="mse", max_scale=0.8, steps=25, horizon_segments=8),
+    ),
+    ("weather", 192): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=144, metric="mae", max_scale=0.5, steps=13),
+        residual=_residual_anchor_default(period=144, metric="mae", max_scale=1.0, steps=25, horizon_segments=8),
+    ),
+    ("weather", 336): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.2, steps=9),
+        residual=_residual_anchor_default(period=96, metric="mae", max_scale=1.2, steps=49, horizon_segments=7),
+    ),
+    ("weather", 720): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.2, steps=9),
+        residual=_residual_anchor_default(period=96, metric="mae", max_scale=1.2, steps=49, horizon_segments=7),
+    ),
 }
 
 
@@ -2842,8 +2858,6 @@ def apply_moe_output_anchor_experts(
     train_stat_anchor_pc: Optional[torch.Tensor] = None,
     train_residual_anchor_phc: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if not bool(moe_enable):
-        return pred_bch
     moe_cfg = moe_cfg or {}
     out = pred_bch
     history_cfg = moe_cfg.get("history_anchor_expert", {}) or {}

@@ -16,7 +16,7 @@ from src.train import (
     _candidate_selector_feature_names,
     _candidate_selector_features,
     _candidate_selector_targets,
-    _collect_pred_residual_gate_tensors,
+    _collect_pred_residual_selector_tensors,
     _fit_static_candidate_channel_selector_from_tensors,
     _cluster_penalty_mask_to_channel_mask,
     _load_finetune_pred_residual_state,
@@ -24,6 +24,7 @@ from src.train import (
     _normalize_history_anchor_cfg,
     _validate_strict_history_anchor_scope,
     apply_default_moe_output_anchor_cfg,
+    apply_moe_output_anchor_experts,
     apply_moe_history_anchor_expert,
     apply_history_anchor_adapter,
     apply_train_stat_anchor_expert,
@@ -59,23 +60,6 @@ class _MeanBackbone(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, cluster_id_c: torch.Tensor) -> torch.Tensor:
         return x.mean(dim=-1, keepdim=True).expand(-1, -1, self.pred_len)
-
-
-class _OnePenaltyGate(torch.nn.Module):
-    def forward(
-        self,
-        feat_bkf: torch.Tensor,
-        straight_through: bool = False,
-        penalty_context_bkp: torch.Tensor | None = None,
-        penalty_context_mode: str = "learned",
-        penalty_context_weight: float = 0.0,
-        penalty_context_detach: bool = True,
-        penalty_context_score: str = "high_violation",
-    ):
-        b, k, _ = feat_bkf.shape
-        mask = torch.ones(b, k, 1, device=feat_bkf.device, dtype=feat_bkf.dtype)
-        probs = torch.ones_like(mask)
-        return mask, probs, None, {}
 
 
 def test_finetune_pred_residual_state_load_restores_checkpoint_weights() -> None:
@@ -161,6 +145,7 @@ class _NoopPredResidual(torch.nn.Module):
         cluster_id_c: torch.Tensor,
         mask_bkp: torch.Tensor,
         skip_bk: torch.Tensor | None = None,
+        **_: object,
     ):
         b, c, h = y_base.shape
         p = mask_bkp.shape[-1]
@@ -280,25 +265,22 @@ def test_strict_history_anchor_rejects_all_observed_scope() -> None:
         _validate_strict_history_anchor_scope(cfg, source="model.history_anchor")
 
 
-def test_pred_residual_gate_tensor_collection_uses_history_anchored_base() -> None:
+def test_pred_residual_selector_tensor_collection_uses_history_anchored_base() -> None:
     x = torch.ones(1, 1, 4)
     y = torch.zeros(1, 1, 2)
     idx = torch.tensor([1])
     loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x, y, idx), batch_size=1)
     observed = torch.arange(20, dtype=torch.float32).view(20, 1)
 
-    tensors = _collect_pred_residual_gate_tensors(
+    tensors = _collect_pred_residual_selector_tensors(
         model=_ZeroBackbone(pred_len=2),
-        gate=_OnePenaltyGate(),
         pred_residual=_NoopPredResidual(),
         loader=loader,
         cluster_id_c=torch.tensor([0]),
         K=1,
         moe_cfg={"enable": True},
         device=torch.device("cpu"),
-        penalty_names=["zero"],
-        penalty_fns={"zero": lambda yhat, yref: torch.zeros_like(yhat[..., 0])},
-        penalty_scale=None,
+        penalty_count=1,
         history_anchor_cfg={"enable": True, "lags": [4], "alpha": 1.0, "blend_target": "prediction"},
         observed_history_tc=observed,
         input_len=4,
@@ -863,6 +845,49 @@ def test_default_moe_output_anchor_cfg_uses_ettm2_h96_best_defaults() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("horizon", "period", "metric", "stat_max", "stat_steps", "resid_max", "resid_steps", "segments"),
+    [
+        (96, 144, "mse", 0.4, 13, 0.8, 25, 8),
+        (192, 144, "mae", 0.5, 13, 1.0, 25, 8),
+        (336, 96, "mae", 0.2, 9, 1.2, 49, 7),
+        (720, 96, "mae", 0.2, 9, 1.2, 49, 7),
+    ],
+)
+def test_default_moe_output_anchor_cfg_uses_weather_best_anchor_defaults(
+    horizon: int,
+    period: int,
+    metric: str,
+    stat_max: float,
+    stat_steps: int,
+    resid_max: float,
+    resid_steps: int,
+    segments: int,
+) -> None:
+    cfg = default_moe_output_anchor_cfg("data/weather.csv", horizon)
+
+    assert cfg["history_anchor_expert"] == {"enable": False}
+    assert cfg["train_stat_anchor_expert"]["period"] == period
+    assert cfg["train_stat_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": metric,
+        "max_scale": stat_max,
+        "steps": stat_steps,
+    }
+    assert cfg["train_residual_anchor_expert"]["period"] == period
+    assert cfg["train_residual_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": metric,
+        "max_scale": resid_max,
+        "steps": resid_steps,
+        "horizon_segments": segments,
+    }
+
+
+def test_default_moe_output_anchor_cfg_normalizes_weather_horizon_suffix() -> None:
+    assert default_moe_output_anchor_cfg("weather_H192", 192)["train_stat_anchor_expert"]["period"] == 144
+
+
 def test_default_moe_output_anchor_cfg_preserves_disabled_residual_cell() -> None:
     cfg = default_moe_output_anchor_cfg("ETTh2", 720)
 
@@ -895,6 +920,31 @@ def test_moe_history_anchor_expert_is_disabled_when_moe_side_config_is_off() -> 
     )
 
     assert torch.allclose(out, pred)
+
+
+def test_moe_output_anchor_experts_apply_when_penalty_moe_is_disabled() -> None:
+    pred = torch.zeros(1, 1, 2)
+    residual_anchor_phc = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+
+    out = apply_moe_output_anchor_experts(
+        pred,
+        base_pred_bch=pred,
+        x_bcl=torch.zeros(1, 1, 2),
+        query_start_abs_b=torch.tensor([0]),
+        input_len=0,
+        moe_cfg={
+            "train_residual_anchor_expert": {
+                "enable": True,
+                "period": 2,
+                "alpha": 1.0,
+                "blend_target": "prediction",
+            }
+        },
+        moe_enable=False,
+        train_residual_anchor_phc=residual_anchor_phc,
+    )
+
+    assert torch.allclose(out, torch.tensor([[[1.0, 2.0]]]))
 
 
 def test_moe_history_anchor_expert_applies_anchor_when_enabled() -> None:
