@@ -89,10 +89,6 @@ def normalize_cfg(
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(run_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(run_dir / "knn_shape_bank.pt")
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg.setdefault("eval", {})["skip_test"] = False
     cfg["eval"]["save_predictions"] = False
     cfg["memory"] = {
@@ -104,7 +100,6 @@ def normalize_cfg(
 
     if epochs is not None:
         cfg.setdefault("train", {})["epochs"] = int(epochs)
-        gate_cal = cfg.setdefault("moe", {}).setdefault("pred_side_residual", {}).setdefault("gate_calibrator", {})
         if "epochs" in gate_cal:
             gate_cal["epochs"] = min(int(gate_cal["epochs"]), int(epochs))
     if batch_size is not None:

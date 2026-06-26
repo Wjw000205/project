@@ -107,7 +107,6 @@ def make_weather_config(base_path: Path, out_path: Path) -> Path:
     transfer["corr_align"] = "head"
     transfer.setdefault("resample", {})
     transfer["resample"].update({"enable": True, "target_step_minutes": 15, "method": "linear"})
-    transfer.setdefault("knn_hybrid", {})["enable"] = False
     transfer["save_corr"] = True
     cfg.setdefault("eval", {})["batch_size"] = 64
     write_yaml(out_path, cfg)

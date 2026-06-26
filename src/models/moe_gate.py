@@ -47,6 +47,8 @@ class ClusterwiseMoEGate(nn.Module):
         prob_floor: float = 0.0,
         allow_skip: bool = False,
         skip_init_bias: float = -2.0,
+        skip_competes: bool = False,
+        skip_argmax_noop: bool = False,
     ):
         super().__init__()
         self.K = num_clusters
@@ -58,6 +60,8 @@ class ClusterwiseMoEGate(nn.Module):
         self.logit_clip = float(logit_clip)
         self.allow_skip = bool(allow_skip)
         self.skip_init_bias = float(skip_init_bias)
+        self.skip_competes = bool(skip_competes) and self.allow_skip
+        self.skip_argmax_noop = bool(skip_argmax_noop) and self.skip_competes
         max_floor = (1.0 / max(self.P, 1)) - 1.0e-6
         self.prob_floor = float(max(0.0, min(prob_floor, max_floor)))
         prior_shape = (num_clusters, max(num_penalties, 1))
@@ -196,10 +200,52 @@ class ClusterwiseMoEGate(nn.Module):
             logits = self.logit_clip * torch.tanh(logits / self.logit_clip)
         if self.training and self.noise_std > 0.0:
             logits = logits + torch.randn_like(logits) * self.noise_std
+        if self.allow_skip:
+            W_skip = torch.stack(list(self.W_skip), dim=0)
+            b_skip = torch.stack(list(self.b_skip), dim=0)
+            skip_logits = torch.einsum("bkh,kh->bk", h, W_skip) + b_skip.unsqueeze(0)
+            if self.logit_clip > 0.0:
+                skip_logits = self.logit_clip * torch.tanh(skip_logits / self.logit_clip)
+            if self.training and self.noise_std > 0.0:
+                skip_logits = skip_logits + torch.randn_like(skip_logits) * self.noise_std
+        else:
+            skip_logits = None
+
         temp = max(self.temperature, 1.0e-6)
         probs = torch.softmax(logits / temp, dim=-1)
         if self.prob_floor > 0.0:
             probs = self.prob_floor + (1.0 - self.P * self.prob_floor) * probs
+
+        if self.allow_skip and self.skip_competes:
+            route_logits = torch.cat([skip_logits.unsqueeze(-1), logits], dim=-1)
+            route_probs = torch.softmax(route_logits / temp, dim=-1)
+            skip_prob = route_probs[..., 0]
+            penalty_route_probs = route_probs[..., 1:]
+            if allowed is not None:
+                penalty_route_probs = penalty_route_probs * allowed.unsqueeze(0).to(dtype=penalty_route_probs.dtype)
+            if self.skip_argmax_noop:
+                skip_hard = (route_probs.argmax(dim=-1) == 0).to(dtype=route_probs.dtype)
+                k = min(self.topk, self.P)
+                top_idx = penalty_route_probs.topk(k=k, dim=-1).indices
+                hard = torch.zeros_like(penalty_route_probs)
+                hard.scatter_(-1, top_idx, 1.0)
+                hard = hard * (1.0 - skip_hard.unsqueeze(-1))
+            else:
+                k = min(self.topk, self.P + 1)
+                top_idx = route_probs.topk(k=k, dim=-1).indices
+                hard_route = torch.zeros_like(route_probs)
+                hard_route.scatter_(-1, top_idx, 1.0)
+                skip_hard = hard_route[..., 0]
+                hard = hard_route[..., 1:] * (1.0 - skip_hard.unsqueeze(-1))
+            if allowed is not None:
+                hard = hard * allowed.unsqueeze(0).to(dtype=hard.dtype)
+            if straight_through:
+                mask = hard - penalty_route_probs.detach() + penalty_route_probs
+                skip = skip_hard - skip_prob.detach() + skip_prob
+            else:
+                mask = hard
+                skip = skip_hard
+            return mask, penalty_route_probs, skip, skip_prob
 
         k = min(self.topk, self.P)
         top_idx = probs.topk(k=k, dim=-1).indices  # [B,K,k]
@@ -213,13 +259,6 @@ class ClusterwiseMoEGate(nn.Module):
         else:
             mask = hard
         if self.allow_skip:
-            W_skip = torch.stack(list(self.W_skip), dim=0)
-            b_skip = torch.stack(list(self.b_skip), dim=0)
-            skip_logits = torch.einsum("bkh,kh->bk", h, W_skip) + b_skip.unsqueeze(0)
-            if self.logit_clip > 0.0:
-                skip_logits = self.logit_clip * torch.tanh(skip_logits / self.logit_clip)
-            if self.training and self.noise_std > 0.0:
-                skip_logits = skip_logits + torch.randn_like(skip_logits) * self.noise_std
             skip_prob = torch.sigmoid(skip_logits)
             skip_hard = (skip_prob > 0.5).to(skip_prob.dtype)
             if straight_through:

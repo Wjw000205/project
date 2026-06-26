@@ -139,7 +139,6 @@ def apply_history_anchor_controls(
         "blend_target": str(blend_target),
         "history_scope": "input_window",
     }
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
 
 
 def add_baseline_deltas(

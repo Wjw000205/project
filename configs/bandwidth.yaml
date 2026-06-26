@@ -136,27 +136,3 @@ portrait:
   dpi: 140
   max_points: 2000
   jump_threshold: 0.6
-knn_hybrid:
-  enable: true
-  mode: rolling
-  scope: same_cluster
-  bank_split: history
-  use_for_model_selection: false
-  k: 96
-  alpha: 1.4
-  shape_bins: 24
-  diff_bins: 12
-  pred_shape_bins: 16
-  pred_diff_bins: 8
-  feature_mode: joint
-  template_mode: residual
-  adaptive_alpha: distance
-  confidence_floor: 0.0
-  distance_sharpness: 1.0
-  selection_policy: val_mse_margin
-  selection_min_rel_improvement: 0.0
-  bank_stride: 2
-  distance_weight: inverse
-  anchor_mode: last
-  bank_chunk_size: 8192
-  path: outputs/bandwidth_multi/knn_shape_bank.pt

@@ -19,7 +19,6 @@ def test_pems_batch_tune_config_enables_lazy_windows(tmp_path) -> None:
     assert cfg["window"]["input_len"] == 96
     assert cfg["window"]["pred_len"] == 12
     assert cfg["window"]["lazy"] is True
-    assert cfg["knn_hybrid"]["enable"] is False
 
 
 def test_pems_batch_tune_config_accepts_input_len_override(tmp_path) -> None:
@@ -184,7 +183,7 @@ def test_pems_batch_tune_config_can_finetune_from_backbone_checkpoint(tmp_path) 
     assert cfg["finetune"]["load_gate"] is False
 
 
-def test_pems_batch_tune_config_can_enable_calibration_and_override_lr(tmp_path) -> None:
+def test_pems_batch_tune_config_can_override_lr(tmp_path) -> None:
     cfg = configure(
         {},
         dataset="PEMS07",
@@ -195,11 +194,9 @@ def test_pems_batch_tune_config_can_enable_calibration_and_override_lr(tmp_path)
         epochs=1,
         skip_test=False,
         device="cuda:0",
-        calibration_cfg={"enable": True, "method": "median", "shrink": 1.0, "max_abs": 0.0},
         lr_override=0.0,
     )
 
-    assert cfg["calibration"] == {"enable": True, "method": "median", "shrink": 1.0, "max_abs": 0.0}
     assert cfg["train"]["lr"] == 0.0
 
 

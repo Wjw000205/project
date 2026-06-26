@@ -62,11 +62,9 @@ def expert_variants() -> list[tuple[str, dict[str, Any]]]:
         ),
         (
             "channel_delta_no_extra_gate_ms15",
-            {**CHANNEL_DELTA, **NO_EXTRA_LOSS, "gate_calibrator": {"max_scale": 1.5, "init_scale": 0.3, "scale_reg": 0.0005}},
         ),
         (
             "channel_delta_no_extra_gate_ms25",
-            {**CHANNEL_DELTA, **NO_EXTRA_LOSS, "gate_calibrator": {"max_scale": 2.5, "init_scale": 0.5, "scale_reg": 0.0001}},
         ),
     ]
 
@@ -135,7 +133,7 @@ def main() -> None:
             continue
         patch = json.loads(json.dumps(base_patch))
         residual = patch["moe"]["pred_side_residual"]
-        residual["selection_policy"] = "val_mse_gate_guarded"
+        residual["selection_policy"] = "val_mse_candidate_channel"
         residual["selection_min_rel_improvement"] = 0.0005
         for key in [
             "selection_holdout_fraction",
@@ -147,11 +145,7 @@ def main() -> None:
             "selection_max_segment_abs_degradation",
         ]:
             residual.pop(key, None)
-        residual["gate_calibrator"] = dict(BEST_GATE)
         residual_patch = dict(residual_patch)
-        gate_patch = residual_patch.pop("gate_calibrator", None)
-        if gate_patch is not None:
-            residual["gate_calibrator"].update(dict(gate_patch))
         residual.update(residual_patch)
         run_cand = Candidate("expert_probe", name, patch)
         row, _ = run_candidate(

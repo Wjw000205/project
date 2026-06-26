@@ -84,7 +84,7 @@ class ResidualSettings:
     train_fraction: float = 0.7
     scale_reg: float = 5.0e-4
     alpha_scale: float = 1.1
-    selection_policy: str = "val_mse_gate"
+    selection_policy: str = "val_mse_candidate_channel"
     gate_entropy_weight: float = 0.0
     gate_balance_weight: float = 0.0
     specialization_weight: float = 0.1
@@ -215,12 +215,7 @@ def apply_fixed_etth1_720_protocol(cfg: Dict[str, Any], out_dir: Path, device: O
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = False
 
-    cfg.setdefault("calibration", {})
-    cfg["calibration"]["enable"] = False
 
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
 
     cfg.setdefault("memory", {})
     cfg["memory"]["enable"] = False
@@ -239,9 +234,6 @@ def disable_moe_patch() -> Dict[str, Any]:
                 "enable": False,
                 "selection_policy": "none",
             },
-        },
-        "knn_hybrid": {
-            "enable": False,
         },
     }
 
@@ -290,19 +282,6 @@ def candidate_patch(
                 "specialization_weight": float(settings.specialization_weight),
                 "norm_weight": float(settings.norm_weight),
                 "selection_policy": settings.selection_policy,
-                "gate_calibrator": {
-                    "loss": "mse",
-                    "selection_metric": "mse",
-                    "epochs": 30,
-                    "train_fraction": float(settings.train_fraction),
-                    "hidden_dim": 32,
-                    "batch_size": 256,
-                    "scale_mode": settings.scale_mode,
-                    "max_scale": float(settings.max_scale),
-                    "init_scale": float(settings.init_scale),
-                    "scale_reg": float(settings.scale_reg),
-                    "standardize_features": True,
-                },
             },
         },
         "train": {
@@ -362,7 +341,7 @@ def base_stage1_candidates() -> List[Candidate]:
         train_fraction=0.7,
         scale_reg=5.0e-4,
         alpha_scale=1.1,
-        selection_policy="val_mse_gate",
+        selection_policy="val_mse_candidate_channel",
         train_selection_metric="val_mae",
     )
     val_mse = copy.copy(known)
@@ -397,7 +376,7 @@ def prioritized_stage3_settings() -> List[ResidualSettings]:
         {"scale_reg": 5.0e-5, "init_scale": 0.9},
         {"alpha_scale": 0.8},
         {"alpha_scale": 1.5},
-        {"selection_policy": "val_mse_gate_guarded"},
+        {"selection_policy": "val_mse_candidate_channel"},
         {"selection_policy": "val_mse_scale", "scale_mode": "sigmoid", "max_scale": 1.5, "init_scale": 1.0},
         {"feature_mode": "legacy", "scale_mode": "sigmoid", "max_scale": 1.25, "init_scale": 0.9},
         {"residual_clip": 6.0, "max_scale": 1.5, "init_scale": 0.9},
@@ -501,7 +480,7 @@ def penalty_sweep_settings() -> List[ResidualSettings]:
         init_scale=0.5,
         alpha_scale=0.5,
         scale_reg=5.0e-4,
-        selection_policy="val_mse_gate_guarded",
+        selection_policy="val_mse_candidate_channel",
     )
     variants = [
         {"max_scale": 0.16, "init_scale": 0.3, "alpha_scale": 0.18},
@@ -509,7 +488,7 @@ def penalty_sweep_settings() -> List[ResidualSettings]:
         {"max_scale": 0.25, "init_scale": 0.4, "alpha_scale": 0.3},
         {"max_scale": 0.3, "init_scale": 0.45, "alpha_scale": 0.35},
         {},
-        {"max_scale": 1.0, "init_scale": 0.8, "alpha_scale": 0.8, "selection_policy": "val_mse_gate"},
+        {"max_scale": 1.0, "init_scale": 0.8, "alpha_scale": 0.8, "selection_policy": "val_mse_candidate_channel"},
         {"feature_mode": "legacy", "max_scale": 0.5, "init_scale": 0.5, "alpha_scale": 0.5},
         {"scale_mode": "sigmoid", "max_scale": 0.5, "init_scale": 0.5, "selection_policy": "val_mse_scale"},
         {"scale_mode": "signed_tanh", "max_scale": 1.5, "init_scale": 0.9, "alpha_scale": 1.1},
@@ -756,12 +735,10 @@ def read_candidate_metrics(candidate: Candidate, cfg_path: Path, run_dir: Path, 
     selected = summary.get("selected") or {}
     residual = summary.get("moe_residual") or {}
     residual_selection = summary.get("moe_residual_selection") or {}
-    gate_cal = summary.get("moe_residual_gate_calibrator") or {}
     windowing = summary.get("windowing") or {}
     cfg = load_yaml(str(cfg_path))
     moe = cfg.get("moe", {}) or {}
     pred = moe.get("pred_side_residual", {}) or {}
-    gate = pred.get("gate_calibrator", {}) or {}
 
     row.update(
         {
@@ -1157,7 +1134,6 @@ def main() -> None:
             "normalize_train_only": True,
             "cluster_train_only": True,
             "model": "dlinear",
-            "knn_hybrid_enable": False,
         },
         "epochs_override": args.epochs,
         "device_override": args.device,

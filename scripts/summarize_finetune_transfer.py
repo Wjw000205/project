@@ -39,8 +39,6 @@ def main() -> None:
         "zero_shot_route_uses_train_only",
         "normalize_train_only",
         "cluster_train_only",
-        "calibration_enable",
-        "knn_hybrid_enable",
         "resample_enable",
         "resample_method",
     ]

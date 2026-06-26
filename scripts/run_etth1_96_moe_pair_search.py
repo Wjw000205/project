@@ -125,14 +125,9 @@ def fixed_h96_protocol(cfg: Dict[str, Any], out_dir: Path, device: Optional[str]
     cfg["portrait"]["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
 
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
 
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = False
-    cfg.setdefault("calibration", {})
-    cfg["calibration"]["enable"] = False
     cfg.setdefault("memory", {})
     cfg["memory"]["enable"] = False
     cfg["memory"]["save_checkpoint"] = False
@@ -158,7 +153,7 @@ def moe_patch(
     penalties: Sequence[str] = ("trend",),
     lambda_scale: float = 0.35,
     residual_enable: bool = True,
-    selection_policy: str = "val_mse_gate_guarded",
+    selection_policy: str = "val_mse_candidate_channel",
     min_rel: float = 0.0,
     min_abs: float = 0.0,
     alpha_scale: float = 0.3,
@@ -188,19 +183,6 @@ def moe_patch(
         "selection_policy": selection_policy,
         "selection_min_abs_improvement": float(min_abs),
         "selection_min_rel_improvement": float(min_rel),
-        "gate_calibrator": {
-            "loss": "mse",
-            "selection_metric": "mse",
-            "epochs": 30,
-            "train_fraction": float(train_fraction),
-            "hidden_dim": 32,
-            "batch_size": 256,
-            "max_scale": float(max_scale),
-            "init_scale": float(init_scale),
-            "scale_reg": float(scale_reg),
-            "scale_mode": scale_mode,
-            "standardize_features": True,
-        },
     }
     if selection_scale_max is not None:
         pred_side["selection_scale_min"] = 0.0
@@ -439,10 +421,8 @@ def row_from_summary(name: str, config_path: Path, off_mse: float, off_mae: floa
     selected = summary.get("selected") or {}
     residual = summary.get("moe_residual") or {}
     selection = summary.get("moe_residual_selection") or {}
-    gate = summary.get("moe_residual_gate_calibrator") or {}
     cfg = load_yaml(config_path)
     pred = ((cfg.get("moe") or {}).get("pred_side_residual") or {})
-    gate_cfg = pred.get("gate_calibrator") or {}
     test_mse = safe_float(test.get("avg_mse"))
     test_mae = safe_float(test.get("avg_mae"))
     per_channel_mse, per_channel_mae = metrics_by_channel(run_dir)

@@ -71,7 +71,6 @@ def localize(cfg: dict[str, Any], *, out_dir: Path, name: str, device: str) -> d
     cfg["exp"]["device"] = device
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["path"] = str(out_dir / "cluster_memory.pt")
     cfg.setdefault("memory", {})["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
     cfg.setdefault("eval", {})["skip_test"] = False
@@ -118,7 +117,6 @@ def base_common(
     cfg.setdefault("early_stop", {}).update({"patience": 4, "min_delta": 1.0e-6})
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
     return cfg
 
 
@@ -141,7 +139,6 @@ def make_backbone_cfg(base: dict[str, Any], args: argparse.Namespace, out_dir: P
         "path": str(out_dir / "cluster_memory.pt"),
         "checkpoint_path": str(out_dir / "best_checkpoint.pt"),
     }
-    cfg["calibration"] = {"enable": False}
     return cfg
 
 
@@ -223,11 +220,6 @@ def make_moe_cfg(base: dict[str, Any], args: argparse.Namespace, out_dir: Path, 
     cfg["train"]["selection_metric"] = "val_mse"
     cfg.setdefault("early_stop", {}).update(
         {"patience": int(args.moe_patience), "min_delta": float(args.moe_min_delta)}
-    )
-    cfg["calibration"] = (
-        {"enable": False}
-        if args.calibration == ""
-        else {"enable": True, "method": args.calibration, "shrink": float(args.calibration_shrink), "max_abs": 0.0}
     )
     cfg["memory"] = {
         "enable": False,
@@ -323,8 +315,6 @@ def main() -> None:
     ap.add_argument("--resid-max", type=float, default=0.8)
     ap.add_argument("--resid-steps", type=int, default=33)
     ap.add_argument("--segments", type=int, default=4)
-    ap.add_argument("--calibration", choices=["", "median", "mean"], default="")
-    ap.add_argument("--calibration-shrink", type=float, default=1.0)
     ap.add_argument("--moe-epochs", type=int, default=1)
     ap.add_argument("--moe-lr", type=float, default=0.0)
     ap.add_argument("--moe-mse-weight", type=float, default=0.5)
@@ -387,8 +377,6 @@ def main() -> None:
     backbone_metrics = {"test_mse": float(backbone_row["test_mse"]), "test_mae": float(backbone_row["test_mae"])}
 
     moe_variant = f"p288_h{args.hidden_dim}_stat{int(args.stat_max*1000):03d}_resid{int(args.resid_max*1000):03d}_seg{args.segments}"
-    if args.calibration:
-        moe_variant += f"_cal{args.calibration}_s{int(args.calibration_shrink*1000):03d}"
     if args.pred_residual:
         lr_tag = f"{float(args.moe_lr):.0e}".replace("+", "").replace("-", "m").replace(".", "p")
         moe_variant += (

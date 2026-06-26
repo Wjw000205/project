@@ -564,7 +564,7 @@ def configure(
                 "enable": True,
                 "corrector_hidden": max(16, int(cand.hidden_dim // 4)),
                 "alpha_scale": float(cand.residual_alpha_scale),
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "feature_mode": cand.residual_feature_mode,
                 "residual_clip": 4.0,
                 "specialization_weight": 0.05,
@@ -613,11 +613,6 @@ def configure(
     cfg["eval"] = {"skip_test": bool(skip_test)}
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg["knn_hybrid"] = copy.deepcopy(cfg.get("knn_hybrid", {}))
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg["calibration"] = {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,

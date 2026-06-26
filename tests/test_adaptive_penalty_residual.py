@@ -7,7 +7,91 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.models.moe_gate import ClusterwiseMoEGate
 from src.models.residual_moe import ClusterwisePredResidualMoE
+
+
+def test_cluster_gate_can_route_noop_as_competing_class() -> None:
+    gate = ClusterwiseMoEGate(
+        num_clusters=1,
+        feat_dim=3,
+        num_penalties=2,
+        hidden_dim=4,
+        topk=1,
+        allow_skip=True,
+        skip_competes=True,
+    )
+    with torch.no_grad():
+        gate.W1[0].zero_()
+        gate.b1[0].zero_()
+        gate.W2[0].zero_()
+        gate.W_skip[0].zero_()
+
+        gate.b2[0].copy_(torch.tensor([0.0, 0.0]))
+        gate.b_skip[0].fill_(8.0)
+        mask, probs, skip, skip_prob = gate(torch.zeros(2, 1, 3), straight_through=False)
+        assert torch.allclose(mask, torch.zeros_like(mask))
+        assert torch.allclose(skip, torch.ones_like(skip))
+        assert torch.all(skip_prob > 0.99)
+        assert torch.allclose(skip_prob + probs.sum(dim=-1), torch.ones(2, 1), atol=1.0e-6)
+
+        gate.b2[0].copy_(torch.tensor([8.0, -8.0]))
+        gate.b_skip[0].fill_(-8.0)
+        mask, _, skip, skip_prob = gate(torch.zeros(2, 1, 3), straight_through=False)
+        assert torch.allclose(mask[..., 0], torch.ones(2, 1))
+        assert torch.allclose(mask[..., 1], torch.zeros(2, 1))
+        assert torch.allclose(skip, torch.zeros_like(skip))
+        assert torch.all(skip_prob < 1.0e-6)
+
+
+def test_cluster_gate_argmax_noop_keeps_skip_from_topk_overriding_best_penalty() -> None:
+    gate = ClusterwiseMoEGate(
+        num_clusters=1,
+        feat_dim=3,
+        num_penalties=2,
+        hidden_dim=4,
+        topk=2,
+        allow_skip=True,
+        skip_competes=True,
+        skip_argmax_noop=True,
+    )
+    with torch.no_grad():
+        gate.W1[0].zero_()
+        gate.b1[0].zero_()
+        gate.W2[0].zero_()
+        gate.W_skip[0].zero_()
+        gate.b2[0].copy_(torch.tensor([6.0, 0.0]))
+        gate.b_skip[0].fill_(4.0)
+
+    mask, _, skip, _ = gate(torch.zeros(2, 1, 3), straight_through=False)
+
+    assert torch.allclose(skip, torch.zeros_like(skip))
+    assert torch.allclose(mask[..., 0], torch.ones(2, 1))
+    assert torch.allclose(mask[..., 1], torch.ones(2, 1))
+
+
+def test_cluster_gate_default_skip_competes_topk_behavior_is_unchanged() -> None:
+    gate = ClusterwiseMoEGate(
+        num_clusters=1,
+        feat_dim=3,
+        num_penalties=2,
+        hidden_dim=4,
+        topk=2,
+        allow_skip=True,
+        skip_competes=True,
+    )
+    with torch.no_grad():
+        gate.W1[0].zero_()
+        gate.b1[0].zero_()
+        gate.W2[0].zero_()
+        gate.W_skip[0].zero_()
+        gate.b2[0].copy_(torch.tensor([6.0, 0.0]))
+        gate.b_skip[0].fill_(4.0)
+
+    mask, _, skip, _ = gate(torch.zeros(2, 1, 3), straight_through=False)
+
+    assert torch.allclose(skip, torch.ones_like(skip))
+    assert torch.allclose(mask, torch.zeros_like(mask))
 
 
 def test_adaptive_penalty_selector_is_cluster_specific() -> None:
@@ -101,6 +185,40 @@ def test_channel_penalty_mask_blocks_disallowed_channel_penalties() -> None:
     assert out["route_bcp"][:, 1, 0].abs().max().item() == 0.0
     assert out["effective_route_bcp"][:, 0, 1].abs().max().item() == 0.0
     assert out["effective_route_bcp"][:, 1, 0].abs().max().item() == 0.0
+
+
+def test_empty_channel_penalty_mask_is_bitwise_identical_to_unset_mask() -> None:
+    torch.manual_seed(18)
+    model = ClusterwisePredResidualMoE(
+        num_clusters=2,
+        num_penalties=3,
+        input_len=6,
+        pred_len=3,
+        hidden_dim=4,
+        init_alpha=1.0,
+        alpha_scale=1.0,
+        intervention_enable=False,
+        penalty_selector_enable=False,
+        fusion_gate_enable=False,
+    )
+
+    x = torch.randn(2, 3, 6)
+    y_base = torch.randn(2, 3, 3)
+    cluster_id = torch.tensor([0, 1, 0], dtype=torch.long)
+    route = torch.rand(2, 2, 3)
+
+    expected = model(x, y_base, cluster_id, route)
+
+    for empty_mask in (torch.empty(0), torch.empty(0, 3), torch.empty(3, 0)):
+        model.set_channel_penalty_allowed_mask(empty_mask)
+        actual = model(x, y_base, cluster_id, route)
+        for key, expected_value in expected.items():
+            assert torch.equal(actual[key], expected_value), key
+
+    model.set_channel_penalty_allowed_mask(None)
+    actual = model(x, y_base, cluster_id, route)
+    for key, expected_value in expected.items():
+        assert torch.equal(actual[key], expected_value), key
 
 
 def test_channel_expert_adapter_overrides_only_marked_channels() -> None:

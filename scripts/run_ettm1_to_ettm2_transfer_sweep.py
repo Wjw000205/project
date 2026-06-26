@@ -224,7 +224,6 @@ def patch_cfg(base: dict[str, Any], variant: dict[str, Any], out_dir: Path) -> d
         if key in variant:
             transfer[key] = variant[key]
     transfer["save_corr"] = True
-    transfer.setdefault("knn_hybrid", {})["enable"] = False
     transfer.setdefault("resample", {})["enable"] = False
     cfg["normalize"]["train_only"] = True
     return cfg

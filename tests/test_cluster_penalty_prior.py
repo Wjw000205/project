@@ -8,6 +8,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.moe_gate import ClusterwiseMoEGate
+from src.train import (
+    build_named_penalty_mask,
+    split_cluster_penalty_prior_allowed_mask_by_stage,
+)
 
 
 def test_penalty_allowed_mask_blocks_disallowed_penalties() -> None:
@@ -31,6 +35,38 @@ def test_penalty_allowed_mask_blocks_disallowed_penalties() -> None:
     assert torch.all(mask[:, 1, 0] == 0)
     assert torch.all(mask[:, 1, 2] == 0)
     assert torch.all(mask[:, 1, 1] == 1)
+
+
+def test_named_penalty_mask_can_preserve_empty_cluster_when_requested() -> None:
+    mask = build_named_penalty_mask(
+        {"0": ["jump"], "1": []},
+        ["jump", "delta"],
+        K=2,
+        device=torch.device("cpu"),
+        allow_empty_clusters=True,
+    )
+
+    assert torch.equal(mask, torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+
+
+def test_cluster_penalty_prior_stage_defaults_to_training_and_eval() -> None:
+    mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    train_mask, late_mask, stage = split_cluster_penalty_prior_allowed_mask_by_stage(mask, None)
+
+    assert stage == "train_and_eval"
+    assert train_mask is mask
+    assert late_mask is None
+
+
+def test_cluster_penalty_prior_stage_can_defer_mask_until_final_eval() -> None:
+    mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    train_mask, late_mask, stage = split_cluster_penalty_prior_allowed_mask_by_stage(mask, "late-eval")
+
+    assert stage == "eval_only"
+    assert train_mask is None
+    assert late_mask is mask
 
 
 if __name__ == "__main__":

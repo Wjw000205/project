@@ -46,10 +46,6 @@ def ensure_run_paths(cfg: Dict[str, Any], out_dir: Path) -> None:
     cfg.setdefault("portrait", {})
     cfg["portrait"]["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("calibration", {})
-    cfg["calibration"]["enable"] = False
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
     cfg.setdefault("memory", {})
     cfg["memory"]["path"] = str(out_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
@@ -78,10 +74,9 @@ def apply_residual_defaults(
     if residual_selection_policy is not None:
         pred_cfg["selection_policy"] = residual_selection_policy if enabled else "none"
     else:
-        pred_cfg.setdefault("selection_policy", "val_mse_gate" if enabled else "none")
+        pred_cfg.setdefault("selection_policy", "val_mse_candidate_channel" if enabled else "none")
     pred_cfg.setdefault("selection_min_abs_improvement", 0.0)
     pred_cfg.setdefault("selection_min_rel_improvement", 0.0)
-    gate_cfg = pred_cfg.setdefault("gate_calibrator", {})
     gate_cfg.setdefault("loss", "mse")
     gate_cfg.setdefault("selection_metric", "mse")
     gate_cfg.setdefault("epochs", 30)

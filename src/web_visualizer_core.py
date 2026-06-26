@@ -470,8 +470,6 @@ def materialize_training_config(
     cfg["corr"]["save_path"] = (run_dir / "corr.npy").as_posix()
     cfg.setdefault("portrait", {})
     cfg["portrait"]["out_dir"] = (run_dir / "cluster_portraits").as_posix()
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["path"] = (run_dir / "knn_shape_bank.pt").as_posix()
     cfg.setdefault("memory", {})
     cfg["memory"]["path"] = (run_dir / "cluster_memory.pt").as_posix()
     cfg["memory"]["checkpoint_path"] = (run_dir / "best_checkpoint.pt").as_posix()

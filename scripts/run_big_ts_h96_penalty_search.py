@@ -323,11 +323,6 @@ def set_run_paths(cfg: dict[str, Any], out_dir: Path) -> None:
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg["plot"] = {"enable": False}
     cfg["portrait"] = {"enable": False, "out_dir": str(out_dir / "cluster_portraits")}
-    cfg["knn_hybrid"] = copy.deepcopy(cfg.get("knn_hybrid", {}))
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg["calibration"] = {"enable": False}
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,
@@ -384,8 +379,7 @@ def configure_candidate(
     res = moe.setdefault("pred_side_residual", {})
     res["enable"] = False
     res["alpha_scale"] = 0.6
-    res["selection_policy"] = "val_mse_gate"
-    res.setdefault("gate_calibrator", {})["batch_size"] = 128
+    res["selection_policy"] = "val_mse_candidate_channel"
 
     train = cfg.setdefault("train", {})
     train["epochs"] = int(epochs)

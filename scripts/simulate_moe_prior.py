@@ -44,8 +44,6 @@ def ensure_local_paths(cfg: Dict[str, Any], out_dir: Path) -> None:
     cfg.setdefault("portrait", {})
     cfg["portrait"]["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
     cfg.setdefault("memory", {})
     cfg["memory"]["path"] = str(out_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")

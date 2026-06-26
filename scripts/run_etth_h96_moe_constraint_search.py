@@ -82,7 +82,7 @@ class Candidate:
     alpha_scale: float
     feature_mode: str = "legacy"
     residual_clip: float = 0.0
-    selection_policy: str = "val_mse_gate"
+    selection_policy: str = "val_mse_candidate_channel"
     selection_min_rel_improvement: float = 0.0
     gate_max_scale: float = 1.0
     gate_init_scale: float = 0.6
@@ -210,10 +210,6 @@ def fixed_protocol(cfg: dict[str, Any], *, out_dir: Path, device: str | None, ep
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,
@@ -297,7 +293,6 @@ def configure_moe(cfg: dict[str, Any], cand: Candidate, *, lambda_value: float) 
             "diagnostics": {"enable": True},
         }
     )
-    gate = residual.setdefault("gate_calibrator", {})
     gate.update(
         {
             "loss": "mse",
@@ -417,7 +412,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.01,
                 "alpha_scale": 1.4,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "gate_max_scale": 1.25,
                 "gate_init_scale": 0.8,
                 "gate_init_bias_enable": True,
@@ -432,7 +427,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.02,
                 "alpha_scale": 1.8,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "gate_max_scale": 1.5,
                 "gate_init_scale": 1.0,
                 "gate_init_bias_enable": True,
@@ -461,7 +456,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.05,
                 "alpha_scale": 2.2,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "gate_max_scale": 1.75,
                 "gate_init_scale": 1.2,
                 "gate_init_bias_enable": True,
@@ -504,7 +499,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.02,
                 "alpha_scale": 1.6,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 1.25,
                 "gate_init_scale": 0.8,
@@ -516,7 +511,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.02,
                 "alpha_scale": 1.8,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 1.5,
                 "gate_init_scale": 1.0,
@@ -548,7 +543,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.0,
                 "alpha_scale": 1.4,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 1.5,
                 "gate_init_scale": 1.0,
@@ -564,7 +559,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.005,
                 "alpha_scale": 1.8,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 1.75,
                 "gate_init_scale": 1.0,
@@ -580,7 +575,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.01,
                 "alpha_scale": 2.2,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 2.0,
                 "gate_init_scale": 1.2,
@@ -616,7 +611,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.005,
                 "alpha_scale": 0.8,
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.001,
                 "gate_max_scale": 0.5,
                 "gate_init_scale": 0.4,
@@ -630,7 +625,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.0,
                 "alpha_scale": 0.8,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 0.5,
                 "gate_init_scale": 0.4,
@@ -641,7 +636,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.001,
                 "alpha_scale": 0.5,
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.001,
                 "gate_max_scale": 0.25,
                 "gate_init_scale": 0.25,
@@ -652,7 +647,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.002,
                 "alpha_scale": 1.1,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 1.0,
                 "gate_init_scale": 0.6,
@@ -664,7 +659,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.003,
                 "alpha_scale": 0.8,
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0005,
                 "gate_max_scale": 0.5,
                 "gate_init_scale": 0.4,
@@ -675,7 +670,7 @@ def candidate_grid(dataset: str, base_penalties: tuple[str, ...], budget: str) -
             {
                 "lambda_init": 0.005,
                 "alpha_scale": 1.0,
-                "selection_policy": "val_mse_gate",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0,
                 "gate_max_scale": 0.75,
                 "gate_init_scale": 0.6,

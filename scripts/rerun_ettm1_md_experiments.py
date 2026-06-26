@@ -49,10 +49,6 @@ def patch_paths(cfg: dict[str, Any], out_dir: Path, device: str | None) -> dict[
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
     cfg["portrait"]["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
-    cfg.setdefault("calibration", {})["enable"] = False
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,

@@ -114,6 +114,161 @@ def load_cluster_memory(path: str, device: torch.device) -> Dict[str, object]:
     return payload
 
 
+def cluster_count_targets_from_source(
+    source_cluster_id_c: torch.Tensor,
+    num_clusters: int,
+    num_target_channels: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    source_id = source_cluster_id_c.detach().to(torch.long).view(-1)
+    K = int(num_clusters)
+    C = int(num_target_channels)
+    if K <= 0:
+        raise ValueError("num_clusters must be positive.")
+    if C < 0:
+        raise ValueError("num_target_channels must be non-negative.")
+    if source_id.numel() == 0:
+        raise ValueError("source_cluster_id_c must not be empty.")
+    if int(source_id.min().item()) < 0 or int(source_id.max().item()) >= K:
+        raise ValueError("source_cluster_id_c contains ids outside [0, num_clusters).")
+
+    raw_counts = torch.bincount(source_id.cpu(), minlength=K)[:K].to(torch.long)
+    if int(raw_counts.sum().item()) == C:
+        return raw_counts.to(device=device or source_cluster_id_c.device)
+    active = [k for k, v in enumerate(raw_counts.tolist()) if int(v) > 0]
+    if not active:
+        raise ValueError("source_cluster_id_c has no active clusters.")
+
+    total = float(raw_counts.sum().item())
+    scaled = [float(raw_counts[k].item()) / total * float(C) for k in range(K)]
+    target = [int(torch.floor(torch.tensor(v)).item()) for v in scaled]
+    min_allowed = [0 for _ in range(K)]
+    if C >= len(active):
+        for k in active:
+            min_allowed[k] = 1
+            if target[k] == 0:
+                target[k] = 1
+
+    while sum(target) < C:
+        candidates = active if active else list(range(K))
+        k_best = max(candidates, key=lambda k: (scaled[k] - target[k], raw_counts[k].item(), -k))
+        target[k_best] += 1
+    while sum(target) > C:
+        candidates = [k for k in active if target[k] > min_allowed[k]]
+        if not candidates:
+            candidates = [k for k in range(K) if target[k] > 0]
+        k_best = min(candidates, key=lambda k: (scaled[k] - target[k], raw_counts[k].item(), k))
+        target[k_best] -= 1
+
+    return torch.tensor(target, dtype=torch.long, device=device or source_cluster_id_c.device)
+
+
+def _state_space_size(counts_k: torch.Tensor) -> int:
+    size = 1
+    for value in counts_k.detach().cpu().tolist():
+        size *= int(value) + 1
+    return int(size)
+
+
+def _exact_count_balanced_assignment(
+    corr_ck: torch.Tensor,
+    desired_counts_k: torch.Tensor,
+    max_states: int,
+) -> Optional[torch.Tensor]:
+    C, K = corr_ck.shape
+    if _state_space_size(desired_counts_k) > int(max_states):
+        return None
+    desired = tuple(int(v) for v in desired_counts_k.detach().cpu().tolist())
+    values = corr_ck.detach().cpu()
+    zero = tuple(0 for _ in range(K))
+    states: Dict[Tuple[int, ...], Tuple[float, List[int]]] = {zero: (0.0, [])}
+    for c in range(C):
+        next_states: Dict[Tuple[int, ...], Tuple[float, List[int]]] = {}
+        for counts, (score, route) in states.items():
+            for k in range(K):
+                if counts[k] >= desired[k]:
+                    continue
+                new_counts = list(counts)
+                new_counts[k] += 1
+                new_counts_t = tuple(new_counts)
+                new_score = score + float(values[c, k].item())
+                old = next_states.get(new_counts_t)
+                if old is None or new_score > old[0]:
+                    next_states[new_counts_t] = (new_score, route + [k])
+        states = next_states
+        if not states:
+            return None
+    best = states.get(desired)
+    if best is None:
+        return None
+    return torch.tensor(best[1], dtype=torch.long, device=corr_ck.device)
+
+
+def _greedy_count_balanced_assignment(
+    corr_ck: torch.Tensor,
+    desired_counts_k: torch.Tensor,
+) -> torch.Tensor:
+    C, K = corr_ck.shape
+    route = torch.argmax(corr_ck, dim=1).to(torch.long).clone()
+    desired = desired_counts_k.to(device=corr_ck.device, dtype=torch.long)
+    counts = torch.bincount(route, minlength=K)[:K].to(torch.long)
+    max_moves = max(1, C * K)
+    for _ in range(max_moves):
+        over = counts > desired
+        under = counts < desired
+        if not bool(over.any().item()) and not bool(under.any().item()):
+            break
+        best_item = None
+        for c in range(C):
+            old_k = int(route[c].item())
+            if not bool(over[old_k].item()):
+                continue
+            for new_k in range(K):
+                if not bool(under[new_k].item()):
+                    continue
+                loss = float((corr_ck[c, old_k] - corr_ck[c, new_k]).item())
+                key = (loss, c, old_k, new_k)
+                if best_item is None or key < best_item[0]:
+                    best_item = (key, c, old_k, new_k)
+        if best_item is None:
+            break
+        _, c, old_k, new_k = best_item
+        route[c] = int(new_k)
+        counts[old_k] -= 1
+        counts[new_k] += 1
+    return route
+
+
+def balance_cluster_assignment_by_source_counts(
+    corr_ck: torch.Tensor,
+    source_cluster_id_c: torch.Tensor,
+    max_exact_states: int = 200000,
+) -> torch.Tensor:
+    """
+    Assign each target channel to a source cluster while preserving the source
+    cluster-size prior as a capacity constraint.
+    """
+    if corr_ck.dim() != 2:
+        raise ValueError("corr_ck must be [C, K].")
+    C, K = corr_ck.shape
+    if C == 0:
+        return torch.empty((0,), dtype=torch.long, device=corr_ck.device)
+    desired = cluster_count_targets_from_source(
+        source_cluster_id_c,
+        num_clusters=K,
+        num_target_channels=C,
+        device=corr_ck.device,
+    )
+    argmax_route = torch.argmax(corr_ck, dim=1).to(torch.long)
+    argmax_counts = torch.bincount(argmax_route, minlength=K)[:K].to(device=corr_ck.device)
+    if torch.equal(argmax_counts.to(torch.long), desired.to(torch.long)):
+        return argmax_route
+    exact = _exact_count_balanced_assignment(corr_ck, desired, max_states=max_exact_states)
+    if exact is not None:
+        return exact
+    return _greedy_count_balanced_assignment(corr_ck, desired)
+
+
 def save_cluster_checkpoint(
     path: str,
     model_state: Dict[str, torch.Tensor],

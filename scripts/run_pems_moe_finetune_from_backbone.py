@@ -146,7 +146,6 @@ def localize(cfg: dict[str, Any], *, out_dir: Path, name: str, device: str) -> d
     cfg["exp"]["device"] = device
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["path"] = str(out_dir / "cluster_memory.pt")
     cfg.setdefault("memory", {})["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
     cfg.setdefault("eval", {})["skip_test"] = False
@@ -168,7 +167,6 @@ def make_cfg(base: dict[str, Any], args: argparse.Namespace, out_dir: Path, chec
     cfg.setdefault("normalize", {})["global_zscore"] = True
     cfg["normalize"]["train_only"] = True
     cfg.setdefault("cluster", {})["train_only"] = True
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
 
     penalties = list(cfg.get("penalties", {}).get("enabled", ["amp_under", "delta", "diff_amp", "direction"]))
     cfg.setdefault("penalties", {})["enabled"] = penalties
@@ -252,11 +250,6 @@ def make_cfg(base: dict[str, Any], args: argparse.Namespace, out_dir: Path, chec
         {"name": "plateau", "factor": 0.5, "patience": 2, "min_lr": 1.0e-6}
     )
     cfg.setdefault("early_stop", {}).update({"patience": int(args.moe_patience), "min_delta": 1.0e-6})
-    cfg["calibration"] = (
-        {"enable": False}
-        if args.calibration == ""
-        else {"enable": True, "method": args.calibration, "shrink": float(args.calibration_shrink), "max_abs": 0.0}
-    )
     cfg["memory"] = {
         "enable": False,
         "save_checkpoint": False,
@@ -292,8 +285,6 @@ def main() -> None:
     ap.add_argument("--resid-max", type=float, default=0.8)
     ap.add_argument("--resid-steps", type=int, default=33)
     ap.add_argument("--segments", type=int, default=4)
-    ap.add_argument("--calibration", choices=["", "median", "mean"], default="")
-    ap.add_argument("--calibration-shrink", type=float, default=1.0)
     ap.add_argument("--moe-epochs", type=int, default=8)
     ap.add_argument("--moe-lr", type=float, default=3.0e-4)
     ap.add_argument("--moe-mse-weight", type=float, default=1.0)
@@ -350,8 +341,6 @@ def main() -> None:
         f"_ep{int(args.moe_epochs)}_lr{lr_tag}"
         f"_{args.pred_selection_policy}"
     )
-    if args.calibration:
-        variant += f"_cal{args.calibration}_s{int(args.calibration_shrink * 1000):03d}"
     out_dir = args.out_root / "runs" / variant
     cfg_out = args.out_root / "configs" / f"{variant}.yaml"
     write_yaml(cfg_out, make_cfg(base, args, out_dir, checkpoint, variant))

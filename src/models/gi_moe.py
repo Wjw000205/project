@@ -42,7 +42,7 @@ v2: Hidden-Block form
 
 ==========================================================================
 Constraints (both versions):
-  - No cluster, no dynamic prototype, no KNN, no neuron-mask gradient hook.
+  - No cluster, no dynamic prototype, no neuron-mask gradient hook.
   - h: [B, C, hidden_dim]; r_p / g_p / y_final: [B, C, H].
   - g_p / α_p must be detached in penalty path.
   - y_final must be detached in penalty path.

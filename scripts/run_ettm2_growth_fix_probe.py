@@ -41,9 +41,6 @@ def set_paths(cfg: dict[str, Any], out_dir: Path, name: str) -> None:
     cfg["memory"]["save_checkpoint"] = False
     cfg["memory"]["path"] = str(out_dir / "cluster_memory.pt")
     cfg["memory"]["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
 
 
 def deep_update(dst: dict[str, Any], src: dict[str, Any]) -> None:
@@ -158,7 +155,7 @@ def candidates() -> list[dict[str, Any]]:
             "pred_residual": {
                 "alpha_scale": 0.8,
                 "residual_clip": 2.0,
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0005,
             },
         },
@@ -171,7 +168,7 @@ def candidates() -> list[dict[str, Any]]:
             "pred_residual": {
                 "alpha_scale": 0.8,
                 "residual_clip": 2.0,
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0005,
             },
         },
@@ -184,7 +181,7 @@ def candidates() -> list[dict[str, Any]]:
             "pred_residual": {
                 "alpha_scale": 0.8,
                 "residual_clip": 2.0,
-                "selection_policy": "val_mse_gate_guarded",
+                "selection_policy": "val_mse_candidate_channel",
                 "selection_min_rel_improvement": 0.0005,
             },
         },
@@ -612,7 +609,7 @@ def candidates() -> list[dict[str, Any]]:
                 seasonal_anchor_period=96,
                 seasonal_anchor_num_periods=2,
                 seasonal_anchor_scale=0.10,
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.0005,
             ),
         },
@@ -641,7 +638,7 @@ def candidates() -> list[dict[str, Any]]:
                 seasonal_anchor_period=96,
                 seasonal_anchor_num_periods=2,
                 seasonal_anchor_scale=0.05,
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.0005,
             ),
         },
@@ -670,7 +667,7 @@ def candidates() -> list[dict[str, Any]]:
                 seasonal_anchor_period=96,
                 seasonal_anchor_num_periods=2,
                 seasonal_anchor_scale=0.25,
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.0005,
             ),
         },
@@ -699,7 +696,7 @@ def candidates() -> list[dict[str, Any]]:
                 seasonal_anchor_period=96,
                 seasonal_anchor_num_periods=2,
                 seasonal_anchor_scale=0.50,
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.0005,
             ),
         },
@@ -811,19 +808,6 @@ def candidates() -> list[dict[str, Any]]:
             "pred_residual": residual_overrides_with(
                 residual_clip=0.0,
                 alpha_scale=1.1,
-                gate_calibrator={
-                    "loss": "mse",
-                    "selection_metric": "mse",
-                    "epochs": 30,
-                    "train_fraction": 0.7,
-                    "hidden_dim": 32,
-                    "batch_size": 256,
-                    "max_scale": 1.0,
-                    "init_scale": 0.4,
-                    "scale_reg": 5.0e-4,
-                    "scale_mode": "sigmoid",
-                    "standardize_features": True,
-                },
             ),
         },
         {
@@ -864,14 +848,7 @@ def candidates() -> list[dict[str, Any]]:
             "train": {"batch_size": 32},
             "moe": channel_prior_overrides(topk=2, select_ranks=[1, 2]),
             "pred_residual": residual_overrides_with(
-                gate_calibrator={
-                    "source_split": "train",
-                    "scale_mode": "signed_tanh",
-                    "max_scale": 0.75,
-                    "init_scale": 0.25,
-                    "scale_reg": 0.001,
-                },
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.001,
             ),
         },
@@ -1054,14 +1031,7 @@ def candidates() -> list[dict[str, Any]]:
             "train": {"batch_size": 32},
             "moe": rnn_safe_moe(channel_prior_overrides(topk=2, select_ranks=[1, 2])),
             "pred_residual": residual_overrides_with(
-                gate_calibrator={
-                    "source_split": "train",
-                    "scale_mode": "signed_tanh",
-                    "max_scale": 0.75,
-                    "init_scale": 0.25,
-                    "scale_reg": 0.001,
-                },
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.001,
             ),
         },
@@ -1120,14 +1090,7 @@ def candidates() -> list[dict[str, Any]]:
             "train": {"batch_size": 64},
             "moe": rnn_safe_moe(channel_prior_overrides(topk=2, select_ranks=[1, 2])),
             "pred_residual": residual_overrides_with(
-                gate_calibrator={
-                    "source_split": "train",
-                    "scale_mode": "signed_tanh",
-                    "max_scale": 0.75,
-                    "init_scale": 0.25,
-                    "scale_reg": 0.001,
-                },
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.001,
             ),
         },
@@ -1151,14 +1114,7 @@ def candidates() -> list[dict[str, Any]]:
                 corrector_hidden=64,
                 alpha_scale=0.8,
                 residual_clip=4.0,
-                gate_calibrator={
-                    "source_split": "train",
-                    "scale_mode": "signed_tanh",
-                    "max_scale": 0.75,
-                    "init_scale": 0.25,
-                    "scale_reg": 0.001,
-                },
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.001,
             ),
         },
@@ -1182,14 +1138,7 @@ def candidates() -> list[dict[str, Any]]:
                 corrector_hidden=64,
                 alpha_scale=1.2,
                 residual_clip=4.0,
-                gate_calibrator={
-                    "source_split": "train",
-                    "scale_mode": "signed_tanh",
-                    "max_scale": 0.75,
-                    "init_scale": 0.25,
-                    "scale_reg": 0.001,
-                },
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.001,
             ),
         },
@@ -1209,14 +1158,7 @@ def candidates() -> list[dict[str, Any]]:
             "train": {"batch_size": 64},
             "moe": rnn_safe_moe(channel_prior_overrides(topk=2, select_ranks=[1, 2])),
             "pred_residual": residual_overrides_with(
-                gate_calibrator={
-                    "source_split": "train",
-                    "scale_mode": "signed_tanh",
-                    "max_scale": 0.75,
-                    "init_scale": 0.25,
-                    "scale_reg": 0.001,
-                },
-                selection_policy="val_mse_gate_guarded",
+                selection_policy="val_mse_candidate_channel",
                 selection_min_rel_improvement=0.001,
             ),
         },

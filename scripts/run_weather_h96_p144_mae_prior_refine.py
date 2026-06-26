@@ -85,7 +85,6 @@ def localize_paths(cfg: dict[str, Any], *, out_dir: Path, variant: str, device: 
     cfg["exp"]["device"] = device
     cfg.setdefault("corr", {})["save_path"] = str(out_dir / "corr.npy")
     cfg.setdefault("portrait", {})["out_dir"] = str(out_dir / "cluster_portraits")
-    cfg.setdefault("knn_hybrid", {})["path"] = str(out_dir / "knn_shape_bank.pt")
     cfg.setdefault("memory", {})["path"] = str(out_dir / "cluster_memory.pt")
     cfg.setdefault("memory", {})["checkpoint_path"] = str(out_dir / "best_checkpoint.pt")
     cfg.setdefault("eval", {})["skip_test"] = False

@@ -189,10 +189,6 @@ def make_source_cfg(
     cfg["train"]["epochs"] = int(epochs)
     cfg["train"]["batch_size"] = int(cfg["train"].get("batch_size", 64))
 
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["knn_hybrid"]["path"] = str(out_dir / "knn_shape_bank.pt")
 
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = False
@@ -257,9 +253,6 @@ def make_transfer_cfg(
     cfg["transfer"]["save_corr"] = True
     cfg["transfer"].setdefault("resample", {})
     cfg["transfer"]["resample"]["enable"] = False
-    cfg["transfer"].setdefault("knn_hybrid", {})
-    cfg["transfer"]["knn_hybrid"]["enable"] = False
-    cfg["transfer"]["knn_hybrid"]["use_for_model_selection"] = False
 
     cfg.setdefault("eval", {})
     cfg["eval"]["batch_size"] = int(cfg["eval"].get("batch_size", 64))

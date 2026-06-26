@@ -328,7 +328,6 @@ def build_transfer_config(
                 "target_step_minutes": 15,
                 "method": "linear",
             },
-            "knn_hybrid": {"enable": False},
             "save_corr": True,
         },
         "eval": {"batch_size": batch_size, "split": "test"},

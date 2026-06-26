@@ -92,7 +92,6 @@ def configure_candidate(
     cfg.setdefault("model", {})["predictor"] = "mlp"
     cfg.setdefault("normalize", {})["train_only"] = True
     cfg.setdefault("cluster", {})["train_only"] = True
-    cfg.setdefault("knn_hybrid", {})["enable"] = False
     cfg.setdefault("eval", {})["skip_test"] = False
     cfg.setdefault("plot", {})["enable"] = False
     cfg.setdefault("portrait", {})["enable"] = False
@@ -110,7 +109,7 @@ def configure_candidate(
     moe_cfg["lambda_min"] = {name: 0.0 for name in penalties}
     moe_cfg["lambda_schedule"] = {name: "none" for name in penalties}
     moe_cfg.setdefault("pred_side_residual", {})["enable"] = True
-    moe_cfg["pred_side_residual"].setdefault("selection_policy", "val_mse_gate")
+    moe_cfg["pred_side_residual"].setdefault("selection_policy", "val_mse_candidate_channel")
     return cfg
 
 

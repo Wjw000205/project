@@ -15,6 +15,7 @@ window:
   input_len: 96
   pred_len: 48
   lazy: true
+  past_context: true
 normalize:
   global_zscore: true
   train_only: true
@@ -39,8 +40,9 @@ cluster:
   train_only: true
 model:
   predictor: context_channel_head_mlp
-  hidden_dim: 128
-  dropout: 0.05
+  hidden_dim: 192
+  dropout: 0.0
+  context_channel_head_blocks: 2
 moe:
   topk: 1
   enable: true
@@ -50,10 +52,10 @@ moe:
   - 1
   detach_penalty_grad: false
   lambda_init:
-    amp_under: 0.01
-    delta: 0.01
-    diff_amp: 0.01
-    direction: 0.01
+    amp_under: 0.0
+    delta: 0.0
+    diff_amp: 0.0
+    direction: 0.0
   dynamic_lambda:
     enable: false
     mode: multiscale
@@ -105,10 +107,9 @@ moe:
     enable: false
     corrector_hidden: 16
     alpha_scale: 0.6
-    selection_policy: val_mse_gate
-    gate_calibrator:
-      epochs: 10
-      batch_size: 128
+    selection_policy: val_mse_candidate_channel
+  freeze_backbone: true
+  router_penalty_context_score: high_violation
 penalties:
   enabled:
   - amp_under
@@ -117,14 +118,14 @@ penalties:
   - direction
   jump_threshold: 0.6
 train:
-  epochs: 16
+  epochs: 36
   batch_size: 64
   lr: 0.001
-  mse_weight: 0.8
+  mse_weight: 0.5
   mae_objective:
     enable: true
     kind: l1
-    weight: 0.8
+    weight: 1.5
     warmup_epochs: 3
   selection_metric: val_mae
   weight_decay: 0.0001
@@ -143,37 +144,20 @@ plot:
 portrait:
   enable: false
   out_dir: outputs/PEMS03_H48/cluster_portraits
-knn_hybrid:
-  enable: false
-  mode: rolling
-  scope: same_channel
-  bank_split: history
-  use_for_model_selection: false
-  k: 96
-  alpha: 1.8
-  shape_bins: 24
-  diff_bins: 12
-  pred_shape_bins: 16
-  pred_diff_bins: 8
-  feature_mode: joint
-  template_mode: residual
-  adaptive_alpha: confidence
-  confidence_floor: 0.0
-  distance_sharpness: 1.0
-  selection_policy: val_mae_guarded
-  selection_min_rel_improvement: 0.0
-  selection_max_rel_mse_regression: 0.03
-  bank_stride: 2
-  distance_weight: inverse
-  anchor_mode: last
-  bank_chunk_size: 8192
-  path: outputs/PEMS03_H48/knn_shape_bank.pt
 eval:
   skip_test: false
-calibration:
-  enable: false
 memory:
   enable: false
   save_checkpoint: false
   path: outputs/PEMS03_H48/cluster_memory.pt
   checkpoint_path: outputs/PEMS03_H48/best_checkpoint.pt
+finetune:
+  enable: true
+  checkpoint_path: F:\Python program\MoELoss - 20260401\outputs\pems_depth_rollout\runs\PEMS03_H48_hid192_b2\best_checkpoint.pt
+  strict_window: true
+  strict_model: true
+  cluster_map: index
+  load_model: true
+  load_gate: false
+  load_dynamic_lambda: false
+  load_learnable_lambda: false

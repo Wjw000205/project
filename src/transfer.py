@@ -17,12 +17,13 @@ from .utils.cluster_memory import (
     load_cluster_checkpoint,
     assign_channels_by_corr,
     assign_channels_by_cycle_template,
+    balance_cluster_assignment_by_source_counts,
+    cluster_count_targets_from_source,
 )
 from .models.cluster_predictor import build_cluster_predictor
 from .models.moe_gate import ClusterwiseMoEGate, scatter_mean_bcf_to_bkf
 from .models.residual_moe import ClusterwisePredResidualMoE
 from .train import extract_gate_features, _select_rank_mask
-from .utils.knn_shape import KNNShapeConfig, ShapeKNNHybrid, predict_bank_outputs
 
 
 def _infer_step_minutes(df: pd.DataFrame, date_col: str) -> float:
@@ -90,8 +91,7 @@ def _load_residual_scales(
     device: torch.device,
 ) -> torch.Tensor:
     selection = source_summary.get("moe_residual_selection", {}) or {}
-    calibrator = selection.get("gate_calibrator", {}) or {}
-    source_channels = list(calibrator.get("channel_names") or selection.get("residual_channels") or [])
+    source_channels = list(selection.get("residual_channels") or [])
     scale_values = list(selection.get("scale_values") or [])
     mean_scale = float(selection.get("mean_scale", 1.0) or 1.0)
     scale_by_name = {
@@ -364,7 +364,7 @@ def main():
     print(
         "Transfer audit: "
         f"input_len={input_len}, pred_len={pred_len}, "
-        f"predictor_variant={predictor_variant}, knn_enable={bool(transfer_cfg.get('knn_hybrid', {}).get('enable', False))}"
+        f"predictor_variant={predictor_variant}"
     )
     print(
         "Leakage audit: "
@@ -429,8 +429,87 @@ def main():
             )
             best_tau_ck = None
 
+    cluster_balance_repair_summary = None
+    repair_cfg_raw = transfer_cfg.get("cluster_balance_repair", {})
+    if isinstance(repair_cfg_raw, bool):
+        repair_cfg = {"enable": bool(repair_cfg_raw)}
+    else:
+        repair_cfg = dict(repair_cfg_raw or {})
+    repair_enabled = bool(repair_cfg.get("enable", False))
+    if repair_enabled and fixed_cluster_id_cfg is None:
+        pre_repair_cluster_id_c = cluster_id_c.clone()
+        pre_counts_k = torch.bincount(pre_repair_cluster_id_c, minlength=K)[:K]
+        active_clusters = int((pre_counts_k > 0).sum().item())
+        dominant_frac = float(pre_counts_k.max().item() / max(int(C), 1))
+        min_unique_clusters = int(repair_cfg.get("min_unique_clusters", 0) or 0)
+        max_dominant_frac_cfg = repair_cfg.get("max_dominant_frac", None)
+        has_trigger = min_unique_clusters > 0 or max_dominant_frac_cfg is not None
+        should_repair = not has_trigger
+        if min_unique_clusters > 0 and active_clusters < min_unique_clusters:
+            should_repair = True
+        if max_dominant_frac_cfg is not None and dominant_frac > float(max_dominant_frac_cfg):
+            should_repair = True
+
+        source_cluster_id_c = memory.get("cluster_id_c", None)
+        if should_repair:
+            if source_cluster_id_c is None:
+                raise ValueError("transfer.cluster_balance_repair requires source memory cluster_id_c.")
+            target_counts_k = cluster_count_targets_from_source(
+                source_cluster_id_c,
+                num_clusters=K,
+                num_target_channels=C,
+                device=device,
+            )
+            repaired_cluster_id_c = balance_cluster_assignment_by_source_counts(
+                corr_ck,
+                source_cluster_id_c.to(device=device),
+                max_exact_states=int(repair_cfg.get("max_exact_states", 200000)),
+            )
+            post_counts_k = torch.bincount(repaired_cluster_id_c, minlength=K)[:K]
+            idx_c = torch.arange(C, device=device)
+            pre_score = float(corr_ck[idx_c, pre_repair_cluster_id_c].sum().item())
+            post_score = float(corr_ck[idx_c, repaired_cluster_id_c].sum().item())
+            changed = not torch.equal(pre_repair_cluster_id_c, repaired_cluster_id_c)
+            cluster_id_c = repaired_cluster_id_c
+            cluster_balance_repair_summary = {
+                "enabled": True,
+                "applied": True,
+                "changed": bool(changed),
+                "trigger_active_clusters": active_clusters,
+                "trigger_dominant_frac": dominant_frac,
+                "min_unique_clusters": min_unique_clusters,
+                "max_dominant_frac": max_dominant_frac_cfg,
+                "target_counts": [int(v) for v in target_counts_k.detach().cpu().tolist()],
+                "pre_counts": [int(v) for v in pre_counts_k.detach().cpu().tolist()],
+                "post_counts": [int(v) for v in post_counts_k.detach().cpu().tolist()],
+                "pre_cluster_id": [int(v) for v in pre_repair_cluster_id_c.detach().cpu().tolist()],
+                "post_cluster_id": [int(v) for v in repaired_cluster_id_c.detach().cpu().tolist()],
+                "pre_corr_score": pre_score,
+                "post_corr_score": post_score,
+                "corr_score_delta": post_score - pre_score,
+            }
+            print(
+                "Cluster balance repair: "
+                f"pre_counts={cluster_balance_repair_summary['pre_counts']}, "
+                f"target_counts={cluster_balance_repair_summary['target_counts']}, "
+                f"post_counts={cluster_balance_repair_summary['post_counts']}, "
+                f"changed={changed}"
+            )
+        else:
+            cluster_balance_repair_summary = {
+                "enabled": True,
+                "applied": False,
+                "trigger_active_clusters": active_clusters,
+                "trigger_dominant_frac": dominant_frac,
+                "min_unique_clusters": min_unique_clusters,
+                "max_dominant_frac": max_dominant_frac_cfg,
+                "pre_counts": [int(v) for v in pre_counts_k.detach().cpu().tolist()],
+            }
+
     corr_max_t = corr_ck.max(dim=1).values
+    corr_selected_t = corr_ck[torch.arange(C, device=device), cluster_id_c]
     corr_max = corr_max_t.detach().cpu().numpy()
+    corr_selected = corr_selected_t.detach().cpu().numpy()
 
     corr_threshold = transfer_cfg.get("corr_threshold", None)
     fallback_mode = str(transfer_cfg.get("fallback_mode", "hard")).lower()
@@ -467,51 +546,10 @@ def main():
         eval_label_start, eval_end = t_val, T
     past_context = bool(cfg.get("window", {}).get("past_context", False))
     eval_start = max(0, int(eval_label_start) - L) if past_context else int(eval_label_start)
-    knn_cfg = KNNShapeConfig.from_dict(transfer_cfg.get("knn_hybrid", {})).resolved_for_horizon(H)
-    knn_hybrid = None
-    knn_predict_batch_size = int(cfg.get("eval", {}).get("batch_size", 64))
-    xte = None
-    yte = None
     eval_seg = data_tc[eval_start:eval_end]
     num_eval_windows = int(eval_seg.shape[0] - L - H + 1)
     if num_eval_windows <= 0:
         raise ValueError(f"No {eval_split} windows available for transfer evaluation.")
-    if knn_cfg.enable:
-        xte, yte = make_strict_windows(data_tc, L, H, eval_start, eval_end)
-        num_eval_windows = int(xte.shape[0])
-        if knn_cfg.mode == "rolling" and knn_cfg.bank_split == "history":
-            x_bank, y_bank = make_strict_windows(data_tc, L, H, 0, T)
-        else:
-            bank_end = t_train if knn_cfg.bank_split == "train" else t_val
-            x_bank, y_bank = make_strict_windows(data_tc, L, H, 0, bank_end)
-        if x_bank.shape[0] == 0:
-            raise ValueError("KNN hybrid bank is empty. Increase available history or change knn_hybrid.bank_split.")
-        base_bank_pred = None
-        if knn_cfg.needs_base_bank_prediction():
-            base_bank_pred = predict_bank_outputs(
-                model=model,
-                x_bank_ncl=x_bank,
-                cluster_id_c=cluster_id_c,
-                batch_size=max(knn_predict_batch_size, 64),
-                device=device,
-            )
-        knn_hybrid = ShapeKNNHybrid.fit(
-            x_bank_ncl=x_bank,
-            y_bank_nch=y_bank,
-            cluster_id_c=cluster_id_c,
-            cfg=knn_cfg,
-            base_bank_pred_nch=base_bank_pred,
-            observed_history_tc=data_tc,
-        )
-        info = knn_hybrid.describe()
-        print(
-            "KNN hybrid enabled: "
-            f"mode={info['mode']}, "
-            f"scope={info['scope']}, bank_split={info['bank_split']}, "
-            f"k={info['k']}, alpha={info['alpha']:.3f}, "
-            f"feature_mode={info['feature_mode']}, template_mode={info['template_mode']}, "
-            f"bank_sizes={info['bank_sizes']}"
-        )
     print(
         f"{eval_split.capitalize()} windows: n={num_eval_windows}, "
         f"range=[{eval_start},{eval_end}), label_start={eval_label_start}, "
@@ -522,43 +560,32 @@ def main():
 
     se_c = torch.zeros(C, device=device)
     ae_c = torch.zeros(C, device=device)
-    base_se_c = torch.zeros(C, device=device) if knn_hybrid is not None else None
-    base_ae_c = torch.zeros(C, device=device) if knn_hybrid is not None else None
     denom = 0
     t0 = time.perf_counter()
     with torch.no_grad():
-        if knn_hybrid is not None:
-            dte = WindowTensorDataset(xte, yte)
-            dl_te = DataLoader(dte, batch_size=bs, shuffle=False, num_workers=0)
-            batches = dl_te
-        else:
-            def stream_test_batches():
-                for start in range(0, num_eval_windows, bs):
-                    end = min(start + bs, num_eval_windows)
-                    xs = []
-                    ys = []
-                    for i in range(start, end):
-                        win = eval_seg[i : i + L + H]
-                        xs.append(win[:L].T)
-                        ys.append(win[L:].T)
-                    idx = torch.arange(start, end, device=device, dtype=torch.long)
-                    yield torch.stack(xs, dim=0), torch.stack(ys, dim=0), idx
+        def stream_test_batches():
+            for start in range(0, num_eval_windows, bs):
+                end = min(start + bs, num_eval_windows)
+                xs = []
+                ys = []
+                for i in range(start, end):
+                    win = eval_seg[i : i + L + H]
+                    xs.append(win[:L].T)
+                    ys.append(win[L:].T)
+                idx = torch.arange(start, end, device=device, dtype=torch.long)
+                yield torch.stack(xs, dim=0), torch.stack(ys, dim=0), idx
 
-            batches = stream_test_batches()
-
-        for x, y, idx in batches:
+        for x, y, idx in stream_test_batches():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
             if use_soft_assignment and w_ck is not None and pred_residual is None:
                 yhat = torch.zeros((x.shape[0], C, H), device=device, dtype=x.dtype)
                 for k in range(K):
                     cid_k = torch.full((C,), k, device=device, dtype=torch.long)
                     yhat_k = model(x, cid_k)
                     yhat = yhat + yhat_k * w_ck[:, k].view(1, C, 1)
-                yhat_base = yhat
             else:
-                yhat_base, yhat = _predict_with_optional_residual(
+                _, yhat = _predict_with_optional_residual(
                     model=model,
                     gate=gate,
                     pred_residual=pred_residual,
@@ -567,18 +594,10 @@ def main():
                     meta=meta,
                     residual_scale_c=residual_scale_c,
                 )
-            if knn_hybrid is not None:
-                accumulate_channel_errors(base_se_c, base_ae_c, yhat, y)
-                query_start_abs_b = eval_start + idx
-                yhat = knn_hybrid.hybridize_batch(x, yhat, cluster_id_c, query_start_abs_b=query_start_abs_b)
             accumulate_channel_errors(se_c, ae_c, yhat, y)
             denom += int(x.shape[0] * y.shape[2])
 
     mse_c, mae_c = mse_mae_from_sums(se_c, ae_c, denom)
-    base_mse_c = None
-    base_mae_c = None
-    if knn_hybrid is not None:
-        base_mse_c, base_mae_c = mse_mae_from_sums(base_se_c, base_ae_c, denom)
 
     df = pd.DataFrame({
         "channel": channel_names,
@@ -586,10 +605,8 @@ def main():
         "MSE": mse_c.detach().cpu().numpy(),
         "cluster_id": cluster_id_c.detach().cpu().numpy(),
         "corr_max": corr_max,
+        "corr_selected": corr_selected,
     })
-    if base_mse_c is not None and base_mae_c is not None:
-        df["MAE_base"] = base_mae_c.detach().cpu().numpy()
-        df["MSE_base"] = base_mse_c.detach().cpu().numpy()
     metrics_name = "test_metrics.csv" if eval_split == "test" else "val_metrics.csv"
     df.to_csv(os.path.join(out_dir, metrics_name), index=False)
 
@@ -597,6 +614,7 @@ def main():
         "channel": channel_names,
         "cluster_id": cluster_id_c.detach().cpu().numpy(),
         "corr_max": corr_max,
+        "corr_selected": corr_selected,
     }
     if best_tau_ck is not None:
         tau_best = best_tau_ck[torch.arange(C, device=device), cluster_id_c].detach().cpu().numpy()
@@ -642,18 +660,15 @@ def main():
         "penalty_names": penalty_names,
         "cluster_id": [int(v) for v in cluster_id_c.detach().cpu().tolist()],
         "corr_max": [float(v) for v in corr_max],
+        "corr_selected": [float(v) for v in corr_selected],
+        "corr_mean": float(np.mean(corr_selected)) if len(corr_selected) > 0 else 0.0,
+        "corr_max_mean": float(np.mean(corr_max)) if len(corr_max) > 0 else 0.0,
     }
+    if cluster_balance_repair_summary is not None:
+        summary["cluster_balance_repair"] = cluster_balance_repair_summary
     if fixed_cluster_id_cfg is not None:
         summary["fixed_cluster_id"] = [int(v) for v in fixed_cluster_id_cfg]
         summary["route_selection"] = "fixed_cluster_id"
-    if base_mse_c is not None and base_mae_c is not None:
-        base_avg_mae = float(base_mae_c.mean().item())
-        base_avg_mse = float(base_mse_c.mean().item())
-        summary["base_avg_mae"] = base_avg_mae
-        summary["base_avg_mse"] = base_avg_mse
-        summary["knn_hybrid"] = knn_hybrid.describe()
-        print(f"Transfer {eval_split} base:   avg_MAE={base_avg_mae:.6f}, avg_MSE={base_avg_mse:.6f}")
-        print(f"Transfer {eval_split} hybrid: avg_MAE={avg_mae:.6f}, avg_MSE={avg_mse:.6f}")
     else:
         print(f"Transfer {eval_split}: avg_MAE={avg_mae:.6f}, avg_MSE={avg_mse:.6f}")
 

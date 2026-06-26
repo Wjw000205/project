@@ -173,7 +173,6 @@ def build_aligned_config(
         cfg["window"]["past_context"] = bool(window_cfg.get("past_context", False))
 
     cfg["normalize"] = dict(target_cfg.get("normalize", cfg.get("normalize", {})) or {})
-    cfg.setdefault("transfer", {}).setdefault("knn_hybrid", {})["enable"] = False
     cfg.setdefault("eval", {})["batch_size"] = int(cfg.get("eval", {}).get("batch_size", 512))
     cfg["eval"]["split"] = "test"
 

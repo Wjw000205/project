@@ -7,7 +7,7 @@ import time
 import math
 import sys
 import builtins
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Iterable, List, Tuple, Optional
 import numpy as np
 import torch
 from torch import nn
@@ -63,7 +63,6 @@ from .utils.cluster_memory import (
     load_cluster_memory,
     load_cluster_checkpoint,
 )
-from .utils.knn_shape import KNNShapeConfig, ShapeKNNHybrid, predict_bank_outputs, save_shape_knn_bank
 from .utils.console_progress import PurpleProgressBar
 from .utils.diagnostic_sampling import select_prediction_sample_indices
 
@@ -174,6 +173,17 @@ def _validation_holdout_split_counts(total: int, holdout_fraction: float, min_ho
     if select_n <= 0:
         return total, 0
     return select_n, holdout_n
+
+
+def _normalize_confidence_gate_source_split(source_split: object) -> str:
+    value = str(source_split or "train_holdout").strip().lower()
+    if value in {"train", "training"}:
+        return "train"
+    if value in {"train_holdout", "train-holdout", "holdout"}:
+        return "train_holdout"
+    raise ValueError(
+        "moe.pred_side_residual.confidence_gate.source_split must be train or train_holdout "
+    )
 
 
 def _contiguous_segment_ranges(total: int, segment_count: int) -> List[Tuple[int, int]]:
@@ -305,6 +315,118 @@ def _should_update_swa(epoch: int, start_epoch: int, update_every: int) -> bool:
     return epoch >= start_epoch and ((epoch - start_epoch) % update_every == 0)
 
 
+def _make_cluster_optimizer_param_groups(
+    *,
+    base_params: List[nn.Parameter],
+    gate_params: List[nn.Parameter],
+    pred_residual_params: List[nn.Parameter],
+    dynamic_lambda_params: List[nn.Parameter],
+    learnable_lambda_params: List[nn.Parameter],
+    base_weight_decay: float,
+    moe_weight_decay: Optional[float],
+    pred_residual_weight_decay: Optional[float],
+) -> List[Dict[str, object]]:
+    moe_params: List[nn.Parameter] = []
+    moe_params.extend(gate_params)
+    moe_params.extend(dynamic_lambda_params)
+    moe_params.extend(learnable_lambda_params)
+
+    groups: List[Dict[str, object]] = []
+    if moe_weight_decay is None:
+        common_params: List[nn.Parameter] = []
+        common_params.extend(base_params)
+        common_params.extend(moe_params)
+        if len(common_params) > 0:
+            groups.append({
+                "params": common_params,
+                "weight_decay": float(base_weight_decay),
+            })
+    else:
+        if len(base_params) > 0:
+            groups.append({
+                "params": base_params,
+                "weight_decay": float(base_weight_decay),
+            })
+    if moe_weight_decay is not None and len(moe_params) > 0:
+        groups.append({
+            "params": moe_params,
+            "weight_decay": float(moe_weight_decay),
+        })
+    if len(pred_residual_params) > 0:
+        residual_wd = pred_residual_weight_decay
+        if residual_wd is None:
+            residual_wd = moe_weight_decay if moe_weight_decay is not None else base_weight_decay
+        groups.append({
+            "params": pred_residual_params,
+            "weight_decay": float(residual_wd),
+        })
+    return groups
+
+
+def _load_finetune_pred_residual_state(
+    *,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    checkpoint: Dict[str, object],
+    source_penalty_names: List[str],
+    target_penalty_names: List[str],
+    strict: bool = True,
+) -> bool:
+    if pred_residual is None or "pred_residual_state" not in checkpoint:
+        return False
+    if list(source_penalty_names) != list(target_penalty_names):
+        raise ValueError(
+            "Fine-tune pred_residual loading requires identical penalty_names: "
+            f"source={list(source_penalty_names)}, target={list(target_penalty_names)}"
+        )
+    pred_residual.load_state_dict(checkpoint["pred_residual_state"], strict=bool(strict))
+    return True
+
+
+def _cluster_penalty_mask_to_channel_mask(
+    allowed_mask_kp: Optional[torch.Tensor],
+    cluster_id_c: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if allowed_mask_kp is None or int(allowed_mask_kp.numel()) == 0:
+        return None
+    if int(allowed_mask_kp.ndim) != 2:
+        raise ValueError(f"cluster penalty mask must have shape [K,P], got {tuple(allowed_mask_kp.shape)}")
+    allowed_kp = allowed_mask_kp.detach().to(dtype=torch.bool)
+    cid_c = cluster_id_c.detach().to(device=allowed_kp.device, dtype=torch.long).view(-1)
+    if int(cid_c.numel()) <= 0:
+        return torch.empty(0, int(allowed_kp.shape[1]), device=allowed_kp.device, dtype=torch.bool)
+    if int(cid_c.min().item()) < 0 or int(cid_c.max().item()) >= int(allowed_kp.shape[0]):
+        raise ValueError(
+            "cluster_id_c contains ids outside the cluster penalty mask range "
+            f"[0,{int(allowed_kp.shape[0]) - 1}]"
+        )
+    return allowed_kp.index_select(0, cid_c).detach().clone()
+
+
+def _gate_cluster_params(gate: ClusterwiseMoEGate, k: int) -> List[nn.Parameter]:
+    params: List[nn.Parameter] = [gate.W1[k], gate.b1[k], gate.W2[k], gate.b2[k]]
+    if gate.W_skip is not None and gate.b_skip is not None:
+        params.extend([gate.W_skip[k], gate.b_skip[k]])
+    return params
+
+
+def _mask_gate_grads_after_epoch(
+    *,
+    gate: ClusterwiseMoEGate,
+    epoch: int,
+    freeze_after_epoch: int,
+    stopped: torch.Tensor,
+) -> bool:
+    if int(freeze_after_epoch) <= 0 or int(epoch) <= int(freeze_after_epoch):
+        return False
+    freeze_mask = torch.ones(
+        gate.K,
+        dtype=torch.bool,
+        device=stopped.device if isinstance(stopped, torch.Tensor) else None,
+    )
+    gate.mask_cluster_grads(freeze_mask)
+    return True
+
+
 def compute_channel_shape_features(data_tc: torch.Tensor, acf_lags: Optional[List[int]] = None) -> torch.Tensor:
     """
     Train-only channel descriptors for feature-aware clustering.
@@ -383,6 +505,35 @@ GATE_FEATURE_NAMES = [
 ]
 
 
+BASE_FORECAST_GATE_FEATURE_NAMES = [
+    "base_mean_shift_over_hist_std",
+    "base_first_shift_over_hist_std",
+    "base_last_shift_over_hist_std",
+    "base_std_over_hist_std",
+    "base_range_over_hist_std",
+    "base_slope_over_hist_std",
+    "base_mad1_over_hist_std",
+    "base_mad2_over_hist_std",
+    "base_last_minus_first_over_hist_std",
+]
+
+
+def _normalize_gate_feature_mode(mode: str) -> str:
+    value = str(mode or "history").lower()
+    if value in {"history", "input", "legacy"}:
+        return "history"
+    if value in {"history_base", "history+base", "input_base", "safe_augmented"}:
+        return "history_base"
+    raise ValueError("moe.gate_feature_mode must be 'history' or 'history_base'.")
+
+
+def _gate_feature_names_for_mode(mode: str = "history") -> List[str]:
+    mode = _normalize_gate_feature_mode(mode)
+    if mode == "history":
+        return list(GATE_FEATURE_NAMES)
+    return list(GATE_FEATURE_NAMES) + list(BASE_FORECAST_GATE_FEATURE_NAMES)
+
+
 def get_gate_feature_dim() -> int:
     return len(GATE_FEATURE_NAMES)
 
@@ -398,6 +549,846 @@ def reduce_cluster_metric(x: torch.Tensor, weight_k: torch.Tensor) -> torch.Tens
     view_shape = [1] * x.dim()
     view_shape[-1] = w.shape[0]
     return (x * w.view(*view_shape)).sum(dim=-1)
+
+
+def _weighted_cluster_sum_mean(
+    sum_k: torch.Tensor,
+    count: int,
+    cluster_weight_k: torch.Tensor,
+) -> float:
+    count = max(int(count), 1)
+    mean_k = sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / float(count)
+    return float(reduce_cluster_metric(mean_k, cluster_weight_k).detach().cpu().item())
+
+
+def _stage2_loss_epoch_summary(
+    *,
+    epoch: int,
+    count: int,
+    cluster_weight_k: torch.Tensor,
+    total_loss_sum_k: torch.Tensor,
+    forecast_loss_sum_k: torch.Tensor,
+    penalty_loss_sum_k: torch.Tensor,
+    pred_residual_aux_loss_sum_k: torch.Tensor,
+    candidate_supervision_loss_sum_k: torch.Tensor,
+    gate_utility_loss_sum_k: torch.Tensor,
+    skip_noop_loss_sum_k: torch.Tensor,
+    intervention_supervision_loss_sum_k: torch.Tensor,
+    other_aux_loss_sum_k: torch.Tensor,
+    train_mse_sum_k: torch.Tensor,
+    train_mae_sum_k: torch.Tensor,
+) -> Dict[str, float]:
+    return {
+        "epoch": int(epoch),
+        "total_train_loss": _weighted_cluster_sum_mean(total_loss_sum_k, count, cluster_weight_k),
+        "forecast_loss_only": _weighted_cluster_sum_mean(forecast_loss_sum_k, count, cluster_weight_k),
+        "aux_penalty_loss": _weighted_cluster_sum_mean(penalty_loss_sum_k, count, cluster_weight_k),
+        "pred_residual_aux_loss": _weighted_cluster_sum_mean(pred_residual_aux_loss_sum_k, count, cluster_weight_k),
+        "candidate_supervision_loss": _weighted_cluster_sum_mean(candidate_supervision_loss_sum_k, count, cluster_weight_k),
+        "gate_utility_loss": _weighted_cluster_sum_mean(gate_utility_loss_sum_k, count, cluster_weight_k),
+        "skip_noop_loss": _weighted_cluster_sum_mean(skip_noop_loss_sum_k, count, cluster_weight_k),
+        "intervention_supervision_loss": _weighted_cluster_sum_mean(intervention_supervision_loss_sum_k, count, cluster_weight_k),
+        "other_aux_loss": _weighted_cluster_sum_mean(other_aux_loss_sum_k, count, cluster_weight_k),
+        "train_mse": _weighted_cluster_sum_mean(train_mse_sum_k, count, cluster_weight_k),
+        "train_mae": _weighted_cluster_sum_mean(train_mae_sum_k, count, cluster_weight_k),
+    }
+
+
+def _stage2_route_epoch_summary(
+    *,
+    penalty_names: List[str],
+    cluster_weight_k: torch.Tensor,
+    route_count_k: torch.Tensor,
+    route_prob_sum_kp: torch.Tensor,
+    route_actual_sum_kp: torch.Tensor,
+    route_entropy_sum_k: torch.Tensor,
+    skip_prob_sum_k: torch.Tensor,
+    skip_active_sum_k: torch.Tensor,
+) -> Dict[str, object]:
+    if route_prob_sum_kp.numel() == 0:
+        return {
+            "route_entropy": 0.0,
+            "prob_distribution": {},
+            "actual_route_distribution": {},
+            "skip_prob": 0.0,
+            "skip_noop_rate": 0.0,
+            "per_cluster": [],
+        }
+    denom_k = route_count_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype).clamp_min(1.0)
+    prob_kp = route_prob_sum_kp.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k.view(-1, 1)
+    actual_kp = route_actual_sum_kp.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k.view(-1, 1)
+    entropy_k = route_entropy_sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k
+    skip_prob_k = skip_prob_sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k
+    skip_active_k = skip_active_sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k
+    route_entropy = float(reduce_cluster_metric(entropy_k, cluster_weight_k).detach().cpu().item())
+    skip_prob = float(reduce_cluster_metric(skip_prob_k, cluster_weight_k).detach().cpu().item())
+    skip_rate = float(reduce_cluster_metric(skip_active_k, cluster_weight_k).detach().cpu().item())
+    prob_p = reduce_cluster_metric(prob_kp.transpose(0, 1), cluster_weight_k).detach().cpu()
+    actual_p = reduce_cluster_metric(actual_kp.transpose(0, 1), cluster_weight_k).detach().cpu()
+    per_cluster = []
+    for k in range(int(prob_kp.shape[0])):
+        per_cluster.append(
+            {
+                "cluster_id": int(k),
+                "route_entropy": float(entropy_k[k].detach().cpu().item()),
+                "skip_prob": float(skip_prob_k[k].detach().cpu().item()),
+                "skip_noop_rate": float(skip_active_k[k].detach().cpu().item()),
+                "prob_distribution": {
+                    penalty_names[p]: float(prob_kp[k, p].detach().cpu().item())
+                    for p in range(min(len(penalty_names), int(prob_kp.shape[1])))
+                },
+                "actual_distribution": {
+                    penalty_names[p]: float(actual_kp[k, p].detach().cpu().item())
+                    for p in range(min(len(penalty_names), int(actual_kp.shape[1])))
+                },
+            }
+        )
+    return {
+        "route_entropy": route_entropy,
+        "prob_distribution": {
+            penalty_names[p]: float(prob_p[p].item())
+            for p in range(min(len(penalty_names), int(prob_p.numel())))
+        },
+        "actual_route_distribution": {
+            penalty_names[p]: float(actual_p[p].item())
+            for p in range(min(len(penalty_names), int(actual_p.numel())))
+        },
+        "skip_prob": skip_prob,
+        "skip_noop_rate": skip_rate,
+        "per_cluster": per_cluster,
+    }
+
+
+def _safe_ratio(num: float, den: float) -> float:
+    return float(num) / float(den) if float(den) > 0.0 else 0.0
+
+
+def _route_accuracy_summary_from_labels(
+    *,
+    labels: torch.Tensor,
+    current_pred: torch.Tensor,
+    label_names: List[str],
+    features: Optional[torch.Tensor] = None,
+    feature_names: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    label_count = int(len(label_names))
+    if label_count <= 0:
+        raise ValueError("label_names must be non-empty.")
+    labels_cpu = labels.detach().cpu().to(dtype=torch.long).view(-1)
+    current_cpu = current_pred.detach().cpu().to(dtype=torch.long).view(-1)
+    if int(labels_cpu.numel()) != int(current_cpu.numel()):
+        raise ValueError("labels and current_pred must have the same length.")
+    valid = (labels_cpu >= 0) & (labels_cpu < label_count)
+    if int(valid.sum().item()) <= 0:
+        return {
+            "samples": 0,
+            "current_accuracy_all": 0.0,
+            "majority_accuracy_all": 0.0,
+            "lift_vs_majority": 0.0,
+            "oracle_skip_rate": 0.0,
+            "actual_skip_rate": 0.0,
+            "skip_recall": 0.0,
+            "skip_precision": 0.0,
+            "penalty_accuracy_on_oracle_penalty": 0.0,
+            "penalty_adoption_recall_on_oracle_penalty": 0.0,
+            "penalty_adoption_precision": 0.0,
+            "penalty_exact_precision": 0.0,
+            "oracle_penalty_rate": 0.0,
+            "penalty_adoption_rate": 0.0,
+            "penalty_adoption_rate_gap_vs_oracle": 0.0,
+            "missed_positive_adoption_rate": 0.0,
+            "confusion_matrix_counts": [[0 for _ in range(label_count)] for _ in range(label_count)],
+            "label_rates": {str(name): 0.0 for name in label_names},
+            "current_prediction_rates": {str(name): 0.0 for name in label_names},
+        }
+    labels_v = labels_cpu[valid]
+    current_v = current_cpu[valid].clamp(0, label_count - 1)
+    samples = int(labels_v.numel())
+    label_counts = torch.bincount(labels_v, minlength=label_count)[:label_count]
+    current_counts = torch.bincount(current_v, minlength=label_count)[:label_count]
+    confusion = torch.zeros(label_count, label_count, dtype=torch.long)
+    for label, pred in zip(labels_v.tolist(), current_v.tolist()):
+        confusion[int(label), int(pred)] += 1
+    correct = current_v == labels_v
+    accuracy = float(correct.to(dtype=torch.float32).mean().item())
+    majority = _safe_ratio(float(label_counts.max().item()), float(samples))
+    oracle_skip = labels_v == 0
+    actual_skip = current_v == 0
+    oracle_penalty = labels_v > 0
+    actual_penalty = current_v > 0
+    oracle_skip_count = int(oracle_skip.sum().item())
+    actual_skip_count = int(actual_skip.sum().item())
+    oracle_penalty_count = int(oracle_penalty.sum().item())
+    actual_penalty_count = int(actual_penalty.sum().item())
+    skip_true_positive = int((oracle_skip & actual_skip).sum().item())
+    correct_penalty = int((oracle_penalty & (current_v == labels_v)).sum().item())
+    adopted_penalty = int((oracle_penalty & actual_penalty).sum().item())
+    wrong_penalty = int((oracle_penalty & actual_penalty & (current_v != labels_v)).sum().item())
+    oracle_penalty_to_skip = int((oracle_penalty & actual_skip).sum().item())
+    oracle_penalty_rate = _safe_ratio(oracle_penalty_count, samples)
+    penalty_adoption_rate = _safe_ratio(actual_penalty_count, samples)
+    summary: Dict[str, object] = {
+        "samples": samples,
+        "current_accuracy_all": accuracy,
+        "majority_accuracy_all": majority,
+        "lift_vs_majority": float(accuracy - majority),
+        "oracle_skip_count": oracle_skip_count,
+        "oracle_skip_rate": _safe_ratio(oracle_skip_count, samples),
+        "actual_skip_count": actual_skip_count,
+        "actual_skip_rate": _safe_ratio(actual_skip_count, samples),
+        "skip_recall": _safe_ratio(skip_true_positive, oracle_skip_count),
+        "skip_precision": _safe_ratio(skip_true_positive, actual_skip_count),
+        "oracle_penalty_samples": oracle_penalty_count,
+        "penalty_accuracy_on_oracle_penalty": _safe_ratio(correct_penalty, oracle_penalty_count),
+        "penalty_adoption_recall_on_oracle_penalty": _safe_ratio(adopted_penalty, oracle_penalty_count),
+        "penalty_adoption_precision": _safe_ratio(adopted_penalty, actual_penalty_count),
+        "penalty_exact_precision": _safe_ratio(correct_penalty, actual_penalty_count),
+        "oracle_penalty_rate": oracle_penalty_rate,
+        "penalty_adoption_count": actual_penalty_count,
+        "penalty_adoption_rate": penalty_adoption_rate,
+        "penalty_adoption_rate_gap_vs_oracle": float(penalty_adoption_rate - oracle_penalty_rate),
+        "missed_positive_adoption_rate": _safe_ratio(oracle_penalty_to_skip, oracle_penalty_count),
+        "oracle_penalty_routed_to_skip_rate": _safe_ratio(oracle_penalty_to_skip, oracle_penalty_count),
+        "oracle_penalty_routed_to_wrong_penalty_rate": _safe_ratio(wrong_penalty, oracle_penalty_count),
+        "oracle_skip_routed_to_penalty_rate": _safe_ratio(int((oracle_skip & actual_penalty).sum().item()), oracle_skip_count),
+        "label_counts": {str(name): int(label_counts[i].item()) for i, name in enumerate(label_names)},
+        "label_rates": {
+            str(name): _safe_ratio(int(label_counts[i].item()), samples)
+            for i, name in enumerate(label_names)
+        },
+        "current_prediction_counts": {
+            str(name): int(current_counts[i].item())
+            for i, name in enumerate(label_names)
+        },
+        "current_prediction_rates": {
+            str(name): _safe_ratio(int(current_counts[i].item()), samples)
+            for i, name in enumerate(label_names)
+        },
+        "confusion_matrix_counts": confusion.tolist(),
+        "confusion_matrix_rows": list(label_names),
+        "confusion_matrix_cols": list(label_names),
+    }
+    if features is not None and feature_names is not None and "skip_prob" in feature_names:
+        idx = int(feature_names.index("skip_prob"))
+        feat_cpu = features.detach().cpu().to(dtype=torch.float32)
+        if feat_cpu.dim() == 3 and int(feat_cpu.shape[0]) == int(valid.numel()) and int(feat_cpu.shape[-1]) > idx:
+            skip_prob = feat_cpu[:, 0, idx].reshape(-1)[valid]
+            finite = torch.isfinite(skip_prob)
+            if int(finite.sum().item()) > 0:
+                skip_prob = skip_prob[finite]
+                summary["skip_probability"] = {
+                    "available": True,
+                    "mean": float(skip_prob.mean().item()),
+                    "p50": float(skip_prob.quantile(0.50).item()),
+                    "p95": float(skip_prob.quantile(0.95).item()),
+                    "max": float(skip_prob.max().item()),
+                    "gt_0_5_rate": float((skip_prob > 0.5).to(dtype=torch.float32).mean().item()),
+                }
+    return summary
+
+
+def _route_distribution_entropy_from_rates(rates: Dict[str, float]) -> float:
+    total = float(sum(max(0.0, float(v)) for v in rates.values()))
+    if total <= 0.0:
+        return 0.0
+    entropy = 0.0
+    for value in rates.values():
+        p = max(0.0, float(value)) / total
+        if p > 0.0:
+            entropy -= p * math.log(p)
+    return float(entropy)
+
+
+def _route_audit_summary_from_tensors(
+    *,
+    tensors: Dict[str, object],
+    explainability: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    label_names = list(tensors.get("label_names", []))
+    summary = _route_accuracy_summary_from_labels(
+        labels=tensors["labels"],  # type: ignore[arg-type,index]
+        current_pred=tensors["current_pred"],  # type: ignore[arg-type,index]
+        label_names=label_names,
+        features=tensors.get("features"),  # type: ignore[arg-type]
+        feature_names=list(tensors.get("feature_names", [])),
+    )
+    summary["oracle_route_distribution"] = dict(summary.get("label_rates", {}))
+    summary["current_route_distribution"] = dict(summary.get("current_prediction_rates", {}))
+    summary["oracle_route_entropy"] = _route_distribution_entropy_from_rates(
+        summary.get("label_rates", {})  # type: ignore[arg-type]
+    )
+    summary["current_route_entropy"] = _route_distribution_entropy_from_rates(
+        summary.get("current_prediction_rates", {})  # type: ignore[arg-type]
+    )
+    if explainability is not None:
+        summary["candidate_oracle_gain_pct_vs_base"] = explainability.get("oracle_gain_pct_vs_base")
+        summary["cluster_penalty_oracle_gain_pct_vs_base"] = explainability.get(
+            "cluster_penalty_oracle_gain_pct_vs_base"
+        )
+        summary["cluster_route_oracle_gain_pct_vs_base"] = explainability.get(
+            "cluster_route_oracle_gain_pct_vs_base"
+        )
+        summary["current_raw_routed_gain_pct_vs_base"] = explainability.get("final_gain_pct_vs_base")
+        summary["base_mse"] = explainability.get("base_mse")
+        summary["raw_routed_mse"] = explainability.get("final_mse")
+    return summary
+
+
+def _stage2_route_audit_thresholds(
+    *,
+    stage2_route_audit_cfg: Dict[str, object],
+    route_ce_min_abs_improvement: float,
+    route_ce_min_rel_improvement: float,
+    route_ce_min_candidate_delta_rms: float,
+    binary_adoption_weight: float,
+    binary_adoption_min_abs_improvement: float,
+    binary_adoption_min_rel_improvement: float,
+    binary_adoption_min_candidate_delta_rms: float,
+) -> Dict[str, object]:
+    cfg = stage2_route_audit_cfg if isinstance(stage2_route_audit_cfg, dict) else {}
+    explicit_keys = {
+        "min_abs_improvement",
+        "min_rel_improvement",
+        "min_candidate_delta_rms",
+        "candidate_action_floor",
+    }
+    if any(key in cfg for key in explicit_keys):
+        default_abs = (
+            binary_adoption_min_abs_improvement
+            if float(binary_adoption_weight) > 0.0
+            else route_ce_min_abs_improvement
+        )
+        default_rel = (
+            binary_adoption_min_rel_improvement
+            if float(binary_adoption_weight) > 0.0
+            else route_ce_min_rel_improvement
+        )
+        default_delta = (
+            binary_adoption_min_candidate_delta_rms
+            if float(binary_adoption_weight) > 0.0
+            else route_ce_min_candidate_delta_rms
+        )
+        return {
+            "min_abs_improvement": float(cfg.get("min_abs_improvement", default_abs)),
+            "min_rel_improvement": float(cfg.get("min_rel_improvement", default_rel)),
+            "min_candidate_delta_rms": float(
+                cfg.get(
+                    "min_candidate_delta_rms",
+                    cfg.get("candidate_action_floor", default_delta),
+                )
+            ),
+            "source": "diagnostics.stage2_route_audit",
+        }
+    if float(binary_adoption_weight) > 0.0:
+        return {
+            "min_abs_improvement": float(binary_adoption_min_abs_improvement),
+            "min_rel_improvement": float(binary_adoption_min_rel_improvement),
+            "min_candidate_delta_rms": float(binary_adoption_min_candidate_delta_rms),
+            "source": "moe.binary_adoption_supervision",
+        }
+    return {
+        "min_abs_improvement": float(route_ce_min_abs_improvement),
+        "min_rel_improvement": float(route_ce_min_rel_improvement),
+        "min_candidate_delta_rms": float(route_ce_min_candidate_delta_rms),
+        "source": "moe.route_ce_supervision",
+    }
+
+
+@torch.no_grad()
+def _cluster_route_oracle_labels_and_gain_from_candidates(
+    *,
+    base_bch: torch.Tensor,
+    cand_bcpH: Optional[torch.Tensor],
+    y_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    min_candidate_delta_rms: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return route labels and raw best-penalty gain with 0=no-op and 1..P=penalty."""
+    B = int(base_bch.shape[0])
+    if cand_bcpH is None or int(cand_bcpH.numel()) == 0:
+        labels = torch.zeros((B, int(K)), device=base_bch.device, dtype=torch.long)
+        gain = torch.zeros((B, int(K)), device=base_bch.device, dtype=base_bch.dtype)
+        return labels, gain
+    P = int(cand_bcpH.shape[2])
+    if P <= 0:
+        labels = torch.zeros((B, int(K)), device=base_bch.device, dtype=torch.long)
+        gain = torch.zeros((B, int(K)), device=base_bch.device, dtype=base_bch.dtype)
+        return labels, gain
+    base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
+    cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
+    base_err_bk = scatter_mean_bc_to_bk(base_err_bc, cluster_id_c, int(K))
+    cand_err_bkp = scatter_mean_bcf_to_bkf(cand_err_bcp, cluster_id_c, int(K))
+    min_delta = max(0.0, float(min_candidate_delta_rms))
+    cand_delta_bkp = None
+    if min_delta > 0.0:
+        cand_delta_bcp = (cand_bcpH - base_bch.unsqueeze(2)).pow(2).mean(dim=-1).sqrt()
+        cand_delta_bkp = scatter_mean_bcf_to_bkf(cand_delta_bcp, cluster_id_c, int(K))
+    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
+        allowed = allowed_mask_kp.to(device=cand_err_bkp.device, dtype=torch.bool)
+        if tuple(allowed.shape) != (int(K), P):
+            raise ValueError(
+                "cluster route oracle allowed mask must have shape [K,P], "
+                f"got {tuple(allowed.shape)} vs {(int(K), P)}."
+            )
+    else:
+        allowed = torch.ones((int(K), P), device=cand_err_bkp.device, dtype=torch.bool)
+    masked_err_bkp = cand_err_bkp.masked_fill(~allowed.unsqueeze(0), float("inf"))
+    if cand_delta_bkp is not None:
+        masked_err_bkp = masked_err_bkp.masked_fill(cand_delta_bkp < min_delta, float("inf"))
+    best_err_bk, best_idx_bk = masked_err_bkp.min(dim=-1)
+    has_candidate_bk = torch.isfinite(best_err_bk)
+    gain_bk = torch.where(has_candidate_bk, base_err_bk - best_err_bk, torch.zeros_like(base_err_bk))
+    required_bk = torch.maximum(
+        torch.full_like(base_err_bk, max(0.0, float(min_abs_improvement))),
+        max(0.0, float(min_rel_improvement)) * base_err_bk.abs().clamp_min(1.0e-12),
+    )
+    use_penalty_bk = has_candidate_bk & (gain_bk > required_bk)
+    labels_bk = torch.where(
+        use_penalty_bk,
+        best_idx_bk.to(dtype=torch.long) + 1,
+        torch.zeros_like(best_idx_bk, dtype=torch.long),
+    )
+    return labels_bk, gain_bk
+
+
+@torch.no_grad()
+def _cluster_route_oracle_labels_from_candidates(
+    *,
+    base_bch: torch.Tensor,
+    cand_bcpH: Optional[torch.Tensor],
+    y_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    min_candidate_delta_rms: float = 0.0,
+) -> torch.Tensor:
+    """Return cluster route labels with 0=no-op and 1..P=penalty index + 1."""
+    labels_bk, _ = _cluster_route_oracle_labels_and_gain_from_candidates(
+        base_bch=base_bch,
+        cand_bcpH=cand_bcpH,
+        y_bch=y_bch,
+        cluster_id_c=cluster_id_c,
+        K=K,
+        allowed_mask_kp=allowed_mask_kp,
+        min_abs_improvement=min_abs_improvement,
+        min_rel_improvement=min_rel_improvement,
+        min_candidate_delta_rms=min_candidate_delta_rms,
+    )
+    return labels_bk
+
+
+@torch.no_grad()
+def _route_ce_active_mask_from_gain(
+    best_penalty_gain_bk: torch.Tensor,
+    *,
+    ignore_abs_gain_below: float = 0.0,
+) -> torch.Tensor:
+    if best_penalty_gain_bk.dim() != 2:
+        raise ValueError("best_penalty_gain_bk must have shape [B,K].")
+    if float(ignore_abs_gain_below) <= 0.0:
+        return torch.ones_like(best_penalty_gain_bk, dtype=torch.bool)
+    gain = best_penalty_gain_bk.detach()
+    return torch.isfinite(gain) & (gain.abs() > float(ignore_abs_gain_below))
+
+
+def _pred_residual_training_skip_arg(
+    *,
+    skip_bk: Optional[torch.Tensor],
+    allow_skip: bool,
+    ignore_skip_during_training: bool = False,
+) -> Optional[torch.Tensor]:
+    if not bool(allow_skip):
+        return None
+    if bool(ignore_skip_during_training):
+        return None
+    return skip_bk
+
+
+def _route_probs_with_skip_class(
+    *,
+    probs_bkp: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    probs_include_skip_mass: bool = False,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    if probs_bkp.dim() != 3:
+        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
+    if skip_prob_bk is None:
+        skip_mass_bk = torch.zeros(probs_bkp.shape[:2], device=probs_bkp.device, dtype=probs_bkp.dtype)
+        penalty_mass_bkp = probs_bkp
+    else:
+        if tuple(skip_prob_bk.shape) != tuple(probs_bkp.shape[:2]):
+            raise ValueError(
+                "skip_prob_bk must have shape [B,K], "
+                f"got {tuple(skip_prob_bk.shape)} vs {tuple(probs_bkp.shape[:2])}."
+            )
+        skip_mass_bk = skip_prob_bk
+        if bool(probs_include_skip_mass):
+            penalty_mass_bkp = probs_bkp
+        else:
+            penalty_mass_bkp = (1.0 - skip_prob_bk).unsqueeze(-1) * probs_bkp
+    route_probs_bkq = torch.cat([skip_mass_bk.unsqueeze(-1), penalty_mass_bkp], dim=-1)
+    route_probs_bkq = torch.nan_to_num(route_probs_bkq, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    return route_probs_bkq / route_probs_bkq.sum(dim=-1, keepdim=True).clamp_min(float(eps))
+
+
+def _route_ce_loss_from_probs(
+    *,
+    probs_bkp: torch.Tensor,
+    labels_bk: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    probs_include_skip_mass: bool = False,
+    class_weight_q: Optional[torch.Tensor] = None,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    route_probs_bkq = _route_probs_with_skip_class(
+        probs_bkp=probs_bkp,
+        skip_prob_bk=skip_prob_bk,
+        probs_include_skip_mass=probs_include_skip_mass,
+        eps=eps,
+    )
+    labels = labels_bk.to(device=route_probs_bkq.device, dtype=torch.long)
+    if tuple(labels.shape) != tuple(route_probs_bkq.shape[:2]):
+        raise ValueError(
+            "route CE labels must have shape [B,K], "
+            f"got {tuple(labels.shape)} vs {tuple(route_probs_bkq.shape[:2])}."
+        )
+    if int(labels.min().item()) < 0 or int(labels.max().item()) >= int(route_probs_bkq.shape[-1]):
+        raise ValueError(
+            "route CE labels must be in [0,P], "
+            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, "
+            f"P={int(route_probs_bkq.shape[-1]) - 1}."
+        )
+    target_prob_bk = route_probs_bkq.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    loss_bk = -target_prob_bk.clamp_min(float(eps)).log()
+    if class_weight_q is not None and int(class_weight_q.numel()) > 0:
+        weight_q = class_weight_q.to(device=loss_bk.device, dtype=loss_bk.dtype).view(-1)
+        if int(weight_q.numel()) != int(route_probs_bkq.shape[-1]):
+            raise ValueError(
+                "route CE class_weight_q must have P+1 entries, "
+                f"got {int(weight_q.numel())} vs {int(route_probs_bkq.shape[-1])}."
+            )
+        loss_bk = loss_bk * weight_q.index_select(0, labels.reshape(-1)).reshape_as(labels).to(dtype=loss_bk.dtype)
+    return loss_bk
+
+
+def _route_binary_adoption_loss_from_probs(
+    *,
+    probs_bkp: torch.Tensor,
+    labels_bk: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    probs_include_skip_mass: bool = False,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    active_mask_bk: Optional[torch.Tensor] = None,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    eps: float = 1.0e-8,
+) -> Optional[torch.Tensor]:
+    if probs_bkp.dim() != 3:
+        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
+    B, K, P = [int(v) for v in probs_bkp.shape]
+    if P <= 0:
+        return None
+    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
+    if tuple(labels.shape) != (B, K):
+        raise ValueError(
+            "binary adoption labels must have shape [B,K], "
+            f"got {tuple(labels.shape)} vs {(B, K)}."
+        )
+    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
+        raise ValueError(
+            "binary adoption labels must be in [0,P], "
+            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
+        )
+
+    route_probs_bkq = _route_probs_with_skip_class(
+        probs_bkp=probs_bkp,
+        skip_prob_bk=skip_prob_bk,
+        probs_include_skip_mass=probs_include_skip_mass,
+        eps=eps,
+    )
+    penalty_mass_bkp = route_probs_bkq[..., 1:].clamp(float(eps), 1.0 - float(eps))
+    target_bkp = torch.zeros_like(penalty_mass_bkp)
+    positive_bk = labels > 0
+    if bool(positive_bk.any().item()):
+        target_bkp.scatter_(
+            dim=-1,
+            index=(labels.clamp_min(1) - 1).unsqueeze(-1),
+            src=positive_bk.to(dtype=target_bkp.dtype).unsqueeze(-1),
+        )
+
+    weight_bkp = torch.ones_like(penalty_mass_bkp)
+    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
+        allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
+        if tuple(allowed.shape) != (K, P):
+            raise ValueError(
+                "binary adoption allowed mask must have shape [K,P], "
+                f"got {tuple(allowed.shape)} vs {(K, P)}."
+            )
+        empty = allowed.sum(dim=-1, keepdim=True) <= 0
+        allowed = torch.where(empty, torch.ones_like(allowed), allowed)
+        weight_bkp = allowed.unsqueeze(0).to(dtype=penalty_mass_bkp.dtype).expand(B, K, P)
+        target_bkp = target_bkp * weight_bkp
+
+    pos_w = max(0.0, float(positive_weight))
+    neg_w = max(0.0, float(negative_weight))
+    bce_bkp = -(
+        (pos_w * target_bkp * penalty_mass_bkp.log())
+        + (neg_w * (1.0 - target_bkp) * (1.0 - penalty_mass_bkp).clamp_min(float(eps)).log())
+    )
+    denom_bk = weight_bkp.sum(dim=-1).clamp_min(1.0)
+    loss_bk = (bce_bkp * weight_bkp).sum(dim=-1) / denom_bk
+    if active_mask_bk is not None:
+        active = active_mask_bk.to(device=loss_bk.device, dtype=torch.bool)
+        if tuple(active.shape) != (B, K):
+            raise ValueError(
+                "binary adoption active_mask_bk must have shape [B,K], "
+                f"got {tuple(active.shape)} vs {(B, K)}."
+            )
+        loss_bk = loss_bk * active.to(dtype=loss_bk.dtype)
+    return loss_bk
+
+
+def _route_rate_alignment_loss_from_probs(
+    *,
+    probs_bkp: torch.Tensor,
+    labels_bk: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    probs_include_skip_mass: bool = False,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    active_mask_bk: Optional[torch.Tensor] = None,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Match batch/cluster predicted route rates to oracle route-label rates.
+
+    This is intentionally a low-capacity aggregate loss. It does not introduce new
+    labels beyond the existing 0=no-op, 1..P=penalty oracle labels; it only
+    discourages the gate from drifting to an adoption rate that disagrees with
+    the train batch's own label distribution.
+    """
+    if probs_bkp.dim() != 3:
+        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
+    B, K, P = [int(v) for v in probs_bkp.shape]
+    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
+    if tuple(labels.shape) != (B, K):
+        raise ValueError(
+            "route-rate labels must have shape [B,K], "
+            f"got {tuple(labels.shape)} vs {(B, K)}."
+        )
+    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
+        raise ValueError(
+            "route-rate labels must be in [0,P], "
+            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
+        )
+
+    route_probs_bkq = _route_probs_with_skip_class(
+        probs_bkp=probs_bkp,
+        skip_prob_bk=skip_prob_bk,
+        probs_include_skip_mass=probs_include_skip_mass,
+        eps=eps,
+    )
+    Q = int(route_probs_bkq.shape[-1])
+    target_bkq = torch.zeros_like(route_probs_bkq)
+    target_bkq.scatter_(dim=-1, index=labels.unsqueeze(-1), src=torch.ones_like(labels, dtype=route_probs_bkq.dtype).unsqueeze(-1))
+
+    active_bk = torch.ones((B, K), device=probs_bkp.device, dtype=route_probs_bkq.dtype)
+    if active_mask_bk is not None:
+        active = active_mask_bk.to(device=probs_bkp.device, dtype=torch.bool)
+        if tuple(active.shape) != (B, K):
+            raise ValueError(
+                "route-rate active_mask_bk must have shape [B,K], "
+                f"got {tuple(active.shape)} vs {(B, K)}."
+            )
+        active_bk = active.to(dtype=route_probs_bkq.dtype)
+
+    class_mask_kq = torch.ones((K, Q), device=probs_bkp.device, dtype=route_probs_bkq.dtype)
+    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
+        allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
+        if tuple(allowed.shape) != (K, P):
+            raise ValueError(
+                "route-rate allowed mask must have shape [K,P], "
+                f"got {tuple(allowed.shape)} vs {(K, P)}."
+            )
+        empty = allowed.sum(dim=-1, keepdim=True) <= 0
+        allowed = torch.where(empty, torch.ones_like(allowed), allowed)
+        class_mask_kq = torch.cat(
+            [
+                torch.ones((K, 1), device=probs_bkp.device, dtype=torch.bool),
+                allowed,
+            ],
+            dim=-1,
+        ).to(dtype=route_probs_bkq.dtype)
+
+    denom_k = active_bk.sum(dim=0).clamp_min(1.0)
+    pred_rate_kq = (route_probs_bkq * active_bk.unsqueeze(-1)).sum(dim=0) / denom_k.unsqueeze(-1)
+    target_rate_kq = (target_bkq * active_bk.unsqueeze(-1)).sum(dim=0) / denom_k.unsqueeze(-1)
+    diff_kq = (pred_rate_kq - target_rate_kq).pow(2) * class_mask_kq
+    loss_k = diff_kq.sum(dim=-1) / class_mask_kq.sum(dim=-1).clamp_min(1.0)
+    has_active_k = (active_bk.sum(dim=0) > 0).to(dtype=loss_k.dtype)
+    loss_k = loss_k * has_active_k
+    return loss_k.unsqueeze(0).expand(B, K)
+
+
+def _route_positive_recall_loss_from_probs(
+    *,
+    probs_bkp: torch.Tensor,
+    labels_bk: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    probs_include_skip_mass: bool = False,
+    active_mask_bk: Optional[torch.Tensor] = None,
+    mode: str = "ce",
+    target_probability: float = 1.0,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Positive-only route CE that trains recall of the oracle penalty class."""
+    if probs_bkp.dim() != 3:
+        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
+    B, K, P = [int(v) for v in probs_bkp.shape]
+    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
+    if tuple(labels.shape) != (B, K):
+        raise ValueError(
+            "positive-recall labels must have shape [B,K], "
+            f"got {tuple(labels.shape)} vs {(B, K)}."
+        )
+    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
+        raise ValueError(
+            "positive-recall labels must be in [0,P], "
+            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
+        )
+    route_probs_bkq = _route_probs_with_skip_class(
+        probs_bkp=probs_bkp,
+        skip_prob_bk=skip_prob_bk,
+        probs_include_skip_mass=probs_include_skip_mass,
+        eps=eps,
+    )
+    target_prob_bk = route_probs_bkq.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    positive_bk = (labels > 0).to(dtype=target_prob_bk.dtype)
+    if active_mask_bk is not None:
+        active = active_mask_bk.to(device=probs_bkp.device, dtype=torch.bool)
+        if tuple(active.shape) != (B, K):
+            raise ValueError(
+                "positive-recall active_mask_bk must have shape [B,K], "
+                f"got {tuple(active.shape)} vs {(B, K)}."
+            )
+        positive_bk = positive_bk * active.to(dtype=target_prob_bk.dtype)
+    mode_l = str(mode or "ce").lower()
+    if mode_l in {"margin", "hinge", "floor"}:
+        target = min(1.0, max(0.0, float(target_probability)))
+        return (target - target_prob_bk).clamp_min(0.0).pow(2) * positive_bk
+    if mode_l not in {"ce", "cross_entropy", "nll"}:
+        raise ValueError(f"Unsupported positive recall loss mode: {mode}")
+    return -target_prob_bk.clamp_min(float(eps)).log() * positive_bk
+
+
+def _route_precision_constrained_recall_loss_from_probs(
+    *,
+    probs_bkp: torch.Tensor,
+    labels_bk: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    probs_include_skip_mass: bool = False,
+    active_mask_bk: Optional[torch.Tensor] = None,
+    recall_mode: str = "ce",
+    recall_target_probability: float = 1.0,
+    false_adopt_max_probability: float = 0.5,
+    false_adopt_weight: float = 1.0,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Recall oracle-positive penalties while capping false adoption on no-op labels."""
+    if probs_bkp.dim() != 3:
+        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
+    B, K, P = [int(v) for v in probs_bkp.shape]
+    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
+    if tuple(labels.shape) != (B, K):
+        raise ValueError(
+            "precision-recall labels must have shape [B,K], "
+            f"got {tuple(labels.shape)} vs {(B, K)}."
+        )
+    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
+        raise ValueError(
+            "precision-recall labels must be in [0,P], "
+            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
+        )
+    recall_loss_bk = _route_positive_recall_loss_from_probs(
+        probs_bkp=probs_bkp,
+        skip_prob_bk=skip_prob_bk,
+        labels_bk=labels,
+        probs_include_skip_mass=probs_include_skip_mass,
+        active_mask_bk=active_mask_bk,
+        mode=recall_mode,
+        target_probability=recall_target_probability,
+        eps=eps,
+    )
+    route_probs_bkq = _route_probs_with_skip_class(
+        probs_bkp=probs_bkp,
+        skip_prob_bk=skip_prob_bk,
+        probs_include_skip_mass=probs_include_skip_mass,
+        eps=eps,
+    )
+    penalty_mass_bk = route_probs_bkq[..., 1:].sum(dim=-1)
+    skip_label_bk = (labels == 0).to(dtype=penalty_mass_bk.dtype)
+    max_prob = min(1.0, max(0.0, float(false_adopt_max_probability)))
+    skip_guard_bk = (penalty_mass_bk - max_prob).clamp_min(0.0).pow(2) * skip_label_bk
+    if active_mask_bk is not None:
+        active = active_mask_bk.to(device=probs_bkp.device, dtype=torch.bool)
+        if tuple(active.shape) != (B, K):
+            raise ValueError(
+                "precision-recall active_mask_bk must have shape [B,K], "
+                f"got {tuple(active.shape)} vs {(B, K)}."
+            )
+        skip_guard_bk = skip_guard_bk * active.to(dtype=skip_guard_bk.dtype)
+    return recall_loss_bk + max(0.0, float(false_adopt_weight)) * skip_guard_bk
+
+
+@torch.no_grad()
+def _route_ce_class_weight_from_labels(
+    *,
+    labels_bk: torch.Tensor,
+    num_classes: int,
+    mode: str = "none",
+    max_weight: float = 0.0,
+    active_mask_bk: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    mode_l = str(mode or "none").lower()
+    if mode_l in {"", "none", "off", "false", "0"}:
+        return None
+    if mode_l not in {"balanced", "inverse_frequency", "inverse_freq"}:
+        raise ValueError(f"Unsupported route CE class_weight mode {mode!r}.")
+    labels = labels_bk.detach().to(dtype=torch.long).reshape(-1)
+    valid = (labels >= 0) & (labels < int(num_classes))
+    if active_mask_bk is not None:
+        active = active_mask_bk.detach().to(device=labels_bk.device, dtype=torch.bool).reshape(-1)
+        if int(active.numel()) != int(labels.numel()):
+            raise ValueError("route CE active_mask_bk must have the same number of elements as labels_bk.")
+        valid = valid & active.to(device=valid.device)
+    if int(valid.sum().item()) <= 0:
+        return None
+    counts = torch.bincount(labels[valid], minlength=int(num_classes)).to(dtype=torch.float32)
+    weights = torch.zeros(int(num_classes), device=labels_bk.device, dtype=torch.float32)
+    present = counts > 0.0
+    if not bool(present.any().item()):
+        return None
+    weights[present] = float(valid.sum().item()) / (
+        float(int(present.sum().item())) * counts[present].clamp_min(1.0)
+    )
+    if float(max_weight) > 0.0:
+        weights = weights.clamp_max(float(max_weight))
+    return weights.to(device=labels_bk.device)
+
+
+def _parameter_grad_l2_norm(params: Iterable[nn.Parameter]) -> float:
+    total = 0.0
+    for param in params:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        total += float(grad.pow(2).sum().item())
+    return float(total ** 0.5)
 
 
 def extract_gate_features(x_bcl: torch.Tensor) -> torch.Tensor:
@@ -461,6 +1452,65 @@ def extract_gate_features(x_bcl: torch.Tensor) -> torch.Tensor:
     return feat
 
 
+def _extract_base_forecast_gate_features(
+    x_bcl: torch.Tensor,
+    y_base_bch: torch.Tensor,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    hist_std = x_bcl.std(dim=-1).clamp_min(eps)
+    hist_last = x_bcl[..., -1]
+    base_mean = y_base_bch.mean(dim=-1)
+    base_first = y_base_bch[..., 0]
+    base_last = y_base_bch[..., -1]
+    base_std = y_base_bch.std(dim=-1) if y_base_bch.shape[-1] > 1 else torch.zeros_like(base_mean)
+    base_range = y_base_bch.max(dim=-1).values - y_base_bch.min(dim=-1).values
+    t = torch.linspace(-1.0, 1.0, steps=y_base_bch.shape[-1], device=y_base_bch.device, dtype=y_base_bch.dtype).view(1, 1, -1)
+    base_center = y_base_bch - base_mean.unsqueeze(-1)
+    base_slope = (base_center * t).mean(dim=-1) / t.pow(2).mean(dim=-1).clamp_min(eps)
+    if y_base_bch.shape[-1] >= 2:
+        d1 = y_base_bch[..., 1:] - y_base_bch[..., :-1]
+        base_mad1 = d1.abs().mean(dim=-1)
+    else:
+        d1 = None
+        base_mad1 = torch.zeros_like(base_mean)
+    if y_base_bch.shape[-1] >= 3:
+        d2 = y_base_bch[..., 2:] - 2 * y_base_bch[..., 1:-1] + y_base_bch[..., :-2]
+        base_mad2 = d2.abs().mean(dim=-1)
+    else:
+        base_mad2 = torch.zeros_like(base_mean)
+    return torch.stack(
+        [
+            (base_mean - hist_last) / hist_std,
+            (base_first - hist_last) / hist_std,
+            (base_last - hist_last) / hist_std,
+            base_std / hist_std,
+            base_range / hist_std,
+            base_slope / hist_std,
+            base_mad1 / hist_std,
+            base_mad2 / hist_std,
+            (base_last - base_first) / hist_std,
+        ],
+        dim=-1,
+    )
+
+
+def _build_gate_routing_features(
+    x_bcl: torch.Tensor,
+    y_base_bch: Optional[torch.Tensor],
+    cluster_id_c: torch.Tensor,
+    K: int,
+    mode: str = "history",
+) -> torch.Tensor:
+    mode = _normalize_gate_feature_mode(mode)
+    feat_bcf = extract_gate_features(x_bcl)
+    if mode == "history_base":
+        if y_base_bch is None:
+            raise ValueError("history_base gate features require y_base_bch.")
+        base_feat_bcf = _extract_base_forecast_gate_features(x_bcl, y_base_bch)
+        feat_bcf = torch.cat([feat_bcf, base_feat_bcf], dim=-1)
+    return scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+
+
 def build_gate_prior_from_penalty_portrait(
     penalty_kp: Optional[torch.Tensor],
     penalty_scale: Optional[torch.Tensor],
@@ -502,6 +1552,7 @@ def build_named_penalty_mask(
     penalty_names: List[str],
     K: int,
     device: torch.device,
+    allow_empty_clusters: bool = False,
 ) -> Optional[torch.Tensor]:
     if allowed_by_cluster is None:
         return None
@@ -527,10 +1578,35 @@ def build_named_penalty_mask(
                     f"{name!r}; available={penalty_names}"
                 )
             mask[k, name_to_idx[name]] = 1.0
-    empty = mask.sum(dim=-1, keepdim=True) <= 0.0
-    if bool(empty.any().item()):
-        mask = torch.where(empty, torch.ones_like(mask), mask)
+    if not bool(allow_empty_clusters):
+        empty = mask.sum(dim=-1, keepdim=True) <= 0.0
+        if bool(empty.any().item()):
+            mask = torch.where(empty, torch.ones_like(mask), mask)
     return mask
+
+
+def normalize_cluster_penalty_prior_apply_stage(apply_stage: object) -> str:
+    value = str(apply_stage or "train_and_eval").strip().lower().replace("-", "_")
+    if value in {"train", "train_eval", "train_and_eval", "train+eval", "always"}:
+        return "train_and_eval"
+    if value in {"eval", "eval_only", "late", "late_eval", "final", "final_eval"}:
+        return "eval_only"
+    raise ValueError(
+        "cluster_penalty_prior.apply_stage must be 'train_and_eval' or 'eval_only' "
+        f"(got {value!r})."
+    )
+
+
+def split_cluster_penalty_prior_allowed_mask_by_stage(
+    allowed_mask_kp: Optional[torch.Tensor],
+    apply_stage: object,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], str]:
+    stage = normalize_cluster_penalty_prior_apply_stage(apply_stage)
+    if allowed_mask_kp is None or int(allowed_mask_kp.numel()) == 0:
+        return None, None, stage
+    if stage == "eval_only":
+        return None, allowed_mask_kp, stage
+    return allowed_mask_kp, None, stage
 
 
 @torch.no_grad()
@@ -1011,24 +2087,12 @@ def _pred_residual_channel_keep_mask(
     max_rel_mse_regression: float = 0.0,
 ) -> torch.Tensor:
     policy = str(policy).lower()
-    if policy in {"val_mse_channel", "val_mse_scale", "val_mse_scale_holdout", "val_mse_gate", "val_mse_gate_guarded"}:
+    if policy in {"val_mse_channel", "val_mse_scale", "val_mse_scale_holdout"}:
         required = torch.maximum(
             torch.full_like(base_mse_c, float(min_abs_improvement)),
             float(min_rel_improvement) * base_mse_c.abs().clamp_min(1.0e-12),
         )
         return (base_mse_c - cand_mse_c) > required
-    if policy == "val_mae_gate_guarded":
-        required_mae = torch.maximum(
-            torch.full_like(base_mae_c, float(min_abs_improvement)),
-            float(min_rel_improvement) * base_mae_c.abs().clamp_min(1.0e-12),
-        )
-        allowed_mse_regression = torch.maximum(
-            torch.full_like(base_mse_c, max(0.0, float(max_abs_mse_regression))),
-            max(0.0, float(max_rel_mse_regression)) * base_mse_c.abs().clamp_min(1.0e-12),
-        )
-        improves_mae = (base_mae_c - cand_mae_c) > required_mae
-        respects_mse = (cand_mse_c - base_mse_c) <= allowed_mse_regression
-        return improves_mae & respects_mse
     raise ValueError(f"Unsupported residual selection policy for channel keep mask: {policy}")
 
 
@@ -1192,6 +2256,225 @@ def _validate_strict_history_anchor_scope(cfg: Optional[dict], *, source: str) -
             f"{source}.history_scope must be 'input_window' for strict input-window training; "
             f"got {history_scope!r}. Set {source}.allow_all_observed=true only for oracle diagnostics."
         )
+
+
+_MOE_OUTPUT_ANCHOR_KEYS = (
+    "history_anchor_expert",
+    "train_stat_anchor_expert",
+    "train_residual_anchor_expert",
+)
+
+
+def _clone_anchor_cfg(value):
+    if isinstance(value, dict):
+        return {key: _clone_anchor_cfg(sub_value) for key, sub_value in value.items()}
+    if isinstance(value, list):
+        return [_clone_anchor_cfg(sub_value) for sub_value in value]
+    return value
+
+
+def _merge_anchor_cfg(default: dict, override: Optional[dict]) -> dict:
+    out = _clone_anchor_cfg(default)
+    if not isinstance(override, dict):
+        return out
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_anchor_cfg(out[key], value)
+        else:
+            out[key] = _clone_anchor_cfg(value)
+    return out
+
+
+def _stat_anchor_default(
+    *,
+    period: int,
+    metric: str = "mse",
+    max_scale: float = 0.2,
+    steps: int = 9,
+    horizon_segments: Optional[int] = None,
+) -> dict:
+    scale_selection = {
+        "enable": True,
+        "metric": str(metric),
+        "max_scale": float(max_scale),
+        "steps": int(steps),
+    }
+    if horizon_segments is not None:
+        scale_selection["horizon_segments"] = int(horizon_segments)
+    return {
+        "enable": True,
+        "period": int(period),
+        "alpha": 0.0,
+        "mode": "phase_mean",
+        "reference": "last",
+        "blend_target": "prediction",
+        "scale_selection": scale_selection,
+    }
+
+
+def _residual_anchor_default(
+    *,
+    period: int,
+    metric: str = "mse",
+    max_scale: float = 1.2,
+    steps: int = 49,
+    horizon_segments: Optional[int] = None,
+) -> dict:
+    scale_selection = {
+        "enable": True,
+        "metric": str(metric),
+        "max_scale": float(max_scale),
+        "steps": int(steps),
+    }
+    if horizon_segments is not None:
+        scale_selection["horizon_segments"] = int(horizon_segments)
+    return {
+        "enable": True,
+        "period": int(period),
+        "alpha": 0.0,
+        "blend_target": "prediction",
+        "scale_selection": scale_selection,
+    }
+
+
+def _moe_output_anchor_default(
+    *,
+    stat: Optional[dict],
+    residual: Optional[dict],
+    history: Optional[dict] = None,
+) -> dict:
+    return {
+        "history_anchor_expert": _clone_anchor_cfg(history or {"enable": False}),
+        "train_stat_anchor_expert": _clone_anchor_cfg(stat or {"enable": False}),
+        "train_residual_anchor_expert": _clone_anchor_cfg(residual or {"enable": False}),
+    }
+
+
+_MAIN_TABLE_MOE_OUTPUT_ANCHOR_DEFAULTS = {
+    ("etth1", 96): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=24),
+        residual=_residual_anchor_default(period=24, horizon_segments=12),
+    ),
+    ("etth1", 192): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=24, metric="mae", horizon_segments=12),
+        residual=_residual_anchor_default(period=24, metric="mae", horizon_segments=12),
+    ),
+    ("etth1", 336): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, max_scale=0.8, steps=33, horizon_segments=4),
+    ),
+    ("etth1", 720): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, max_scale=0.15, steps=7),
+        residual=_residual_anchor_default(period=96, max_scale=0.6, steps=25, horizon_segments=7),
+    ),
+    ("etth2", 96): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, horizon_segments=7),
+    ),
+    ("etth2", 192): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae"),
+        residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
+    ),
+    ("etth2", 336): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae"),
+        residual=_residual_anchor_default(period=96, metric="mae", max_scale=2.6, steps=105, horizon_segments=7),
+    ),
+    ("etth2", 720): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, max_scale=0.4, steps=17),
+        residual=None,
+    ),
+    ("ettm1", 96): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, max_scale=1.6, steps=65, horizon_segments=7),
+    ),
+    ("ettm1", 192): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, max_scale=2.65, steps=107, horizon_segments=7),
+    ),
+    ("ettm1", 336): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, max_scale=2.4, steps=97, horizon_segments=7),
+    ),
+    ("ettm1", 720): _moe_output_anchor_default(
+        history={
+            "enable": True,
+            "lags": [96, 192, 288],
+            "alpha": 0.2,
+            "blend_target": "prediction",
+            "history_scope": "input_window",
+        },
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, horizon_segments=7),
+    ),
+    ("ettm2", 96): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.18, steps=8),
+        residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
+    ),
+    ("ettm2", 192): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96),
+        residual=_residual_anchor_default(period=96, horizon_segments=4),
+    ),
+    ("ettm2", 336): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, horizon_segments=12),
+        residual=_residual_anchor_default(period=96, horizon_segments=12),
+    ),
+    ("ettm2", 720): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.18, steps=8),
+        residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
+    ),
+    ("weather", 96): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=144, metric="mse", max_scale=0.4, steps=13),
+        residual=_residual_anchor_default(period=144, metric="mse", max_scale=0.8, steps=25, horizon_segments=8),
+    ),
+    ("weather", 192): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=144, metric="mae", max_scale=0.5, steps=13),
+        residual=_residual_anchor_default(period=144, metric="mae", max_scale=1.0, steps=25, horizon_segments=8),
+    ),
+    ("weather", 336): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.2, steps=9),
+        residual=_residual_anchor_default(period=96, metric="mae", max_scale=1.2, steps=49, horizon_segments=7),
+    ),
+    ("weather", 720): _moe_output_anchor_default(
+        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.2, steps=9),
+        residual=_residual_anchor_default(period=96, metric="mae", max_scale=1.2, steps=49, horizon_segments=7),
+    ),
+}
+
+
+def _normalize_anchor_default_dataset_name(dataset_name: object) -> str:
+    raw = str(dataset_name or "").strip()
+    if not raw:
+        return ""
+    stem = os.path.splitext(os.path.basename(raw))[0]
+    key = stem.lower()
+    if "_h" in key:
+        head, tail = key.rsplit("_h", 1)
+        if tail.isdigit():
+            return head
+    return key
+
+
+def default_moe_output_anchor_cfg(dataset_name: object, pred_len: int) -> dict:
+    dataset_key = _normalize_anchor_default_dataset_name(dataset_name)
+    horizon = int(pred_len)
+    if dataset_key.startswith("pems"):
+        return _moe_output_anchor_default(
+            stat=_stat_anchor_default(period=288),
+            residual=_residual_anchor_default(period=288, horizon_segments=4),
+        )
+    defaults = _MAIN_TABLE_MOE_OUTPUT_ANCHOR_DEFAULTS.get((dataset_key, horizon), {})
+    return _clone_anchor_cfg(defaults)
+
+
+def apply_default_moe_output_anchor_cfg(moe_cfg: Optional[dict], *, dataset_name: object, pred_len: int) -> dict:
+    out = dict(moe_cfg or {})
+    defaults = default_moe_output_anchor_cfg(dataset_name, pred_len)
+    for key in _MOE_OUTPUT_ANCHOR_KEYS:
+        if key not in out and key in defaults:
+            out[key] = _clone_anchor_cfg(defaults[key])
+        elif key in out and key in defaults and isinstance(out.get(key), dict):
+            out[key] = _merge_anchor_cfg(defaults[key], out[key])
+    return out
 
 
 def _history_anchor_values(
@@ -1560,6 +2843,55 @@ def apply_train_residual_anchor_expert(
     if blend_target == "prediction":
         return pred_bch + alpha * residual_bch
     return pred_bch + alpha * (base_pred_bch + residual_bch - base_pred_bch)
+
+
+def apply_moe_output_anchor_experts(
+    pred_bch: torch.Tensor,
+    *,
+    base_pred_bch: torch.Tensor,
+    x_bcl: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    moe_cfg: Optional[dict],
+    moe_enable: bool,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    moe_cfg = moe_cfg or {}
+    out = pred_bch
+    history_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
+    stat_cfg = moe_cfg.get("train_stat_anchor_expert", {}) or {}
+    residual_cfg = moe_cfg.get("train_residual_anchor_expert", {}) or {}
+    if bool(history_cfg.get("enable", False)):
+        out = apply_moe_history_anchor_expert(
+            out,
+            base_pred_bch=base_pred_bch,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_cfg,
+        )
+    if bool(stat_cfg.get("enable", False)):
+        out = apply_train_stat_anchor_expert(
+            out,
+            base_pred_bch=base_pred_bch,
+            x_bcl=x_bcl,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=train_stat_anchor_pc,
+            cfg=stat_cfg,
+        )
+    if bool(residual_cfg.get("enable", False)) and train_residual_anchor_phc is not None:
+        out = apply_train_residual_anchor_expert(
+            out,
+            base_pred_bch=base_pred_bch,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            residual_anchor_phc=train_residual_anchor_phc,
+            cfg=residual_cfg,
+        )
+    return out
 
 
 def apply_train_stat_input_centering(
@@ -2188,6 +3520,7 @@ def eval_loop(
     gate_balance_weight: float = 0.0,
     gate_soft_weight: float = 0.0,
     gate_entropy_target_frac: float = 0.0,
+    gate_feature_mode: str = "history",
     penalty_scale: torch.Tensor = None,
     dynamic_lambda: ClusterwiseDynamicLambda = None,
     lambda_min_kp: torch.Tensor = None,
@@ -2195,13 +3528,8 @@ def eval_loop(
     mae_objective_kind: str = "l1",
     mae_objective_beta: float = 1.0,
     pred_residual: Optional[ClusterwisePredResidualMoE] = None,
-    pred_residual_gate: Optional[nn.Module] = None,
     pred_residual_selector: Optional[nn.Module] = None,
     pred_residual_scale_c: Optional[torch.Tensor] = None,
-    residual_correction_ch: Optional[torch.Tensor] = None,
-    knn_hybrid: ShapeKNNHybrid = None,
-    knn_fusion_scale_ch: Optional[torch.Tensor] = None,
-    knn_fusion_gate: Optional[nn.Module] = None,
     eval_start: int = 0,
     history_anchor_cfg: Optional[dict] = None,
     observed_history_tc: Optional[torch.Tensor] = None,
@@ -2227,6 +3555,7 @@ def eval_loop(
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
+    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
     moe_history_anchor_expert_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
     train_stat_anchor_expert_cfg = moe_cfg.get("train_stat_anchor_expert", {}) or {}
     train_residual_anchor_expert_cfg = moe_cfg.get("train_residual_anchor_expert", {}) or {}
@@ -2282,7 +3611,8 @@ def eval_loop(
         # Route on the base prediction. This keeps the router's penalty
         # context independent from the residual expert it is selecting.
         feat_bcf = extract_gate_features(x)            # [B,C,F]
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
+        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F] for dynamic lambda
+        gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
         series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
@@ -2297,7 +3627,7 @@ def eval_loop(
         if moe_enable and P > 0:
             straight_through = (not moe_cfg["detach_penalty_grad"])
             mask_bkp, probs_bkp, skip_bk, _ = gate(
-                feat_bkf,
+                gate_feat_bkf,
                 straight_through=straight_through,
                 penalty_context_bkp=route_pen_bkp,
                 penalty_context_mode=router_mode,
@@ -2324,6 +3654,7 @@ def eval_loop(
 
         yhat_residual_raw = yhat_base
         residual_gate_scale = None
+        output_anchors_applied = False
         if pred_residual is not None and moe_enable and P > 0:
             pred_out = pred_residual(
                 x,
@@ -2331,54 +3662,30 @@ def eval_loop(
                 cluster_id_c,
                 mask_bkp,
                 skip_bk=skip_bk if allow_skip else None,
+                query_start_abs_b=query_start_abs_b,
             )
             yhat_residual_raw = pred_out["y_final"]
             yhat = yhat_residual_raw
             if pred_residual_selector is not None:
                 pred_residual_selector.eval()
-                cand_bcpH = _pred_residual_candidate_predictions(
+                selector_base_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
                     yhat_base,
                     pred_out,
                     pred_residual_scale_c=pred_residual_scale_c,
+                    apply_output_anchors=True,
+                    x_bcl=x,
+                    query_start_abs_b=query_start_abs_b,
+                    input_len=int(input_len or x.shape[-1]),
+                    moe_cfg=moe_cfg,
+                    moe_enable=moe_enable,
+                    observed_history_tc=observed_history_tc,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
                 )
                 if cand_bcpH is not None:
-                    yhat, _ = pred_residual_selector.select_prediction(x, yhat_base, cand_bcpH)
+                    yhat, _ = pred_residual_selector.select_prediction(x, selector_base_bch, cand_bcpH)
                     yhat_residual_raw = yhat
-            elif pred_residual_gate is not None:
-                pred_residual_gate.eval()
-                gate_feat = _knn_gate_features(x, yhat_base, yhat)
-                scale = pred_residual_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
-                if bool(getattr(pred_residual_gate, "apply_activation_threshold", False)):
-                    threshold_raw = getattr(
-                        pred_residual_gate,
-                        "activation_threshold_c",
-                        getattr(pred_residual_gate, "activation_threshold", 0.0),
-                    )
-                    threshold = torch.as_tensor(threshold_raw, device=scale.device, dtype=scale.dtype)
-                    if threshold.numel() == 1:
-                        threshold = threshold.reshape(1, 1, 1)
-                    elif threshold.numel() == scale.shape[1]:
-                        threshold = threshold.reshape(1, scale.shape[1], 1)
-                    else:
-                        raise ValueError(
-                            f"Residual gate activation threshold must be scalar or length {scale.shape[1]}, "
-                            f"got {int(threshold.numel())}."
-                        )
-                    if bool(getattr(pred_residual_gate, "activation_head_enable", False)):
-                        active_score = pred_residual_gate.activation_prob(gate_feat).to(
-                            device=scale.device,
-                            dtype=scale.dtype,
-                        ).unsqueeze(-1)
-                        active = active_score > threshold
-                    else:
-                        by_abs = bool(getattr(pred_residual_gate, "activation_by_abs_scale", False))
-                        active = scale.abs() > threshold if by_abs else scale > threshold
-                    scale = scale * active.to(dtype=scale.dtype)
-                if pred_residual_scale_c is not None:
-                    channel_scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
-                    scale = scale * channel_scale
-                residual_gate_scale = scale
-                yhat = yhat_base + scale * (yhat - yhat_base)
+                    output_anchors_applied = True
             elif pred_residual_scale_c is not None:
                 scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
                 residual_gate_scale = scale.expand(yhat.shape[0], -1, -1)
@@ -2386,53 +3693,20 @@ def eval_loop(
         else:
             yhat = yhat_base
 
-        if moe_enable and bool(moe_history_anchor_expert_cfg.get("enable", False)):
-            yhat = apply_moe_history_anchor_expert(
-                yhat,
-                base_pred_bch=yhat_base,
-                observed_history_tc=observed_history_tc,
-                query_start_abs_b=query_start_abs_b,
-                input_len=int(input_len or x.shape[-1]),
-                cfg=moe_history_anchor_expert_cfg,
-            )
-        if moe_enable and bool(train_stat_anchor_expert_cfg.get("enable", False)):
-            yhat = apply_train_stat_anchor_expert(
+        if not output_anchors_applied:
+            yhat = apply_moe_output_anchor_experts(
                 yhat,
                 base_pred_bch=yhat_base,
                 x_bcl=x,
                 query_start_abs_b=query_start_abs_b,
                 input_len=int(input_len or x.shape[-1]),
-                stat_anchor_pc=train_stat_anchor_pc,
-                cfg=train_stat_anchor_expert_cfg,
-            )
-        if (
-            moe_enable
-            and bool(train_residual_anchor_expert_cfg.get("enable", False))
-            and train_residual_anchor_phc is not None
-        ):
-            yhat = apply_train_residual_anchor_expert(
-                yhat,
-                base_pred_bch=yhat_base,
-                query_start_abs_b=query_start_abs_b,
-                input_len=int(input_len or x.shape[-1]),
-                residual_anchor_phc=train_residual_anchor_phc,
-                cfg=train_residual_anchor_expert_cfg,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=observed_history_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
             )
 
-        if knn_hybrid is not None:
-            yhat_pre_knn = yhat
-            yhat = knn_hybrid.hybridize_batch(x, yhat, cluster_id_c, query_start_abs_b=query_start_abs_b)
-            if knn_fusion_scale_ch is not None:
-                scale = knn_fusion_scale_ch.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
-                yhat = yhat_pre_knn + scale * (yhat - yhat_pre_knn)
-            if knn_fusion_gate is not None:
-                knn_fusion_gate.eval()
-                gate_feat = _knn_gate_features(x, yhat_pre_knn, yhat)
-                scale = knn_fusion_gate(gate_feat).to(device=yhat.device, dtype=yhat.dtype).unsqueeze(-1)
-                yhat = yhat_pre_knn + scale * (yhat - yhat_pre_knn)
-        if residual_correction_ch is not None:
-            corr_ch = residual_correction_ch.to(device=yhat.device, dtype=yhat.dtype)
-            yhat = yhat + corr_ch.unsqueeze(0)
         yhat = apply_calendar_residual_correction(
             yhat,
             calendar_feature_tf=calendar_feature_tf,
@@ -2565,110 +3839,9 @@ def eval_loop(
 
 
 @torch.no_grad()
-def estimate_residual_correction(
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    method: str = "median",
-    shrink: float = 1.0,
-    max_abs: float = 0.0,
-    knn_hybrid: ShapeKNNHybrid = None,
-    eval_start: int = 0,
-) -> Optional[torch.Tensor]:
-    if len(loader) == 0:
-        return None
-    method = str(method).lower()
-    if method not in {"median", "mean"}:
-        raise ValueError(f"Unsupported calibration.method='{method}'. Expected median or mean.")
-    model.eval()
-    residuals = []
-    sum_ch = None
-    count = 0
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        yhat = model(x, cluster_id_c)
-        if knn_hybrid is not None:
-            query_start_abs_b = eval_start + idx
-            yhat = knn_hybrid.hybridize_batch(x, yhat, cluster_id_c, query_start_abs_b=query_start_abs_b)
-        residual = y - yhat
-        if method == "mean":
-            batch_sum = residual.sum(dim=0)
-            sum_ch = batch_sum if sum_ch is None else (sum_ch + batch_sum)
-            count += int(residual.shape[0])
-        else:
-            residuals.append(residual.detach().cpu())
-    if method == "mean":
-        if sum_ch is None or count == 0:
-            return None
-        corr_ch = sum_ch / float(count)
-    else:
-        if len(residuals) == 0:
-            return None
-        corr_ch = torch.cat(residuals, dim=0).median(dim=0).values.to(device=device)
-    corr_ch = corr_ch * float(shrink)
-    if max_abs and float(max_abs) > 0.0:
-        corr_ch = corr_ch.clamp(min=-float(max_abs), max=float(max_abs))
-    return corr_ch.detach().cpu()
 
 
 @torch.no_grad()
-def estimate_per_channel_guarded_shrink_correction(
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    grid: List[float],
-    max_rel_mse_regression: float = 0.01,
-    max_abs: float = 0.0,
-    eval_start: int = 0,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Per-channel median-offset calibration with a per-channel MSE-regression cap.
-
-    Builds the unit (shrink=1) median residual offset per (channel, horizon) on
-    `loader`, then for each CHANNEL picks the largest shrink from `grid` whose
-    val MSE regression on that channel stays within `max_rel_mse_regression`
-    (relative to the uncalibrated MSE), while minimizing that channel's MAE.
-
-    The offset only shifts predictions by a constant per (c, h), so for residual
-    r = y - yhat the calibrated residual is r - s * unit[c, h]; per-channel MAE/MSE
-    over a shrink grid are evaluated analytically from the collected residuals —
-    no extra forward passes. Returns (corr_ch [C, H], chosen_shrink_c [C]).
-    """
-    if len(loader) == 0:
-        return None
-    model.eval()
-    residuals = []
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        residuals.append((y - model(x, cluster_id_c)).detach().cpu())
-    if len(residuals) == 0:
-        return None
-    r_nch = torch.cat(residuals, dim=0)                       # [N, C, H]
-    unit_ch = r_nch.median(dim=0).values                      # [C, H]
-    grid_t = torch.as_tensor(sorted(set(float(g) for g in grid)), dtype=r_nch.dtype)
-    if float(grid_t.min()) > 0.0:                             # always allow s=0 (no change)
-        grid_t = torch.cat([torch.zeros(1, dtype=r_nch.dtype), grid_t])
-    C = r_nch.shape[1]
-    # residual under shrink s: r - s*unit  -> per (s, channel) MAE/MSE over n,h
-    # shapes: r_nch [N,C,H], unit_ch [C,H], grid_t [S]
-    shifted = r_nch.unsqueeze(0) - grid_t.view(-1, 1, 1, 1) * unit_ch.unsqueeze(0).unsqueeze(0)  # [S,N,C,H]
-    mse_sc = shifted.pow(2).mean(dim=(1, 3))                  # [S, C]
-    mae_sc = shifted.abs().mean(dim=(1, 3))                   # [S, C]
-    base_mse_c = mse_sc[0]                                    # s=0 row (uncalibrated)
-    cap_c = (1.0 + float(max_rel_mse_regression)) * base_mse_c
-    allowed = mse_sc <= cap_c.unsqueeze(0)                    # [S, C]
-    big = mae_sc.max() + 1.0
-    mae_masked = torch.where(allowed, mae_sc, mae_sc + big)   # forbid disallowed shrinks
-    best_s_idx = mae_masked.argmin(dim=0)                     # [C]
-    chosen_shrink_c = grid_t[best_s_idx]                      # [C]
-    corr_ch = chosen_shrink_c.view(C, 1) * unit_ch           # [C, H]
-    if max_abs and float(max_abs) > 0.0:
-        corr_ch = corr_ch.clamp(min=-float(max_abs), max=float(max_abs))
-    return corr_ch.detach().cpu(), chosen_shrink_c.detach().cpu()
 
 
 def _calendar_features_from_datetime(
@@ -2958,13 +4131,8 @@ def fit_calendar_residual_correction_from_eval_path(
     mae_objective_kind: str = "l1",
     mae_objective_beta: float = 1.0,
     pred_residual: Optional[ClusterwisePredResidualMoE] = None,
-    pred_residual_gate: Optional[nn.Module] = None,
     pred_residual_selector: Optional[nn.Module] = None,
     pred_residual_scale_c: Optional[torch.Tensor] = None,
-    residual_correction_ch: Optional[torch.Tensor] = None,
-    knn_hybrid: ShapeKNNHybrid = None,
-    knn_fusion_scale_ch: Optional[torch.Tensor] = None,
-    knn_fusion_gate: Optional[nn.Module] = None,
     eval_start: int = 0,
     history_anchor_cfg: Optional[dict] = None,
     observed_history_tc: Optional[torch.Tensor] = None,
@@ -3008,13 +4176,8 @@ def fit_calendar_residual_correction_from_eval_path(
         mae_objective_kind=mae_objective_kind,
         mae_objective_beta=mae_objective_beta,
         pred_residual=pred_residual,
-        pred_residual_gate=pred_residual_gate,
         pred_residual_selector=pred_residual_selector,
         pred_residual_scale_c=pred_residual_scale_c,
-        residual_correction_ch=residual_correction_ch,
-        knn_hybrid=knn_hybrid,
-        knn_fusion_scale_ch=knn_fusion_scale_ch,
-        knn_fusion_gate=knn_fusion_gate,
         eval_start=eval_start,
         history_anchor_cfg=history_anchor_cfg,
         observed_history_tc=observed_history_tc,
@@ -3041,79 +4204,190 @@ def fit_calendar_residual_correction_from_eval_path(
     return coef_cf, summary
 
 
-@torch.no_grad()
-def estimate_knn_fusion_scale(
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    knn_hybrid: ShapeKNNHybrid,
-    eval_start: int = 0,
-    metric: str = "mae",
-    min_scale: float = 0.0,
-    max_scale: float = 1.5,
-    grid_steps: int = 31,
-) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
-    if len(loader) == 0 or knn_hybrid is None:
-        return None, {"enable": False, "reason": "empty_loader_or_knn_disabled"}
-    metric = str(metric).lower()
-    if metric not in {"mae", "mse"}:
-        raise ValueError("knn_hybrid.fusion_calibrator.metric must be mae or mse.")
-    min_scale = float(min_scale)
-    max_scale = float(max_scale)
-    if max_scale < min_scale:
-        min_scale, max_scale = max_scale, min_scale
-    grid_steps = max(2, int(grid_steps))
-
-    model.eval()
-    C = int(cluster_id_c.numel())
-    if metric == "mse":
-        num_c = torch.zeros(C, device=device)
-        den_c = torch.zeros(C, device=device)
-    else:
-        grid_g = torch.linspace(min_scale, max_scale, steps=grid_steps, device=device)
-        ae_gc = torch.zeros((grid_steps, C), device=device)
-    count = 0
-
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        base = model(x, cluster_id_c)
-        query_start_abs_b = eval_start + idx
-        hybrid = knn_hybrid.hybridize_batch(x, base, cluster_id_c, query_start_abs_b=query_start_abs_b)
-        delta = hybrid - base
-        target_delta = y - base
-        if metric == "mse":
-            num_c += (delta * target_delta).sum(dim=(0, 2))
-            den_c += delta.pow(2).sum(dim=(0, 2))
-        else:
-            pred_gbch = base.unsqueeze(0) + grid_g.view(-1, 1, 1, 1) * delta.unsqueeze(0)
-            ae_gc += (pred_gbch - y.unsqueeze(0)).abs().sum(dim=(1, 3))
-        count += int(x.shape[0] * x.shape[-2] * y.shape[-1])
-
-    if metric == "mse":
-        scale_c = num_c / den_c.clamp_min(1.0e-12)
-        scale_c = scale_c.clamp(min=min_scale, max=max_scale)
-    else:
-        best_idx_c = ae_gc.argmin(dim=0)
-        scale_c = grid_g.index_select(0, best_idx_c)
-
-    summary = {
-        "enable": True,
-        "metric": metric,
-        "min_scale": min_scale,
-        "max_scale": max_scale,
-        "grid_steps": int(grid_steps),
-        "scale": [float(v) for v in scale_c.detach().cpu().tolist()],
-        "mean_scale": float(scale_c.mean().item()),
-        "min_fitted_scale": float(scale_c.min().item()),
-        "max_fitted_scale": float(scale_c.max().item()),
-    }
-    return scale_c.detach().cpu(), summary
+CANDIDATE_DELTA_FEATURE_NAMES = [
+    "hist_mean",
+    "log_hist_std",
+    "hist_last",
+    "hist_range",
+    "hist_slope",
+    "delta_abs_mean",
+    "delta_abs_max",
+    "delta_std",
+    "delta_bias",
+    "base_std",
+    "hybrid_std",
+    "base_shift",
+    "hybrid_shift",
+]
 
 
-def _knn_gate_features(
+HISTORY_PROXY_SELECTOR_FEATURE_NAMES = [
+    "proxy_base_mse",
+    "proxy_hybrid_mse",
+    "proxy_mse_delta",
+    "proxy_base_mae",
+    "proxy_hybrid_mae",
+    "proxy_mae_delta",
+    "proxy_hybrid_bias",
+]
+
+
+SHAPE_PROXY_SELECTOR_FEATURE_NAMES = [
+    "hist_diff_rms",
+    "hist_d2_rms",
+    "base_slope",
+    "hybrid_slope",
+    "base_hist_slope_gap",
+    "hybrid_hist_slope_gap",
+    "hybrid_base_slope_delta",
+    "base_diff_rms",
+    "hybrid_diff_rms",
+    "hybrid_base_diff_rms_delta",
+    "base_d2_rms",
+    "hybrid_d2_rms",
+    "hybrid_base_d2_rms_delta",
+    "base_hist_corr",
+    "hybrid_hist_corr",
+    "hybrid_base_corr_delta",
+    "base_hist_std_ratio",
+    "hybrid_hist_std_ratio",
+    "hybrid_base_std_ratio_delta",
+]
+
+
+def _candidate_selector_feature_names(feature_mode: str = "base") -> List[str]:
+    mode = str(feature_mode or "base").lower()
+    if mode in {"base", "default"}:
+        return list(CANDIDATE_DELTA_FEATURE_NAMES)
+    if mode in {"history_proxy", "proxy"}:
+        return list(CANDIDATE_DELTA_FEATURE_NAMES) + list(HISTORY_PROXY_SELECTOR_FEATURE_NAMES)
+    if mode in {"shape_proxy", "shape", "rich_shape"}:
+        return list(CANDIDATE_DELTA_FEATURE_NAMES) + list(HISTORY_PROXY_SELECTOR_FEATURE_NAMES) + list(SHAPE_PROXY_SELECTOR_FEATURE_NAMES)
+    raise ValueError("candidate_selector.feature_mode must be base, history_proxy, or shape_proxy.")
+
+
+def _history_proxy_for_candidate_selector(x_bcl: torch.Tensor, pred_len: int) -> torch.Tensor:
+    H = int(pred_len)
+    if H <= 0:
+        raise ValueError("candidate selector history proxy requires pred_len > 0.")
+    L = int(x_bcl.shape[-1])
+    if L >= H:
+        return x_bcl[..., -H:]
+    return x_bcl[..., -1:].expand(*x_bcl.shape[:-1], H)
+
+
+def _sequence_slope_bch(values_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    if values_bch.shape[-1] <= 1:
+        return torch.zeros_like(values_bch[..., 0])
+    t = torch.linspace(-1.0, 1.0, steps=values_bch.shape[-1], device=values_bch.device, dtype=values_bch.dtype)
+    t = t.view(*([1] * (values_bch.dim() - 1)), -1)
+    centered = values_bch - values_bch.mean(dim=-1, keepdim=True)
+    return (centered * t).mean(dim=-1) / t.pow(2).mean().clamp_min(eps)
+
+
+def _sequence_diff_rms_bch(values_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    if values_bch.shape[-1] <= 1:
+        return torch.zeros_like(values_bch[..., 0])
+    return values_bch.diff(dim=-1).pow(2).mean(dim=-1).clamp_min(eps).sqrt()
+
+
+def _sequence_d2_rms_bch(values_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    if values_bch.shape[-1] <= 2:
+        return torch.zeros_like(values_bch[..., 0])
+    return values_bch.diff(dim=-1).diff(dim=-1).pow(2).mean(dim=-1).clamp_min(eps).sqrt()
+
+
+def _sequence_corr_bch(a_bch: torch.Tensor, b_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    if a_bch.shape[-1] <= 1:
+        return torch.zeros_like(a_bch[..., 0])
+    a_center = a_bch - a_bch.mean(dim=-1, keepdim=True)
+    b_center = b_bch - b_bch.mean(dim=-1, keepdim=True)
+    denom = a_center.pow(2).mean(dim=-1).sqrt() * b_center.pow(2).mean(dim=-1).sqrt()
+    return (a_center * b_center).mean(dim=-1) / denom.clamp_min(eps)
+
+
+def _candidate_selector_features(
+    x_bcl: torch.Tensor,
+    base_bch: torch.Tensor,
+    hybrid_bch: torch.Tensor,
+    feature_mode: str = "base",
+) -> torch.Tensor:
+    base_feat = _candidate_delta_features(x_bcl, base_bch, hybrid_bch)
+    mode = str(feature_mode or "base").lower()
+    if mode in {"base", "default"}:
+        return base_feat
+    if mode not in {"history_proxy", "proxy", "shape_proxy", "shape", "rich_shape"}:
+        raise ValueError("candidate_selector.feature_mode must be base, history_proxy, or shape_proxy.")
+    eps = 1.0e-6
+    hist_std = x_bcl.std(dim=-1).clamp_min(eps)
+    hist_proxy = _history_proxy_for_candidate_selector(x_bcl, int(base_bch.shape[-1])).to(
+        device=base_bch.device,
+        dtype=base_bch.dtype,
+    )
+    scale2 = hist_std.pow(2).clamp_min(eps).to(device=base_bch.device, dtype=base_bch.dtype)
+    scale1 = hist_std.to(device=base_bch.device, dtype=base_bch.dtype)
+    base_proxy_mse = (base_bch - hist_proxy).pow(2).mean(dim=-1) / scale2
+    hybrid_proxy_mse = (hybrid_bch - hist_proxy).pow(2).mean(dim=-1) / scale2
+    base_proxy_mae = (base_bch - hist_proxy).abs().mean(dim=-1) / scale1
+    hybrid_proxy_mae = (hybrid_bch - hist_proxy).abs().mean(dim=-1) / scale1
+    proxy_extra = torch.stack(
+        [
+            base_proxy_mse,
+            hybrid_proxy_mse,
+            hybrid_proxy_mse - base_proxy_mse,
+            base_proxy_mae,
+            hybrid_proxy_mae,
+            hybrid_proxy_mae - base_proxy_mae,
+            (hybrid_bch - hist_proxy).mean(dim=-1) / scale1,
+        ],
+        dim=-1,
+    )
+    if mode in {"history_proxy", "proxy"}:
+        return torch.cat([base_feat, proxy_extra], dim=-1)
+
+    hist_proxy = hist_proxy.to(device=base_bch.device, dtype=base_bch.dtype)
+    hist_slope = _sequence_slope_bch(hist_proxy, eps=eps)
+    base_slope = _sequence_slope_bch(base_bch, eps=eps)
+    hybrid_slope = _sequence_slope_bch(hybrid_bch, eps=eps)
+    hist_diff_rms = _sequence_diff_rms_bch(hist_proxy, eps=eps).to(dtype=base_bch.dtype) / scale1
+    base_diff_rms = _sequence_diff_rms_bch(base_bch, eps=eps) / scale1
+    hybrid_diff_rms = _sequence_diff_rms_bch(hybrid_bch, eps=eps) / scale1
+    hist_d2_rms = _sequence_d2_rms_bch(hist_proxy, eps=eps).to(dtype=base_bch.dtype) / scale1
+    base_d2_rms = _sequence_d2_rms_bch(base_bch, eps=eps) / scale1
+    hybrid_d2_rms = _sequence_d2_rms_bch(hybrid_bch, eps=eps) / scale1
+    base_corr = _sequence_corr_bch(base_bch, hist_proxy, eps=eps)
+    hybrid_corr = _sequence_corr_bch(hybrid_bch, hist_proxy, eps=eps)
+    hist_proxy_std = hist_proxy.std(dim=-1).clamp_min(eps)
+    base_std_ratio = base_bch.std(dim=-1) / hist_proxy_std
+    hybrid_std_ratio = hybrid_bch.std(dim=-1) / hist_proxy_std
+    shape_extra = torch.stack(
+        [
+            hist_diff_rms,
+            hist_d2_rms,
+            base_slope,
+            hybrid_slope,
+            (base_slope - hist_slope) / scale1,
+            (hybrid_slope - hist_slope) / scale1,
+            (hybrid_slope - base_slope) / scale1,
+            base_diff_rms,
+            hybrid_diff_rms,
+            hybrid_diff_rms - base_diff_rms,
+            base_d2_rms,
+            hybrid_d2_rms,
+            hybrid_d2_rms - base_d2_rms,
+            base_corr,
+            hybrid_corr,
+            hybrid_corr - base_corr,
+            base_std_ratio,
+            hybrid_std_ratio,
+            hybrid_std_ratio - base_std_ratio,
+        ],
+        dim=-1,
+    )
+    return torch.cat([base_feat, proxy_extra, shape_extra], dim=-1)
+
+
+def _candidate_delta_features(
     x_bcl: torch.Tensor,
     base_bch: torch.Tensor,
     hybrid_bch: torch.Tensor,
@@ -3161,22 +4435,90 @@ def _pred_residual_candidate_predictions(
     y_base_bch: torch.Tensor,
     pred_out: Dict[str, torch.Tensor],
     pred_residual_scale_c: Optional[torch.Tensor] = None,
+    include_intervention: bool = True,
+    include_selector: bool = True,
 ) -> Optional[torch.Tensor]:
     residuals = pred_out.get("residuals")
     alpha_cp = pred_out.get("alpha_cp")
     intervention_bcp = pred_out.get("intervention_bcp")
     selector_bcp = pred_out.get("selector_bcp")
+    confidence_active_bcp = pred_out.get("confidence_active_bcp")
     if residuals is None or alpha_cp is None or intervention_bcp is None:
         return None
     if residuals.numel() == 0:
         return None
     if selector_bcp is None:
         selector_bcp = torch.ones_like(intervention_bcp)
-    scale_bcp = intervention_bcp * selector_bcp * alpha_cp.unsqueeze(0)
+    if confidence_active_bcp is None:
+        confidence_active_bcp = torch.ones_like(intervention_bcp)
+    if not bool(include_intervention):
+        intervention_bcp = torch.ones_like(intervention_bcp)
+        confidence_active_bcp = torch.ones_like(confidence_active_bcp)
+    if not bool(include_selector):
+        selector_bcp = torch.ones_like(selector_bcp)
+    scale_bcp = intervention_bcp * selector_bcp * confidence_active_bcp * alpha_cp.unsqueeze(0)
     if pred_residual_scale_c is not None:
         channel_scale = pred_residual_scale_c.to(device=y_base_bch.device, dtype=y_base_bch.dtype).view(1, -1, 1)
         scale_bcp = scale_bcp * channel_scale
     return y_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
+
+
+def _pred_residual_candidates_on_eval_path(
+    y_base_bch: torch.Tensor,
+    pred_out: Dict[str, torch.Tensor],
+    *,
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
+    apply_output_anchors: bool = False,
+    x_bcl: Optional[torch.Tensor] = None,
+    query_start_abs_b: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    moe_cfg: Optional[dict] = None,
+    moe_enable: bool = True,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    include_intervention: bool = True,
+    include_selector: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    cand_bcpH = _pred_residual_candidate_predictions(
+        y_base_bch,
+        pred_out,
+        pred_residual_scale_c=pred_residual_scale_c,
+        include_intervention=include_intervention,
+        include_selector=include_selector,
+    )
+    if cand_bcpH is None or not apply_output_anchors:
+        return y_base_bch, cand_bcpH
+    if x_bcl is None or query_start_abs_b is None:
+        raise ValueError("Output-anchor candidate evaluation requires x_bcl and query_start_abs_b.")
+    y_base_final = apply_moe_output_anchor_experts(
+        y_base_bch,
+        base_pred_bch=y_base_bch,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len),
+        moe_cfg=moe_cfg,
+        moe_enable=moe_enable,
+        observed_history_tc=observed_history_tc,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+    )
+    cand_final_parts = [
+        apply_moe_output_anchor_experts(
+            cand_bcpH[:, :, p, :],
+            base_pred_bch=y_base_bch,
+            x_bcl=x_bcl,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        for p in range(int(cand_bcpH.shape[2]))
+    ]
+    return y_base_final, torch.stack(cand_final_parts, dim=2)
 
 
 def _candidate_selector_targets(
@@ -3186,11 +4528,22 @@ def _candidate_selector_targets(
     y_bch: torch.Tensor,
     min_abs_improvement: float = 0.0,
     min_rel_improvement: float = 0.0,
+    allowed_mask_cp: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
     cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
+    allowed = _selector_allowed_mask_cp(
+        allowed_mask_cp,
+        C=int(cand_err_bcp.shape[1]),
+        P=int(cand_err_bcp.shape[2]),
+        device=cand_err_bcp.device,
+        context="candidate selector target",
+    )
+    if allowed is not None:
+        cand_err_bcp = cand_err_bcp.masked_fill(~allowed.unsqueeze(0), float("inf"))
     best_err_bc, best_p_bc = cand_err_bcp.min(dim=-1)
     gain_bc = base_err_bc - best_err_bc
+    gain_bc = torch.where(torch.isfinite(gain_bc), gain_bc, torch.full_like(gain_bc, float("-inf")))
     required_bc = torch.maximum(
         torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
         max(0.0, float(min_rel_improvement)) * base_err_bc.abs().clamp_min(1.0e-12),
@@ -3198,50 +4551,405 @@ def _candidate_selector_targets(
     return torch.where(gain_bc > required_bc, best_p_bc.to(dtype=torch.long) + 1, torch.zeros_like(best_p_bc))
 
 
+def _selector_allowed_mask_cp(
+    allowed_mask_cp: Optional[torch.Tensor],
+    *,
+    C: int,
+    P: int,
+    device: torch.device,
+    context: str,
+) -> Optional[torch.Tensor]:
+    if allowed_mask_cp is None or int(allowed_mask_cp.numel()) == 0:
+        return None
+    allowed = allowed_mask_cp.to(device=device, dtype=torch.bool)
+    if tuple(allowed.shape) != (int(C), int(P)):
+        raise ValueError(
+            f"{context} allowed mask must have shape [C,P], "
+            f"got {tuple(allowed.shape)} vs {(int(C), int(P))}."
+        )
+    return allowed
+
+
+def _candidate_selector_adoption_decision(
+    *,
+    current_mse: float,
+    current_mae: float,
+    selector_mse: float,
+    selector_mae: float,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    max_rel_mae_regression: float = 0.0,
+) -> Dict[str, object]:
+    current_mse_f = float(current_mse)
+    current_mae_f = float(current_mae)
+    selector_mse_f = float(selector_mse)
+    selector_mae_f = float(selector_mae)
+    required = max(
+        max(0.0, float(min_abs_improvement)),
+        max(0.0, float(min_rel_improvement)) * max(abs(current_mse_f), 1.0e-12),
+    )
+    mse_improvement = current_mse_f - selector_mse_f
+    mae_regression = selector_mae_f - current_mae_f
+    allowed_mae_regression = max(0.0, float(max_rel_mae_regression)) * max(abs(current_mae_f), 1.0e-12)
+    finite = all(math.isfinite(v) for v in (current_mse_f, current_mae_f, selector_mse_f, selector_mae_f))
+    adopt = bool(finite and mse_improvement > required and mae_regression <= allowed_mae_regression)
+    return {
+        "adopt": adopt,
+        "current_mse": current_mse_f,
+        "current_mae": current_mae_f,
+        "selector_mse": selector_mse_f,
+        "selector_mae": selector_mae_f,
+        "mse_improvement": float(mse_improvement),
+        "mse_improvement_pct": float(100.0 * mse_improvement / max(abs(current_mse_f), 1.0e-12)),
+        "required_mse_improvement": float(required),
+        "min_abs_improvement": float(max(0.0, float(min_abs_improvement))),
+        "min_rel_improvement": float(max(0.0, float(min_rel_improvement))),
+        "mae_regression": float(mae_regression),
+        "mae_regression_pct": float(100.0 * mae_regression / max(abs(current_mae_f), 1.0e-12)),
+        "allowed_mae_regression": float(allowed_mae_regression),
+        "max_rel_mae_regression": float(max(0.0, float(max_rel_mae_regression))),
+        "finite": bool(finite),
+    }
+
+
+def _candidate_selector_candidate_scale(
+    *,
+    pred_residual_scale_c: Optional[torch.Tensor],
+    selector_cfg: Dict[str, object],
+) -> Tuple[Optional[torch.Tensor], str]:
+    use_channel_scale = bool(selector_cfg.get("use_channel_scale_for_candidates", True))
+    if use_channel_scale:
+        return pred_residual_scale_c, "channel_scale"
+    return None, "unscaled"
+
+
+def _cluster_utility_threshold_stats(
+    *,
+    gain_bcp: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    allowed_mask_kp: Optional[torch.Tensor],
+    thresholds: List[float],
+) -> Dict[str, torch.Tensor]:
+    if gain_bcp.numel() == 0:
+        return {
+            "valid_count_kt": torch.zeros(int(K), len(thresholds), dtype=torch.float64),
+            "total_count_k": torch.zeros(int(K), dtype=torch.float64),
+            "best_gain_sum_k": torch.zeros(int(K), dtype=torch.float64),
+            "best_gain_positive_count_k": torch.zeros(int(K), dtype=torch.float64),
+        }
+    gain_bkp = scatter_mean_bcf_to_bkf(gain_bcp, cluster_id_c, int(K)).to(dtype=torch.float64)
+    B, _, P = gain_bkp.shape
+    if allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
+        allowed = allowed_mask_kp.to(device=gain_bkp.device, dtype=torch.bool)
+        if tuple(allowed.shape) != (int(K), int(P)):
+            raise ValueError(
+                "utility threshold allowed mask must have shape [K,P], "
+                f"got {tuple(allowed.shape)} vs {(int(K), int(P))}."
+            )
+    else:
+        allowed = torch.ones((int(K), int(P)), device=gain_bkp.device, dtype=torch.bool)
+    allowed_bkp = allowed.unsqueeze(0).expand_as(gain_bkp)
+    masked_gain_bkp = gain_bkp.masked_fill(~allowed_bkp, -float("inf"))
+    best_gain_bk = masked_gain_bkp.max(dim=-1).values
+    best_gain_bk = torch.nan_to_num(best_gain_bk, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_counts = []
+    allowed_float = allowed_bkp.to(dtype=gain_bkp.dtype)
+    for threshold in thresholds:
+        utility_bkp = (gain_bkp - float(threshold)).clamp_min(0.0) * allowed_float
+        valid_counts.append((utility_bkp.sum(dim=-1) > 0.0).sum(dim=0).to(dtype=torch.float64))
+    if valid_counts:
+        valid_count_kt = torch.stack(valid_counts, dim=-1)
+    else:
+        valid_count_kt = torch.zeros(int(K), 0, device=gain_bkp.device, dtype=torch.float64)
+    return {
+        "valid_count_kt": valid_count_kt.detach().cpu(),
+        "total_count_k": torch.full((int(K),), int(B), dtype=torch.float64),
+        "best_gain_sum_k": best_gain_bk.sum(dim=0).detach().cpu().to(dtype=torch.float64),
+        "best_gain_positive_count_k": (best_gain_bk > 0.0).sum(dim=0).detach().cpu().to(dtype=torch.float64),
+    }
+
+
 def _mse_utility_gate_supervision_loss(
     *,
     probs_bkp: Optional[torch.Tensor],
-    allowed_mask_kp: Optional[torch.Tensor],
+    skip_prob_bk: Optional[torch.Tensor] = None,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
     y_base_bch: torch.Tensor,
     pred_out: Optional[Dict[str, torch.Tensor]],
     y_bch: torch.Tensor,
     cluster_id_c: torch.Tensor,
     K: int,
+    y_base_eval_bch: Optional[torch.Tensor] = None,
+    cand_eval_bcpH: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
     min_gain: float = 0.0,
     target_power: float = 1.0,
+    include_skip: bool = False,
+    probs_include_skip_mass: bool = False,
+    target_mode: str = "soft_utility",
+    return_diagnostics: bool = False,
     eps: float = 1.0e-8,
 ) -> Optional[torch.Tensor]:
     if probs_bkp is None or pred_out is None or probs_bkp.numel() == 0:
-        return None
-    cand_bcpH = _pred_residual_candidate_predictions(y_base_bch, pred_out)
+        return (None, None) if return_diagnostics else None
+    target_mode_l = str(target_mode or "soft_utility").lower()
+    hard_target = target_mode_l in {"hard", "hard_oracle", "argmax", "one_hot"}
+    if target_mode_l not in {"soft", "soft_utility", "utility", "hard", "hard_oracle", "argmax", "one_hot"}:
+        raise ValueError(
+            "mse utility gate supervision target_mode must be one of "
+            "soft_utility or hard_oracle aliases, "
+            f"got {target_mode!r}."
+        )
+    base_bch = y_base_eval_bch if y_base_eval_bch is not None else y_base_bch
+    cand_bcpH = cand_eval_bcpH if cand_eval_bcpH is not None else _pred_residual_candidate_predictions(y_base_bch, pred_out)
     if cand_bcpH is None or cand_bcpH.numel() == 0:
-        return None
+        return (None, None) if return_diagnostics else None
     with torch.no_grad():
-        base_err_bc = (y_base_bch - y_bch).pow(2).mean(dim=-1)
+        base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
         cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
         gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
-        utility_bcp = (gain_bcp - float(min_gain)).clamp_min(0.0)
+        gain_bkp = scatter_mean_bcf_to_bkf(gain_bcp, cluster_id_c, K)
         if allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
             allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
-            allowed_bkp = allowed.unsqueeze(0).expand_as(probs_bkp).to(dtype=utility_bcp.dtype)
+            allowed_bkp = allowed.unsqueeze(0).expand_as(probs_bkp).to(dtype=gain_bkp.dtype)
         else:
-            allowed_bkp = (probs_bkp.detach() > 0.0).to(dtype=utility_bcp.dtype)
-        utility_bkp = scatter_mean_bcf_to_bkf(utility_bcp, cluster_id_c, K) * allowed_bkp
+            allowed_bkp = (probs_bkp.detach() > 0.0).to(dtype=gain_bkp.dtype)
+        utility_bkp = (gain_bkp - float(min_gain)).clamp_min(0.0) * allowed_bkp
         if float(target_power) != 1.0:
             utility_bkp = utility_bkp.clamp_min(0.0).pow(float(target_power))
         valid_bk = utility_bkp.sum(dim=-1) > 0.0
-        if not bool(valid_bk.any().item()):
-            return None
-        temp = max(float(temperature), 1.0e-6)
-        target_bkp = utility_bkp.clamp_min(eps).log() / temp
-        target_bkp = target_bkp.masked_fill(~valid_bk.unsqueeze(-1), 0.0)
-        target_bkp = torch.softmax(target_bkp, dim=-1) * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
-        target_bkp = target_bkp * allowed_bkp
-        target_bkp = target_bkp / target_bkp.sum(dim=-1, keepdim=True).clamp_min(eps)
+        masked_gain_bkp = gain_bkp.masked_fill(allowed_bkp <= 0.0, float("-inf"))
+        best_gain_bk, best_idx_bk = masked_gain_bkp.max(dim=-1)
+        best_gain_bk = torch.where(torch.isfinite(best_gain_bk), best_gain_bk, torch.zeros_like(best_gain_bk))
+        target_skip_bk = (~valid_bk).to(dtype=utility_bkp.dtype) if bool(include_skip) else torch.zeros_like(utility_bkp[..., 0])
+        diagnostics = {
+            "valid_bk": valid_bk.to(dtype=utility_bkp.dtype).detach(),
+            "target_skip_bk": target_skip_bk.detach(),
+            "best_gain_bk": best_gain_bk.detach(),
+            "utility_sum_bk": utility_bkp.sum(dim=-1).detach(),
+            "probs_include_skip_mass": torch.full_like(valid_bk, float(bool(probs_include_skip_mass)), dtype=utility_bkp.dtype).detach(),
+        }
+        if skip_prob_bk is not None:
+            diagnostics["skip_prob_bk"] = skip_prob_bk.detach()
+        if bool(include_skip):
+            if skip_prob_bk is None:
+                return (None, diagnostics) if return_diagnostics else None
+            if tuple(skip_prob_bk.shape) != tuple(probs_bkp.shape[:2]):
+                raise ValueError(
+                    "skip-aware mse utility gate supervision requires skip_prob_bk shape [B,K], "
+                    f"got {tuple(skip_prob_bk.shape)} vs {tuple(probs_bkp.shape[:2])}."
+                )
+            target_bkp = torch.zeros_like(utility_bkp)
+            if bool(valid_bk.any().item()):
+                if hard_target:
+                    target_bkp.scatter_(-1, best_idx_bk.unsqueeze(-1), 1.0)
+                    target_bkp = target_bkp * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
+                    target_bkp = target_bkp * allowed_bkp
+                else:
+                    temp = max(float(temperature), 1.0e-6)
+                    pos_logits = utility_bkp.clamp_min(eps).log() / temp
+                    pos_logits = pos_logits.masked_fill(~valid_bk.unsqueeze(-1), 0.0)
+                    target_bkp = torch.softmax(pos_logits, dim=-1) * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
+                    target_bkp = target_bkp * allowed_bkp
+                    target_bkp = target_bkp / target_bkp.sum(dim=-1, keepdim=True).clamp_min(eps)
+        else:
+            if not bool(valid_bk.any().item()):
+                return (None, diagnostics) if return_diagnostics else None
+            if hard_target:
+                target_bkp = torch.zeros_like(utility_bkp)
+                target_bkp.scatter_(-1, best_idx_bk.unsqueeze(-1), 1.0)
+                target_bkp = target_bkp * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
+                target_bkp = target_bkp * allowed_bkp
+            else:
+                temp = max(float(temperature), 1.0e-6)
+                target_bkp = utility_bkp.clamp_min(eps).log() / temp
+                target_bkp = target_bkp.masked_fill(~valid_bk.unsqueeze(-1), 0.0)
+                target_bkp = torch.softmax(target_bkp, dim=-1) * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
+                target_bkp = target_bkp * allowed_bkp
+                target_bkp = target_bkp / target_bkp.sum(dim=-1, keepdim=True).clamp_min(eps)
+    if bool(include_skip):
+        if bool(probs_include_skip_mass):
+            penalty_mass_bkp = probs_bkp.clamp_min(eps)
+        else:
+            penalty_mass_bkp = (1.0 - skip_prob_bk).clamp_min(eps).unsqueeze(-1) * probs_bkp.clamp_min(eps)
+        loss_penalty_bk = -(target_bkp * penalty_mass_bkp.log()).sum(dim=-1)
+        loss_skip_bk = -(target_skip_bk * skip_prob_bk.clamp_min(eps).log())
+        loss_bk = loss_penalty_bk + loss_skip_bk
+        return (loss_bk, diagnostics) if return_diagnostics else loss_bk
     log_probs = probs_bkp.clamp_min(eps).log()
     loss_bk = -(target_bkp * log_probs).sum(dim=-1)
-    return torch.where(valid_bk, loss_bk, torch.zeros_like(loss_bk))
+    loss_bk = torch.where(valid_bk, loss_bk, torch.zeros_like(loss_bk))
+    return (loss_bk, diagnostics) if return_diagnostics else loss_bk
+
+
+def _pred_residual_candidate_supervision_loss(
+    *,
+    y_base_bch: torch.Tensor,
+    pred_out: Optional[Dict[str, torch.Tensor]],
+    y_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    penalty_names: Optional[List[str]] = None,
+    penalty_fns: Optional[Dict[str, callable]] = None,
+    penalty_scale: Optional[torch.Tensor] = None,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    only_allowed: bool = True,
+    loss_kind: str = "mse",
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    include_intervention: bool = True,
+    include_selector: bool = True,
+    apply_output_anchors: bool = False,
+    x_bcl: Optional[torch.Tensor] = None,
+    query_start_abs_b: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    moe_cfg: Optional[dict] = None,
+    moe_enable: bool = True,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if pred_out is None:
+        return None
+    base_eval_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
+        y_base_bch,
+        pred_out,
+        apply_output_anchors=apply_output_anchors,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len),
+        moe_cfg=moe_cfg,
+        moe_enable=moe_enable,
+        observed_history_tc=observed_history_tc,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+        include_intervention=include_intervention,
+        include_selector=include_selector,
+    )
+    if cand_bcpH is None or cand_bcpH.numel() == 0:
+        return None
+    loss_mode = str(loss_kind).lower()
+    if loss_mode in {"own_penalty", "penalty", "attribute", "shape"}:
+        if penalty_names is None or penalty_fns is None or len(penalty_names) != int(cand_bcpH.shape[2]):
+            raise ValueError("own_penalty candidate supervision requires one penalty name/function per branch.")
+        per_penalty = []
+        for p, name in enumerate(penalty_names):
+            pen_bc = penalty_fns[name](cand_bcpH[:, :, p, :], y_bch)
+            if penalty_scale is not None and penalty_scale.numel() > p:
+                scale_p = penalty_scale[p].to(device=pen_bc.device, dtype=pen_bc.dtype).clamp_min(1.0e-6)
+                pen_bc = pen_bc / scale_p
+            per_penalty.append(pen_bc)
+        err_bcp = torch.stack(per_penalty, dim=-1)
+    elif loss_mode in {"mse", "l2"}:
+        err_bcpH = cand_bcpH - y_bch.unsqueeze(2)
+        err_bcp = err_bcpH.pow(2).mean(dim=-1)
+    elif loss_mode in {"mae", "l1"}:
+        err_bcpH = cand_bcpH - y_bch.unsqueeze(2)
+        err_bcp = err_bcpH.abs().mean(dim=-1)
+    elif loss_mode in {"gain_hinge", "gain_hinge_mse", "mse_gain_hinge", "residual_gain_hinge"}:
+        cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
+        base_err_bc = (base_eval_bch - y_bch).pow(2).mean(dim=-1)
+        required_bc = torch.maximum(
+            torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
+            max(0.0, float(min_rel_improvement)) * base_err_bc.detach().abs().clamp_min(1.0e-12),
+        )
+        err_bcp = (cand_err_bcp - base_err_bc.detach().unsqueeze(-1) + required_bc.unsqueeze(-1)).clamp_min(0.0)
+    elif loss_mode in {"gain_hinge_mae", "mae_gain_hinge", "l1_gain_hinge"}:
+        cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).abs().mean(dim=-1)
+        base_err_bc = (base_eval_bch - y_bch).abs().mean(dim=-1)
+        required_bc = torch.maximum(
+            torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
+            max(0.0, float(min_rel_improvement)) * base_err_bc.detach().abs().clamp_min(1.0e-12),
+        )
+        err_bcp = (cand_err_bcp - base_err_bc.detach().unsqueeze(-1) + required_bc.unsqueeze(-1)).clamp_min(0.0)
+    else:
+        raise ValueError(
+            "moe.pred_side_residual.candidate_supervision.loss must be mse, mae, own_penalty, "
+            "gain_hinge_mse, or gain_hinge_mae "
+            f"(got {loss_kind!r})."
+        )
+    err_bkp = scatter_mean_bcf_to_bkf(err_bcp, cluster_id_c, K)
+    if bool(only_allowed) and allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
+        allowed = allowed_mask_kp.to(device=err_bkp.device, dtype=err_bkp.dtype)
+        if allowed.shape != err_bkp.shape[1:]:
+            raise ValueError(
+                "candidate_supervision allowed mask must have shape [K,P], "
+                f"got {tuple(allowed.shape)} vs {tuple(err_bkp.shape[1:])}."
+            )
+        empty = allowed.sum(dim=-1, keepdim=True) <= 0.0
+        allowed = torch.where(empty, torch.ones_like(allowed), allowed)
+        return (err_bkp * allowed.unsqueeze(0)).sum(dim=-1) / allowed.sum(dim=-1).clamp_min(1.0).view(1, -1)
+    return err_bkp.mean(dim=-1)
+
+
+def _pred_residual_intervention_supervision_loss(
+    *,
+    y_base_bch: torch.Tensor,
+    pred_out: Optional[Dict[str, torch.Tensor]],
+    y_bch: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    only_allowed: bool = True,
+    min_gain: float = 0.0,
+    pos_weight: float = 1.0,
+    apply_output_anchors: bool = False,
+    x_bcl: Optional[torch.Tensor] = None,
+    query_start_abs_b: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    moe_cfg: Optional[dict] = None,
+    moe_enable: bool = True,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if pred_out is None:
+        return None
+    intervention_bcp = pred_out.get("intervention_bcp")
+    if intervention_bcp is None or intervention_bcp.numel() == 0:
+        return None
+    base_eval_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
+        y_base_bch,
+        pred_out,
+        apply_output_anchors=apply_output_anchors,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len),
+        moe_cfg=moe_cfg,
+        moe_enable=moe_enable,
+        observed_history_tc=observed_history_tc,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+        include_intervention=False,
+        include_selector=False,
+    )
+    if cand_bcpH is None or cand_bcpH.numel() == 0:
+        return None
+    base_err_bc = (base_eval_bch.detach() - y_bch.detach()).pow(2).mean(dim=-1)
+    cand_err_bcp = (cand_bcpH.detach() - y_bch.detach().unsqueeze(2)).pow(2).mean(dim=-1)
+    target_bcp = ((base_err_bc.unsqueeze(-1) - cand_err_bcp) > float(min_gain)).to(dtype=intervention_bcp.dtype)
+    prob_bcp = intervention_bcp.clamp(1.0e-6, 1.0 - 1.0e-6)
+    loss_bcp = -(
+        float(max(pos_weight, 0.0)) * target_bcp * prob_bcp.log()
+        + (1.0 - target_bcp) * (1.0 - prob_bcp).log()
+    )
+    if bool(only_allowed) and allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
+        allowed_cp = allowed_mask_kp.to(device=loss_bcp.device, dtype=torch.bool).index_select(
+            0,
+            cluster_id_c.to(device=loss_bcp.device, dtype=torch.long),
+        )
+        if allowed_cp.shape != loss_bcp.shape[1:]:
+            raise ValueError(
+                "intervention supervision allowed mask must broadcast to [C,P], "
+                f"got {tuple(allowed_cp.shape)} vs {tuple(loss_bcp.shape[1:])}."
+            )
+        loss_bcp = loss_bcp * allowed_cp.to(dtype=loss_bcp.dtype).unsqueeze(0)
+        denom_bc = allowed_cp.to(dtype=loss_bcp.dtype).sum(dim=-1).clamp_min(1.0).view(1, -1)
+        loss_bc = loss_bcp.sum(dim=-1) / denom_bc
+    else:
+        loss_bc = loss_bcp.mean(dim=-1)
+    return scatter_mean_bc_to_bk(loss_bc, cluster_id_c, K)
 
 
 class PredResidualCandidateSelector(nn.Module):
@@ -3255,17 +4963,21 @@ class PredResidualCandidateSelector(nn.Module):
         init_skip_bias: float = 0.0,
         init_penalty_bias: float = 0.0,
         use_penalty_identity: bool = False,
+        feature_mode: str = "base",
     ):
         super().__init__()
         self.base_F = int(feat_dim)
         self.C = int(num_channels)
         self.P = int(num_penalties)
         self.use_penalty_identity = bool(use_penalty_identity)
+        self.feature_mode = str(feature_mode or "base").lower()
         self.F = self.base_F + (self.P if self.use_penalty_identity else 0)
         hidden = int(hidden_dim)
         self.register_buffer("feature_mean", torch.zeros(1, 1, self.F), persistent=True)
         self.register_buffer("feature_std", torch.ones(1, 1, self.F), persistent=True)
         self.register_buffer("feature_standardize_enabled", torch.tensor(0.0), persistent=True)
+        self.register_buffer("feature_standardize_clip", torch.tensor(0.0), persistent=True)
+        self.register_buffer("allowed_penalty_mask_cp", torch.empty(0, 0, dtype=torch.bool), persistent=False)
         self.net = nn.Sequential(
             nn.Linear(self.F, hidden),
             nn.GELU(),
@@ -3302,12 +5014,48 @@ class PredResidualCandidateSelector(nn.Module):
         self.feature_std.copy_(std.clamp_min(1.0e-6))
         self.feature_standardize_enabled.fill_(1.0)
 
+    def set_feature_standardize_clip(self, clip_value: float) -> None:
+        self.feature_standardize_clip.fill_(max(0.0, float(clip_value)))
+
+    def set_allowed_penalty_mask(self, allowed_mask_cp: Optional[torch.Tensor]) -> None:
+        if allowed_mask_cp is None or int(allowed_mask_cp.numel()) == 0:
+            self.allowed_penalty_mask_cp = torch.empty(0, 0, device=self.skip_bias.device, dtype=torch.bool)
+            return
+        allowed = _selector_allowed_mask_cp(
+            allowed_mask_cp,
+            C=self.C,
+            P=self.P,
+            device=self.skip_bias.device,
+            context="candidate selector",
+        )
+        self.allowed_penalty_mask_cp = allowed.detach().clone()
+
+    def _resolved_allowed_penalty_mask(self, allowed_mask_cp: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
+        mask = allowed_mask_cp
+        if mask is None or int(mask.numel()) == 0:
+            mask = self.allowed_penalty_mask_cp
+        return _selector_allowed_mask_cp(mask, C=self.C, P=self.P, device=device, context="candidate selector")
+
+    def _mask_disallowed_logits(
+        self,
+        logits_bcq: torch.Tensor,
+        allowed_mask_cp: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        allowed = self._resolved_allowed_penalty_mask(allowed_mask_cp, logits_bcq.device)
+        if allowed is None:
+            return logits_bcq
+        penalty_logits = logits_bcq[..., 1:].masked_fill(~allowed.unsqueeze(0), torch.finfo(logits_bcq.dtype).min)
+        return torch.cat([logits_bcq[..., :1], penalty_logits], dim=-1)
+
     def _standardize_feat(self, feat: torch.Tensor) -> torch.Tensor:
         if bool(self.feature_standardize_enabled.item() > 0.5):
             feat = (feat - self.feature_mean.to(device=feat.device, dtype=feat.dtype)) / self.feature_std.to(
                 device=feat.device,
                 dtype=feat.dtype,
             )
+            clip_value = float(self.feature_standardize_clip.item())
+            if clip_value > 0.0:
+                feat = feat.clamp(min=-clip_value, max=clip_value)
         return feat
 
     def _append_penalty_identity(
@@ -3340,6 +5088,7 @@ class PredResidualCandidateSelector(nn.Module):
         skip_feat_bcf: torch.Tensor,
         cand_feat_bcpf: torch.Tensor,
         apply_decision_margin: bool = False,
+        allowed_mask_cp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         skip_feat_bcf, cand_feat_bcpf = self._append_penalty_identity(skip_feat_bcf, cand_feat_bcpf)
         skip_feat_bcf = self._standardize_feat(skip_feat_bcf)
@@ -3355,15 +5104,25 @@ class PredResidualCandidateSelector(nn.Module):
                 dtype=cand_score_bcp.dtype,
             )
             cand_score_bcp = cand_score_bcp - margin
-        return torch.cat([skip_score_bc.unsqueeze(-1), cand_score_bcp], dim=-1)
+        logits_bcq = torch.cat([skip_score_bc.unsqueeze(-1), cand_score_bcp], dim=-1)
+        return self._mask_disallowed_logits(logits_bcq, allowed_mask_cp=allowed_mask_cp)
 
-    def logits(self, x_bcl: torch.Tensor, base_bch: torch.Tensor, cand_bcpH: torch.Tensor) -> torch.Tensor:
-        skip_feat = _knn_gate_features(x_bcl, base_bch, base_bch)
+    def logits(
+        self,
+        x_bcl: torch.Tensor,
+        base_bch: torch.Tensor,
+        cand_bcpH: torch.Tensor,
+        allowed_mask_cp: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        skip_feat = _candidate_selector_features(x_bcl, base_bch, base_bch, feature_mode=self.feature_mode)
         cand_feat = torch.stack(
-            [_knn_gate_features(x_bcl, base_bch, cand_bcpH[:, :, p, :]) for p in range(int(cand_bcpH.shape[2]))],
+            [
+                _candidate_selector_features(x_bcl, base_bch, cand_bcpH[:, :, p, :], feature_mode=self.feature_mode)
+                for p in range(int(cand_bcpH.shape[2]))
+            ],
             dim=2,
         )
-        return self.logits_from_features(skip_feat, cand_feat)
+        return self.logits_from_features(skip_feat, cand_feat, allowed_mask_cp=allowed_mask_cp)
 
     def select_from_features(
         self,
@@ -3371,8 +5130,14 @@ class PredResidualCandidateSelector(nn.Module):
         cand_feat_bcpf: torch.Tensor,
         base_bch: torch.Tensor,
         cand_bcpH: torch.Tensor,
+        allowed_mask_cp: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits_bcq = self.logits_from_features(skip_feat_bcf, cand_feat_bcpf, apply_decision_margin=True)
+        logits_bcq = self.logits_from_features(
+            skip_feat_bcf,
+            cand_feat_bcpf,
+            apply_decision_margin=True,
+            allowed_mask_cp=allowed_mask_cp,
+        )
         selected_class_bc = logits_bcq.argmax(dim=-1)
         all_pred_bcqh = torch.cat([base_bch.unsqueeze(2), cand_bcpH], dim=2)
         gather_idx = selected_class_bc.view(*selected_class_bc.shape, 1, 1).expand(-1, -1, 1, int(base_bch.shape[-1]))
@@ -3384,13 +5149,59 @@ class PredResidualCandidateSelector(nn.Module):
         x_bcl: torch.Tensor,
         base_bch: torch.Tensor,
         cand_bcpH: torch.Tensor,
+        allowed_mask_cp: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        skip_feat = _knn_gate_features(x_bcl, base_bch, base_bch)
+        skip_feat = _candidate_selector_features(x_bcl, base_bch, base_bch, feature_mode=self.feature_mode)
         cand_feat = torch.stack(
-            [_knn_gate_features(x_bcl, base_bch, cand_bcpH[:, :, p, :]) for p in range(int(cand_bcpH.shape[2]))],
+            [
+                _candidate_selector_features(x_bcl, base_bch, cand_bcpH[:, :, p, :], feature_mode=self.feature_mode)
+                for p in range(int(cand_bcpH.shape[2]))
+            ],
             dim=2,
         )
-        return self.select_from_features(skip_feat, cand_feat, base_bch, cand_bcpH)
+        return self.select_from_features(skip_feat, cand_feat, base_bch, cand_bcpH, allowed_mask_cp=allowed_mask_cp)
+
+
+class StaticPredResidualCandidateSelector(nn.Module):
+    def __init__(self, selected_class_c: torch.Tensor):
+        super().__init__()
+        selected = selected_class_c.detach().to(dtype=torch.long).view(-1)
+        self.register_buffer("selected_class_c", selected, persistent=True)
+
+    def select_prediction(
+        self,
+        x_bcl: torch.Tensor,
+        base_bch: torch.Tensor,
+        cand_bcpH: torch.Tensor,
+        allowed_mask_cp: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, C, H = base_bch.shape
+        if int(self.selected_class_c.numel()) != int(C):
+            raise ValueError(
+                f"Static candidate selector expected {int(self.selected_class_c.numel())} channels, got {int(C)}."
+            )
+        selected_class_c = self.selected_class_c.to(device=base_bch.device)
+        if allowed_mask_cp is not None and int(allowed_mask_cp.numel()) > 0:
+            allowed = _selector_allowed_mask_cp(
+                allowed_mask_cp,
+                C=int(C),
+                P=int(cand_bcpH.shape[2]),
+                device=base_bch.device,
+                context="static candidate selector",
+            )
+            penalty_idx_c = (selected_class_c - 1).clamp_min(0)
+            candidate_selected_c = selected_class_c > 0
+            allowed_selected_c = allowed.gather(1, penalty_idx_c.view(-1, 1)).squeeze(1)
+            selected_class_c = torch.where(
+                candidate_selected_c & allowed_selected_c,
+                selected_class_c,
+                torch.zeros_like(selected_class_c),
+            )
+        selected_class_bc = selected_class_c.view(1, C).expand(B, C)
+        all_pred_bcqh = torch.cat([base_bch.unsqueeze(2), cand_bcpH], dim=2)
+        gather_idx = selected_class_bc.view(B, C, 1, 1).expand(B, C, 1, H)
+        selected_bch = all_pred_bcqh.gather(2, gather_idx).squeeze(2)
+        return selected_bch, selected_class_bc
 
 
 def _activation_feature_mask_for_mode(mode: str, feat_dim: int) -> torch.Tensor:
@@ -3420,855 +5231,20 @@ def _activation_feature_mask_for_mode(mode: str, feat_dim: int) -> torch.Tensor:
     return mask
 
 
-class KNNResidualGate(nn.Module):
-    def __init__(
-        self,
-        feat_dim: int,
-        num_channels: int,
-        hidden_dim: int = 32,
-        dropout: float = 0.0,
-        max_scale: float = 1.5,
-        init_scale: float = 1.0,
-        scale_mode: str = "sigmoid",
-        activation_head: bool = False,
-        activation_init_prob: float = 0.5,
-        activation_cluster_ids: Optional[torch.Tensor] = None,
-        activation_cluster_bias: bool = False,
-    ):
-        super().__init__()
-        self.F = int(feat_dim)
-        self.C = int(num_channels)
-        self.max_scale = max(float(max_scale), 1.0e-6)
-        self.scale_mode = str(scale_mode).lower()
-        self.activation_head_enable = bool(activation_head)
-        self.activation_cluster_bias_enable = bool(activation_cluster_bias)
-        if self.scale_mode not in {"sigmoid", "signed_tanh"}:
-            raise ValueError("Residual gate scale_mode must be 'sigmoid' or 'signed_tanh'.")
-        self.register_buffer("feature_mean", torch.zeros(1, 1, self.F), persistent=True)
-        self.register_buffer("feature_std", torch.ones(1, 1, self.F), persistent=True)
-        self.register_buffer("feature_standardize_enabled", torch.tensor(0.0), persistent=True)
-        self.register_buffer("activation_feature_mask", torch.ones(1, 1, self.F), persistent=True)
-        if activation_cluster_ids is None:
-            cluster_id = torch.zeros(self.C, dtype=torch.long)
-        else:
-            cluster_id = activation_cluster_ids.detach().cpu().to(dtype=torch.long).reshape(-1)
-            if int(cluster_id.numel()) != self.C:
-                raise ValueError(f"activation_cluster_ids must have {self.C} entries, got {int(cluster_id.numel())}.")
-            cluster_id = cluster_id.clamp_min(0)
-        self.register_buffer("activation_cluster_id_c", cluster_id, persistent=True)
-        activation_num_clusters = int(cluster_id.max().item()) + 1 if self.C > 0 else 1
-        if self.scale_mode == "signed_tanh":
-            init_scale = max(-self.max_scale + 1.0e-6, min(float(init_scale), self.max_scale - 1.0e-6))
-            init_ratio = init_scale / self.max_scale
-            init_bias = 0.5 * math.log((1.0 + init_ratio) / max(1.0 - init_ratio, 1.0e-6))
-        else:
-            init_scale = max(1.0e-6, min(float(init_scale), self.max_scale - 1.0e-6))
-            init_prob = init_scale / self.max_scale
-            init_bias = math.log(init_prob / max(1.0 - init_prob, 1.0e-6))
-        self.net = nn.Sequential(
-            nn.Linear(self.F, int(hidden_dim)),
-            nn.GELU(),
-            nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
-            nn.Linear(int(hidden_dim), 1),
-        )
-        self.channel_bias = nn.Parameter(torch.zeros(self.C))
-        if self.activation_head_enable:
-            activation_init_prob = min(max(float(activation_init_prob), 1.0e-6), 1.0 - 1.0e-6)
-            activation_init_bias = math.log(activation_init_prob / max(1.0 - activation_init_prob, 1.0e-6))
-            self.activation_net = nn.Sequential(
-                nn.Linear(self.F, int(hidden_dim)),
-                nn.GELU(),
-                nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
-                nn.Linear(int(hidden_dim), 1),
-            )
-            self.activation_channel_bias = nn.Parameter(torch.zeros(self.C))
-            if self.activation_cluster_bias_enable:
-                self.activation_cluster_bias = nn.Parameter(torch.zeros(activation_num_clusters))
-            else:
-                self.activation_cluster_bias = None
-        else:
-            activation_init_bias = 0.0
-            self.activation_net = None
-            self.activation_channel_bias = None
-            self.activation_cluster_bias = None
-        self.reset_parameters(init_bias)
-        if self.activation_head_enable:
-            self.reset_activation_parameters(activation_init_bias)
-
-    def reset_parameters(self, init_bias: float):
-        for module in self.net:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-        last = self.net[-1]
-        if isinstance(last, nn.Linear):
-            nn.init.zeros_(last.weight)
-            nn.init.constant_(last.bias, float(init_bias))
-
-    def reset_activation_parameters(self, init_bias: float):
-        if self.activation_net is None:
-            return
-        for module in self.activation_net:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-        last = self.activation_net[-1]
-        if isinstance(last, nn.Linear):
-            nn.init.zeros_(last.weight)
-            nn.init.constant_(last.bias, float(init_bias))
-
-    def set_feature_standardization(self, mean_f: torch.Tensor, std_f: torch.Tensor) -> None:
-        mean = mean_f.detach().view(1, 1, self.F).to(device=self.feature_mean.device, dtype=self.feature_mean.dtype)
-        std = std_f.detach().view(1, 1, self.F).to(device=self.feature_std.device, dtype=self.feature_std.dtype)
-        self.feature_mean.copy_(mean)
-        self.feature_std.copy_(std.clamp_min(1.0e-6))
-        self.feature_standardize_enabled.fill_(1.0)
-
-    def clear_feature_standardization(self) -> None:
-        self.feature_mean.zero_()
-        self.feature_std.fill_(1.0)
-        self.feature_standardize_enabled.zero_()
-
-    def set_activation_feature_mask(self, mask_f: torch.Tensor) -> None:
-        mask = mask_f.detach().view(1, 1, self.F).to(
-            device=self.activation_feature_mask.device,
-            dtype=self.activation_feature_mask.dtype,
-        )
-        self.activation_feature_mask.copy_(mask.clamp(0.0, 1.0))
-
-    def _standardize_feat(self, feat_bcf: torch.Tensor) -> torch.Tensor:
-        if bool(self.feature_standardize_enabled.item() > 0.5):
-            feat_bcf = (feat_bcf - self.feature_mean.to(device=feat_bcf.device, dtype=feat_bcf.dtype)) / self.feature_std.to(
-                device=feat_bcf.device,
-                dtype=feat_bcf.dtype,
-            )
-        return feat_bcf
-
-    def forward(self, feat_bcf: torch.Tensor) -> torch.Tensor:
-        feat_bcf = self._standardize_feat(feat_bcf)
-        logits_bc = self.net(feat_bcf).squeeze(-1) + self.channel_bias.view(1, -1)
-        if self.scale_mode == "signed_tanh":
-            return self.max_scale * torch.tanh(logits_bc)
-        return self.max_scale * torch.sigmoid(logits_bc)
-
-    def activation_prob(self, feat_bcf: torch.Tensor) -> torch.Tensor:
-        if self.activation_net is None or self.activation_channel_bias is None:
-            scale = self.forward(feat_bcf)
-            if self.scale_mode == "signed_tanh":
-                return ((scale / self.max_scale) + 1.0).mul(0.5).clamp(1.0e-6, 1.0 - 1.0e-6)
-            return (scale / self.max_scale).clamp(1.0e-6, 1.0 - 1.0e-6)
-        feat_bcf = self._standardize_feat(feat_bcf)
-        feat_bcf = feat_bcf * self.activation_feature_mask.to(device=feat_bcf.device, dtype=feat_bcf.dtype)
-        logits_bc = self.activation_net(feat_bcf).squeeze(-1) + self.activation_channel_bias.view(1, -1)
-        if self.activation_cluster_bias is not None:
-            cluster_bias_c = self.activation_cluster_bias.index_select(
-                0,
-                self.activation_cluster_id_c.to(device=self.activation_cluster_bias.device),
-            )
-            logits_bc = logits_bc + cluster_bias_c.to(device=logits_bc.device, dtype=logits_bc.dtype).view(1, -1)
-        return torch.sigmoid(logits_bc).clamp(1.0e-6, 1.0 - 1.0e-6)
 
 
 @torch.no_grad()
-def _collect_knn_gate_tensors(
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    knn_hybrid: ShapeKNNHybrid,
-    eval_start: int,
-) -> Optional[Dict[str, torch.Tensor]]:
-    if len(loader) == 0 or knn_hybrid is None:
-        return None
-    model.eval()
-    feat_parts = []
-    base_parts = []
-    delta_parts = []
-    y_parts = []
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        base = model(x, cluster_id_c)
-        query_start_abs_b = eval_start + idx
-        hybrid = knn_hybrid.hybridize_batch(x, base, cluster_id_c, query_start_abs_b=query_start_abs_b)
-        feat = _knn_gate_features(x, base, hybrid)
-        feat_parts.append(feat.detach().cpu())
-        base_parts.append(base.detach().cpu())
-        delta_parts.append((hybrid - base).detach().cpu())
-        y_parts.append(y.detach().cpu())
-    if len(feat_parts) == 0:
-        return None
-    return {
-        "feat": torch.cat(feat_parts, dim=0),
-        "base": torch.cat(base_parts, dim=0),
-        "delta": torch.cat(delta_parts, dim=0),
-        "y": torch.cat(y_parts, dim=0),
-    }
 
 
-def train_knn_residual_gate(
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    knn_hybrid: ShapeKNNHybrid,
-    eval_start: int,
-    channel_names: List[str],
-    cfg: Dict[str, object],
-) -> Tuple[Optional[KNNResidualGate], Dict[str, object]]:
-    tensors = _collect_knn_gate_tensors(
-        model=model,
-        loader=loader,
-        cluster_id_c=cluster_id_c,
-        device=device,
-        knn_hybrid=knn_hybrid,
-        eval_start=eval_start,
-    )
-    if tensors is None:
-        return None, {"enable": False, "reason": "empty_loader_or_knn_disabled"}
-
-    feat = tensors["feat"]
-    base = tensors["base"]
-    delta = tensors["delta"]
-    y = tensors["y"]
-    n = int(feat.shape[0])
-    c = int(feat.shape[1])
-    train_fraction = float(cfg.get("train_fraction", 0.7))
-    split = int(max(1, min(n - 1, round(n * train_fraction)))) if n > 1 else n
-    train_idx = torch.arange(0, split, dtype=torch.long)
-    hold_idx = torch.arange(split, n, dtype=torch.long)
-    if hold_idx.numel() == 0:
-        hold_idx = train_idx
-
-    gate = KNNResidualGate(
-        feat_dim=int(feat.shape[-1]),
-        num_channels=c,
-        hidden_dim=int(cfg.get("hidden_dim", 32)),
-        dropout=float(cfg.get("dropout", 0.0)),
-        max_scale=float(cfg.get("max_scale", 1.5)),
-        init_scale=float(cfg.get("init_scale", 1.0)),
-        scale_mode=str(cfg.get("scale_mode", "sigmoid")),
-    ).to(device)
-    lr = float(cfg.get("lr", 1.0e-3))
-    weight_decay = float(cfg.get("weight_decay", 1.0e-4))
-    batch_size = max(1, int(cfg.get("batch_size", 128)))
-    epochs = max(1, int(cfg.get("epochs", 30)))
-    scale_reg = float(cfg.get("scale_reg", 0.0))
-    init_scale = float(cfg.get("init_scale", 1.0))
-    loss_kind = str(cfg.get("loss", "mae")).lower()
-    if loss_kind not in {"mae", "smooth_l1"}:
-        raise ValueError("knn_hybrid.gate_calibrator.loss must be mae or smooth_l1.")
-    beta = float(cfg.get("beta", 0.5))
-    opt = torch.optim.AdamW(gate.parameters(), lr=lr, weight_decay=weight_decay)
-    best_state = None
-    best_hold = float("inf")
-    best_epoch = 0
-
-    def _loss_for(scale_bc: torch.Tensor, base_bch: torch.Tensor, delta_bch: torch.Tensor, y_bch: torch.Tensor):
-        pred = base_bch + scale_bc.unsqueeze(-1) * delta_bch
-        if loss_kind == "smooth_l1":
-            loss = torch.nn.functional.smooth_l1_loss(pred, y_bch, beta=beta)
-        else:
-            loss = (pred - y_bch).abs().mean()
-        if scale_reg > 0.0:
-            loss = loss + scale_reg * (scale_bc - init_scale).pow(2).mean()
-        return loss
-
-    def _eval_idx(idx: torch.Tensor) -> Tuple[float, float, torch.Tensor]:
-        gate.eval()
-        ae = 0.0
-        se = 0.0
-        denom = 0
-        scale_sum = torch.zeros(c, device=device)
-        count = 0
-        with torch.no_grad():
-            for b0 in range(0, int(idx.numel()), batch_size):
-                batch_idx = idx[b0:b0 + batch_size]
-                feat_b = feat.index_select(0, batch_idx).to(device)
-                base_b = base.index_select(0, batch_idx).to(device)
-                delta_b = delta.index_select(0, batch_idx).to(device)
-                y_b = y.index_select(0, batch_idx).to(device)
-                scale_b = gate(feat_b)
-                pred_b = base_b + scale_b.unsqueeze(-1) * delta_b
-                err = pred_b - y_b
-                ae += float(err.abs().sum().item())
-                se += float(err.pow(2).sum().item())
-                denom += int(err.numel())
-                scale_sum += scale_b.sum(dim=0)
-                count += int(scale_b.shape[0])
-        return ae / max(denom, 1), se / max(denom, 1), (scale_sum / max(count, 1)).detach().cpu()
-
-    for ep in range(1, epochs + 1):
-        gate.train()
-        perm = train_idx[torch.randperm(train_idx.numel())]
-        for b0 in range(0, int(perm.numel()), batch_size):
-            batch_idx = perm[b0:b0 + batch_size]
-            feat_b = feat.index_select(0, batch_idx).to(device)
-            base_b = base.index_select(0, batch_idx).to(device)
-            delta_b = delta.index_select(0, batch_idx).to(device)
-            y_b = y.index_select(0, batch_idx).to(device)
-            scale_b = gate(feat_b)
-            loss = _loss_for(scale_b, base_b, delta_b, y_b, feat_bcf=feat_b)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(gate.parameters(), float(cfg.get("grad_clip", 1.0)))
-            opt.step()
-        hold_mae, _, _ = _eval_idx(hold_idx)
-        if hold_mae < best_hold:
-            best_hold = hold_mae
-            best_epoch = ep
-            best_state = {k: v.detach().cpu().clone() for k, v in gate.state_dict().items()}
-
-    if best_state is not None:
-        gate.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-    train_mae, train_mse, train_scale_c = _eval_idx(train_idx)
-    hold_mae, hold_mse, hold_scale_c = _eval_idx(hold_idx)
-    summary = {
-        "enable": True,
-        "train_windows": int(train_idx.numel()),
-        "holdout_windows": int(hold_idx.numel()),
-        "best_epoch": int(best_epoch),
-        "train_mae": float(train_mae),
-        "train_mse": float(train_mse),
-        "holdout_mae": float(hold_mae),
-        "holdout_mse": float(hold_mse),
-        "channel_names": list(channel_names),
-        "train_mean_scale": [float(v) for v in train_scale_c.tolist()],
-        "holdout_mean_scale": [float(v) for v in hold_scale_c.tolist()],
-    }
-    gate.eval()
-    return gate, summary
 
 
 @torch.no_grad()
-def _collect_pred_residual_gate_tensors(
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    penalty_scale: Optional[torch.Tensor],
-    select_ranks: Optional[List[int]] = None,
-    gate_soft_weight: float = 0.0,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-) -> Optional[Dict[str, torch.Tensor]]:
-    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
-        return None
-    moe_enable = bool(moe_cfg.get("enable", True))
-    if not moe_enable:
-        return None
-
-    model.eval()
-    gate.eval()
-    pred_residual.eval()
-    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
-    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
-    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
-    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
-    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
-
-    feat_parts = []
-    base_parts = []
-    delta_parts = []
-    y_parts = []
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long)
-        y_base_raw = model(x, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=int(eval_start) + idx,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        feat_bcf = extract_gate_features(x)
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
-        route_pen_bkp = _router_penalty_context_from_history(
-            x_bcl=x,
-            yhat_base_bch=y_base,
-            penalty_names=penalty_names,
-            penalty_fns=penalty_fns,
-            penalty_scale=penalty_scale,
-            cluster_id_c=cluster_id_c,
-            K=K,
-        )
-        mask_bkp, probs_bkp, skip_bk, _ = gate(
-            feat_bkf,
-            straight_through=False,
-            penalty_context_bkp=route_pen_bkp,
-            penalty_context_mode=router_mode,
-            penalty_context_weight=router_penalty_context_weight,
-            penalty_context_detach=router_detach_penalty_context,
-            penalty_context_score=router_penalty_context_score,
-        )
-        rank_mask = None
-        if select_ranks is not None:
-            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
-            rank_mask = mask_bkp
-        if gate_soft_weight > 0.0:
-            probs_sel = probs_bkp
-            if rank_mask is not None:
-                probs_sel = probs_sel * rank_mask
-                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
-            probs_sel = probs_sel * target_mass
-            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
-
-        pred_out = pred_residual(
-            x,
-            y_base,
-            cluster_id_c,
-            mask_bkp,
-            skip_bk=skip_bk if allow_skip else None,
-        )
-        y_residual = pred_out["y_final"]
-        feat = _knn_gate_features(x, y_base, y_residual)
-        feat_parts.append(feat.detach().cpu())
-        base_parts.append(y_base.detach().cpu())
-        delta_parts.append((y_residual - y_base).detach().cpu())
-        y_parts.append(y.detach().cpu())
-
-    if len(feat_parts) == 0:
-        return None
-    return {
-        "feat": torch.cat(feat_parts, dim=0),
-        "base": torch.cat(base_parts, dim=0),
-        "delta": torch.cat(delta_parts, dim=0),
-        "y": torch.cat(y_parts, dim=0),
-    }
 
 
 @torch.no_grad()
-def _pred_residual_gate_activation_metrics_from_tensors(
-    tensors: Optional[Dict[str, torch.Tensor]],
-    residual_gate: Optional[KNNResidualGate],
-    device: torch.device,
-    batch_size: int,
-    activation_threshold: float,
-    label_min_improvement: float = 0.0,
-    activation_by_abs_scale: bool = False,
-    apply_activation_threshold: bool = False,
-    channel_scale_c: Optional[torch.Tensor] = None,
-    indices: Optional[torch.Tensor] = None,
-    channel_names: Optional[List[str]] = None,
-    cluster_id_c: Optional[torch.Tensor] = None,
-) -> Optional[Dict[str, object]]:
-    if tensors is None or residual_gate is None:
-        return None
-    feat = tensors["feat"]
-    base = tensors["base"]
-    delta = tensors["delta"]
-    y = tensors["y"]
-    n = int(feat.shape[0])
-    if n == 0:
-        return None
-    if indices is None:
-        indices = torch.arange(0, n, dtype=torch.long)
-    else:
-        indices = indices.detach().cpu().to(dtype=torch.long)
-    if indices.numel() == 0:
-        return None
-
-    residual_gate.eval()
-    c = int(feat.shape[1])
-    threshold_t = torch.as_tensor(activation_threshold, dtype=torch.float32)
-    if threshold_t.numel() == 1:
-        threshold_summary = float(max(0.0, float(threshold_t.reshape(-1)[0].item())))
-        threshold_bc_cpu = torch.full((1, c), threshold_summary, dtype=torch.float32)
-    elif threshold_t.numel() == c:
-        threshold_bc_cpu = threshold_t.reshape(1, c).clamp_min(0.0)
-        threshold_summary = [float(v) for v in threshold_bc_cpu.reshape(-1).tolist()]
-    else:
-        raise ValueError(f"activation_threshold must be scalar or length {c}, got {int(threshold_t.numel())}")
-    min_improvement = max(0.0, float(label_min_improvement))
-    batch_size = max(1, int(batch_size))
-
-    tp = fp = tn = fn = 0
-    tp_c = torch.zeros(c, dtype=torch.long)
-    fp_c = torch.zeros(c, dtype=torch.long)
-    tn_c = torch.zeros(c, dtype=torch.long)
-    fn_c = torch.zeros(c, dtype=torch.long)
-    base_se = raw_se = scaled_se = 0.0
-    denom = 0
-    scale_sum = 0.0
-    scale_abs_sum = 0.0
-    scale_count = 0
-    channel_scale = None
-    if channel_scale_c is not None:
-        channel_scale = channel_scale_c.detach().to(device=device, dtype=torch.float32).view(1, -1)
-
-    for b0 in range(0, int(indices.numel()), batch_size):
-        batch_idx = indices[b0:b0 + batch_size]
-        feat_b = feat.index_select(0, batch_idx).to(device)
-        base_b = base.index_select(0, batch_idx).to(device)
-        delta_b = delta.index_select(0, batch_idx).to(device)
-        y_b = y.index_select(0, batch_idx).to(device)
-
-        scale_b = residual_gate(feat_b)
-        if channel_scale is not None:
-            scale_b = scale_b * channel_scale.to(device=scale_b.device, dtype=scale_b.dtype)
-        threshold_bc = threshold_bc_cpu.to(device=scale_b.device, dtype=scale_b.dtype)
-        if bool(getattr(residual_gate, "activation_head_enable", False)):
-            active_score_b = residual_gate.activation_prob(feat_b).to(device=scale_b.device, dtype=scale_b.dtype)
-        elif activation_by_abs_scale:
-            active_score_b = scale_b.abs()
-        else:
-            active_score_b = scale_b
-
-        raw_pred_b = base_b + delta_b
-        base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
-        raw_err_bc = (raw_pred_b - y_b).pow(2).mean(dim=-1)
-        active_label = (base_err_bc - raw_err_bc) > min_improvement
-        active_pred = active_score_b > threshold_bc
-        scale_for_pred = scale_b * active_pred.to(dtype=scale_b.dtype) if apply_activation_threshold else scale_b
-        scaled_pred_b = base_b + scale_for_pred.unsqueeze(-1) * delta_b
-
-        tp += int((active_pred & active_label).sum().item())
-        fp += int((active_pred & (~active_label)).sum().item())
-        tn += int(((~active_pred) & (~active_label)).sum().item())
-        fn += int(((~active_pred) & active_label).sum().item())
-        tp_c += (active_pred & active_label).detach().cpu().sum(dim=0).to(dtype=torch.long)
-        fp_c += (active_pred & (~active_label)).detach().cpu().sum(dim=0).to(dtype=torch.long)
-        tn_c += ((~active_pred) & (~active_label)).detach().cpu().sum(dim=0).to(dtype=torch.long)
-        fn_c += ((~active_pred) & active_label).detach().cpu().sum(dim=0).to(dtype=torch.long)
-        base_se += float((base_b - y_b).pow(2).sum().item())
-        raw_se += float((raw_pred_b - y_b).pow(2).sum().item())
-        scaled_se += float((scaled_pred_b - y_b).pow(2).sum().item())
-        denom += int(y_b.numel())
-        scale_sum += float(scale_b.sum().item())
-        scale_abs_sum += float(scale_b.abs().sum().item())
-        scale_count += int(scale_b.numel())
-
-    total = tp + fp + tn + fn
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    specificity = tn / max(tn + fp, 1)
-    f1 = 2.0 * precision * recall / max(precision + recall, 1.0e-12)
-    base_mse = base_se / max(denom, 1)
-    raw_mse = raw_se / max(denom, 1)
-    scaled_mse = scaled_se / max(denom, 1)
-    names = list(channel_names) if channel_names is not None and len(channel_names) == c else [f"ch_{i}" for i in range(c)]
-    per_channel = []
-    for ci in range(c):
-        c_tp = int(tp_c[ci].item())
-        c_fp = int(fp_c[ci].item())
-        c_tn = int(tn_c[ci].item())
-        c_fn = int(fn_c[ci].item())
-        c_total = c_tp + c_fp + c_tn + c_fn
-        c_precision = c_tp / max(c_tp + c_fp, 1)
-        c_recall = c_tp / max(c_tp + c_fn, 1)
-        c_specificity = c_tn / max(c_tn + c_fp, 1)
-        c_f1 = 2.0 * c_precision * c_recall / max(c_precision + c_recall, 1.0e-12)
-        per_channel.append(
-            {
-                "channel": names[ci],
-                "cluster_id": (
-                    int(cluster_id_c.detach().cpu()[ci].item())
-                    if cluster_id_c is not None and int(cluster_id_c.numel()) == c
-                    else None
-                ),
-                "samples": int(c_total),
-                "start_hit_rate": float(c_recall),
-                "stop_hit_rate": float(c_specificity),
-                "precision": float(c_precision),
-                "f1": float(c_f1),
-                "accuracy": float((c_tp + c_tn) / max(c_total, 1)),
-                "target_positive_rate": float((c_tp + c_fn) / max(c_total, 1)),
-                "pred_positive_rate": float((c_tp + c_fp) / max(c_total, 1)),
-                "false_start_rate": float(c_fp / max(c_fp + c_tn, 1)),
-                "miss_start_rate": float(c_fn / max(c_fn + c_tp, 1)),
-                "true_positive": c_tp,
-                "false_positive": c_fp,
-                "true_negative": c_tn,
-                "false_negative": c_fn,
-            }
-        )
-    per_cluster = []
-    if cluster_id_c is not None and int(cluster_id_c.numel()) == c:
-        cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
-        for k in torch.unique(cid).tolist():
-            mask = cid == int(k)
-            k_tp = int(tp_c[mask].sum().item())
-            k_fp = int(fp_c[mask].sum().item())
-            k_tn = int(tn_c[mask].sum().item())
-            k_fn = int(fn_c[mask].sum().item())
-            k_total = k_tp + k_fp + k_tn + k_fn
-            k_precision = k_tp / max(k_tp + k_fp, 1)
-            k_recall = k_tp / max(k_tp + k_fn, 1)
-            k_specificity = k_tn / max(k_tn + k_fp, 1)
-            k_f1 = 2.0 * k_precision * k_recall / max(k_precision + k_recall, 1.0e-12)
-            per_cluster.append(
-                {
-                    "cluster_id": int(k),
-                    "samples": int(k_total),
-                    "start_hit_rate": float(k_recall),
-                    "stop_hit_rate": float(k_specificity),
-                    "precision": float(k_precision),
-                    "f1": float(k_f1),
-                    "accuracy": float((k_tp + k_tn) / max(k_total, 1)),
-                    "target_positive_rate": float((k_tp + k_fn) / max(k_total, 1)),
-                    "pred_positive_rate": float((k_tp + k_fp) / max(k_total, 1)),
-                    "false_start_rate": float(k_fp / max(k_fp + k_tn, 1)),
-                    "miss_start_rate": float(k_fn / max(k_fn + k_tp, 1)),
-                    "true_positive": k_tp,
-                    "false_positive": k_fp,
-                    "true_negative": k_tn,
-                    "false_negative": k_fn,
-                }
-            )
-    return {
-        "enable": True,
-        "threshold": threshold_summary,
-        "label_min_improvement": float(min_improvement),
-        "activation_by_abs_scale": bool(activation_by_abs_scale),
-        "apply_activation_threshold": bool(apply_activation_threshold),
-        "samples": int(total),
-        "accuracy": float((tp + tn) / max(total, 1)),
-        "hit_rate": float((tp + tn) / max(total, 1)),
-        "start_hit_rate": float(recall),
-        "stop_hit_rate": float(specificity),
-        "false_start_rate": float(fp / max(fp + tn, 1)),
-        "miss_start_rate": float(fn / max(fn + tp, 1)),
-        "balanced_accuracy": float(0.5 * (recall + specificity)),
-        "precision": float(precision),
-        "recall": float(recall),
-        "specificity": float(specificity),
-        "f1": float(f1),
-        "true_positive": int(tp),
-        "false_positive": int(fp),
-        "true_negative": int(tn),
-        "false_negative": int(fn),
-        "target_positive_rate": float((tp + fn) / max(total, 1)),
-        "pred_positive_rate": float((tp + fp) / max(total, 1)),
-        "mean_scale": float(scale_sum / max(scale_count, 1)),
-        "mean_abs_scale": float(scale_abs_sum / max(scale_count, 1)),
-        "base_mse": float(base_mse),
-        "raw_residual_mse": float(raw_mse),
-        "scaled_mse": float(scaled_mse),
-        "raw_residual_gain_pct_vs_base": float(100.0 * (base_mse - raw_mse) / max(abs(base_mse), 1.0e-12)),
-        "scaled_gain_pct_vs_base": float(100.0 * (base_mse - scaled_mse) / max(abs(base_mse), 1.0e-12)),
-        "per_channel": per_channel,
-        "per_cluster": per_cluster,
-    }
 
 
 @torch.no_grad()
-def _select_pred_residual_activation_threshold(
-    tensors: Optional[Dict[str, torch.Tensor]],
-    residual_gate: Optional[KNNResidualGate],
-    device: torch.device,
-    batch_size: int,
-    label_min_improvement: float,
-    activation_by_abs_scale: bool,
-    indices: Optional[torch.Tensor],
-    max_candidates: int = 101,
-    selection_metric: str = "accuracy",
-    scope: str = "global",
-    channel_names: Optional[List[str]] = None,
-    cluster_id_c: Optional[torch.Tensor] = None,
-) -> Tuple[object, Dict[str, object]]:
-    if tensors is None or residual_gate is None:
-        return 0.0, {"mode": "auto", "reason": "missing_tensors_or_gate"}
-    feat = tensors["feat"]
-    base = tensors["base"]
-    delta = tensors["delta"]
-    y = tensors["y"]
-    n = int(feat.shape[0])
-    if n == 0:
-        return 0.0, {"mode": "auto", "reason": "empty_tensors"}
-    if indices is None:
-        indices = torch.arange(0, n, dtype=torch.long)
-    else:
-        indices = indices.detach().cpu().to(dtype=torch.long)
-    if indices.numel() == 0:
-        return 0.0, {"mode": "auto", "reason": "empty_indices"}
-
-    residual_gate.eval()
-    batch_size = max(1, int(batch_size))
-    min_improvement = max(0.0, float(label_min_improvement))
-    score_parts = []
-    label_parts = []
-    base_err_parts = []
-    scaled_err_parts = []
-    for b0 in range(0, int(indices.numel()), batch_size):
-        batch_idx = indices[b0:b0 + batch_size]
-        feat_b = feat.index_select(0, batch_idx).to(device)
-        base_b = base.index_select(0, batch_idx).to(device)
-        delta_b = delta.index_select(0, batch_idx).to(device)
-        y_b = y.index_select(0, batch_idx).to(device)
-        scale_b = residual_gate(feat_b)
-        if bool(getattr(residual_gate, "activation_head_enable", False)):
-            score_b = residual_gate.activation_prob(feat_b)
-        else:
-            score_b = scale_b.abs() if activation_by_abs_scale else scale_b
-        base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
-        raw_err_bc = (base_b + delta_b - y_b).pow(2).mean(dim=-1)
-        scaled_err_bc = (base_b + scale_b.unsqueeze(-1) * delta_b - y_b).pow(2).mean(dim=-1)
-        label_b = (base_err_bc - raw_err_bc) > min_improvement
-        score_parts.append(score_b.detach().cpu())
-        label_parts.append(label_b.detach().cpu())
-        base_err_parts.append(base_err_bc.detach().cpu())
-        scaled_err_parts.append(scaled_err_bc.detach().cpu())
-
-    scores = torch.cat(score_parts, dim=0)
-    labels = torch.cat(label_parts, dim=0)
-    base_err = torch.cat(base_err_parts, dim=0)
-    scaled_err = torch.cat(scaled_err_parts, dim=0)
-    if scores.numel() == 0:
-        return 0.0, {"mode": "auto", "reason": "empty_scores"}
-
-    metric_mode = str(selection_metric).lower()
-    if metric_mode not in {"accuracy", "balanced_accuracy", "f1", "mse"}:
-        raise ValueError("activation_threshold_selection_metric must be accuracy, balanced_accuracy, f1, or mse.")
-
-    def _best_for_vectors(
-        score_v: torch.Tensor,
-        label_v: torch.Tensor,
-        base_err_v: torch.Tensor,
-        scaled_err_v: torch.Tensor,
-    ) -> Tuple[float, Dict[str, object]]:
-        score_v = score_v.reshape(-1)
-        label_v = label_v.reshape(-1).to(dtype=torch.bool)
-        base_err_v = base_err_v.reshape(-1)
-        scaled_err_v = scaled_err_v.reshape(-1)
-        if score_v.numel() == 0:
-            return 0.0, {"reason": "empty_scores"}
-        if int(label_v.sum().item()) == 0:
-            threshold = float(score_v.max().item()) + 1.0e-6
-            return threshold, {"reason": "no_positive_labels", "threshold": threshold}
-        uniq = torch.unique(score_v)
-        if uniq.numel() > max_candidates:
-            candidates_v = torch.unique(torch.quantile(score_v, torch.linspace(0.0, 1.0, steps=max_candidates)))
-        else:
-            candidates_v = uniq
-        candidates_v = torch.unique(
-            torch.cat(
-                [
-                    torch.tensor([0.0], dtype=score_v.dtype),
-                    candidates_v,
-                    torch.tensor([float(score_v.max().item()) + 1.0e-6], dtype=score_v.dtype),
-                ],
-                dim=0,
-            )
-        )
-        best_v = {
-            "threshold": 0.0,
-            "accuracy": -1.0,
-            "balanced_accuracy": -1.0,
-            "f1": -1.0,
-            "mse": float("inf"),
-            "precision": 0.0,
-            "recall": 0.0,
-            "specificity": 0.0,
-            "pred_positive_rate": 0.0,
-            "target_positive_rate": float(label_v.float().mean().item()),
-            "num_candidates": int(candidates_v.numel()),
-        }
-        for cand in candidates_v.tolist():
-            pred = score_v > float(cand)
-            tp = int((pred & label_v).sum().item())
-            fp = int((pred & (~label_v)).sum().item())
-            tn = int(((~pred) & (~label_v)).sum().item())
-            fn = int(((~pred) & label_v).sum().item())
-            total = tp + fp + tn + fn
-            precision = tp / max(tp + fp, 1)
-            recall = tp / max(tp + fn, 1)
-            specificity = tn / max(tn + fp, 1)
-            balanced_accuracy = 0.5 * (recall + specificity)
-            f1 = 2.0 * precision * recall / max(precision + recall, 1.0e-12)
-            acc = (tp + tn) / max(total, 1)
-            mse = float(torch.where(pred, scaled_err_v, base_err_v).mean().item())
-            if metric_mode == "mse":
-                better = (mse < best_v["mse"]) or (
-                    abs(mse - best_v["mse"]) <= 1.0e-12 and balanced_accuracy > best_v["balanced_accuracy"]
-                )
-            elif metric_mode == "f1":
-                better = (f1 > best_v["f1"]) or (
-                    abs(f1 - best_v["f1"]) <= 1.0e-12 and balanced_accuracy > best_v["balanced_accuracy"]
-                )
-            elif metric_mode == "balanced_accuracy":
-                better = (balanced_accuracy > best_v["balanced_accuracy"]) or (
-                    abs(balanced_accuracy - best_v["balanced_accuracy"]) <= 1.0e-12 and f1 > best_v["f1"]
-                )
-            else:
-                better = (acc > best_v["accuracy"]) or (abs(acc - best_v["accuracy"]) <= 1.0e-12 and f1 > best_v["f1"])
-            if better:
-                best_v.update(
-                    {
-                        "threshold": float(cand),
-                        "accuracy": float(acc),
-                        "balanced_accuracy": float(balanced_accuracy),
-                        "f1": float(f1),
-                        "mse": float(mse),
-                        "precision": float(precision),
-                        "recall": float(recall),
-                        "specificity": float(specificity),
-                        "pred_positive_rate": float((tp + fp) / max(total, 1)),
-                    }
-                )
-        return float(best_v["threshold"]), best_v
-
-    scope_mode = str(scope).lower()
-    if scope_mode in {"per_channel", "channel", "channels"}:
-        c = int(scores.shape[1])
-        names = list(channel_names) if channel_names is not None and len(channel_names) == c else [f"ch_{i}" for i in range(c)]
-        thresholds = []
-        per_channel = []
-        for ci in range(c):
-            thr, info = _best_for_vectors(scores[:, ci], labels[:, ci], base_err[:, ci], scaled_err[:, ci])
-            thresholds.append(float(thr))
-            item = dict(info)
-            item["channel"] = names[ci]
-            item["cluster_id"] = (
-                int(cluster_id_c.detach().cpu()[ci].item())
-                if cluster_id_c is not None and int(cluster_id_c.numel()) == c
-                else None
-            )
-            per_channel.append(item)
-        return thresholds, {
-            "mode": "auto",
-            "scope": "channel",
-            "selection_metric": metric_mode,
-            "threshold": thresholds,
-            "per_channel": per_channel,
-        }
-    if scope_mode in {"per_cluster", "cluster", "clusters"}:
-        c = int(scores.shape[1])
-        if cluster_id_c is None or int(cluster_id_c.numel()) != c:
-            raise ValueError("activation_threshold_scope=cluster requires cluster_id_c with one id per channel.")
-        cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
-        thresholds = torch.zeros(c, dtype=torch.float32)
-        per_cluster = []
-        for k in torch.unique(cid).tolist():
-            mask = cid == int(k)
-            thr, info = _best_for_vectors(scores[:, mask], labels[:, mask], base_err[:, mask], scaled_err[:, mask])
-            thresholds[mask] = float(thr)
-            item = dict(info)
-            item["cluster_id"] = int(k)
-            per_cluster.append(item)
-        return [float(v) for v in thresholds.tolist()], {
-            "mode": "auto",
-            "scope": "cluster",
-            "selection_metric": metric_mode,
-            "threshold": [float(v) for v in thresholds.tolist()],
-            "per_cluster": per_cluster,
-        }
-
-    thr, info = _best_for_vectors(scores, labels, base_err, scaled_err)
-    info.update({"mode": "auto", "scope": "global", "selection_metric": metric_mode})
-    return float(thr), info
 
 
 @torch.no_grad()
@@ -4291,6 +5267,12 @@ def evaluate_gate_penalty_hit_metrics(
     observed_history_tc: Optional[torch.Tensor] = None,
     input_len: int = 0,
     eval_start: int = 0,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    gate_feature_mode: str = "history",
 ) -> Optional[Dict[str, object]]:
     if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
         return None
@@ -4308,6 +5290,12 @@ def evaluate_gate_penalty_hit_metrics(
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
 
     P = len(penalty_names)
+    cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
+    allowed_mask_device = None
+    if allowed_mask_kp is not None:
+        allowed_mask_device = allowed_mask_kp.detach().to(device=device, dtype=torch.bool)
+        if tuple(allowed_mask_device.shape) != (int(K), int(P)):
+            raise ValueError("allowed_mask_kp must have shape [K,P] for gate penalty hit diagnostics.")
     total = positive_total = hit_total = positive_hit_total = 0
     selected_positive = 0
     base_se = oracle_se = selected_se = 0.0
@@ -4321,17 +5309,32 @@ def evaluate_gate_penalty_hit_metrics(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         idx = idx.to(device=device, dtype=torch.long)
-        y_base_raw = model(x, cluster_id_c)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
         y_base = apply_history_anchor_adapter(
             y_base_raw,
             base_pred_bch=y_base_raw,
             observed_history_tc=observed_history_tc,
-            query_start_abs_b=int(eval_start) + idx,
+            query_start_abs_b=query_start_abs_b,
             input_len=int(input_len),
             cfg=history_anchor_cfg,
         )
-        feat_bcf = extract_gate_features(x)
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
             yhat_base_bch=y_base,
@@ -4369,6 +5372,7 @@ def evaluate_gate_penalty_hit_metrics(
             cluster_id_c,
             mask_bkp,
             skip_bk=skip_bk if allow_skip else None,
+            query_start_abs_b=query_start_abs_b,
         )
         residuals = pred_out.get("residuals")
         intervention_bcp = pred_out.get("intervention_bcp")
@@ -4379,13 +5383,32 @@ def evaluate_gate_penalty_hit_metrics(
         if selector_bcp is None:
             selector_bcp = torch.ones_like(intervention_bcp)
 
-        scale_bcp = intervention_bcp * selector_bcp * alpha_cp.unsqueeze(0)
-        cand_bcpH = y_base.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
+        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
+            y_base,
+            pred_out,
+            apply_output_anchors=True,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        if cand_bcpH is None:
+            continue
         err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
-        base_err_bc = (y_base - y).pow(2).mean(dim=-1)
-        oracle_err_bc, oracle_p_bc = err_bcp.min(dim=-1)
-        route_bcp = mask_bkp[:, cluster_id_c, :]
-        probs_bcp = probs_bkp[:, cluster_id_c, :]
+        base_err_bc = (y_base_final - y).pow(2).mean(dim=-1)
+        if allowed_mask_device is not None:
+            allowed_bcp = allowed_mask_device.index_select(0, cid_c).unsqueeze(0)
+            err_for_oracle_bcp = err_bcp.masked_fill(~allowed_bcp, float("inf"))
+        else:
+            err_for_oracle_bcp = err_bcp
+        oracle_penalty_err_bc, oracle_p_bc = err_for_oracle_bcp.min(dim=-1)
+        oracle_err_bc = torch.where(torch.isfinite(oracle_penalty_err_bc), oracle_penalty_err_bc, base_err_bc)
+        route_bcp = mask_bkp[:, cid_c, :]
+        probs_bcp = probs_bkp[:, cid_c, :]
         selected_score_bcp = route_bcp * probs_bcp
         selected_p_bc = selected_score_bcp.argmax(dim=-1)
         selected_err_bc = err_bcp.gather(-1, selected_p_bc.unsqueeze(-1)).squeeze(-1)
@@ -4399,7 +5422,7 @@ def evaluate_gate_penalty_hit_metrics(
         hit_total += int(hit_bc.sum().item())
         positive_hit_total += int((hit_bc & positive_bc).sum().item())
         selected_positive += int(selected_positive_bc.sum().item())
-        base_se += float((y_base - y).pow(2).sum().item())
+        base_se += float((y_base_final - y).pow(2).sum().item())
         oracle_se += float(oracle_err_bc.sum().item() * y.shape[-1])
         selected_se += float(selected_err_bc.sum().item() * y.shape[-1])
         denom += int(y.numel())
@@ -4451,6 +5474,1165 @@ def _pearson_list(xs: List[float], ys: List[float]) -> Optional[float]:
     return float((x * y).sum() / denom)
 
 
+def _explainability_train_subsplit_ranges(
+    num_windows: int,
+    holdout_fraction: float = 0.30,
+) -> Dict[str, Tuple[int, int]]:
+    n = int(num_windows)
+    if n <= 0:
+        return {}
+    if n == 1:
+        return {"train_fit": (0, 1)}
+    frac = max(0.0, min(float(holdout_fraction), 0.95))
+    holdout = int(math.ceil(float(n) * frac))
+    holdout = max(1, min(holdout, n - 1))
+    cut = n - holdout
+    return {
+        "train_fit": (0, cut),
+        "train_holdout": (cut, n),
+    }
+
+
+def _cluster_route_label_feature_diagnostics(
+    feat_bkf: torch.Tensor,
+    route_label_bk: torch.Tensor,
+    penalty_names: List[str],
+    feature_names: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    label_names = ["skip"] + [str(name) for name in penalty_names]
+    if feature_names is None:
+        feature_names = [f"feature_{i}" for i in range(int(feat_bkf.shape[-1]))]
+    else:
+        feature_names = [str(name) for name in feature_names]
+
+    def _label_name(label: int) -> Optional[str]:
+        if 0 <= int(label) < len(label_names):
+            return label_names[int(label)]
+        return None
+
+    def _majority_label(labels_n: torch.Tensor, label_count: int) -> Tuple[int, float]:
+        if labels_n.numel() <= 0:
+            return -1, 0.0
+        counts = torch.bincount(labels_n.to(dtype=torch.long), minlength=label_count)[:label_count]
+        label = int(counts.argmax().item())
+        acc = float(counts[label].item() / max(int(labels_n.numel()), 1))
+        return label, acc
+
+    feat = feat_bkf.detach().cpu().to(dtype=torch.float32)
+    labels = route_label_bk.detach().cpu().to(dtype=torch.long)
+    if feat.dim() != 3 or labels.dim() != 2:
+        raise ValueError("feat_bkf must be [B,K,F] and route_label_bk must be [B,K].")
+    if int(feat.shape[0]) != int(labels.shape[0]) or int(feat.shape[1]) != int(labels.shape[1]):
+        raise ValueError("feat_bkf and route_label_bk must share [B,K].")
+
+    B, K, F = int(feat.shape[0]), int(feat.shape[1]), int(feat.shape[2])
+    per_cluster = []
+    label_count = len(label_names)
+    for k in range(K):
+        valid = (labels[:, k] >= 0) & (labels[:, k] < label_count)
+        labels_k = labels[valid, k]
+        feat_kf = feat[valid, k, :]
+        samples = int(labels_k.numel())
+        counts = torch.bincount(labels_k, minlength=label_count)[:label_count] if samples > 0 else torch.zeros(label_count, dtype=torch.long)
+        rates = counts.to(dtype=torch.float64) / max(samples, 1)
+        majority_label, majority_acc = _majority_label(labels_k, label_count)
+        entropy_bits = 0.0
+        for rate in rates.tolist():
+            if float(rate) > 0.0:
+                entropy_bits -= float(rate) * math.log(float(rate), 2)
+
+        best_stump = None
+        if samples >= 2 and F > 0 and int((counts > 0).sum().item()) >= 2:
+            best_acc = -1.0
+            best_payload = None
+            for f in range(F):
+                values = feat_kf[:, f]
+                finite = torch.isfinite(values)
+                if int(finite.sum().item()) < 2:
+                    continue
+                values_f = values[finite]
+                labels_f = labels_k[finite]
+                unique = torch.unique(values_f).sort().values
+                if int(unique.numel()) < 2:
+                    continue
+                if int(unique.numel()) <= 16:
+                    thresholds = (unique[:-1] + unique[1:]) * 0.5
+                else:
+                    quantiles = torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], dtype=values_f.dtype)
+                    thresholds = torch.unique(torch.quantile(values_f, quantiles)).sort().values
+                for threshold in thresholds:
+                    left = values_f <= threshold
+                    right = ~left
+                    if int(left.sum().item()) <= 0 or int(right.sum().item()) <= 0:
+                        continue
+                    left_label, _ = _majority_label(labels_f[left], label_count)
+                    right_label, _ = _majority_label(labels_f[right], label_count)
+                    pred = torch.where(
+                        left,
+                        torch.full_like(labels_f, int(left_label)),
+                        torch.full_like(labels_f, int(right_label)),
+                    )
+                    acc = float((pred == labels_f).to(dtype=torch.float32).mean().item())
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_payload = {
+                            "feature": feature_names[f] if f < len(feature_names) else f"feature_{f}",
+                            "feature_index": int(f),
+                            "threshold": float(threshold.item()),
+                            "op": "<=",
+                            "left_label": _label_name(left_label),
+                            "right_label": _label_name(right_label),
+                            "accuracy": acc,
+                            "lift_vs_majority": float(acc - majority_acc),
+                        }
+            best_stump = best_payload
+
+        label_counts = {label_names[i]: int(counts[i].item()) for i in range(label_count)}
+        label_rates = {label_names[i]: float(rates[i].item()) for i in range(label_count)}
+        per_cluster.append(
+            {
+                "cluster_id": int(k),
+                "samples": samples,
+                "label_counts": label_counts,
+                "label_rates": label_rates,
+                "majority_label": _label_name(majority_label),
+                "majority_acc": float(majority_acc),
+                "entropy_bits": float(entropy_bits),
+                "best_stump": best_stump,
+            }
+        )
+
+    return {
+        "samples": int(B * K),
+        "label_names": label_names,
+        "feature_names": feature_names,
+        "per_cluster": per_cluster,
+    }
+
+
+def _cluster_route_label_phase_diagnostics(
+    query_start_abs_b: torch.Tensor,
+    route_label_bk: torch.Tensor,
+    penalty_names: List[str],
+    periods: List[int],
+    num_bins: int = 8,
+    phase_offset: int = 0,
+) -> Dict[str, object]:
+    label_names = ["skip"] + [str(name) for name in penalty_names]
+    label_count = len(label_names)
+
+    def _label_name(label: int) -> Optional[str]:
+        if 0 <= int(label) < label_count:
+            return label_names[int(label)]
+        return None
+
+    def _counts_payload(labels_n: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int], Dict[str, float], Optional[str], float]:
+        if labels_n.numel() <= 0:
+            counts = torch.zeros(label_count, dtype=torch.long)
+            return counts, {name: 0 for name in label_names}, {name: 0.0 for name in label_names}, None, 0.0
+        counts = torch.bincount(labels_n.to(dtype=torch.long), minlength=label_count)[:label_count]
+        total = int(labels_n.numel())
+        majority = int(counts.argmax().item())
+        label_counts = {label_names[i]: int(counts[i].item()) for i in range(label_count)}
+        label_rates = {label_names[i]: float(counts[i].item() / max(total, 1)) for i in range(label_count)}
+        majority_acc = float(counts[majority].item() / max(total, 1))
+        return counts, label_counts, label_rates, _label_name(majority), majority_acc
+
+    starts = query_start_abs_b.detach().cpu().to(dtype=torch.long).reshape(-1)
+    labels = route_label_bk.detach().cpu().to(dtype=torch.long)
+    if labels.dim() != 2:
+        raise ValueError("route_label_bk must have shape [B,K].")
+    if int(labels.shape[0]) != int(starts.numel()):
+        raise ValueError("query_start_abs_b length must match route_label_bk batch dimension.")
+
+    clean_periods = []
+    for period in periods:
+        period_i = int(period)
+        if period_i > 0 and period_i not in clean_periods:
+            clean_periods.append(period_i)
+    bins_requested = int(num_bins)
+    if bins_requested <= 0:
+        bins_requested = 8
+
+    K = int(labels.shape[1])
+    per_period = []
+    for period in clean_periods:
+        bins = max(1, min(int(bins_requested), int(period)))
+        phase_b = (starts + int(phase_offset)).remainder(int(period))
+        bin_b = torch.div(phase_b * bins, int(period), rounding_mode="floor").clamp(min=0, max=bins - 1)
+        period_clusters = []
+        for k in range(K):
+            valid = (labels[:, k] >= 0) & (labels[:, k] < label_count)
+            labels_k = labels[valid, k]
+            bin_k = bin_b[valid]
+            samples = int(labels_k.numel())
+            _, label_counts, label_rates, global_majority_label, global_majority_acc = _counts_payload(labels_k)
+            bin_payloads = []
+            phase_correct = 0
+            for b in range(bins):
+                bin_mask = bin_k == int(b)
+                labels_bin = labels_k[bin_mask]
+                bin_samples = int(labels_bin.numel())
+                counts, bin_counts, bin_rates, majority_label, majority_acc = _counts_payload(labels_bin)
+                if bin_samples > 0:
+                    phase_correct += int(counts.max().item())
+                start_phase = int(math.floor(float(b) * float(period) / float(bins)))
+                end_phase = int(math.floor(float(b + 1) * float(period) / float(bins)))
+                bin_payloads.append(
+                    {
+                        "bin": int(b),
+                        "phase_start": start_phase,
+                        "phase_end": end_phase,
+                        "samples": bin_samples,
+                        "label_counts": bin_counts,
+                        "label_rates": bin_rates,
+                        "majority_label": majority_label,
+                        "majority_acc": float(majority_acc),
+                    }
+                )
+            phase_majority_acc = float(phase_correct / max(samples, 1))
+            period_clusters.append(
+                {
+                    "cluster_id": int(k),
+                    "samples": samples,
+                    "label_counts": label_counts,
+                    "label_rates": label_rates,
+                    "global_majority_label": global_majority_label,
+                    "global_majority_acc": float(global_majority_acc),
+                    "phase_majority_acc": phase_majority_acc,
+                    "lift_vs_global": float(phase_majority_acc - global_majority_acc),
+                    "bins": bin_payloads,
+                }
+            )
+        per_period.append(
+            {
+                "period": int(period),
+                "num_bins": int(bins),
+                "per_cluster": period_clusters,
+            }
+        )
+
+    return {
+        "samples": int(labels.numel()),
+        "window_count": int(labels.shape[0]),
+        "label_names": label_names,
+        "periods": clean_periods,
+        "num_bins_requested": int(bins_requested),
+        "phase_offset": int(phase_offset),
+        "per_period": per_period,
+    }
+
+
+def _cluster_top1_confidence_gain_diagnostics(
+    *,
+    top1_conf_bc: torch.Tensor,
+    top1_gain_bc: torch.Tensor,
+    top1_p_bc: torch.Tensor,
+    top1_active_bc: torch.Tensor,
+    skip_bc: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    penalty_names: List[str],
+    bins: List[float],
+) -> Dict[str, object]:
+    conf = top1_conf_bc.detach().cpu().to(dtype=torch.float32)
+    gain = top1_gain_bc.detach().cpu().to(dtype=torch.float32)
+    top1_p = top1_p_bc.detach().cpu().to(dtype=torch.long)
+    active = top1_active_bc.detach().cpu().to(dtype=torch.bool)
+    skipped = skip_bc.detach().cpu().to(dtype=torch.bool)
+    cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
+    if conf.shape != gain.shape or conf.shape != top1_p.shape or conf.shape != active.shape or conf.shape != skipped.shape:
+        raise ValueError("top1 confidence diagnostics inputs must share shape [B,C].")
+    if conf.dim() != 2:
+        raise ValueError("top1 confidence diagnostics inputs must have shape [B,C].")
+    if int(cid.numel()) != int(conf.shape[1]):
+        raise ValueError("cluster_id_c length must match confidence channel dimension.")
+
+    clean_bins = sorted({float(v) for v in bins if math.isfinite(float(v))})
+    if len(clean_bins) < 2:
+        clean_bins = [0.0, 0.5, 1.0]
+    if clean_bins[0] > 0.0:
+        clean_bins = [0.0] + clean_bins
+    if clean_bins[-1] < 1.0:
+        clean_bins = clean_bins + [1.0]
+    label_names = [str(name) for name in penalty_names]
+
+    def _bin_payload(mask_bc: torch.Tensor, lower: float, upper: float, is_last: bool) -> Dict[str, object]:
+        if is_last:
+            bin_mask = mask_bc & (conf >= float(lower)) & (conf <= float(upper))
+        else:
+            bin_mask = mask_bc & (conf >= float(lower)) & (conf < float(upper))
+        samples = int(bin_mask.sum().item())
+        active_mask = bin_mask & active
+        skipped_mask = bin_mask & skipped
+        active_count = int(active_mask.sum().item())
+        skipped_count = int(skipped_mask.sum().item())
+        if samples > 0:
+            mean_gain = float(gain[bin_mask].mean().item())
+            positive_rate = float((gain[bin_mask] > 0.0).to(dtype=torch.float32).mean().item())
+        else:
+            mean_gain = 0.0
+            positive_rate = 0.0
+        if active_count > 0:
+            active_mean_gain = float(gain[active_mask].mean().item())
+            active_positive_rate = float((gain[active_mask] > 0.0).to(dtype=torch.float32).mean().item())
+            harmful_not_skipped_rate = float((gain[active_mask] <= 0.0).to(dtype=torch.float32).mean().item())
+        else:
+            active_mean_gain = 0.0
+            active_positive_rate = 0.0
+            harmful_not_skipped_rate = 0.0
+        if skipped_count > 0:
+            skipped_positive_rate = float((gain[skipped_mask] > 0.0).to(dtype=torch.float32).mean().item())
+        else:
+            skipped_positive_rate = 0.0
+        return {
+            "low": float(lower),
+            "high": float(upper),
+            "samples": samples,
+            "active_count": active_count,
+            "skipped_count": skipped_count,
+            "mean_gain_mse": mean_gain,
+            "positive_rate": positive_rate,
+            "active_mean_gain_mse": active_mean_gain,
+            "active_positive_rate": active_positive_rate,
+            "harmful_not_skipped_rate": harmful_not_skipped_rate,
+            "skipped_positive_rate": skipped_positive_rate,
+        }
+
+    def _group_payload(mask_bc: torch.Tensor) -> Dict[str, object]:
+        payload_bins = []
+        for i in range(len(clean_bins) - 1):
+            payload_bins.append(
+                _bin_payload(
+                    mask_bc,
+                    lower=clean_bins[i],
+                    upper=clean_bins[i + 1],
+                    is_last=i == len(clean_bins) - 2,
+                )
+            )
+        samples = int(mask_bc.sum().item())
+        if samples > 0:
+            mean_gain = float(gain[mask_bc].mean().item())
+            positive_rate = float((gain[mask_bc] > 0.0).to(dtype=torch.float32).mean().item())
+        else:
+            mean_gain = 0.0
+            positive_rate = 0.0
+        return {
+            "samples": samples,
+            "mean_gain_mse": mean_gain,
+            "positive_rate": positive_rate,
+            "bins": payload_bins,
+        }
+
+    per_cluster = []
+    for k in range(int(K)):
+        cluster_mask = (cid == int(k)).view(1, -1).expand_as(conf)
+        per_penalty = []
+        for p, name in enumerate(label_names):
+            per_penalty.append(
+                {
+                    "penalty": name,
+                    **_group_payload(cluster_mask & (top1_p == int(p))),
+                }
+            )
+        per_cluster.append(
+            {
+                "cluster_id": int(k),
+                "all": _group_payload(cluster_mask),
+                "per_penalty": per_penalty,
+            }
+        )
+
+    return {
+        "bins": [float(v) for v in clean_bins],
+        "penalty_names": label_names,
+        "per_cluster": per_cluster,
+    }
+
+
+def _build_penalty_route_learnability_class_features(
+    *,
+    gate_feat_bkf: torch.Tensor,
+    skip_feat_bkf: torch.Tensor,
+    cand_feat_bkpf: torch.Tensor,
+    gate_prob_bkp: torch.Tensor,
+    route_bkp: torch.Tensor,
+    intervention_bkp: torch.Tensor,
+    selector_bkp: torch.Tensor,
+    alpha_bkp: torch.Tensor,
+    skip_prob_bk: Optional[torch.Tensor],
+    cluster_count: int,
+    penalty_names: List[str],
+) -> Tuple[torch.Tensor, List[str]]:
+    if gate_feat_bkf.dim() != 3:
+        raise ValueError("gate_feat_bkf must have shape [B,K,F].")
+    if skip_feat_bkf.dim() != 3:
+        raise ValueError("skip_feat_bkf must have shape [B,K,F].")
+    if cand_feat_bkpf.dim() != 4:
+        raise ValueError("cand_feat_bkpf must have shape [B,K,P,F].")
+    B, K, gate_dim = [int(v) for v in gate_feat_bkf.shape]
+    if tuple(skip_feat_bkf.shape[:2]) != (B, K):
+        raise ValueError("skip_feat_bkf must share [B,K] with gate_feat_bkf.")
+    if tuple(cand_feat_bkpf.shape[:3]) != (B, K, len(penalty_names)):
+        raise ValueError("cand_feat_bkpf must share [B,K,P] with penalty_names.")
+    P = int(cand_feat_bkpf.shape[2])
+    Q = P + 1
+    stat_shape = (B, K, P)
+    for name, value in [
+        ("gate_prob_bkp", gate_prob_bkp),
+        ("route_bkp", route_bkp),
+        ("intervention_bkp", intervention_bkp),
+        ("selector_bkp", selector_bkp),
+    ]:
+        if tuple(value.shape) != stat_shape:
+            raise ValueError(f"{name} must have shape [B,K,P].")
+    if alpha_bkp.dim() == 2:
+        if tuple(alpha_bkp.shape) != (K, P):
+            raise ValueError("alpha_bkp must have shape [K,P] or [B,K,P].")
+        alpha_bkp = alpha_bkp.unsqueeze(0).expand(B, K, P)
+    elif tuple(alpha_bkp.shape) != stat_shape:
+        raise ValueError("alpha_bkp must have shape [K,P] or [B,K,P].")
+    if skip_prob_bk is None:
+        skip_prob_bk = torch.zeros(B, K, device=gate_feat_bkf.device, dtype=gate_feat_bkf.dtype)
+    if tuple(skip_prob_bk.shape) != (B, K):
+        raise ValueError("skip_prob_bk must have shape [B,K].")
+
+    dtype = gate_feat_bkf.dtype
+    device = gate_feat_bkf.device
+    zero_bk1 = torch.zeros(B, K, 1, device=device, dtype=dtype)
+    class_gate_prob = torch.cat([zero_bk1, gate_prob_bkp.to(device=device, dtype=dtype)], dim=-1)
+    class_route = torch.cat([zero_bk1, route_bkp.to(device=device, dtype=dtype)], dim=-1)
+    class_intervention = torch.cat([zero_bk1, intervention_bkp.to(device=device, dtype=dtype)], dim=-1)
+    class_selector = torch.cat([zero_bk1, selector_bkp.to(device=device, dtype=dtype)], dim=-1)
+    class_alpha = torch.cat([zero_bk1, alpha_bkp.to(device=device, dtype=dtype)], dim=-1)
+    class_skip_prob = skip_prob_bk.to(device=device, dtype=dtype).unsqueeze(-1).expand(B, K, Q)
+    stat_features = torch.stack(
+        [
+            class_gate_prob,
+            class_route,
+            class_intervention,
+            class_selector,
+            class_alpha,
+            class_skip_prob,
+        ],
+        dim=-1,
+    )
+
+    candidate_features = torch.cat(
+        [
+            skip_feat_bkf.to(device=device, dtype=dtype).unsqueeze(2),
+            cand_feat_bkpf.to(device=device, dtype=dtype),
+        ],
+        dim=2,
+    )
+    gate_features = gate_feat_bkf.to(device=device, dtype=dtype).unsqueeze(2).expand(B, K, Q, gate_dim)
+    class_eye = torch.eye(Q, device=device, dtype=dtype).view(1, 1, Q, Q).expand(B, K, Q, Q)
+    cluster_total = int(cluster_count) if int(cluster_count) > 0 else K
+    if cluster_total < K:
+        raise ValueError("cluster_count cannot be smaller than gate_feat_bkf.shape[1].")
+    cluster_eye = torch.eye(cluster_total, device=device, dtype=dtype)[:K].view(1, K, 1, cluster_total)
+    cluster_features = cluster_eye.expand(B, K, Q, cluster_total)
+    features = torch.cat(
+        [
+            gate_features,
+            candidate_features,
+            stat_features,
+            class_eye,
+            cluster_features,
+        ],
+        dim=-1,
+    ).contiguous()
+
+    feature_names = (
+        [f"gate_feature_{i}" for i in range(gate_dim)]
+        + [f"candidate_feature_{i}" for i in range(int(candidate_features.shape[-1]))]
+        + ["gate_prob", "route_weight", "intervention", "selector", "alpha", "skip_prob"]
+        + ["class_skip"]
+        + [f"class_{name}" for name in penalty_names]
+        + [f"cluster_{k}" for k in range(cluster_total)]
+    )
+    return features, feature_names
+
+
+def _scatter_mean_bcpf_to_bkpf(values_bcpf: torch.Tensor, cluster_id_c: torch.Tensor, K: int) -> torch.Tensor:
+    if values_bcpf.dim() != 4:
+        raise ValueError("values_bcpf must have shape [B,C,P,F].")
+    B, C, P, F_dim = [int(v) for v in values_bcpf.shape]
+    flat_bcf = values_bcpf.reshape(B, C, P * F_dim)
+    pooled = scatter_mean_bcf_to_bkf(flat_bcf, cluster_id_c, int(K))
+    return pooled.reshape(B, int(K), P, F_dim)
+
+
+@torch.no_grad()
+def _collect_penalty_route_learnability_tensors(
+    *,
+    model: nn.Module,
+    gate: ClusterwiseMoEGate,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    penalty_scale: Optional[torch.Tensor],
+    select_ranks: Optional[List[int]],
+    gate_soft_weight: float,
+    split_name: str,
+    feature_mode: str = "base",
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    min_candidate_delta_rms: float = 0.0,
+    max_batches: int = 0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    gate_feature_mode: str = "history",
+) -> Optional[Dict[str, object]]:
+    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
+        return None
+    moe_enable = bool(moe_cfg.get("enable", True))
+    if not moe_enable:
+        return None
+
+    model.eval()
+    gate.eval()
+    pred_residual.eval()
+    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
+    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
+    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
+    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
+    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
+    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
+    P = len(penalty_names)
+    cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
+    allowed_mask_device = None
+    if allowed_mask_kp is not None:
+        allowed_mask_device = allowed_mask_kp.detach().to(device=device, dtype=torch.bool)
+        if tuple(allowed_mask_device.shape) != (int(K), int(P)):
+            raise ValueError("allowed_mask_kp must have shape [K,P] for route learnability diagnostics.")
+
+    feature_chunks: List[torch.Tensor] = []
+    label_chunks: List[torch.Tensor] = []
+    current_chunks: List[torch.Tensor] = []
+    query_start_chunks: List[torch.Tensor] = []
+    gain_chunks: List[torch.Tensor] = []
+    feature_names: Optional[List[str]] = None
+    batch_count = 0
+
+    for x, y, idx in loader:
+        batch_count += 1
+        if max_batches > 0 and batch_count > int(max_batches):
+            break
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
+        route_pen_bkp = _router_penalty_context_from_history(
+            x_bcl=x,
+            yhat_base_bch=y_base,
+            penalty_names=penalty_names,
+            penalty_fns=penalty_fns,
+            penalty_scale=penalty_scale,
+            cluster_id_c=cluster_id_c,
+            K=K,
+        )
+        mask_bkp, probs_bkp, skip_bk, skip_prob_bk = gate(
+            feat_bkf,
+            straight_through=False,
+            penalty_context_bkp=route_pen_bkp,
+            penalty_context_mode=router_mode,
+            penalty_context_weight=router_penalty_context_weight,
+            penalty_context_detach=router_detach_penalty_context,
+            penalty_context_score=router_penalty_context_score,
+        )
+        rank_mask = None
+        if select_ranks is not None:
+            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+            rank_mask = mask_bkp
+        if gate_soft_weight > 0.0:
+            probs_sel = probs_bkp
+            if rank_mask is not None:
+                probs_sel = probs_sel * rank_mask
+                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            probs_sel = probs_sel * target_mass
+            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
+
+        pred_out = pred_residual(
+            x,
+            y_base,
+            cluster_id_c,
+            mask_bkp,
+            skip_bk=skip_bk if allow_skip else None,
+            query_start_abs_b=query_start_abs_b,
+        )
+        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
+            y_base,
+            pred_out,
+            apply_output_anchors=True,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        if cand_bcpH is None:
+            continue
+        labels_bk, raw_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+            base_bch=y_base_final,
+            cand_bcpH=cand_bcpH,
+            y_bch=y,
+            cluster_id_c=cid_c,
+            K=int(K),
+            allowed_mask_kp=allowed_mask_device,
+            min_abs_improvement=float(min_abs_improvement),
+            min_rel_improvement=float(min_rel_improvement),
+            min_candidate_delta_rms=float(min_candidate_delta_rms),
+        )
+        gain_bk = raw_gain_bk.clamp_min(0.0)
+
+        route_bcp = pred_out.get("route_bcp", mask_bkp[:, cid_c, :])
+        intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp))
+        selector_bcp = pred_out.get("selector_bcp", torch.ones_like(route_bcp))
+        alpha_cp = pred_out.get("alpha_cp")
+        if alpha_cp is None:
+            alpha_cp = torch.ones(int(cid_c.numel()), P, device=device, dtype=x.dtype)
+        skip_feat_bcf = _candidate_selector_features(x, y_base_final, y_base_final, feature_mode=feature_mode)
+        cand_feat_parts = [
+            _candidate_selector_features(x, y_base_final, cand_bcpH[:, :, p, :], feature_mode=feature_mode)
+            for p in range(P)
+        ]
+        cand_feat_bcpf = torch.stack(cand_feat_parts, dim=2)
+        skip_feat_bkf = scatter_mean_bcf_to_bkf(skip_feat_bcf, cluster_id_c, int(K))
+        cand_feat_bkpf = _scatter_mean_bcpf_to_bkpf(cand_feat_bcpf, cluster_id_c, int(K))
+        route_bkp = scatter_mean_bcf_to_bkf(route_bcp, cluster_id_c, int(K))
+        intervention_bkp = scatter_mean_bcf_to_bkf(intervention_bcp, cluster_id_c, int(K))
+        selector_bkp = scatter_mean_bcf_to_bkf(selector_bcp, cluster_id_c, int(K))
+        alpha_bkp = scatter_mean_bcf_to_bkf(alpha_cp.unsqueeze(0).expand(x.shape[0], -1, -1), cluster_id_c, int(K))
+        class_features_bkqf, names = _build_penalty_route_learnability_class_features(
+            gate_feat_bkf=feat_bkf,
+            skip_feat_bkf=skip_feat_bkf,
+            cand_feat_bkpf=cand_feat_bkpf,
+            gate_prob_bkp=probs_bkp,
+            route_bkp=route_bkp,
+            intervention_bkp=intervention_bkp,
+            selector_bkp=selector_bkp,
+            alpha_bkp=alpha_bkp,
+            skip_prob_bk=skip_prob_bk if allow_skip else None,
+            cluster_count=int(K),
+            penalty_names=penalty_names,
+        )
+        feature_names = names
+        current_penalty_bk = (mask_bkp * probs_bkp).argmax(dim=-1).to(dtype=torch.long) + 1
+        if allow_skip:
+            current_penalty_bk = torch.where(
+                skip_bk > 0.5,
+                torch.zeros_like(current_penalty_bk),
+                current_penalty_bk,
+            )
+        feature_chunks.append(class_features_bkqf.detach().cpu().reshape(-1, P + 1, class_features_bkqf.shape[-1]))
+        label_chunks.append(labels_bk.detach().cpu().reshape(-1))
+        current_chunks.append(current_penalty_bk.detach().cpu().reshape(-1))
+        query_start_chunks.append(query_start_abs_b.detach().cpu().view(-1, 1).expand(-1, int(K)).reshape(-1))
+        gain_chunks.append(gain_bk.detach().cpu().reshape(-1))
+
+    if not feature_chunks:
+        return None
+    return {
+        "split": str(split_name),
+        "features": torch.cat(feature_chunks, dim=0),
+        "labels": torch.cat(label_chunks, dim=0),
+        "current_pred": torch.cat(current_chunks, dim=0),
+        "query_start_abs": torch.cat(query_start_chunks, dim=0),
+        "oracle_gain_mse": torch.cat(gain_chunks, dim=0),
+        "label_names": ["skip"] + [str(name) for name in penalty_names],
+        "feature_names": list(feature_names or []),
+    }
+
+
+def _penalty_route_learnability_metrics_from_scores(
+    *,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    current_pred: torch.Tensor,
+    label_names: List[str],
+) -> Dict[str, object]:
+    if scores.dim() != 2:
+        raise ValueError("scores must have shape [N,num_classes].")
+    label_count = int(scores.shape[1])
+    if len(label_names) != label_count:
+        raise ValueError("label_names length must match scores.shape[1].")
+    labels = labels.detach().cpu().to(dtype=torch.long).view(-1)
+    current_pred = current_pred.detach().cpu().to(dtype=torch.long).view(-1)
+    if int(labels.numel()) != int(scores.shape[0]) or int(current_pred.numel()) != int(scores.shape[0]):
+        raise ValueError("scores, labels, and current_pred must share N.")
+    valid = (labels >= 0) & (labels < label_count)
+    if int(valid.sum().item()) <= 0:
+        return {
+            "samples": 0,
+            "accuracy_all": 0.0,
+            "current_accuracy_all": 0.0,
+            "majority_accuracy_all": 0.0,
+            "accuracy_on_positive_oracle": 0.0,
+            "current_accuracy_on_positive_oracle": 0.0,
+            "prediction_counts": {name: 0 for name in label_names},
+            "current_prediction_counts": {name: 0 for name in label_names},
+            "label_counts": {name: 0 for name in label_names},
+        }
+    labels_v = labels[valid]
+    current_v = current_pred[valid].clamp(0, label_count - 1)
+    pred_v = scores.detach().cpu()[valid].argmax(dim=-1).to(dtype=torch.long)
+    label_counts_t = torch.bincount(labels_v, minlength=label_count)[:label_count]
+    pred_counts_t = torch.bincount(pred_v, minlength=label_count)[:label_count]
+    current_counts_t = torch.bincount(current_v, minlength=label_count)[:label_count]
+    samples = int(labels_v.numel())
+    positive = labels_v > 0
+    positive_count = int(positive.sum().item())
+    majority_acc = float(label_counts_t.max().item() / max(samples, 1))
+    accuracy = float((pred_v == labels_v).to(dtype=torch.float32).mean().item())
+    current_accuracy = float((current_v == labels_v).to(dtype=torch.float32).mean().item())
+    if positive_count > 0:
+        positive_accuracy = float((pred_v[positive] == labels_v[positive]).to(dtype=torch.float32).mean().item())
+        current_positive_accuracy = float(
+            (current_v[positive] == labels_v[positive]).to(dtype=torch.float32).mean().item()
+        )
+    else:
+        positive_accuracy = 0.0
+        current_positive_accuracy = 0.0
+    return {
+        "samples": samples,
+        "positive_oracle_samples": positive_count,
+        "accuracy_all": accuracy,
+        "current_accuracy_all": current_accuracy,
+        "majority_accuracy_all": majority_acc,
+        "lift_vs_current": float(accuracy - current_accuracy),
+        "lift_vs_majority": float(accuracy - majority_acc),
+        "accuracy_on_positive_oracle": positive_accuracy,
+        "current_accuracy_on_positive_oracle": current_positive_accuracy,
+        "prediction_counts": {name: int(pred_counts_t[i].item()) for i, name in enumerate(label_names)},
+        "current_prediction_counts": {name: int(current_counts_t[i].item()) for i, name in enumerate(label_names)},
+        "label_counts": {name: int(label_counts_t[i].item()) for i, name in enumerate(label_names)},
+        "label_rates": {
+            name: float(label_counts_t[i].item() / max(samples, 1)) for i, name in enumerate(label_names)
+        },
+    }
+
+
+class _PenaltyRouteLearnabilityHead(nn.Module):
+    def __init__(
+        self,
+        feat_dim: int,
+        num_classes: int,
+        hidden_dim: int = 0,
+        dropout: float = 0.0,
+        head_mode: str = "classwise",
+    ):
+        super().__init__()
+        self.head_mode = str(head_mode or "classwise").lower()
+        if self.head_mode in {"flat", "multiclass"}:
+            in_dim = int(feat_dim) * int(num_classes)
+            if int(hidden_dim) > 0:
+                self.net = nn.Sequential(
+                    nn.Linear(in_dim, int(hidden_dim)),
+                    nn.ReLU(),
+                    nn.Dropout(float(dropout)),
+                    nn.Linear(int(hidden_dim), int(num_classes)),
+                )
+            else:
+                self.net = nn.Linear(in_dim, int(num_classes))
+            return
+        if self.head_mode not in {"classwise", "candidate", "shared"}:
+            raise ValueError("route learnability head_mode must be classwise or flat.")
+        if int(hidden_dim) > 0:
+            self.net = nn.Sequential(
+                nn.Linear(int(feat_dim), int(hidden_dim)),
+                nn.ReLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden_dim), 1),
+            )
+        else:
+            self.net = nn.Linear(int(feat_dim), 1)
+
+    def forward(self, features_nqf: torch.Tensor) -> torch.Tensor:
+        if features_nqf.dim() != 3:
+            raise ValueError("features_nqf must have shape [N,num_classes,F].")
+        if self.head_mode in {"flat", "multiclass"}:
+            return self.net(features_nqf.flatten(start_dim=1))
+        return self.net(features_nqf).squeeze(-1)
+
+
+def _fit_penalty_route_learnability_head_from_tensors(
+    *,
+    train_tensors: Dict[str, torch.Tensor],
+    eval_tensors_by_split: Dict[str, Dict[str, torch.Tensor]],
+    label_names: List[str],
+    feature_names: List[str],
+    cfg: Dict[str, object],
+    device: torch.device,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    train_features = train_tensors["features"].detach().to(dtype=torch.float32)
+    train_labels = train_tensors["labels"].detach().to(dtype=torch.long).view(-1)
+    train_current = train_tensors["current_pred"].detach().to(dtype=torch.long).view(-1)
+    if train_features.dim() != 3:
+        raise ValueError("train features must have shape [N,num_classes,F].")
+    if int(train_features.shape[0]) != int(train_labels.numel()):
+        raise ValueError("train labels length must match train features N.")
+    label_count = int(train_features.shape[1])
+    if len(label_names) != label_count:
+        raise ValueError("label_names length must match train feature class count.")
+    valid = (train_labels >= 0) & (train_labels < label_count)
+    if int(valid.sum().item()) <= 0:
+        raise ValueError("penalty route learnability probe has no valid train labels.")
+    train_features = train_features[valid]
+    train_labels = train_labels[valid]
+    train_current = train_current[valid]
+    flat = train_features.reshape(-1, int(train_features.shape[-1]))
+    feat_mean = flat.mean(dim=0)
+    feat_std = flat.std(dim=0).clamp_min(1.0e-6)
+
+    seed = int(cfg.get("seed", 0))
+    torch.manual_seed(seed)
+    model = _PenaltyRouteLearnabilityHead(
+        feat_dim=int(train_features.shape[-1]),
+        num_classes=label_count,
+        hidden_dim=int(cfg.get("hidden_dim", 32)),
+        dropout=float(cfg.get("dropout", 0.0)),
+        head_mode=str(cfg.get("head_mode", "classwise")),
+    ).to(device)
+    init_bias_mode = str(cfg.get("init_bias", "none")).lower()
+    if init_bias_mode in {"train_prior", "label_prior", "prior"}:
+        counts = torch.bincount(train_labels, minlength=label_count).to(dtype=torch.float32)
+        counts = counts + float(cfg.get("prior_smoothing", 1.0e-6))
+        prior_logits = torch.log(counts / counts.sum().clamp_min(1.0e-12)).to(device=device)
+        with torch.no_grad():
+            final_layer = model.net if isinstance(model.net, nn.Linear) else model.net[-1]
+            if isinstance(final_layer, nn.Linear) and int(final_layer.out_features) == label_count:
+                if bool(cfg.get("zero_init_output", True)):
+                    final_layer.weight.zero_()
+                final_layer.bias.copy_(prior_logits)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg.get("lr", 1.0e-3)),
+        weight_decay=float(cfg.get("weight_decay", 1.0e-4)),
+    )
+    batch_size = max(1, int(cfg.get("batch_size", 256)))
+    epochs = max(1, int(cfg.get("epochs", 60)))
+    class_weight_mode = str(cfg.get("class_weight", "none")).lower()
+    class_weight = None
+    class_weight_summary = None
+    if class_weight_mode in {"balanced", "auto"}:
+        counts = torch.bincount(train_labels, minlength=label_count).to(dtype=torch.float32).clamp_min(1.0)
+        weight = float(train_labels.numel()) / (float(label_count) * counts)
+        if "class_weight_min" in cfg or "class_weight_max" in cfg:
+            weight = weight.clamp(
+                min=float(cfg.get("class_weight_min", 0.0)),
+                max=float(cfg.get("class_weight_max", float("inf"))),
+            )
+        class_weight = weight.to(device=device)
+        class_weight_summary = [float(v) for v in weight.detach().cpu().tolist()]
+    elif isinstance(cfg.get("class_weight"), (list, tuple)):
+        weight = torch.as_tensor(cfg.get("class_weight"), dtype=torch.float32)
+        if int(weight.numel()) != label_count:
+            raise ValueError(f"route learnability class_weight must have {label_count} entries.")
+        class_weight = weight.to(device=device)
+        class_weight_summary = [float(v) for v in weight.detach().cpu().tolist()]
+
+    def _standardize(features: torch.Tensor) -> torch.Tensor:
+        return (features.to(device=device, dtype=torch.float32) - feat_mean.to(device=device).view(1, 1, -1)) / feat_std.to(
+            device=device
+        ).view(1, 1, -1)
+
+    train_features_device = train_features.to(device=device)
+    train_labels_device = train_labels.to(device=device)
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_loss = float("inf")
+    best_train_loss = float("inf")
+    best_epoch = 0
+    selection_split_requested = str(cfg.get("early_stop_split", cfg.get("selection_split", "train"))).lower()
+    if selection_split_requested in {"", "none", "off", "false", "0"}:
+        selection_split_requested = "train"
+    selection_split = selection_split_requested
+    selection_fallback_reason = None
+    if selection_split != "train" and selection_split not in eval_tensors_by_split:
+        selection_fallback_reason = f"selection split {selection_split!r} not available; fell back to train loss"
+        selection_split = "train"
+    selection_metric = str(cfg.get("selection_metric", cfg.get("early_stop_metric", "loss"))).lower()
+    metric_alias = {
+        "ce": "loss",
+        "cross_entropy": "loss",
+        "val_loss": "loss",
+        "acc": "accuracy",
+        "accuracy_all": "accuracy",
+        "val_accuracy": "accuracy",
+        "lift": "lift_vs_majority",
+        "majority_lift": "lift_vs_majority",
+    }
+    selection_metric = metric_alias.get(selection_metric, selection_metric)
+    if selection_metric not in {"loss", "accuracy", "lift_vs_majority"}:
+        raise ValueError("route learnability selection_metric must be loss, accuracy, or lift_vs_majority.")
+    minimize_selection = selection_metric == "loss"
+    best_selection_value = float("inf") if minimize_selection else -float("inf")
+    best_selection_loss = float("inf")
+    best_selection_metrics: Dict[str, object] = {}
+    early_stop_patience = int(cfg.get("early_stop_patience", cfg.get("patience", 0)))
+    early_stop_min_delta = float(cfg.get("early_stop_min_delta", cfg.get("min_delta", 0.0)))
+    include_initial_eval = bool(cfg.get("include_initial_eval", False))
+    epochs_without_improvement = 0
+    stopped_epoch = 0
+    selection_history: List[Dict[str, object]] = []
+
+    def _filtered_eval_tensors(tensors: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = tensors["features"].detach().to(dtype=torch.float32)
+        labels = tensors["labels"].detach().to(dtype=torch.long).view(-1)
+        current = tensors["current_pred"].detach().to(dtype=torch.long).view(-1)
+        valid_eval = (labels >= 0) & (labels < label_count)
+        return features[valid_eval], labels[valid_eval], current[valid_eval]
+
+    def _loss_and_metrics_for_features(
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        current: torch.Tensor,
+    ) -> Tuple[float, Dict[str, object]]:
+        if int(labels.numel()) <= 0:
+            metrics = _penalty_route_learnability_metrics_from_scores(
+                scores=torch.zeros(0, label_count),
+                labels=labels,
+                current_pred=current,
+                label_names=label_names,
+            )
+            return float("inf"), metrics
+        with torch.no_grad():
+            scores_device = model(_standardize(features))
+            loss = nn.functional.cross_entropy(scores_device, labels.to(device=device), weight=None)
+            scores = scores_device.detach().cpu()
+        metrics = _penalty_route_learnability_metrics_from_scores(
+            scores=scores,
+            labels=labels,
+            current_pred=current,
+            label_names=label_names,
+        )
+        return float(loss.detach().item()), metrics
+
+    train_selection_tensors = {
+        "features": train_features.detach().cpu(),
+        "labels": train_labels.detach().cpu(),
+        "current_pred": train_current.detach().cpu(),
+    }
+
+    def _selection_value_for_epoch(epoch_train_loss: float) -> Tuple[float, float, Dict[str, object]]:
+        if selection_split == "train":
+            if selection_metric == "loss":
+                return float(epoch_train_loss), float(epoch_train_loss), {}
+            features, labels, current = _filtered_eval_tensors(train_selection_tensors)
+        else:
+            features, labels, current = _filtered_eval_tensors(eval_tensors_by_split[selection_split])
+        eval_loss, metrics = _loss_and_metrics_for_features(features, labels, current)
+        if selection_metric == "loss":
+            value = eval_loss
+        elif selection_metric == "accuracy":
+            value = float(metrics.get("accuracy_all", 0.0))
+        else:
+            value = float(metrics.get("lift_vs_majority", 0.0))
+        return float(value), float(eval_loss), metrics
+
+    def _selection_improved(value: float) -> bool:
+        if minimize_selection:
+            return value < (best_selection_value - early_stop_min_delta)
+        return value > (best_selection_value + early_stop_min_delta)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    if include_initial_eval:
+        model.eval()
+        selection_value, selection_loss, selection_metrics = _selection_value_for_epoch(float("inf"))
+        selection_history.append(
+            {
+                "epoch": 0,
+                "train_loss": None,
+                "selection_split": selection_split,
+                "selection_metric": selection_metric,
+                "selection_value": float(selection_value),
+                "selection_loss": float(selection_loss),
+            }
+        )
+        if _selection_improved(selection_value):
+            best_epoch = 0
+            best_selection_value = float(selection_value)
+            best_selection_loss = float(selection_loss)
+            best_selection_metrics = dict(selection_metrics)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    for epoch in range(1, epochs + 1):
+        order = torch.randperm(int(train_features.shape[0]), generator=generator)
+        model.train()
+        total_loss = 0.0
+        total_seen = 0
+        for start in range(0, int(order.numel()), batch_size):
+            idx = order[start : start + batch_size].to(device=device)
+            features = _standardize(train_features_device.index_select(0, idx))
+            target = train_labels_device.index_select(0, idx)
+            logits = model(features)
+            loss = nn.functional.cross_entropy(logits, target, weight=class_weight)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            batch_n = int(target.numel())
+            total_loss += float(loss.detach().item()) * batch_n
+            total_seen += batch_n
+        epoch_loss = total_loss / max(total_seen, 1)
+        best_train_loss = min(best_train_loss, float(epoch_loss))
+        model.eval()
+        selection_value, selection_loss, selection_metrics = _selection_value_for_epoch(epoch_loss)
+        selection_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": float(epoch_loss),
+                "selection_split": selection_split,
+                "selection_metric": selection_metric,
+                "selection_value": float(selection_value),
+                "selection_loss": float(selection_loss),
+            }
+        )
+        if _selection_improved(selection_value):
+            best_loss = float(epoch_loss)
+            best_epoch = int(epoch)
+            best_selection_value = float(selection_value)
+            best_selection_loss = float(selection_loss)
+            best_selection_metrics = dict(selection_metrics)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+                stopped_epoch = int(epoch)
+                break
+    if best_epoch <= 0:
+        best_epoch = 1
+    model.load_state_dict(best_state, strict=True)
+    model.eval()
+
+    def _metrics_for(tensors: Dict[str, torch.Tensor]) -> Dict[str, object]:
+        features, labels, current = _filtered_eval_tensors(tensors)
+        if int(labels.numel()) <= 0:
+            return _penalty_route_learnability_metrics_from_scores(
+                scores=torch.zeros(0, label_count),
+                labels=labels,
+                current_pred=current,
+                label_names=label_names,
+            )
+        with torch.no_grad():
+            scores = model(_standardize(features)).detach().cpu()
+        return _penalty_route_learnability_metrics_from_scores(
+            scores=scores,
+            labels=labels,
+            current_pred=current,
+            label_names=label_names,
+        )
+
+    split_metrics = {
+        "train": _metrics_for(
+            {
+                "features": train_features.detach().cpu(),
+                "labels": train_labels.detach().cpu(),
+                "current_pred": train_current.detach().cpu(),
+            }
+        )
+    }
+    for split_name, tensors in eval_tensors_by_split.items():
+        split_metrics[str(split_name)] = _metrics_for(tensors)
+
+    summary = {
+        "enable": True,
+        "samples_train": int(train_labels.numel()),
+        "label_names": list(label_names),
+        "feature_names": list(feature_names),
+        "config": {
+            "epochs": int(epochs),
+            "batch_size": int(batch_size),
+            "lr": float(cfg.get("lr", 1.0e-3)),
+            "head_mode": str(cfg.get("head_mode", "classwise")).lower(),
+            "hidden_dim": int(cfg.get("hidden_dim", 32)),
+            "dropout": float(cfg.get("dropout", 0.0)),
+            "weight_decay": float(cfg.get("weight_decay", 1.0e-4)),
+            "class_weight": class_weight_mode,
+            "class_weight_values": class_weight_summary,
+            "class_weight_min": None if "class_weight_min" not in cfg else float(cfg.get("class_weight_min", 0.0)),
+            "class_weight_max": None if "class_weight_max" not in cfg else float(cfg.get("class_weight_max", 0.0)),
+            "selection_split": selection_split_requested,
+            "selection_metric": selection_metric,
+            "early_stop_patience": int(early_stop_patience),
+            "early_stop_min_delta": float(early_stop_min_delta),
+            "init_bias": init_bias_mode,
+            "include_initial_eval": bool(include_initial_eval),
+            "seed": int(seed),
+        },
+        "best_train_loss": float(best_train_loss),
+        "selection": {
+            "split": selection_split,
+            "requested_split": selection_split_requested,
+            "fallback_reason": selection_fallback_reason,
+            "metric": selection_metric,
+            "best_epoch": int(best_epoch),
+            "best_value": float(best_selection_value),
+            "best_loss": float(best_selection_loss),
+            "best_train_epoch_loss": float(best_loss),
+            "minimize": bool(minimize_selection),
+            "patience": int(early_stop_patience),
+            "min_delta": float(early_stop_min_delta),
+            "stopped_epoch": int(stopped_epoch),
+            "best_metrics": best_selection_metrics,
+        },
+        "selection_history": selection_history,
+        "splits": split_metrics,
+    }
+    artifact = {
+        "state_dict": best_state,
+        "feature_mean": feat_mean.detach().cpu(),
+        "feature_std": feat_std.detach().cpu(),
+        "class_weight": None if class_weight is None else class_weight.detach().cpu(),
+        "label_names": list(label_names),
+        "feature_names": list(feature_names),
+        "config": dict(summary["config"]),
+        "selection": dict(summary["selection"]),
+    }
+    return summary, artifact
+
+
 @torch.no_grad()
 def evaluate_penalty_explainability(
     model: nn.Module,
@@ -4471,6 +6653,15 @@ def evaluate_penalty_explainability(
     prior_prob_kp: Optional[torch.Tensor] = None,
     allowed_mask_kp: Optional[torch.Tensor] = None,
     max_batches: int = 0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    input_len: int = 0,
+    eval_start: int = 0,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    gate_feature_mode: str = "history",
 ) -> Optional[Dict[str, object]]:
     if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
         return None
@@ -4486,18 +6677,44 @@ def evaluate_penalty_explainability(
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
-    moe_history_anchor_expert_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
+    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
+    explain_cfg = moe_cfg.get("explainability", {}) or {}
+    utility_thresholds = [float(v) for v in (explain_cfg.get("utility_thresholds", []) or [])]
+    route_label_phase_periods = [
+        int(v) for v in (explain_cfg.get("route_label_phase_periods", []) or []) if int(v) > 0
+    ]
+    route_label_phase_bins = int(explain_cfg.get("route_label_phase_bins", 8))
+    top1_confidence_bins = [float(v) for v in (explain_cfg.get("top1_confidence_bins", []) or [])]
 
     P = len(penalty_names)
     cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
     cid_cpu = cluster_id_c.detach().cpu().to(dtype=torch.long)
     cluster_channel_count = torch.bincount(cid_cpu, minlength=K).clamp_min(1).to(dtype=torch.float32)
+    allowed_mask_device = None
+    if allowed_mask_kp is not None:
+        allowed_mask_device = allowed_mask_kp.detach().to(device=device, dtype=torch.bool)
+        if tuple(allowed_mask_device.shape) != (int(K), int(P)):
+            raise ValueError("allowed_mask_kp must have shape [K,P] for explainability diagnostics.")
 
     total_bc_k = torch.zeros(K, dtype=torch.float64)
     base_err_sum_k = torch.zeros(K, dtype=torch.float64)
     final_err_sum_k = torch.zeros(K, dtype=torch.float64)
+    oracle_err_sum_k = torch.zeros(K, dtype=torch.float64)
+    cluster_penalty_oracle_err_sum_k = torch.zeros(K, dtype=torch.float64)
+    cluster_route_oracle_err_sum_k = torch.zeros(K, dtype=torch.float64)
+    cluster_route_oracle_skip_count_k = torch.zeros(K, dtype=torch.float64)
+    cluster_route_oracle_decision_count_k = torch.zeros(K, dtype=torch.float64)
     fusion_sum_k = torch.zeros(K, dtype=torch.float64)
+    skip_count_k = torch.zeros(K, dtype=torch.float64)
+    skip_on_oracle_positive_count_k = torch.zeros(K, dtype=torch.float64)
     selected_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    top1_intended_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    top1_selected_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    top1_selected_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    top1_selected_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
+    skipped_top1_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    skipped_on_oracle_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    harmful_top1_not_skipped_count_kp = torch.zeros(K, P, dtype=torch.float64)
     oracle_count_kp = torch.zeros(K, P, dtype=torch.float64)
     positive_oracle_count_kp = torch.zeros(K, P, dtype=torch.float64)
     selected_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
@@ -4508,22 +6725,58 @@ def evaluate_penalty_explainability(
     single_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
     selected_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
     selected_gain_count_kp = torch.zeros(K, P, dtype=torch.float64)
+    utility_valid_count_kt = torch.zeros(K, len(utility_thresholds), dtype=torch.float64)
+    utility_total_count_k = torch.zeros(K, dtype=torch.float64)
+    utility_best_gain_sum_k = torch.zeros(K, dtype=torch.float64)
+    utility_best_gain_positive_count_k = torch.zeros(K, dtype=torch.float64)
 
     total_decisions = 0
     total_selected = 0
     total_oracle_positive = 0
     total_selected_positive = 0
     batch_count = 0
+    route_label_feature_chunks: List[torch.Tensor] = []
+    route_label_chunks: List[torch.Tensor] = []
+    route_label_query_start_chunks: List[torch.Tensor] = []
+    top1_conf_chunks: List[torch.Tensor] = []
+    top1_gain_chunks: List[torch.Tensor] = []
+    top1_penalty_chunks: List[torch.Tensor] = []
+    top1_active_chunks: List[torch.Tensor] = []
+    top1_skip_chunks: List[torch.Tensor] = []
 
-    for x, y, _ in loader:
+    for x, y, idx in loader:
         batch_count += 1
         if max_batches > 0 and batch_count > int(max_batches):
             break
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        y_base = model(x, cluster_id_c)
-        feat_bcf = extract_gate_features(x)
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        idx = idx.to(device=device, dtype=torch.long)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=observed_history_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            cfg=history_anchor_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
             yhat_base_bch=y_base,
@@ -4561,6 +6814,7 @@ def evaluate_penalty_explainability(
             cluster_id_c,
             mask_bkp,
             skip_bk=skip_bk if allow_skip else None,
+            query_start_abs_b=query_start_abs_b,
         )
         residuals = pred_out.get("residuals")
         alpha_cp = pred_out.get("alpha_cp")
@@ -4572,36 +6826,123 @@ def evaluate_penalty_explainability(
         selector_bcp = pred_out.get("selector_bcp", torch.ones_like(route_bcp))
         intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp))
         fusion_bc = pred_out.get("fusion_bc", torch.ones_like(route_bcp[..., 0]))
-        y_final = pred_out["y_final"]
+        y_final_raw = pred_out["y_final"]
+        y_final = apply_moe_output_anchor_experts(
+            y_final_raw,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
 
-        alpha_bcp = alpha_cp.unsqueeze(0)
-        single_scale_bcp = alpha_bcp * selector_bcp * intervention_bcp
-        cand_bcpH = y_base.unsqueeze(2) + single_scale_bcp.unsqueeze(-1) * residuals
-        base_err_bc = (y_base - y).pow(2).mean(dim=-1)
+        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
+            y_base,
+            pred_out,
+            apply_output_anchors=True,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        if cand_bcpH is None:
+            continue
+        base_err_bc = (y_base_final - y).pow(2).mean(dim=-1)
         final_err_bc = (y_final - y).pow(2).mean(dim=-1)
         cand_err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
         gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
-        oracle_gain_bc, oracle_p_bc = gain_bcp.max(dim=-1)
+        if utility_thresholds:
+            utility_stats = _cluster_utility_threshold_stats(
+                gain_bcp=gain_bcp.detach(),
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=allowed_mask_kp,
+                thresholds=utility_thresholds,
+            )
+            utility_valid_count_kt += utility_stats["valid_count_kt"]
+            utility_total_count_k += utility_stats["total_count_k"]
+            utility_best_gain_sum_k += utility_stats["best_gain_sum_k"]
+            utility_best_gain_positive_count_k += utility_stats["best_gain_positive_count_k"]
+        if allowed_mask_device is not None:
+            allowed_bcp = allowed_mask_device.index_select(0, cid_c).unsqueeze(0)
+            cand_err_for_oracle_bcp = cand_err_bcp.masked_fill(~allowed_bcp, float("inf"))
+        else:
+            cand_err_for_oracle_bcp = cand_err_bcp
+        oracle_penalty_err_bc, oracle_p_bc = cand_err_for_oracle_bcp.min(dim=-1)
+        oracle_err_bc = torch.where(torch.isfinite(oracle_penalty_err_bc), oracle_penalty_err_bc, base_err_bc)
+        oracle_gain_bc = base_err_bc - oracle_err_bc
         selected_bool_bcp = route_bcp > 0
         selected_positive_bcp = selected_bool_bcp & (gain_bcp > 0)
         positive_oracle_bc = oracle_gain_bc > 0
+        raw_route_bcp = mask_bkp[:, cid_c, :]
+        raw_score_bcp = raw_route_bcp * probs_bkp[:, cid_c, :]
+        top1_p_bc = raw_score_bcp.argmax(dim=-1)
+        top1_conf_bc = probs_bkp[:, cid_c, :].gather(-1, top1_p_bc.unsqueeze(-1)).squeeze(-1)
+        top1_weight_bc = raw_route_bcp.gather(-1, top1_p_bc.unsqueeze(-1)).squeeze(-1)
+        skip_bc = (skip_bk[:, cid_c] > 0.5) if allow_skip else torch.zeros_like(base_err_bc, dtype=torch.bool)
+        top1_active_bc = (top1_weight_bc > 0) & (~skip_bc)
+        top1_gain_bc = gain_bcp.gather(-1, top1_p_bc.unsqueeze(-1)).squeeze(-1)
+        top1_positive_bc = top1_active_bc & (top1_gain_bc > 0)
+        top1_harmful_bc = top1_active_bc & (top1_gain_bc <= 0)
 
         total_decisions += int(base_err_bc.numel())
         total_selected += int(selected_bool_bcp.sum().item())
         total_oracle_positive += int(positive_oracle_bc.sum().item())
         total_selected_positive += int(selected_positive_bcp.sum().item())
 
+        route_label_bk = torch.full((base_err_bc.shape[0], K), -1, device=device, dtype=torch.long)
         for k in range(K):
             ch_mask = cid_c == int(k)
             if not bool(ch_mask.any().item()):
                 continue
             base_k = base_err_bc[:, ch_mask]
             final_k = final_err_bc[:, ch_mask]
+            cand_err_k = cand_err_bcp[:, ch_mask, :]
             total_k = int(base_k.numel())
+            channels_k = int(ch_mask.sum().item())
             total_bc_k[k] += total_k
             base_err_sum_k[k] += float(base_k.sum().item())
             final_err_sum_k[k] += float(final_k.sum().item())
+            oracle_err_sum_k[k] += float(oracle_err_bc[:, ch_mask].sum().item())
+            cluster_base_err_b = base_k.mean(dim=1)
+            cluster_penalty_err_bp = cand_err_k.mean(dim=1)
+            if allowed_mask_device is not None:
+                allowed_p = allowed_mask_device[int(k)].view(1, P)
+                cluster_penalty_err_bp = cluster_penalty_err_bp.masked_fill(~allowed_p, float("inf"))
+            best_cluster_penalty_err_b, best_cluster_penalty_p_b = cluster_penalty_err_bp.min(dim=-1)
+            has_allowed_penalty_b = torch.isfinite(best_cluster_penalty_err_b)
+            best_cluster_penalty_err_for_sum_b = torch.where(
+                has_allowed_penalty_b,
+                best_cluster_penalty_err_b,
+                cluster_base_err_b,
+            )
+            best_cluster_route_err_b = torch.minimum(cluster_base_err_b, best_cluster_penalty_err_for_sum_b)
+            cluster_route_label_b = torch.where(
+                cluster_base_err_b <= best_cluster_penalty_err_for_sum_b,
+                torch.zeros_like(best_cluster_penalty_p_b),
+                best_cluster_penalty_p_b + 1,
+            )
+            cluster_route_label_b = torch.where(
+                has_allowed_penalty_b,
+                cluster_route_label_b,
+                torch.zeros_like(cluster_route_label_b),
+            )
+            route_label_bk[:, int(k)] = cluster_route_label_b
+            cluster_penalty_oracle_err_sum_k[k] += float(best_cluster_penalty_err_for_sum_b.sum().item() * channels_k)
+            cluster_route_oracle_err_sum_k[k] += float(best_cluster_route_err_b.sum().item() * channels_k)
+            cluster_route_oracle_skip_count_k[k] += float((cluster_route_label_b == 0).sum().item())
+            cluster_route_oracle_decision_count_k[k] += int(cluster_base_err_b.numel())
             fusion_sum_k[k] += float(fusion_bc[:, ch_mask].sum().item())
+            skip_count_k[k] += float(skip_bc[:, ch_mask].sum().item())
+            skip_on_oracle_positive_count_k[k] += float((skip_bc[:, ch_mask] & positive_oracle_bc[:, ch_mask]).sum().item())
 
             selected_count_kp[k] += selected_bool_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
             selected_positive_count_kp[k] += selected_positive_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
@@ -4615,9 +6956,40 @@ def evaluate_penalty_explainability(
 
             oracle_k = oracle_p_bc[:, ch_mask].detach().cpu().reshape(-1)
             oracle_pos_k = oracle_p_bc[:, ch_mask][positive_oracle_bc[:, ch_mask]].detach().cpu().reshape(-1)
+            top1_k = top1_p_bc[:, ch_mask].detach().cpu().reshape(-1)
+            top1_active_k = top1_p_bc[:, ch_mask][top1_active_bc[:, ch_mask]].detach().cpu().reshape(-1)
+            top1_positive_k = top1_p_bc[:, ch_mask][top1_positive_bc[:, ch_mask]].detach().cpu().reshape(-1)
+            top1_harmful_k = top1_p_bc[:, ch_mask][top1_harmful_bc[:, ch_mask]].detach().cpu().reshape(-1)
+            skipped_top1_k = top1_p_bc[:, ch_mask][skip_bc[:, ch_mask]].detach().cpu().reshape(-1)
+            skipped_positive_k = top1_p_bc[:, ch_mask][skip_bc[:, ch_mask] & positive_oracle_bc[:, ch_mask]].detach().cpu().reshape(-1)
             oracle_count_kp[k] += torch.bincount(oracle_k, minlength=P)[:P].to(dtype=torch.float64)
             if oracle_pos_k.numel() > 0:
                 positive_oracle_count_kp[k] += torch.bincount(oracle_pos_k, minlength=P)[:P].to(dtype=torch.float64)
+            top1_intended_count_kp[k] += torch.bincount(top1_k, minlength=P)[:P].to(dtype=torch.float64)
+            if top1_active_k.numel() > 0:
+                top1_selected_count_kp[k] += torch.bincount(top1_active_k, minlength=P)[:P].to(dtype=torch.float64)
+            if top1_positive_k.numel() > 0:
+                top1_selected_positive_count_kp[k] += torch.bincount(top1_positive_k, minlength=P)[:P].to(dtype=torch.float64)
+            if top1_harmful_k.numel() > 0:
+                harmful_top1_not_skipped_count_kp[k] += torch.bincount(top1_harmful_k, minlength=P)[:P].to(dtype=torch.float64)
+            if skipped_top1_k.numel() > 0:
+                skipped_top1_count_kp[k] += torch.bincount(skipped_top1_k, minlength=P)[:P].to(dtype=torch.float64)
+            if skipped_positive_k.numel() > 0:
+                skipped_on_oracle_positive_count_kp[k] += torch.bincount(skipped_positive_k, minlength=P)[:P].to(dtype=torch.float64)
+            active_gain_k = top1_gain_bc[:, ch_mask] * top1_active_bc[:, ch_mask].to(dtype=top1_gain_bc.dtype)
+            for p in range(P):
+                top1_selected_gain_sum_kp[k, p] += float(
+                    active_gain_k[top1_p_bc[:, ch_mask] == int(p)].sum().item()
+                )
+        route_label_feature_chunks.append(feat_bkf.detach().cpu())
+        route_label_chunks.append(route_label_bk.detach().cpu())
+        route_label_query_start_chunks.append(query_start_abs_b.detach().cpu())
+        if top1_confidence_bins:
+            top1_conf_chunks.append(top1_conf_bc.detach().cpu())
+            top1_gain_chunks.append(top1_gain_bc.detach().cpu())
+            top1_penalty_chunks.append(top1_p_bc.detach().cpu())
+            top1_active_chunks.append(top1_active_bc.detach().cpu())
+            top1_skip_chunks.append(skip_bc.detach().cpu())
 
     if total_decisions <= 0:
         return None
@@ -4649,13 +7021,30 @@ def evaluate_penalty_explainability(
         cluster_total = float(total_bc_k[k].item())
         base_mse_k = float(base_err_sum_k[k].item() / max(cluster_total, 1.0))
         final_mse_k = float(final_err_sum_k[k].item() / max(cluster_total, 1.0))
+        oracle_mse_k = float(oracle_err_sum_k[k].item() / max(cluster_total, 1.0))
+        cluster_penalty_oracle_mse_k = float(cluster_penalty_oracle_err_sum_k[k].item() / max(cluster_total, 1.0))
+        cluster_route_oracle_mse_k = float(cluster_route_oracle_err_sum_k[k].item() / max(cluster_total, 1.0))
         cluster_gain = float(100.0 * (base_mse_k - final_mse_k) / max(abs(base_mse_k), 1.0e-12))
+        oracle_gain_pct = float(100.0 * (base_mse_k - oracle_mse_k) / max(abs(base_mse_k), 1.0e-12))
+        cluster_penalty_oracle_gain_pct = float(
+            100.0 * (base_mse_k - cluster_penalty_oracle_mse_k) / max(abs(base_mse_k), 1.0e-12)
+        )
+        cluster_route_oracle_gain_pct = float(
+            100.0 * (base_mse_k - cluster_route_oracle_mse_k) / max(abs(base_mse_k), 1.0e-12)
+        )
+        cluster_route_oracle_skip_rate = float(
+            cluster_route_oracle_skip_count_k[k].item() / max(cluster_route_oracle_decision_count_k[k].item(), 1.0)
+        )
+        skip_rate = float(skip_count_k[k].item() / max(cluster_total, 1.0))
+        skip_on_positive_rate = float(skip_on_oracle_positive_count_k[k].item() / max(total_bc_k[k].item(), 1.0))
         cluster_rows = []
         for p, name in enumerate(penalty_names):
             selected_count = float(selected_count_kp[k, p].item())
             selected_gain_count = float(selected_gain_count_kp[k, p].item())
+            top1_selected_count = float(top1_selected_count_kp[k, p].item())
             mean_gain = float(mean_gain_kp[k, p].item())
             selected_mean_gain = float(selected_gain_sum_kp[k, p].item() / max(selected_gain_count, 1.0))
+            top1_selected_mean_gain = float(top1_selected_gain_sum_kp[k, p].item() / max(top1_selected_count, 1.0))
             prior_value = float(prior[k, p].item()) if math.isfinite(float(prior[k, p].item())) else None
             portrait_value = float(portrait[k, p].item()) if math.isfinite(float(portrait[k, p].item())) else None
             allowed_value = bool(allowed[k, p].item() > 0.5)
@@ -4678,6 +7067,25 @@ def evaluate_penalty_explainability(
                 "prior_actual_gain_corr_for_penalty": penalty_corr.get(name),
                 "selected_count": int(selected_count),
                 "selected_rate": float(selected_count / max(cluster_total, 1.0)),
+                "top1_intended_count": int(top1_intended_count_kp[k, p].item()),
+                "top1_intended_rate": float(top1_intended_count_kp[k, p].item() / max(cluster_total, 1.0)),
+                "top1_selected_count": int(top1_selected_count),
+                "top1_selected_rate": float(top1_selected_count / max(cluster_total, 1.0)),
+                "top1_selected_positive_count": int(top1_selected_positive_count_kp[k, p].item()),
+                "top1_selected_positive_rate": float(
+                    top1_selected_positive_count_kp[k, p].item() / max(top1_selected_count, 1.0)
+                ),
+                "top1_selected_mean_gain_mse": top1_selected_mean_gain,
+                "harmful_top1_not_skipped_count": int(harmful_top1_not_skipped_count_kp[k, p].item()),
+                "harmful_top1_not_skipped_rate": float(
+                    harmful_top1_not_skipped_count_kp[k, p].item() / max(top1_selected_count, 1.0)
+                ),
+                "skipped_top1_count": int(skipped_top1_count_kp[k, p].item()),
+                "skipped_top1_rate": float(skipped_top1_count_kp[k, p].item() / max(cluster_total, 1.0)),
+                "skipped_on_oracle_positive_count": int(skipped_on_oracle_positive_count_kp[k, p].item()),
+                "skipped_on_oracle_positive_rate": float(
+                    skipped_on_oracle_positive_count_kp[k, p].item() / max(cluster_total, 1.0)
+                ),
                 "oracle_count": int(oracle_count_kp[k, p].item()),
                 "oracle_rate": float(oracle_count_kp[k, p].item() / max(cluster_total, 1.0)),
                 "positive_oracle_count": int(positive_oracle_count_kp[k, p].item()),
@@ -4692,7 +7100,16 @@ def evaluate_penalty_explainability(
                 "selected_mean_gain_mse": selected_mean_gain,
                 "cluster_base_mse": base_mse_k,
                 "cluster_final_mse": final_mse_k,
+                "cluster_oracle_mse": oracle_mse_k,
+                "cluster_penalty_oracle_mse": cluster_penalty_oracle_mse_k,
+                "cluster_penalty_oracle_gain_pct_vs_base": cluster_penalty_oracle_gain_pct,
+                "cluster_route_oracle_mse": cluster_route_oracle_mse_k,
+                "cluster_route_oracle_gain_pct_vs_base": cluster_route_oracle_gain_pct,
+                "cluster_route_oracle_skip_rate": cluster_route_oracle_skip_rate,
                 "cluster_final_gain_pct": cluster_gain,
+                "cluster_oracle_gain_pct_vs_base": oracle_gain_pct,
+                "cluster_skip_rate": skip_rate,
+                "cluster_skip_on_oracle_positive_rate": skip_on_positive_rate,
                 "mean_fusion_gate": float(fusion_sum_k[k].item() / max(cluster_total, 1.0)),
                 "reason": reason,
             }
@@ -4713,7 +7130,18 @@ def evaluate_penalty_explainability(
                 "channels": int(cluster_channel_count[k].item()),
                 "base_mse": base_mse_k,
                 "final_mse": final_mse_k,
+                "oracle_mse": oracle_mse_k,
+                "cluster_penalty_oracle_mse": cluster_penalty_oracle_mse_k,
+                "cluster_penalty_oracle_gain_pct_vs_base": cluster_penalty_oracle_gain_pct,
+                "cluster_route_oracle_mse": cluster_route_oracle_mse_k,
+                "cluster_route_oracle_gain_pct_vs_base": cluster_route_oracle_gain_pct,
+                "cluster_route_oracle_skip_rate": cluster_route_oracle_skip_rate,
                 "final_gain_pct": cluster_gain,
+                "oracle_gain_pct_vs_base": oracle_gain_pct,
+                "skip_count": int(skip_count_k[k].item()),
+                "skip_rate": skip_rate,
+                "skip_on_oracle_positive_count": int(skip_on_oracle_positive_count_k[k].item()),
+                "skip_on_oracle_positive_rate": skip_on_positive_rate,
                 "top_penalties": [
                     {
                         "penalty": item["penalty"],
@@ -4721,6 +7149,9 @@ def evaluate_penalty_explainability(
                         "train_prior_prob": item["train_prior_prob"],
                         "mean_single_penalty_gain_mse": item["mean_single_penalty_gain_mse"],
                         "selected_rate": item["selected_rate"],
+                        "top1_selected_positive_rate": item["top1_selected_positive_rate"],
+                        "harmful_top1_not_skipped_rate": item["harmful_top1_not_skipped_rate"],
+                        "skipped_top1_rate": item["skipped_top1_rate"],
                         "reason": item["reason"],
                     }
                     for item in cluster_rows_sorted[: min(3, len(cluster_rows_sorted))]
@@ -4730,6 +7161,66 @@ def evaluate_penalty_explainability(
 
     base_mse = float(base_err_sum_k.sum().item() / max(total_decisions, 1))
     final_mse = float(final_err_sum_k.sum().item() / max(total_decisions, 1))
+    oracle_mse = float(oracle_err_sum_k.sum().item() / max(total_decisions, 1))
+    cluster_penalty_oracle_mse = float(cluster_penalty_oracle_err_sum_k.sum().item() / max(total_decisions, 1))
+    cluster_route_oracle_mse = float(cluster_route_oracle_err_sum_k.sum().item() / max(total_decisions, 1))
+    cluster_route_oracle_decisions = float(cluster_route_oracle_decision_count_k.sum().item())
+    cluster_route_oracle_skip_rate = float(
+        cluster_route_oracle_skip_count_k.sum().item() / max(cluster_route_oracle_decisions, 1.0)
+    )
+    utility_threshold_summary = []
+    if utility_thresholds:
+        for k in range(K):
+            total_k = float(utility_total_count_k[k].item())
+            utility_threshold_summary.append(
+                {
+                    "cluster_id": int(k),
+                    "windows": int(total_k),
+                    "mean_best_allowed_gain_mse": float(utility_best_gain_sum_k[k].item() / max(total_k, 1.0)),
+                    "positive_best_allowed_gain_rate": float(
+                        utility_best_gain_positive_count_k[k].item() / max(total_k, 1.0)
+                    ),
+                    "thresholds": [
+                        {
+                            "min_gain": float(threshold),
+                            "valid_count": int(utility_valid_count_kt[k, t].item()),
+                            "valid_rate": float(utility_valid_count_kt[k, t].item() / max(total_k, 1.0)),
+                        }
+                        for t, threshold in enumerate(utility_thresholds)
+                    ],
+                }
+            )
+    route_label_feature_diagnostics = None
+    if route_label_feature_chunks and route_label_chunks:
+        route_label_feature_diagnostics = _cluster_route_label_feature_diagnostics(
+            feat_bkf=torch.cat(route_label_feature_chunks, dim=0),
+            route_label_bk=torch.cat(route_label_chunks, dim=0),
+            penalty_names=penalty_names,
+            feature_names=_gate_feature_names_for_mode(gate_feature_mode),
+        )
+    route_label_phase_diagnostics = None
+    if route_label_phase_periods and route_label_chunks and route_label_query_start_chunks:
+        route_label_phase_diagnostics = _cluster_route_label_phase_diagnostics(
+            query_start_abs_b=torch.cat(route_label_query_start_chunks, dim=0),
+            route_label_bk=torch.cat(route_label_chunks, dim=0),
+            penalty_names=penalty_names,
+            periods=route_label_phase_periods,
+            num_bins=route_label_phase_bins,
+            phase_offset=int(input_len),
+        )
+    top1_confidence_gain_diagnostics = None
+    if top1_confidence_bins and top1_conf_chunks:
+        top1_confidence_gain_diagnostics = _cluster_top1_confidence_gain_diagnostics(
+            top1_conf_bc=torch.cat(top1_conf_chunks, dim=0),
+            top1_gain_bc=torch.cat(top1_gain_chunks, dim=0),
+            top1_p_bc=torch.cat(top1_penalty_chunks, dim=0),
+            top1_active_bc=torch.cat(top1_active_chunks, dim=0),
+            skip_bc=torch.cat(top1_skip_chunks, dim=0),
+            cluster_id_c=cluster_id_c.detach().cpu(),
+            K=K,
+            penalty_names=penalty_names,
+            bins=top1_confidence_bins,
+        )
     return {
         "split": split_name,
         "samples": int(total_decisions),
@@ -4739,7 +7230,22 @@ def evaluate_penalty_explainability(
         "base_mse": base_mse,
         "final_mse": final_mse,
         "final_gain_pct_vs_base": float(100.0 * (base_mse - final_mse) / max(abs(base_mse), 1.0e-12)),
+        "oracle_mse": oracle_mse,
+        "oracle_gain_pct_vs_base": float(100.0 * (base_mse - oracle_mse) / max(abs(base_mse), 1.0e-12)),
+        "cluster_penalty_oracle_mse": cluster_penalty_oracle_mse,
+        "cluster_penalty_oracle_gain_pct_vs_base": float(
+            100.0 * (base_mse - cluster_penalty_oracle_mse) / max(abs(base_mse), 1.0e-12)
+        ),
+        "cluster_route_oracle_mse": cluster_route_oracle_mse,
+        "cluster_route_oracle_gain_pct_vs_base": float(
+            100.0 * (base_mse - cluster_route_oracle_mse) / max(abs(base_mse), 1.0e-12)
+        ),
+        "cluster_route_oracle_skip_rate": cluster_route_oracle_skip_rate,
         "prior_actual_gain_corr": penalty_corr,
+        "utility_target_thresholds": utility_threshold_summary,
+        "route_label_feature_diagnostics": route_label_feature_diagnostics,
+        "route_label_phase_diagnostics": route_label_phase_diagnostics,
+        "top1_confidence_gain_diagnostics": top1_confidence_gain_diagnostics,
         "per_cluster": per_cluster,
         "rows": rows,
     }
@@ -4765,414 +7271,6 @@ def save_penalty_explainability_artifacts(
     return paths
 
 
-def train_pred_residual_gate(
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    penalty_scale: Optional[torch.Tensor],
-    select_ranks: Optional[List[int]],
-    gate_soft_weight: float,
-    channel_names: List[str],
-    cfg: Dict[str, object],
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-) -> Tuple[Optional[KNNResidualGate], Dict[str, object]]:
-    tensors = _collect_pred_residual_gate_tensors(
-        model=model,
-        gate=gate,
-        pred_residual=pred_residual,
-        loader=loader,
-        cluster_id_c=cluster_id_c,
-        K=K,
-        moe_cfg=moe_cfg,
-        device=device,
-        penalty_names=penalty_names,
-        penalty_fns=penalty_fns,
-        penalty_scale=penalty_scale,
-        select_ranks=select_ranks,
-        gate_soft_weight=gate_soft_weight,
-        history_anchor_cfg=history_anchor_cfg,
-        observed_history_tc=observed_history_tc,
-        input_len=input_len,
-        eval_start=eval_start,
-    )
-    if tensors is None:
-        return None, {"enable": False, "reason": "empty_loader_or_residual_disabled"}
-
-    feat = tensors["feat"]
-    base = tensors["base"]
-    delta = tensors["delta"]
-    y = tensors["y"]
-    n = int(feat.shape[0])
-    c = int(feat.shape[1])
-    train_fraction = float(cfg.get("train_fraction", 0.7))
-    split = int(max(1, min(n - 1, round(n * train_fraction)))) if n > 1 else n
-    train_idx = torch.arange(0, split, dtype=torch.long)
-    hold_idx = torch.arange(split, n, dtype=torch.long)
-    if hold_idx.numel() == 0:
-        hold_idx = train_idx
-    standardize_features = bool(cfg.get("standardize_features", False))
-    activation_head_enable = bool(cfg.get("activation_head_enable", False))
-    activation_feature_mode = str(cfg.get("activation_feature_mode", "full"))
-    activation_train_soft_gating = bool(cfg.get("activation_train_soft_gating", False))
-    activation_cluster_bias_enable = bool(cfg.get("activation_cluster_bias_enable", False))
-
-    residual_gate = KNNResidualGate(
-        feat_dim=int(feat.shape[-1]),
-        num_channels=c,
-        hidden_dim=int(cfg.get("hidden_dim", 32)),
-        dropout=float(cfg.get("dropout", 0.0)),
-        max_scale=float(cfg.get("max_scale", 1.0)),
-        init_scale=float(cfg.get("init_scale", 0.8)),
-        scale_mode=str(cfg.get("scale_mode", "sigmoid")),
-        activation_head=activation_head_enable,
-        activation_init_prob=float(cfg.get("activation_init_prob", 0.5)),
-        activation_cluster_ids=cluster_id_c.detach().cpu() if activation_cluster_bias_enable else None,
-        activation_cluster_bias=activation_cluster_bias_enable,
-    ).to(device)
-    activation_feature_mask = _activation_feature_mask_for_mode(activation_feature_mode, int(feat.shape[-1]))
-    residual_gate.set_activation_feature_mask(activation_feature_mask.to(device))
-    lr = float(cfg.get("lr", 1.0e-3))
-    weight_decay = float(cfg.get("weight_decay", 1.0e-4))
-    batch_size = max(1, int(cfg.get("batch_size", 256)))
-    epochs = max(1, int(cfg.get("epochs", 30)))
-    scale_reg = float(cfg.get("scale_reg", 1.0e-4))
-    init_scale = float(cfg.get("init_scale", 0.8))
-    loss_kind = str(cfg.get("loss", "mse")).lower()
-    if loss_kind not in {"mse", "mae", "smooth_l1"}:
-        raise ValueError("moe.pred_side_residual.gate_calibrator.loss must be mse, mae, or smooth_l1.")
-    selection_metric = str(cfg.get("selection_metric", loss_kind)).lower()
-    if selection_metric not in {"mse", "mae"}:
-        raise ValueError("moe.pred_side_residual.gate_calibrator.selection_metric must be mse or mae.")
-    beta = float(cfg.get("beta", 0.5))
-    activation_threshold_raw = cfg.get("activation_threshold", 0.1)
-    activation_threshold_auto = str(activation_threshold_raw).lower() == "auto"
-    activation_threshold = 0.1 if activation_threshold_auto else float(activation_threshold_raw)
-    activation_label_min_improvement = float(cfg.get("activation_label_min_improvement", 0.0))
-    activation_by_abs_scale = bool(
-        cfg.get("activation_by_abs_scale", str(cfg.get("scale_mode", "sigmoid")).lower() == "signed_tanh")
-    )
-    apply_activation_threshold = bool(cfg.get("apply_activation_threshold", False))
-    activation_bce_weight = float(cfg.get("activation_bce_weight", 0.0))
-    activation_inactive_scale_weight = float(cfg.get("activation_inactive_scale_weight", 0.0))
-    activation_pos_weight_cfg = cfg.get("activation_pos_weight", "auto")
-    activation_pos_weight_scope = str(cfg.get("activation_pos_weight_scope", "global")).lower()
-    if activation_pos_weight_scope not in {"global", "cluster", "channel"}:
-        raise ValueError("activation_pos_weight_scope must be global, cluster, or channel.")
-    activation_pos_weight_min = float(cfg.get("activation_pos_weight_min", 1.0e-6))
-    activation_pos_weight_max = float(cfg.get("activation_pos_weight_max", 5.0))
-    activation_rate_balance_weight = float(cfg.get("activation_rate_balance_weight", 0.0))
-    activation_rate_balance_scope = str(cfg.get("activation_rate_balance_scope", "global")).lower()
-    if activation_rate_balance_scope not in {"global", "cluster"}:
-        raise ValueError("activation_rate_balance_scope must be global or cluster.")
-    opt = torch.optim.AdamW(residual_gate.parameters(), lr=lr, weight_decay=weight_decay)
-    best_state = None
-    best_hold = float("inf")
-    best_epoch = 0
-    feature_std_summary: Dict[str, object] = {
-        "standardize_features": bool(standardize_features),
-        "fit_windows": int(train_idx.numel()) if standardize_features else 0,
-        "min_std": None,
-        "max_std": None,
-    }
-    if standardize_features:
-        feat_train = feat.index_select(0, train_idx)
-        feat_flat = feat_train.reshape(-1, int(feat.shape[-1]))
-        feat_mean = feat_flat.mean(dim=0)
-        feat_std = feat_flat.std(dim=0, unbiased=False).clamp_min(1.0e-6)
-        residual_gate.set_feature_standardization(feat_mean.to(device), feat_std.to(device))
-        feature_std_summary.update(
-            {
-                "min_std": float(feat_std.min().item()),
-                "max_std": float(feat_std.max().item()),
-            }
-        )
-
-    max_gate_scale = max(float(residual_gate.max_scale), 1.0e-6)
-
-    def _active_labels(base_bch: torch.Tensor, delta_bch: torch.Tensor, y_bch: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
-            raw_err_bc = (base_bch + delta_bch - y_bch).pow(2).mean(dim=-1)
-            return (base_err_bc - raw_err_bc) > activation_label_min_improvement
-
-    def _scale_activation_prob(scale_bc: torch.Tensor) -> torch.Tensor:
-        if activation_by_abs_scale:
-            prob = scale_bc.abs() / max_gate_scale
-        elif str(residual_gate.scale_mode) == "signed_tanh":
-            prob = (scale_bc / max_gate_scale + 1.0) * 0.5
-        else:
-            prob = scale_bc / max_gate_scale
-        return prob.clamp(1.0e-6, 1.0 - 1.0e-6)
-
-    activation_pos_weight = 1.0
-    activation_pos_weight_bc: Optional[torch.Tensor] = None
-    activation_pos_weight_summary: object = 1.0
-    if activation_bce_weight > 0.0:
-        if str(activation_pos_weight_cfg).lower() == "auto":
-            pos_c = torch.zeros(c, dtype=torch.float64)
-            neg_c = torch.zeros(c, dtype=torch.float64)
-            for b0 in range(0, int(train_idx.numel()), batch_size):
-                batch_idx = train_idx[b0:b0 + batch_size]
-                labels_b = _active_labels(
-                    base.index_select(0, batch_idx),
-                    delta.index_select(0, batch_idx),
-                    y.index_select(0, batch_idx),
-                ).detach().cpu()
-                pos_c += labels_b.sum(dim=0).to(dtype=torch.float64)
-                neg_c += (~labels_b).sum(dim=0).to(dtype=torch.float64)
-            if activation_pos_weight_scope == "channel":
-                weight_c = (neg_c / pos_c.clamp_min(1.0)).clamp(
-                    max(activation_pos_weight_min, 1.0e-6),
-                    max(activation_pos_weight_max, 1.0e-6),
-                )
-                activation_pos_weight_bc = weight_c.to(device=device, dtype=torch.float32).view(1, -1)
-                activation_pos_weight_summary = [float(v) for v in weight_c.tolist()]
-                activation_pos_weight = float(weight_c.mean().item())
-            elif activation_pos_weight_scope == "cluster":
-                cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
-                weight_c = torch.ones(c, dtype=torch.float64)
-                for k in torch.unique(cid).tolist():
-                    mask = cid == int(k)
-                    pos_k = pos_c[mask].sum()
-                    neg_k = neg_c[mask].sum()
-                    weight_k = (neg_k / pos_k.clamp_min(1.0)).clamp(
-                        max(activation_pos_weight_min, 1.0e-6),
-                        max(activation_pos_weight_max, 1.0e-6),
-                    )
-                    weight_c[mask] = weight_k
-                activation_pos_weight_bc = weight_c.to(device=device, dtype=torch.float32).view(1, -1)
-                activation_pos_weight_summary = [float(v) for v in weight_c.tolist()]
-                activation_pos_weight = float(weight_c.mean().item())
-            else:
-                pos = float(pos_c.sum().item())
-                neg = float(neg_c.sum().item())
-                activation_pos_weight = min(
-                    max(neg / max(pos, 1.0), max(activation_pos_weight_min, 1.0e-6)),
-                    max(activation_pos_weight_max, 1.0e-6),
-                )
-                activation_pos_weight_summary = float(activation_pos_weight)
-        else:
-            activation_pos_weight = float(activation_pos_weight_cfg)
-            activation_pos_weight_summary = float(activation_pos_weight)
-
-    def _loss_for(
-        scale_bc: torch.Tensor,
-        base_bch: torch.Tensor,
-        delta_bch: torch.Tensor,
-        y_bch: torch.Tensor,
-        feat_bcf: Optional[torch.Tensor] = None,
-    ):
-        scale_for_loss = scale_bc
-        activation_prob_bc = None
-        if activation_head_enable and feat_bcf is not None:
-            activation_prob_bc = residual_gate.activation_prob(feat_bcf).to(dtype=scale_bc.dtype)
-            if activation_train_soft_gating:
-                scale_for_loss = scale_for_loss * activation_prob_bc
-        pred = base_bch + scale_for_loss.unsqueeze(-1) * delta_bch
-        if loss_kind == "mse":
-            loss = (pred - y_bch).pow(2).mean()
-        elif loss_kind == "smooth_l1":
-            loss = torch.nn.functional.smooth_l1_loss(pred, y_bch, beta=beta)
-        else:
-            loss = (pred - y_bch).abs().mean()
-        if activation_bce_weight > 0.0:
-            labels_bc = _active_labels(base_bch, delta_bch, y_bch).to(dtype=scale_bc.dtype)
-            prob_bc = (
-                activation_prob_bc
-                if activation_prob_bc is not None
-                else _scale_activation_prob(scale_bc)
-            )
-            pos_weight = (
-                activation_pos_weight_bc.to(device=scale_bc.device, dtype=scale_bc.dtype)
-                if activation_pos_weight_bc is not None
-                else torch.as_tensor(float(activation_pos_weight), device=scale_bc.device, dtype=scale_bc.dtype)
-            )
-            bce_bc = -(
-                pos_weight * labels_bc * prob_bc.log()
-                + (1.0 - labels_bc) * (1.0 - prob_bc).log()
-            )
-            loss = loss + activation_bce_weight * bce_bc.mean()
-            if activation_rate_balance_weight > 0.0:
-                if activation_rate_balance_scope == "cluster":
-                    cid = cluster_id_c.to(device=prob_bc.device, dtype=torch.long)
-                    rate_loss = torch.zeros((), device=prob_bc.device, dtype=prob_bc.dtype)
-                    num_rates = 0
-                    for k in torch.unique(cid).tolist():
-                        mask = cid == int(k)
-                        if bool(mask.any().item()):
-                            prob_rate = prob_bc[:, mask].mean()
-                            label_rate = labels_bc[:, mask].mean()
-                            rate_loss = rate_loss + (prob_rate - label_rate).pow(2)
-                            num_rates += 1
-                    loss = loss + activation_rate_balance_weight * rate_loss / max(num_rates, 1)
-                else:
-                    loss = loss + activation_rate_balance_weight * (prob_bc.mean() - labels_bc.mean()).pow(2)
-            if activation_inactive_scale_weight > 0.0:
-                inactive_bc = labels_bc < 0.5
-                if bool(inactive_bc.any().item()):
-                    loss = loss + activation_inactive_scale_weight * prob_bc[inactive_bc].pow(2).mean()
-        if scale_reg > 0.0:
-            loss = loss + scale_reg * (scale_bc - init_scale).pow(2).mean()
-        return loss
-
-    def _eval_idx(idx: torch.Tensor) -> Tuple[float, float, torch.Tensor]:
-        residual_gate.eval()
-        ae = 0.0
-        se = 0.0
-        denom = 0
-        scale_sum = torch.zeros(c, device=device)
-        count = 0
-        with torch.no_grad():
-            for b0 in range(0, int(idx.numel()), batch_size):
-                batch_idx = idx[b0:b0 + batch_size]
-                feat_b = feat.index_select(0, batch_idx).to(device)
-                base_b = base.index_select(0, batch_idx).to(device)
-                delta_b = delta.index_select(0, batch_idx).to(device)
-                y_b = y.index_select(0, batch_idx).to(device)
-                scale_b = residual_gate(feat_b)
-                scale_for_pred_b = scale_b
-                if activation_train_soft_gating and activation_head_enable:
-                    scale_for_pred_b = scale_for_pred_b * residual_gate.activation_prob(feat_b).to(dtype=scale_b.dtype)
-                pred_b = base_b + scale_for_pred_b.unsqueeze(-1) * delta_b
-                err = pred_b - y_b
-                ae += float(err.abs().sum().item())
-                se += float(err.pow(2).sum().item())
-                denom += int(err.numel())
-                scale_sum += scale_b.sum(dim=0)
-                count += int(scale_b.shape[0])
-        return ae / max(denom, 1), se / max(denom, 1), (scale_sum / max(count, 1)).detach().cpu()
-
-    for ep in range(1, epochs + 1):
-        residual_gate.train()
-        perm = train_idx[torch.randperm(train_idx.numel())]
-        for b0 in range(0, int(perm.numel()), batch_size):
-            batch_idx = perm[b0:b0 + batch_size]
-            feat_b = feat.index_select(0, batch_idx).to(device)
-            base_b = base.index_select(0, batch_idx).to(device)
-            delta_b = delta.index_select(0, batch_idx).to(device)
-            y_b = y.index_select(0, batch_idx).to(device)
-            scale_b = residual_gate(feat_b)
-            loss = _loss_for(scale_b, base_b, delta_b, y_b, feat_bcf=feat_b)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(residual_gate.parameters(), float(cfg.get("grad_clip", 1.0)))
-            opt.step()
-        hold_mae, hold_mse, _ = _eval_idx(hold_idx)
-        hold_metric = hold_mse if selection_metric == "mse" else hold_mae
-        if hold_metric < best_hold:
-            best_hold = hold_metric
-            best_epoch = ep
-            best_state = {k: v.detach().cpu().clone() for k, v in residual_gate.state_dict().items()}
-
-    if best_state is not None:
-        residual_gate.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-    train_mae, train_mse, train_scale_c = _eval_idx(train_idx)
-    hold_mae, hold_mse, hold_scale_c = _eval_idx(hold_idx)
-    activation_threshold_selection = {"mode": "fixed", "threshold": float(activation_threshold)}
-    if activation_threshold_auto:
-        activation_threshold, activation_threshold_selection = _select_pred_residual_activation_threshold(
-            tensors=tensors,
-            residual_gate=residual_gate,
-            device=device,
-            batch_size=batch_size,
-            label_min_improvement=activation_label_min_improvement,
-            activation_by_abs_scale=activation_by_abs_scale,
-            indices=hold_idx,
-            max_candidates=int(cfg.get("activation_threshold_candidates", 101)),
-            selection_metric=str(cfg.get("activation_threshold_selection_metric", "accuracy")),
-            scope=str(cfg.get("activation_threshold_scope", "global")),
-            channel_names=channel_names,
-            cluster_id_c=cluster_id_c,
-        )
-    activation_threshold_tensor = torch.as_tensor(activation_threshold, dtype=torch.float32)
-    if activation_threshold_tensor.numel() == 1:
-        residual_gate.activation_threshold = float(activation_threshold_tensor.reshape(-1)[0].item())
-    elif activation_threshold_tensor.numel() == c:
-        residual_gate.activation_threshold = [float(v) for v in activation_threshold_tensor.reshape(-1).tolist()]
-        residual_gate.activation_threshold_c = activation_threshold_tensor.reshape(-1).detach().cpu()
-    else:
-        raise ValueError(f"activation_threshold must be scalar or length {c}, got {int(activation_threshold_tensor.numel())}")
-    residual_gate.apply_activation_threshold = bool(apply_activation_threshold)
-    residual_gate.activation_by_abs_scale = bool(activation_by_abs_scale)
-    train_activation = _pred_residual_gate_activation_metrics_from_tensors(
-        tensors=tensors,
-        residual_gate=residual_gate,
-        device=device,
-        batch_size=batch_size,
-        activation_threshold=activation_threshold,
-        label_min_improvement=activation_label_min_improvement,
-        activation_by_abs_scale=activation_by_abs_scale,
-        apply_activation_threshold=apply_activation_threshold,
-        indices=train_idx,
-        channel_names=channel_names,
-        cluster_id_c=cluster_id_c,
-    )
-    hold_activation = _pred_residual_gate_activation_metrics_from_tensors(
-        tensors=tensors,
-        residual_gate=residual_gate,
-        device=device,
-        batch_size=batch_size,
-        activation_threshold=activation_threshold,
-        label_min_improvement=activation_label_min_improvement,
-        activation_by_abs_scale=activation_by_abs_scale,
-        apply_activation_threshold=apply_activation_threshold,
-        indices=hold_idx,
-        channel_names=channel_names,
-        cluster_id_c=cluster_id_c,
-    )
-    summary = {
-        "enable": True,
-        "loss": loss_kind,
-        "selection_metric": selection_metric,
-        "scale_mode": str(residual_gate.scale_mode),
-        "activation_threshold": (
-            [float(v) for v in torch.as_tensor(activation_threshold).reshape(-1).tolist()]
-            if torch.as_tensor(activation_threshold).numel() > 1
-            else float(torch.as_tensor(activation_threshold).reshape(-1)[0].item())
-        ),
-        "activation_threshold_selection": activation_threshold_selection,
-        "activation_label_min_improvement": float(activation_label_min_improvement),
-        "activation_by_abs_scale": bool(activation_by_abs_scale),
-        "apply_activation_threshold": bool(apply_activation_threshold),
-        "activation_head_enable": bool(activation_head_enable),
-        "activation_feature_mode": str(activation_feature_mode),
-        "activation_feature_mask": [float(v) for v in activation_feature_mask.reshape(-1).tolist()],
-        "activation_train_soft_gating": bool(activation_train_soft_gating),
-        "activation_cluster_bias_enable": bool(activation_cluster_bias_enable),
-        "activation_bce_weight": float(activation_bce_weight),
-        "activation_inactive_scale_weight": float(activation_inactive_scale_weight),
-        "activation_pos_weight": activation_pos_weight_summary,
-        "activation_pos_weight_scope": str(activation_pos_weight_scope),
-        "activation_pos_weight_min": float(activation_pos_weight_min),
-        "activation_pos_weight_max": float(activation_pos_weight_max),
-        "activation_rate_balance_weight": float(activation_rate_balance_weight),
-        "activation_rate_balance_scope": str(activation_rate_balance_scope),
-        "train_windows": int(train_idx.numel()),
-        "holdout_windows": int(hold_idx.numel()),
-        "best_epoch": int(best_epoch),
-        "train_mae": float(train_mae),
-        "train_mse": float(train_mse),
-        "holdout_mae": float(hold_mae),
-        "holdout_mse": float(hold_mse),
-        "channel_names": list(channel_names),
-        "train_mean_scale": [float(v) for v in train_scale_c.tolist()],
-        "holdout_mean_scale": [float(v) for v in hold_scale_c.tolist()],
-        "feature_standardization": feature_std_summary,
-        "train_activation": train_activation,
-        "holdout_activation": hold_activation,
-    }
-    residual_gate.eval()
-    return residual_gate, summary
 
 
 @torch.no_grad()
@@ -5190,6 +7288,11 @@ def _collect_pred_residual_selector_tensors(
     observed_history_tc: Optional[torch.Tensor] = None,
     input_len: int = 0,
     eval_start: int = 0,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    candidate_feature_mode: str = "base",
 ) -> Optional[Dict[str, torch.Tensor]]:
     if len(loader) == 0 or pred_residual is None or int(penalty_count) <= 0:
         return None
@@ -5202,20 +7305,37 @@ def _collect_pred_residual_selector_tensors(
     cand_feat_parts = []
     base_parts = []
     cand_parts = []
+    confidence_parts = []
     y_parts = []
     P = int(penalty_count)
     for x, y, idx in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         idx = idx.to(device=device, dtype=torch.long)
-        y_base_raw = model(x, cluster_id_c)
+        query_start_abs_b = int(eval_start) + idx
+        x_model = apply_train_stat_input_centering(
+            x,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
         y_base = apply_history_anchor_adapter(
             y_base_raw,
             base_pred_bch=y_base_raw,
             observed_history_tc=observed_history_tc,
-            query_start_abs_b=int(eval_start) + idx,
+            query_start_abs_b=query_start_abs_b,
             input_len=int(input_len),
             cfg=history_anchor_cfg,
+        )
+        y_base = apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
         )
         mask_all_bkp = torch.ones(x.shape[0], int(K), P, device=device, dtype=y_base.dtype)
         pred_out = pred_residual(
@@ -5224,23 +7344,44 @@ def _collect_pred_residual_selector_tensors(
             cluster_id_c,
             mask_all_bkp,
             skip_bk=None,
+            query_start_abs_b=query_start_abs_b,
         )
-        cand_bcpH = _pred_residual_candidate_predictions(
+        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
             y_base,
             pred_out,
             pred_residual_scale_c=pred_residual_scale_c,
+            apply_output_anchors=True,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=True,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
         )
         if cand_bcpH is None:
             continue
-        skip_feat = _knn_gate_features(x, y_base, y_base)
+        skip_feat = _candidate_selector_features(x, y_base_final, y_base_final, feature_mode=candidate_feature_mode)
         cand_feat = torch.stack(
-            [_knn_gate_features(x, y_base, cand_bcpH[:, :, p, :]) for p in range(P)],
+            [
+                _candidate_selector_features(
+                    x,
+                    y_base_final,
+                    cand_bcpH[:, :, p, :],
+                    feature_mode=candidate_feature_mode,
+                )
+                for p in range(P)
+            ],
             dim=2,
         )
         skip_feat_parts.append(skip_feat.detach().cpu())
         cand_feat_parts.append(cand_feat.detach().cpu())
-        base_parts.append(y_base.detach().cpu())
+        base_parts.append(y_base_final.detach().cpu())
         cand_parts.append(cand_bcpH.detach().cpu())
+        confidence_parts.append(
+            pred_out.get("intervention_bcp", torch.ones_like(cand_bcpH[..., 0])).detach().cpu()
+        )
         y_parts.append(y.detach().cpu())
 
     if len(skip_feat_parts) == 0:
@@ -5250,8 +7391,381 @@ def _collect_pred_residual_selector_tensors(
         "cand_feat": torch.cat(cand_feat_parts, dim=0),
         "base": torch.cat(base_parts, dim=0),
         "cand": torch.cat(cand_parts, dim=0),
+        "confidence": torch.cat(confidence_parts, dim=0),
         "y": torch.cat(y_parts, dim=0),
     }
+
+
+@torch.no_grad()
+def _select_pred_residual_confidence_thresholds_from_tensors(
+    *,
+    tensors: Optional[Dict[str, torch.Tensor]],
+    cluster_id_c: torch.Tensor,
+    K: int,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    penalty_names: Optional[List[str]] = None,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    max_candidates: int = 101,
+    selection_metric: str = "mse",
+    min_precision: float = 0.0,
+    max_pred_positive_rate: Optional[float] = None,
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    if tensors is None:
+        raise ValueError("confidence threshold selection requires collected train tensors.")
+    base = tensors.get("base")
+    cand = tensors.get("cand")
+    y = tensors.get("y")
+    confidence = tensors.get("confidence")
+    if base is None or cand is None or y is None or confidence is None:
+        raise ValueError("confidence threshold selection requires base, cand, y, and confidence tensors.")
+    if cand.ndim != 4:
+        raise ValueError(f"candidate tensor must have shape [B,C,P,H], got {tuple(cand.shape)}")
+    B, C, P, _ = cand.shape
+    if base.shape[:2] != (B, C) or y.shape[:2] != (B, C) or confidence.shape != (B, C, P):
+        raise ValueError(
+            "confidence threshold tensors have inconsistent shapes: "
+            f"base={tuple(base.shape)}, cand={tuple(cand.shape)}, "
+            f"y={tuple(y.shape)}, confidence={tuple(confidence.shape)}"
+        )
+    cluster_id = cluster_id_c.detach().cpu().to(dtype=torch.long).view(-1)
+    if int(cluster_id.numel()) != int(C):
+        raise ValueError(f"cluster_id_c must have one entry per channel, got {int(cluster_id.numel())} vs {int(C)}")
+    K = int(K)
+    if K <= 0:
+        raise ValueError("K must be positive for confidence threshold selection.")
+    metric_mode = str(selection_metric).lower()
+    if metric_mode not in {"mse", "precision_guarded_mse"}:
+        raise ValueError(
+            "confidence threshold selection currently supports selection_metric='mse' "
+            "or 'precision_guarded_mse'."
+        )
+
+    if allowed_mask_kp is None:
+        allowed = torch.ones(K, P, dtype=torch.bool)
+    else:
+        if allowed_mask_kp.shape != (K, P):
+            raise ValueError(f"allowed_mask_kp must have shape [{K},{P}], got {tuple(allowed_mask_kp.shape)}")
+        allowed = allowed_mask_kp.detach().cpu().to(dtype=torch.float32) > 0.0
+
+    names = list(penalty_names or [f"p{p}" for p in range(P)])
+    if len(names) != P:
+        names = [f"p{p}" for p in range(P)]
+
+    min_abs = max(0.0, float(min_abs_improvement))
+    min_rel = max(0.0, float(min_rel_improvement))
+    min_precision = max(0.0, float(min_precision))
+    max_rate = None
+    if max_pred_positive_rate is not None:
+        max_rate = min(1.0, max(0.0, float(max_pred_positive_rate)))
+    max_candidates = max(2, int(max_candidates))
+    base_err_bc = (base - y).pow(2).mean(dim=-1).detach().cpu()
+    cand_err_bcp = (cand - y.unsqueeze(2)).pow(2).mean(dim=-1).detach().cpu()
+    confidence_bcp = confidence.detach().cpu().to(dtype=torch.float32)
+    thresholds = torch.full((K, P), 1.000001, dtype=torch.float32)
+    per_cluster_penalty: Dict[str, Dict[str, object]] = {}
+
+    for k in range(K):
+        channel_mask_c = cluster_id == int(k)
+        per_penalty: Dict[str, object] = {}
+        for p in range(P):
+            name = str(names[p])
+            if not bool(allowed[k, p].item()):
+                per_penalty[name] = {
+                    "allowed": False,
+                    "threshold": float(thresholds[k, p].item()),
+                    "samples": 0,
+                    "reason": "disallowed",
+                }
+                continue
+            if not bool(channel_mask_c.any().item()):
+                per_penalty[name] = {
+                    "allowed": True,
+                    "threshold": float(thresholds[k, p].item()),
+                    "samples": 0,
+                    "reason": "empty_cluster",
+                }
+                continue
+
+            score_v = confidence_bcp[:, channel_mask_c, p].reshape(-1)
+            base_err_v = base_err_bc[:, channel_mask_c].reshape(-1)
+            cand_err_v = cand_err_bcp[:, channel_mask_c, p].reshape(-1)
+            finite = torch.isfinite(score_v) & torch.isfinite(base_err_v) & torch.isfinite(cand_err_v)
+            score_v = score_v[finite]
+            base_err_v = base_err_v[finite]
+            cand_err_v = cand_err_v[finite]
+            if int(score_v.numel()) == 0:
+                per_penalty[name] = {
+                    "allowed": True,
+                    "threshold": float(thresholds[k, p].item()),
+                    "samples": 0,
+                    "reason": "empty_scores",
+                }
+                continue
+
+            gain_v = base_err_v - cand_err_v
+            required_v = torch.maximum(
+                torch.full_like(gain_v, min_abs),
+                min_rel * base_err_v.abs().clamp_min(1.0e-12),
+            )
+            positive_v = gain_v > required_v
+            if int(positive_v.sum().item()) == 0:
+                threshold = float(score_v.max().item()) + 1.0e-6
+                thresholds[k, p] = float(threshold)
+                per_penalty[name] = {
+                    "allowed": True,
+                    "threshold": threshold,
+                    "samples": int(score_v.numel()),
+                    "reason": "no_positive_gain_labels",
+                    "positive_rate": 0.0,
+                    "base_mse": float(base_err_v.mean().item()),
+                    "selected_mse": float(base_err_v.mean().item()),
+                    "selected_gain_pct_vs_base": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "pred_positive_rate": 0.0,
+                }
+                continue
+
+            uniq = torch.unique(score_v)
+            if int(uniq.numel()) > max_candidates:
+                quantiles = torch.linspace(0.0, 1.0, steps=max_candidates, dtype=score_v.dtype)
+                candidates_v = torch.unique(torch.quantile(score_v, quantiles))
+            else:
+                candidates_v = uniq
+            candidates_v = torch.unique(
+                torch.cat(
+                    [
+                        torch.tensor([0.0], dtype=score_v.dtype),
+                        candidates_v,
+                        torch.tensor([float(score_v.max().item()) + 1.0e-6], dtype=score_v.dtype),
+                    ],
+                    dim=0,
+                )
+            )
+            base_mse = float(base_err_v.mean().item())
+            skip_threshold = float(score_v.max().item()) + 1.0e-6
+            best = {
+                "threshold": skip_threshold,
+                "mse": base_mse,
+                "precision": 0.0,
+                "recall": 0.0,
+                "pred_positive_rate": 0.0,
+                "reason": "no_improving_threshold",
+                "skip_selected": True,
+            }
+            feasible_count = 0
+            for candidate_threshold in candidates_v.tolist():
+                pred_active = score_v >= float(candidate_threshold)
+                selected_err = torch.where(pred_active, cand_err_v, base_err_v)
+                selected_mse = float(selected_err.mean().item())
+                tp = int((pred_active & positive_v).sum().item())
+                fp = int((pred_active & (~positive_v)).sum().item())
+                fn = int(((~pred_active) & positive_v).sum().item())
+                precision = tp / max(tp + fp, 1)
+                recall = tp / max(tp + fn, 1)
+                pred_rate = float(pred_active.to(dtype=torch.float32).mean().item())
+                if metric_mode == "precision_guarded_mse":
+                    if precision + 1.0e-12 < min_precision:
+                        continue
+                    if max_rate is not None and pred_rate > float(max_rate) + 1.0e-12:
+                        continue
+                feasible_count += 1
+                better = selected_mse < float(best["mse"]) - 1.0e-12
+                if not better and abs(selected_mse - float(best["mse"])) <= 1.0e-12:
+                    better = precision > float(best["precision"]) + 1.0e-12
+                if not better and abs(selected_mse - float(best["mse"])) <= 1.0e-12 and abs(precision - float(best["precision"])) <= 1.0e-12:
+                    better = float(candidate_threshold) > float(best["threshold"])
+                if better:
+                    best = {
+                        "threshold": float(candidate_threshold),
+                        "mse": selected_mse,
+                        "precision": float(precision),
+                        "recall": float(recall),
+                        "pred_positive_rate": pred_rate,
+                        "reason": "selected",
+                        "skip_selected": False,
+                    }
+            if metric_mode == "precision_guarded_mse" and feasible_count == 0:
+                best["reason"] = "no_threshold_meets_confidence_guard"
+            thresholds[k, p] = float(best["threshold"])
+            per_penalty[name] = {
+                "allowed": True,
+                "threshold": float(best["threshold"]),
+                "samples": int(score_v.numel()),
+                "feasible_threshold_count": int(feasible_count),
+                "reason": str(best["reason"]),
+                "skip_selected": bool(best["skip_selected"]),
+                "positive_rate": float(positive_v.to(dtype=torch.float32).mean().item()),
+                "base_mse": base_mse,
+                "selected_mse": float(best["mse"]),
+                "selected_gain_pct_vs_base": float(
+                    100.0 * (base_mse - float(best["mse"])) / max(abs(base_mse), 1.0e-12)
+                ),
+                "precision": float(best["precision"]),
+                "recall": float(best["recall"]),
+                "pred_positive_rate": float(best["pred_positive_rate"]),
+            }
+        per_cluster_penalty[str(k)] = per_penalty
+
+    summary = {
+        "enable": True,
+        "source_requirement": "train_only",
+        "selection_metric": metric_mode,
+        "min_abs_improvement": float(min_abs),
+        "min_rel_improvement": float(min_rel),
+        "min_precision": float(min_precision),
+        "max_pred_positive_rate": None if max_rate is None else float(max_rate),
+        "threshold_kp": [[float(v) for v in row] for row in thresholds.tolist()],
+        "penalty_names": names,
+        "per_cluster_penalty": per_cluster_penalty,
+    }
+    return thresholds, summary
+
+
+@torch.no_grad()
+def _candidate_selector_feature_gain_diagnostics(
+    *,
+    tensors: Optional[Dict[str, torch.Tensor]],
+    feature_names: Optional[List[str]] = None,
+    penalty_names: Optional[List[str]] = None,
+    allowed_mask_cp: Optional[torch.Tensor] = None,
+    indices: Optional[torch.Tensor] = None,
+    cluster_id_c: Optional[torch.Tensor] = None,
+    K: Optional[int] = None,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+    topk: int = 5,
+) -> Optional[Dict[str, object]]:
+    if tensors is None:
+        return None
+    cand_feat = tensors.get("cand_feat")
+    base = tensors.get("base")
+    cand = tensors.get("cand")
+    y = tensors.get("y")
+    if cand_feat is None or base is None or cand is None or y is None:
+        return None
+    n = int(base.shape[0])
+    if n <= 0:
+        return None
+    if indices is None:
+        indices = torch.arange(0, n, dtype=torch.long)
+    else:
+        indices = indices.detach().cpu().to(dtype=torch.long)
+    if int(indices.numel()) == 0:
+        return None
+
+    cand_feat = cand_feat.index_select(0, indices)
+    base = base.index_select(0, indices)
+    cand = cand.index_select(0, indices)
+    y = y.index_select(0, indices)
+    B, C, P, F = cand_feat.shape
+    names = list(feature_names or [f"f{i}" for i in range(F)])
+    if len(names) != F:
+        names = [f"f{i}" for i in range(F)]
+    penalties = list(penalty_names or [f"p{i}" for i in range(P)])
+    if len(penalties) != P:
+        penalties = [f"p{i}" for i in range(P)]
+
+    allowed = _selector_allowed_mask_cp(
+        allowed_mask_cp,
+        C=int(C),
+        P=int(P),
+        device=cand_feat.device,
+        context="candidate selector feature diagnostics",
+    )
+    valid_bcp = torch.ones((B, C, P), dtype=torch.bool, device=cand_feat.device)
+    if allowed is not None:
+        valid_bcp = valid_bcp & allowed.unsqueeze(0)
+
+    base_err_bc = (base - y).pow(2).mean(dim=-1)
+    cand_err_bcp = (cand - y.unsqueeze(2)).pow(2).mean(dim=-1)
+    gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
+    required_bcp = torch.maximum(
+        torch.full_like(gain_bcp, max(0.0, float(min_abs_improvement))),
+        max(0.0, float(min_rel_improvement)) * base_err_bc.abs().unsqueeze(-1).clamp_min(1.0e-12),
+    )
+    positive_bcp = gain_bcp > required_bcp
+
+    finite_bcpf = torch.isfinite(cand_feat).all(dim=-1)
+    finite_bcp = finite_bcpf & torch.isfinite(gain_bcp)
+    valid_bcp = valid_bcp & finite_bcp
+
+    def _corr_table(feat_nf: torch.Tensor, target_n: torch.Tensor, limit: int) -> List[Dict[str, object]]:
+        if int(feat_nf.shape[0]) <= 1:
+            return [
+                {"feature": names[i], "corr": 0.0, "abs_corr": 0.0, "std": 0.0}
+                for i in range(min(int(limit), int(feat_nf.shape[1])))
+            ]
+        x = feat_nf.to(dtype=torch.float64)
+        target = target_n.to(dtype=torch.float64)
+        y_center = target - target.mean()
+        y_ss = y_center.pow(2).sum()
+        x_center = x - x.mean(dim=0, keepdim=True)
+        x_ss = x_center.pow(2).sum(dim=0)
+        denom = (x_ss * y_ss).clamp_min(0.0).sqrt()
+        corr_f = torch.where(denom > 1.0e-12, (x_center * y_center.unsqueeze(-1)).sum(dim=0) / denom, torch.zeros_like(denom))
+        std_f = x.std(dim=0, unbiased=False)
+        order = sorted(range(int(x.shape[1])), key=lambda i: (-abs(float(corr_f[i].item())), i))
+        rows = []
+        for i in order[: max(0, int(limit))]:
+            corr = float(corr_f[i].item())
+            rows.append(
+                {
+                    "feature": names[i],
+                    "corr": corr,
+                    "abs_corr": abs(corr),
+                    "std": float(std_f[i].item()),
+                }
+            )
+        return rows
+
+    def _summarize(mask_bcp: torch.Tensor) -> Dict[str, object]:
+        flat_mask = mask_bcp.reshape(-1)
+        samples = int(flat_mask.sum().item())
+        if samples <= 0:
+            return {
+                "samples": 0,
+                "positive_rate": 0.0,
+                "mean_gain": 0.0,
+                "top_abs_gain_corr": [],
+                "top_abs_positive_corr": [],
+            }
+        feat_nf = cand_feat.reshape(-1, F)[flat_mask]
+        gain_n = gain_bcp.reshape(-1)[flat_mask]
+        positive_n = positive_bcp.reshape(-1)[flat_mask].to(dtype=torch.float32)
+        return {
+            "samples": samples,
+            "positive_rate": float(positive_n.mean().item()),
+            "mean_gain": float(gain_n.mean().item()),
+            "top_abs_gain_corr": _corr_table(feat_nf, gain_n, int(topk)),
+            "top_abs_positive_corr": _corr_table(feat_nf, positive_n, int(topk)),
+        }
+
+    summary = _summarize(valid_bcp)
+    summary["feature_names"] = names
+    summary["penalty_names"] = penalties
+    summary["min_abs_improvement"] = float(max(0.0, float(min_abs_improvement)))
+    summary["min_rel_improvement"] = float(max(0.0, float(min_rel_improvement)))
+    summary["allowed_candidates"] = int(valid_bcp.sum().item())
+    by_penalty = {}
+    for p_idx, name in enumerate(penalties):
+        penalty_mask = torch.zeros_like(valid_bcp)
+        penalty_mask[:, :, p_idx] = valid_bcp[:, :, p_idx]
+        by_penalty[str(name)] = _summarize(penalty_mask)
+    summary["by_penalty"] = by_penalty
+
+    if cluster_id_c is not None:
+        cluster_idx = cluster_id_c.detach().cpu().to(dtype=torch.long)
+        if int(cluster_idx.numel()) == int(C):
+            k_count = int(K) if K is not None else int(cluster_idx.max().item() + 1)
+            by_cluster = {}
+            for k in range(k_count):
+                channel_mask_c = (cluster_idx == int(k)).to(device=valid_bcp.device)
+                cluster_mask = valid_bcp & channel_mask_c.view(1, C, 1)
+                by_cluster[str(k)] = _summarize(cluster_mask)
+            summary["by_cluster"] = by_cluster
+    return summary
 
 
 @torch.no_grad()
@@ -5264,6 +7778,7 @@ def _pred_residual_selector_metrics_from_tensors(
     min_rel_improvement: float,
     indices: Optional[torch.Tensor] = None,
     penalty_names: Optional[List[str]] = None,
+    allowed_mask_cp: Optional[torch.Tensor] = None,
 ) -> Optional[Dict[str, object]]:
     if tensors is None or selector is None:
         return None
@@ -5285,6 +7800,13 @@ def _pred_residual_selector_metrics_from_tensors(
     selector.eval()
     P = int(cand.shape[2])
     q = P + 1
+    allowed_mask_device = _selector_allowed_mask_cp(
+        allowed_mask_cp,
+        C=int(base.shape[1]),
+        P=P,
+        device=device,
+        context="candidate selector metrics",
+    )
     batch_size = max(1, int(batch_size))
     base_se = selected_se = target_se = oracle_se = 0.0
     denom = 0
@@ -5300,13 +7822,20 @@ def _pred_residual_selector_metrics_from_tensors(
         base_b = base.index_select(0, batch_idx).to(device)
         cand_b = cand.index_select(0, batch_idx).to(device)
         y_b = y.index_select(0, batch_idx).to(device)
-        selected_b, selected_class_b = selector.select_from_features(skip_feat_b, cand_feat_b, base_b, cand_b)
+        selected_b, selected_class_b = selector.select_from_features(
+            skip_feat_b,
+            cand_feat_b,
+            base_b,
+            cand_b,
+            allowed_mask_cp=allowed_mask_device,
+        )
         target_b = _candidate_selector_targets(
             base_bch=base_b,
             cand_bcpH=cand_b,
             y_bch=y_b,
             min_abs_improvement=min_abs_improvement,
             min_rel_improvement=min_rel_improvement,
+            allowed_mask_cp=allowed_mask_device,
         )
         all_pred_bq = torch.cat([base_b.unsqueeze(2), cand_b], dim=2)
         target_pred_b = all_pred_bq.gather(
@@ -5315,7 +7844,16 @@ def _pred_residual_selector_metrics_from_tensors(
         ).squeeze(2)
         base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
         cand_err_bcp = (cand_b - y_b.unsqueeze(2)).pow(2).mean(dim=-1)
-        oracle_err_bc, oracle_p_bc = cand_err_bcp.min(dim=-1)
+        if allowed_mask_device is not None:
+            cand_err_bcp = cand_err_bcp.masked_fill(~allowed_mask_device.unsqueeze(0), float("inf"))
+        best_cand_err_bc, oracle_p_bc = cand_err_bcp.min(dim=-1)
+        oracle_use_bc = torch.isfinite(best_cand_err_bc) & (best_cand_err_bc < base_err_bc)
+        oracle_err_bc = torch.where(oracle_use_bc, best_cand_err_bc, base_err_bc)
+        oracle_class_bc = torch.where(
+            oracle_use_bc,
+            oracle_p_bc.to(dtype=torch.long) + 1,
+            torch.zeros_like(oracle_p_bc, dtype=torch.long),
+        )
         selected_se += float((selected_b - y_b).pow(2).sum().item())
         target_se += float((target_pred_b - y_b).pow(2).sum().item())
         oracle_se += float(oracle_err_bc.sum().item() * y_b.shape[-1])
@@ -5325,7 +7863,7 @@ def _pred_residual_selector_metrics_from_tensors(
         correct += int((selected_class_b == target_b).sum().item())
         selected_count_q += torch.bincount(selected_class_b.detach().cpu().reshape(-1), minlength=q)[:q]
         target_count_q += torch.bincount(target_b.detach().cpu().reshape(-1), minlength=q)[:q]
-        oracle_count_q += torch.bincount((oracle_p_bc.detach().cpu().reshape(-1) + 1), minlength=q)[:q]
+        oracle_count_q += torch.bincount(oracle_class_bc.detach().cpu().reshape(-1), minlength=q)[:q]
 
     if denom <= 0:
         return None
@@ -5356,6 +7894,149 @@ def _pred_residual_selector_metrics_from_tensors(
     }
 
 
+def _candidate_selector_feature_standardization_stats(
+    *,
+    skip_feat: torch.Tensor,
+    cand_feat: torch.Tensor,
+    selector: PredResidualCandidateSelector,
+    train_idx: torch.Tensor,
+    mode: str = "mean_std",
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
+    skip_train_raw = skip_feat.index_select(0, train_idx)
+    cand_train_raw = cand_feat.index_select(0, train_idx)
+    skip_train_aug, cand_train_aug = selector._append_penalty_identity(skip_train_raw, cand_train_raw)
+    skip_train = skip_train_aug.reshape(-1, int(skip_train_aug.shape[-1]))
+    cand_train = cand_train_aug.reshape(-1, int(cand_train_aug.shape[-1]))
+    feat_train = torch.cat([skip_train, cand_train], dim=0).to(dtype=torch.float32)
+    mode_norm = str(mode or "mean_std").lower()
+    if mode_norm in {"robust", "median_iqr", "iqr"}:
+        feat_mean = feat_train.median(dim=0).values
+        q = torch.quantile(feat_train, torch.tensor([0.25, 0.75], device=feat_train.device), dim=0)
+        iqr_scale = (q[1] - q[0]) / 1.349
+        std_fallback = feat_train.std(dim=0, unbiased=False)
+        feat_std = torch.where(iqr_scale > 1.0e-6, iqr_scale, std_fallback).clamp_min(1.0e-6)
+        mode_summary = "robust"
+    elif mode_norm in {"mean_std", "standard", "std"}:
+        feat_mean = feat_train.mean(dim=0)
+        feat_std = feat_train.std(dim=0, unbiased=False).clamp_min(1.0e-6)
+        mode_summary = "mean_std"
+    else:
+        raise ValueError("candidate_selector.standardization_mode must be mean_std or robust.")
+    summary = {
+        "mode": mode_summary,
+        "min_std": float(feat_std.min().item()),
+        "max_std": float(feat_std.max().item()),
+    }
+    return feat_mean, feat_std, summary
+
+
+@torch.no_grad()
+def _fit_static_candidate_channel_selector_from_tensors(
+    *,
+    tensors: Dict[str, torch.Tensor],
+    allowed_mask_cp: Optional[torch.Tensor] = None,
+    penalty_names: Optional[List[str]] = None,
+    channel_names: Optional[List[str]] = None,
+    select_indices: Optional[torch.Tensor] = None,
+    eval_indices: Optional[torch.Tensor] = None,
+    min_abs_improvement: float = 0.0,
+    min_rel_improvement: float = 0.0,
+) -> Tuple[StaticPredResidualCandidateSelector, Dict[str, object]]:
+    base = tensors["base"]
+    cand = tensors["cand"]
+    y = tensors["y"]
+    n, C, _ = base.shape
+    P = int(cand.shape[2])
+    if select_indices is None:
+        select_indices = torch.arange(0, n, dtype=torch.long)
+    else:
+        select_indices = select_indices.detach().cpu().to(dtype=torch.long)
+    if eval_indices is None:
+        eval_indices = select_indices
+    else:
+        eval_indices = eval_indices.detach().cpu().to(dtype=torch.long)
+    allowed = _selector_allowed_mask_cp(
+        allowed_mask_cp,
+        C=int(C),
+        P=P,
+        device=base.device,
+        context="static candidate channel selector",
+    )
+
+    def _mse_mae_for_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        base_i = base.index_select(0, indices)
+        cand_i = cand.index_select(0, indices)
+        y_i = y.index_select(0, indices)
+        base_mse_c = (base_i - y_i).pow(2).mean(dim=(0, 2))
+        base_mae_c = (base_i - y_i).abs().mean(dim=(0, 2))
+        cand_mse_cp = (cand_i - y_i.unsqueeze(2)).pow(2).mean(dim=(0, 3))
+        cand_mae_cp = (cand_i - y_i.unsqueeze(2)).abs().mean(dim=(0, 3))
+        if allowed is not None:
+            cand_mse_cp = cand_mse_cp.masked_fill(~allowed, float("inf"))
+            cand_mae_cp = cand_mae_cp.masked_fill(~allowed, float("inf"))
+        return base_mse_c, base_mae_c, cand_mse_cp, cand_mae_cp
+
+    select_base_mse_c, select_base_mae_c, select_cand_mse_cp, select_cand_mae_cp = _mse_mae_for_indices(select_indices)
+    best_cand_mse_c, best_p_c = select_cand_mse_cp.min(dim=-1)
+    best_cand_mae_c = select_cand_mae_cp.gather(1, best_p_c.view(-1, 1)).squeeze(1)
+    required_c = torch.maximum(
+        torch.full_like(select_base_mse_c, max(0.0, float(min_abs_improvement))),
+        max(0.0, float(min_rel_improvement)) * select_base_mse_c.abs().clamp_min(1.0e-12),
+    )
+    use_candidate_c = torch.isfinite(best_cand_mse_c) & ((select_base_mse_c - best_cand_mse_c) > required_c)
+    selected_class_c = torch.where(
+        use_candidate_c,
+        best_p_c.to(dtype=torch.long) + 1,
+        torch.zeros_like(best_p_c, dtype=torch.long),
+    )
+    selector = StaticPredResidualCandidateSelector(selected_class_c)
+
+    eval_base_mse_c, eval_base_mae_c, eval_cand_mse_cp, eval_cand_mae_cp = _mse_mae_for_indices(eval_indices)
+    safe_p_c = (selected_class_c - 1).clamp_min(0)
+    chosen_cand_mse_c = eval_cand_mse_cp.gather(1, safe_p_c.view(-1, 1)).squeeze(1)
+    chosen_cand_mae_c = eval_cand_mae_cp.gather(1, safe_p_c.view(-1, 1)).squeeze(1)
+    selected_mse_c = torch.where(selected_class_c > 0, chosen_cand_mse_c, eval_base_mse_c)
+    selected_mae_c = torch.where(selected_class_c > 0, chosen_cand_mae_c, eval_base_mae_c)
+
+    penalties = list(penalty_names or [f"p{i}" for i in range(P)])
+    if len(penalties) != P:
+        penalties = [f"p{i}" for i in range(P)]
+    channels = list(channel_names or [f"ch_{i}" for i in range(C)])
+    if len(channels) != C:
+        channels = [f"ch_{i}" for i in range(C)]
+    selected_classes = [int(v) for v in selected_class_c.detach().cpu().tolist()]
+    selected_names = [penalties[cls - 1] if cls > 0 else "skip" for cls in selected_classes]
+    base_avg_mse = float(eval_base_mse_c.mean().item())
+    base_avg_mae = float(eval_base_mae_c.mean().item())
+    selected_avg_mse = float(selected_mse_c.mean().item())
+    selected_avg_mae = float(selected_mae_c.mean().item())
+    summary = {
+        "mode": "static_candidate_channel",
+        "selection_windows": int(select_indices.numel()),
+        "eval_windows": int(eval_indices.numel()),
+        "min_abs_improvement": float(max(0.0, float(min_abs_improvement))),
+        "min_rel_improvement": float(max(0.0, float(min_rel_improvement))),
+        "selected_class": selected_classes,
+        "selected_penalty_by_channel": selected_names,
+        "selected_channels": [channels[i] for i, cls in enumerate(selected_classes) if cls > 0],
+        "num_candidate_channels": int((selected_class_c > 0).sum().item()),
+        "select_base_mse_per_channel": [float(v) for v in select_base_mse_c.detach().cpu().tolist()],
+        "select_best_candidate_mse_per_channel": [float(v) for v in best_cand_mse_c.detach().cpu().tolist()],
+        "select_best_candidate_mae_per_channel": [float(v) for v in best_cand_mae_c.detach().cpu().tolist()],
+        "eval_base_avg_mse": base_avg_mse,
+        "eval_base_avg_mae": base_avg_mae,
+        "eval_selected_avg_mse": selected_avg_mse,
+        "eval_selected_avg_mae": selected_avg_mae,
+        "eval_gain_pct_vs_base": float(100.0 * (base_avg_mse - selected_avg_mse) / max(abs(base_avg_mse), 1.0e-12)),
+        "eval_mae_gain_pct_vs_base": float(100.0 * (base_avg_mae - selected_avg_mae) / max(abs(base_avg_mae), 1.0e-12)),
+        "eval_base_mse_per_channel": [float(v) for v in eval_base_mse_c.detach().cpu().tolist()],
+        "eval_selected_mse_per_channel": [float(v) for v in selected_mse_c.detach().cpu().tolist()],
+        "eval_base_mae_per_channel": [float(v) for v in eval_base_mae_c.detach().cpu().tolist()],
+        "eval_selected_mae_per_channel": [float(v) for v in selected_mae_c.detach().cpu().tolist()],
+    }
+    return selector, summary
+
+
 def train_pred_residual_candidate_selector(
     model: nn.Module,
     pred_residual: Optional[ClusterwisePredResidualMoE],
@@ -5372,7 +8053,15 @@ def train_pred_residual_candidate_selector(
     observed_history_tc: Optional[torch.Tensor] = None,
     input_len: int = 0,
     eval_start: int = 0,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    allowed_mask_kp: Optional[torch.Tensor] = None,
+    gate_feature_mode: str = "history",
 ) -> Tuple[Optional[PredResidualCandidateSelector], Dict[str, object]]:
+    candidate_feature_mode = str(cfg.get("feature_mode", "base")).lower()
+    candidate_feature_names = _candidate_selector_feature_names(candidate_feature_mode)
     tensors = _collect_pred_residual_selector_tensors(
         model=model,
         pred_residual=pred_residual,
@@ -5387,6 +8076,11 @@ def train_pred_residual_candidate_selector(
         observed_history_tc=observed_history_tc,
         input_len=input_len,
         eval_start=eval_start,
+        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+        candidate_feature_mode=candidate_feature_mode,
     )
     if tensors is None:
         return None, {"enable": False, "reason": "empty_loader_or_residual_disabled"}
@@ -5399,6 +8093,16 @@ def train_pred_residual_candidate_selector(
     n = int(base.shape[0])
     c = int(base.shape[1])
     p = int(cand.shape[2])
+    allowed_mask_cp = None
+    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
+        allowed_kp = allowed_mask_kp.detach().to(dtype=torch.bool)
+        if tuple(allowed_kp.shape) != (int(K), p):
+            raise ValueError(
+                "candidate_selector allowed_mask_kp must have shape [K,P], "
+                f"got {tuple(allowed_kp.shape)} vs {(int(K), p)}."
+            )
+        cluster_idx = cluster_id_c.detach().cpu().to(dtype=torch.long)
+        allowed_mask_cp = allowed_kp.detach().cpu().index_select(0, cluster_idx)
     train_fraction = float(cfg.get("train_fraction", 0.75))
     split = int(max(1, min(n - 1, round(n * train_fraction)))) if n > 1 else n
     train_idx = torch.arange(0, split, dtype=torch.long)
@@ -5415,25 +8119,31 @@ def train_pred_residual_candidate_selector(
         init_skip_bias=float(cfg.get("init_skip_bias", 0.0)),
         init_penalty_bias=float(cfg.get("init_penalty_bias", 0.0)),
         use_penalty_identity=bool(cfg.get("use_penalty_identity", False)),
+        feature_mode=candidate_feature_mode,
     ).to(device)
+    selector.set_allowed_penalty_mask(allowed_mask_cp)
     standardize_features = bool(cfg.get("standardize_features", True))
     feature_std_summary: Dict[str, object] = {
         "standardize_features": bool(standardize_features),
         "fit_windows": int(train_idx.numel()) if standardize_features else 0,
+        "mode": None,
         "min_std": None,
         "max_std": None,
+        "clip": 0.0,
     }
     if standardize_features:
-        skip_train_raw = skip_feat.index_select(0, train_idx)
-        cand_train_raw = cand_feat.index_select(0, train_idx)
-        skip_train_aug, cand_train_aug = selector._append_penalty_identity(skip_train_raw, cand_train_raw)
-        skip_train = skip_train_aug.reshape(-1, int(skip_train_aug.shape[-1]))
-        cand_train = cand_train_aug.reshape(-1, int(cand_train_aug.shape[-1]))
-        feat_train = torch.cat([skip_train, cand_train], dim=0)
-        feat_mean = feat_train.mean(dim=0)
-        feat_std = feat_train.std(dim=0, unbiased=False).clamp_min(1.0e-6)
+        feat_mean, feat_std, std_stats = _candidate_selector_feature_standardization_stats(
+            skip_feat=skip_feat,
+            cand_feat=cand_feat,
+            selector=selector,
+            train_idx=train_idx,
+            mode=str(cfg.get("standardization_mode", "mean_std")),
+        )
         selector.set_feature_standardization(feat_mean.to(device), feat_std.to(device))
-        feature_std_summary.update({"min_std": float(feat_std.min().item()), "max_std": float(feat_std.max().item())})
+        feature_clip = float(cfg.get("standardize_clip", cfg.get("feature_clip", 0.0)))
+        selector.set_feature_standardize_clip(feature_clip)
+        feature_std_summary.update(std_stats)
+        feature_std_summary["clip"] = float(max(0.0, feature_clip))
 
     min_abs_improvement = float(cfg.get("label_min_abs_improvement", cfg.get("min_abs_improvement", 0.0)))
     min_rel_improvement = float(cfg.get("label_min_rel_improvement", cfg.get("min_rel_improvement", 0.0)))
@@ -5453,6 +8163,7 @@ def train_pred_residual_candidate_selector(
         y_bch=y.index_select(0, train_idx),
         min_abs_improvement=min_abs_improvement,
         min_rel_improvement=min_rel_improvement,
+        allowed_mask_cp=allowed_mask_cp,
     ).reshape(-1)
     if isinstance(class_weight_cfg, str) and class_weight_cfg.lower() == "auto":
         counts = torch.bincount(train_target, minlength=p + 1).to(dtype=torch.float32)
@@ -5496,8 +8207,9 @@ def train_pred_residual_candidate_selector(
             y_bch=y_b,
             min_abs_improvement=min_abs_improvement,
             min_rel_improvement=min_rel_improvement,
+            allowed_mask_cp=allowed_mask_cp,
         )
-        logits_bcq = selector.logits_from_features(skip_feat_b, cand_feat_b)
+        logits_bcq = selector.logits_from_features(skip_feat_b, cand_feat_b, allowed_mask_cp=allowed_mask_cp)
         loss_bc = torch.nn.functional.cross_entropy(
             logits_bcq.reshape(-1, p + 1),
             target_b.reshape(-1),
@@ -5532,6 +8244,7 @@ def train_pred_residual_candidate_selector(
             min_rel_improvement=min_rel_improvement,
             indices=hold_idx,
             penalty_names=penalty_names,
+            allowed_mask_cp=allowed_mask_cp,
         )
         hold_mse = float((hold_metrics or {}).get("selected_mse", float("inf")))
         if hold_mse < best_hold:
@@ -5561,6 +8274,7 @@ def train_pred_residual_candidate_selector(
                 min_rel_improvement=min_rel_improvement,
                 indices=hold_idx,
                 penalty_names=penalty_names,
+                allowed_mask_cp=allowed_mask_cp,
             )
             if metrics is None:
                 continue
@@ -5591,6 +8305,7 @@ def train_pred_residual_candidate_selector(
         min_rel_improvement=min_rel_improvement,
         indices=train_idx,
         penalty_names=penalty_names,
+        allowed_mask_cp=allowed_mask_cp,
     )
     hold_metrics = _pred_residual_selector_metrics_from_tensors(
         tensors=tensors,
@@ -5601,7 +8316,34 @@ def train_pred_residual_candidate_selector(
         min_rel_improvement=min_rel_improvement,
         indices=hold_idx,
         penalty_names=penalty_names,
+        allowed_mask_cp=allowed_mask_cp,
     )
+    feature_gain_diagnostics = {
+        "train": _candidate_selector_feature_gain_diagnostics(
+            tensors=tensors,
+            feature_names=candidate_feature_names,
+            penalty_names=penalty_names,
+            allowed_mask_cp=allowed_mask_cp,
+            indices=train_idx,
+            cluster_id_c=cluster_id_c,
+            K=K,
+            min_abs_improvement=min_abs_improvement,
+            min_rel_improvement=min_rel_improvement,
+            topk=int(cfg.get("feature_gain_diagnostic_topk", 5)),
+        ),
+        "holdout": _candidate_selector_feature_gain_diagnostics(
+            tensors=tensors,
+            feature_names=candidate_feature_names,
+            penalty_names=penalty_names,
+            allowed_mask_cp=allowed_mask_cp,
+            indices=hold_idx,
+            cluster_id_c=cluster_id_c,
+            K=K,
+            min_abs_improvement=min_abs_improvement,
+            min_rel_improvement=min_rel_improvement,
+            topk=int(cfg.get("feature_gain_diagnostic_topk", 5)),
+        ),
+    }
     summary = {
         "enable": True,
         "train_windows": int(train_idx.numel()),
@@ -5613,11 +8355,15 @@ def train_pred_residual_candidate_selector(
         "negative_sample_weight": float(negative_sample_weight),
         "class_weight": class_weight_summary,
         "use_penalty_identity": bool(selector.use_penalty_identity),
+        "feature_mode": candidate_feature_mode,
         "decision_margin": float(selector.decision_margin),
         "decision_margin_selection": margin_selection,
         "feature_standardization": feature_std_summary,
         "channel_names": list(channel_names),
         "penalty_names": list(penalty_names),
+        "allowed_mask_cp": allowed_mask_cp.to(dtype=torch.long).tolist() if allowed_mask_cp is not None else None,
+        "gate_feature_mode": _normalize_gate_feature_mode(gate_feature_mode),
+        "feature_gain_diagnostics": feature_gain_diagnostics,
         "train": train_metrics,
         "holdout": hold_metrics,
     }
@@ -5772,8 +8518,24 @@ def main():
 
     L = int(cfg["window"]["input_len"])
     H = int(cfg["window"]["pred_len"])
+    cfg["moe"] = apply_default_moe_output_anchor_cfg(
+        cfg.get("moe", {}) or {},
+        dataset_name=cfg.get("data", {}).get("csv_path", ""),
+        pred_len=H,
+    )
     eval_cfg = cfg.get("eval", {}) or {}
     skip_test = bool(eval_cfg.get("skip_test", True))
+    diagnostics_cfg = cfg.get("diagnostics", {}) or {}
+    stage2_loss_audit_cfg = diagnostics_cfg.get("stage2_loss_audit", {}) or {}
+    stage2_loss_audit_enable = bool(stage2_loss_audit_cfg.get("enable", False))
+    if stage2_loss_audit_enable:
+        print("Stage-2 loss audit diagnostics enabled.")
+    stage2_route_audit_cfg = diagnostics_cfg.get("stage2_route_audit", {}) or {}
+    if not isinstance(stage2_route_audit_cfg, dict):
+        stage2_route_audit_cfg = {"enable": bool(stage2_route_audit_cfg)}
+    stage2_route_audit_enable = bool(stage2_route_audit_cfg.get("enable", False))
+    if stage2_route_audit_enable:
+        print("Stage-2 route audit diagnostics enabled.")
 
     # Keep materialized windows on CPU.  Electricity-style datasets with many
     # channels and long horizons can expand to tens of GB; batches are moved to
@@ -5782,9 +8544,6 @@ def main():
     window_cfg = cfg.get("window", {}) or {}
     past_context = bool(window_cfg.get("past_context", False))
     lazy_windows = bool(window_cfg.get("lazy", False))
-    knn_cfg = KNNShapeConfig.from_dict(cfg.get("knn_hybrid", {})).resolved_for_horizon(H)
-    if lazy_windows and knn_cfg.enable:
-        raise ValueError("window.lazy=true is incompatible with knn_hybrid.enable=true.")
     history_anchor_cfg = cfg.get("model", {}).get("history_anchor", cfg.get("history_anchor", {})) or {}
     history_anchor_cfg = _normalize_history_anchor_cfg(history_anchor_cfg)
     _validate_strict_history_anchor_scope(history_anchor_cfg, source="model.history_anchor")
@@ -5870,25 +8629,6 @@ def main():
         f"past_context={past_context}, lazy={lazy_windows}"
     )
 
-    knn_hybrid_val = None
-    knn_hybrid_test = None
-    knn_bank_path = None
-    knn_test_bank_windows = None
-    knn_requires_base_bank = bool(knn_cfg.enable and knn_cfg.needs_base_bank_prediction())
-    x_hist_val = y_hist_val = None
-    starts_hist_val = None
-    x_all = y_all = starts_all = None
-    if knn_cfg.enable:
-        if len(xtr) == 0:
-            raise ValueError("knn_hybrid requires non-empty training windows.")
-        if knn_requires_base_bank and knn_cfg.use_for_model_selection:
-            raise ValueError(
-                "knn_hybrid.use_for_model_selection=true is not supported when feature_mode=joint "
-                "or template_mode=residual because the bank depends on model predictions. "
-                "Set use_for_model_selection=false."
-            )
-        knn_bank_path = str(cfg.get("knn_hybrid", {}).get("path", os.path.join(out_dir, "knn_shape_bank.pt")))
-
     cluster_memory_bank = None
     if memory_enable:
         cluster_memory_bank = OnlineClusterMemory(
@@ -5918,6 +8658,53 @@ def main():
     penalty_names = list(cfg["penalties"]["enabled"])
     penalty_fns = build_penalty_bank(penalty_names, jump_thr=float(cfg["penalties"]["jump_threshold"]))
     P = len(penalty_names)
+    stage2_route_audit_loaders: Dict[str, DataLoader] = {}
+    stage2_route_audit_eval_starts: Dict[str, int] = {}
+    stage2_route_audit_train_subsplits: Dict[str, Tuple[int, int]] = {}
+    if stage2_route_audit_enable:
+        requested_route_splits = [
+            str(name).lower()
+            for name in (stage2_route_audit_cfg.get("splits", ["train_fit", "train_holdout", "val"]) or [])
+        ]
+        if "test" in requested_route_splits and not bool(stage2_route_audit_cfg.get("allow_test", False)):
+            raise ValueError("diagnostics.stage2_route_audit refuses to read test unless allow_test=true.")
+        if len(dtr) > 0 and "train" in requested_route_splits:
+            stage2_route_audit_loaders["train"] = DataLoader(
+                dtr,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            stage2_route_audit_eval_starts["train"] = 0
+        train_subsplit_names = {"train_fit", "train_holdout"}
+        if len(dtr) > 0 and any(name in requested_route_splits for name in train_subsplit_names):
+            stage2_route_audit_train_subsplits = _explainability_train_subsplit_ranges(
+                num_windows=len(dtr),
+                holdout_fraction=float(stage2_route_audit_cfg.get("train_holdout_fraction", 0.30)),
+            )
+            for split_name in ("train_fit", "train_holdout"):
+                if split_name not in requested_route_splits:
+                    continue
+                if split_name not in stage2_route_audit_train_subsplits:
+                    continue
+                start_i, end_i = stage2_route_audit_train_subsplits[split_name]
+                if int(end_i) <= int(start_i):
+                    continue
+                stage2_route_audit_loaders[split_name] = DataLoader(
+                    Subset(dtr, range(int(start_i), int(end_i))),
+                    batch_size=bs,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+                stage2_route_audit_eval_starts[split_name] = 0
+        if len(dva) > 0 and "val" in requested_route_splits:
+            stage2_route_audit_loaders["val"] = dl_va
+            stage2_route_audit_eval_starts["val"] = int(val_eval_start)
+        if len(dte) > 0 and "test" in requested_route_splits and bool(stage2_route_audit_cfg.get("allow_test", False)):
+            stage2_route_audit_loaders["test"] = dl_te
+            stage2_route_audit_eval_starts["test"] = int(test_eval_start)
     mse_weight = float(cfg["train"].get("mse_weight", 1.0))
     mae_objective_cfg = cfg["train"].get("mae_objective", {}) or {}
     mae_objective_enable = bool(mae_objective_cfg.get("enable", False))
@@ -5990,33 +8777,6 @@ def main():
             ],
         }
         print(f"Saved per-cluster MAE objective weights to: {artifact_path}")
-
-    calibration_cfg = cfg.get("calibration", {}) or {}
-    calibration_enable = bool(calibration_cfg.get("enable", False))
-    calibration_method = str(calibration_cfg.get("method", "median")).lower()
-    calibration_shrink = float(calibration_cfg.get("shrink", 1.0))
-    calibration_max_abs = float(calibration_cfg.get("max_abs", 0.0))
-    # Optional post-hoc shrink sweep. Calibration is an eval-only operation, so a
-    # single trained model can be evaluated at many shrink values without
-    # retraining. The unit (shrink=1) correction is estimated once on val and
-    # then linearly rescaled per shrink — identical results to separate runs at
-    # ~1/N the cost and with zero cross-run nondeterminism.
-    calibration_shrink_sweep = [float(s) for s in (calibration_cfg.get("shrink_sweep", []) or [])]
-    if any(s < 0.0 for s in calibration_shrink_sweep):
-        raise ValueError("calibration.shrink_sweep values must be non-negative.")
-    # Optional per-channel guarded shrink: each channel picks its own shrink under
-    # a per-channel val MSE-regression cap (richer than one global shrink, still
-    # MSE-safe by construction). Evaluated post-hoc on the single trained model.
-    per_channel_shrink_cfg = calibration_cfg.get("per_channel_shrink", {}) or {}
-    per_channel_shrink_enable = bool(per_channel_shrink_cfg.get("enable", False))
-    per_channel_shrink_grid = [float(s) for s in (per_channel_shrink_cfg.get("grid", [0.0, 0.3, 0.5, 0.7, 0.85, 1.0]) or [])]
-    per_channel_shrink_max_rel_mse = float(per_channel_shrink_cfg.get("max_rel_mse_regression", 0.01))
-    if any(s < 0.0 for s in per_channel_shrink_grid):
-        raise ValueError("calibration.per_channel_shrink.grid values must be non-negative.")
-    if calibration_method not in {"median", "mean"}:
-        raise ValueError(f"Unsupported calibration.method='{calibration_method}'. Expected median or mean.")
-    if calibration_shrink < 0.0:
-        raise ValueError("calibration.shrink must be non-negative.")
 
     selection_metric = str(cfg["train"].get("selection_metric", "val_loss")).lower()
     if selection_metric not in {"val_loss", "val_mse", "val_mae", "train_loss", "train_mse", "train_mae"}:
@@ -6118,6 +8878,7 @@ def main():
         kwargs.setdefault("model_train_stat_adapter_cfg", model_train_stat_adapter_cfg)
         kwargs.setdefault("train_stat_anchor_pc", train_stat_anchor_pc)
         kwargs.setdefault("train_residual_anchor_phc", train_residual_anchor_phc)
+        kwargs.setdefault("gate_feature_mode", gate_feature_mode)
         kwargs.setdefault("calendar_feature_tf", calendar_feature_tf)
         kwargs.setdefault("calendar_residual_coef_cf", calendar_residual_coef_cf)
         return eval_loop(*args, **kwargs)
@@ -6205,12 +8966,44 @@ def main():
     gate_soft_weight = float(moe_cfg.get("gate_soft_weight", 0.0))
     gate_entropy_target_frac = float(moe_cfg.get("gate_entropy_target_frac", 0.0))
     gate_route_on_penalty_only = bool(moe_cfg.get("gate_route_on_penalty_only", False))
+    gate_feature_mode = _normalize_gate_feature_mode(moe_cfg.get("gate_feature_mode", "history"))
     router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
     router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
     router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
     pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
     pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
+    phase_residual_candidate_cfg = pred_residual_cfg.get("phase_residual_candidate", {}) or {}
+    if not isinstance(phase_residual_candidate_cfg, dict):
+        phase_residual_candidate_cfg = {"enable": bool(phase_residual_candidate_cfg)}
+    phase_residual_candidate_enable = bool(phase_residual_candidate_cfg.get("enable", False)) and pred_residual_enable
+    raw_phase_residual_candidate_names = phase_residual_candidate_cfg.get(
+        "names",
+        phase_residual_candidate_cfg.get("penalty_names", []),
+    )
+    if isinstance(raw_phase_residual_candidate_names, str):
+        phase_residual_candidate_names = [raw_phase_residual_candidate_names]
+    else:
+        phase_residual_candidate_names = [str(v) for v in (raw_phase_residual_candidate_names or [])]
+    if phase_residual_candidate_enable and len(phase_residual_candidate_names) == 0:
+        raise ValueError("moe.pred_side_residual.phase_residual_candidate.names must be non-empty when enabled.")
+    phase_residual_candidate_period = int(phase_residual_candidate_cfg.get("period", 96))
+    if phase_residual_candidate_enable and phase_residual_candidate_period <= 0:
+        raise ValueError("moe.pred_side_residual.phase_residual_candidate.period must be positive.")
+    phase_residual_candidate_scale = float(phase_residual_candidate_cfg.get("scale", 1.0))
+    phase_residual_candidate_summary: Dict[str, object] = {
+        "enable": bool(phase_residual_candidate_enable),
+        "names": list(phase_residual_candidate_names),
+        "period": int(phase_residual_candidate_period),
+        "scale": float(phase_residual_candidate_scale),
+        "source_split": "train" if phase_residual_candidate_enable else None,
+    }
+    pred_residual_ignore_skip_during_training = bool(
+        pred_residual_cfg.get(
+            "ignore_skip_during_training",
+            pred_residual_cfg.get("train_ignore_skip", False),
+        )
+    ) and pred_residual_enable
     pred_residual_specialization_weight = (
         float(pred_residual_cfg.get("specialization_weight", 0.1)) if pred_residual_enable else 0.0
     )
@@ -6218,12 +9011,124 @@ def main():
     pred_residual_intervention_weight = (
         float(pred_residual_cfg.get("intervention_weight", 1.0e-3)) if pred_residual_enable else 0.0
     )
+    pred_residual_candidate_supervision_cfg = (
+        pred_residual_cfg.get(
+            "adapter_attribute_supervision",
+            pred_residual_cfg.get("candidate_supervision", {}),
+        )
+        or {}
+    )
+    if not isinstance(pred_residual_candidate_supervision_cfg, dict):
+        pred_residual_candidate_supervision_cfg = {"weight": float(pred_residual_candidate_supervision_cfg)}
+    pred_residual_candidate_supervision_weight = (
+        float(
+            pred_residual_candidate_supervision_cfg.get(
+                "weight",
+                pred_residual_cfg.get("candidate_supervision_weight", 0.0),
+            )
+        )
+        if pred_residual_enable
+        else 0.0
+    )
+    pred_residual_candidate_supervision_loss = str(
+        pred_residual_candidate_supervision_cfg.get("loss", "mse")
+    ).lower()
+    pred_residual_candidate_supervision_min_abs = float(
+        pred_residual_candidate_supervision_cfg.get("min_abs_improvement", 0.0)
+    )
+    pred_residual_candidate_supervision_min_rel = float(
+        pred_residual_candidate_supervision_cfg.get("min_rel_improvement", 0.0)
+    )
+    pred_residual_candidate_supervision_only_allowed = bool(
+        pred_residual_candidate_supervision_cfg.get("only_allowed", True)
+    )
+    pred_residual_candidate_supervision_include_intervention = bool(
+        pred_residual_candidate_supervision_cfg.get("include_intervention", False)
+    )
+    pred_residual_candidate_supervision_include_selector = bool(
+        pred_residual_candidate_supervision_cfg.get("include_selector", False)
+    )
+    pred_residual_intervention_supervision_cfg = pred_residual_cfg.get("intervention_supervision", {}) or {}
+    if not isinstance(pred_residual_intervention_supervision_cfg, dict):
+        pred_residual_intervention_supervision_cfg = {"weight": float(pred_residual_intervention_supervision_cfg)}
+    pred_residual_intervention_supervision_weight = (
+        float(pred_residual_intervention_supervision_cfg.get("weight", 0.0))
+        if pred_residual_enable
+        else 0.0
+    )
+    pred_residual_intervention_supervision_min_gain = float(
+        pred_residual_intervention_supervision_cfg.get("min_gain", 0.0)
+    )
+    pred_residual_intervention_supervision_pos_weight = float(
+        pred_residual_intervention_supervision_cfg.get("pos_weight", 1.0)
+    )
+    pred_residual_intervention_supervision_only_allowed = bool(
+        pred_residual_intervention_supervision_cfg.get("only_allowed", True)
+    )
+    pred_residual_confidence_gate_cfg = pred_residual_cfg.get("confidence_gate", {}) or {}
+    if not isinstance(pred_residual_confidence_gate_cfg, dict):
+        pred_residual_confidence_gate_cfg = {"enable": bool(pred_residual_confidence_gate_cfg)}
+    pred_residual_confidence_gate_enable = (
+        bool(pred_residual_confidence_gate_cfg.get("enable", False))
+        and pred_residual_enable
+        and P > 0
+    )
+    pred_residual_confidence_gate_source_split = "train_holdout"
+    if pred_residual_confidence_gate_enable:
+        pred_residual_confidence_gate_source_split = _normalize_confidence_gate_source_split(
+            pred_residual_confidence_gate_cfg.get("source_split", "train_holdout")
+        )
+    pred_residual_confidence_gate_threshold = pred_residual_confidence_gate_cfg.get("threshold", "auto")
+    pred_residual_confidence_gate_min_abs = float(
+        pred_residual_confidence_gate_cfg.get(
+            "min_abs_improvement",
+            pred_residual_intervention_supervision_cfg.get("min_gain", 0.0),
+        )
+    )
+    pred_residual_confidence_gate_min_rel = float(
+        pred_residual_confidence_gate_cfg.get("min_rel_improvement", 0.0)
+    )
+    pred_residual_confidence_gate_holdout_fraction = float(
+        pred_residual_confidence_gate_cfg.get("train_holdout_fraction", 0.30)
+    )
+    pred_residual_confidence_gate_max_candidates = int(
+        pred_residual_confidence_gate_cfg.get("threshold_candidates", 101)
+    )
+    pred_residual_confidence_gate_selection_metric = str(
+        pred_residual_confidence_gate_cfg.get("selection_metric", "mse")
+    ).lower()
+    pred_residual_confidence_gate_min_precision = float(
+        pred_residual_confidence_gate_cfg.get("min_precision", 0.0)
+    )
+    pred_residual_confidence_gate_max_pred_rate_raw = pred_residual_confidence_gate_cfg.get(
+        "max_pred_positive_rate",
+        None,
+    )
+    pred_residual_confidence_gate_max_pred_rate = (
+        None
+        if pred_residual_confidence_gate_max_pred_rate_raw is None
+        else float(pred_residual_confidence_gate_max_pred_rate_raw)
+    )
     pred_residual_detach_routed_penalty_pred = (
         bool(pred_residual_cfg.get("detach_routed_penalty_pred", False)) if pred_residual_enable else False
     )
+    pred_residual_freeze_gate_after_epoch = (
+        int(pred_residual_cfg.get("freeze_gate_after_epoch", 0)) if pred_residual_enable else 0
+    )
+    pred_residual_weight_decay = None
+    if pred_residual_enable:
+        raw_pred_residual_wd = pred_residual_cfg.get("weight_decay", None)
+        if raw_pred_residual_wd is None:
+            raw_pred_residual_wd = pred_residual_cfg.get("optimizer_weight_decay", None)
+        if raw_pred_residual_wd is not None:
+            pred_residual_weight_decay = float(raw_pred_residual_wd)
     allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable and P > 0
     skip_cost = float(moe_cfg.get("skip_cost", 0.0)) if allow_skip else 0.0
     skip_init_bias = float(moe_cfg.get("skip_init_bias", -2.0))
+    skip_competes = bool(
+        moe_cfg.get("skip_competes_with_penalties", moe_cfg.get("noop_compete_enable", False))
+    ) and allow_skip
+    skip_argmax_noop = bool(moe_cfg.get("skip_argmax_noop", False)) and skip_competes
     skip_supervision_weight = float(moe_cfg.get("skip_supervision_weight", 0.0)) if allow_skip else 0.0
     skip_supervision_margin = float(moe_cfg.get("skip_supervision_margin", 0.0))
     mse_utility_gate_cfg = moe_cfg.get("mse_utility_gate_supervision", {}) or {}
@@ -6237,12 +9142,244 @@ def main():
     mse_utility_gate_temperature = float(mse_utility_gate_cfg.get("temperature", 1.0))
     mse_utility_gate_min_gain = float(mse_utility_gate_cfg.get("min_gain", 0.0))
     mse_utility_gate_target_power = float(mse_utility_gate_cfg.get("target_power", 1.0))
+    mse_utility_gate_target_mode = str(mse_utility_gate_cfg.get("target_mode", "soft_utility"))
+    mse_utility_gate_include_skip = bool(
+        mse_utility_gate_cfg.get("include_skip", mse_utility_gate_cfg.get("skip_aware", False))
+    ) and allow_skip
+    route_ce_cfg = moe_cfg.get("route_ce_supervision", {}) or {}
+    if not isinstance(route_ce_cfg, dict):
+        route_ce_cfg = {"enable": bool(route_ce_cfg)}
+    route_ce_enable = (
+        bool(route_ce_cfg.get("enable", False))
+        and moe_enable
+        and pred_residual_enable
+        and P > 0
+    )
+    route_ce_weight = float(route_ce_cfg.get("weight", 0.0)) if route_ce_enable else 0.0
+    route_ce_min_abs_improvement = float(route_ce_cfg.get("min_abs_improvement", 0.0))
+    route_ce_min_rel_improvement = float(route_ce_cfg.get("min_rel_improvement", 0.0))
+    route_ce_min_candidate_delta_rms = float(
+        route_ce_cfg.get(
+            "min_candidate_delta_rms",
+            route_ce_cfg.get("candidate_action_floor", 0.0),
+        )
+    )
+    route_ce_ignore_abs_gain_below = float(
+        route_ce_cfg.get(
+            "ignore_abs_gain_below",
+            route_ce_cfg.get("ignore_near_zero_abs_gain", 0.0),
+        )
+    )
+    route_ce_class_weight_mode = str(route_ce_cfg.get("class_weight", "none"))
+    route_ce_max_class_weight = float(route_ce_cfg.get("max_class_weight", 0.0))
+    route_ce_require_skip = bool(route_ce_cfg.get("require_skip", True))
+    route_ce_require_skip_competes = bool(route_ce_cfg.get("require_skip_competes", True))
+    route_ce_require_skip_argmax_noop = bool(route_ce_cfg.get("require_skip_argmax_noop", True))
+    if route_ce_weight > 0.0:
+        if route_ce_require_skip and not allow_skip:
+            raise ValueError("moe.route_ce_supervision requires moe.allow_skip=true.")
+        if route_ce_require_skip_competes and not skip_competes:
+            raise ValueError("moe.route_ce_supervision requires moe.skip_competes_with_penalties=true.")
+        if route_ce_require_skip_argmax_noop and not skip_argmax_noop:
+            raise ValueError("moe.route_ce_supervision requires moe.skip_argmax_noop=true.")
+    binary_adoption_cfg = moe_cfg.get("binary_adoption_supervision", {}) or {}
+    if not isinstance(binary_adoption_cfg, dict):
+        binary_adoption_cfg = {"enable": bool(binary_adoption_cfg)}
+    binary_adoption_enable = (
+        bool(binary_adoption_cfg.get("enable", False))
+        and moe_enable
+        and pred_residual_enable
+        and P > 0
+    )
+    binary_adoption_weight = (
+        float(binary_adoption_cfg.get("weight", 0.0)) if binary_adoption_enable else 0.0
+    )
+    binary_adoption_min_abs_improvement = float(
+        binary_adoption_cfg.get("min_abs_improvement", route_ce_min_abs_improvement)
+    )
+    binary_adoption_min_rel_improvement = float(
+        binary_adoption_cfg.get("min_rel_improvement", route_ce_min_rel_improvement)
+    )
+    binary_adoption_min_candidate_delta_rms = float(
+        binary_adoption_cfg.get("min_candidate_delta_rms", route_ce_min_candidate_delta_rms)
+    )
+    binary_adoption_ignore_abs_gain_below = float(
+        binary_adoption_cfg.get("ignore_abs_gain_below", route_ce_ignore_abs_gain_below)
+    )
+    binary_adoption_positive_weight = float(binary_adoption_cfg.get("positive_weight", 1.0))
+    binary_adoption_negative_weight = float(binary_adoption_cfg.get("negative_weight", 1.0))
+    binary_adoption_require_skip = bool(binary_adoption_cfg.get("require_skip", True))
+    binary_adoption_require_skip_competes = bool(binary_adoption_cfg.get("require_skip_competes", True))
+    binary_adoption_require_skip_argmax_noop = bool(
+        binary_adoption_cfg.get("require_skip_argmax_noop", True)
+    )
+    if binary_adoption_weight > 0.0:
+        if binary_adoption_require_skip and not allow_skip:
+            raise ValueError("moe.binary_adoption_supervision requires moe.allow_skip=true.")
+        if binary_adoption_require_skip_competes and not skip_competes:
+            raise ValueError(
+                "moe.binary_adoption_supervision requires moe.skip_competes_with_penalties=true."
+            )
+        if binary_adoption_require_skip_argmax_noop and not skip_argmax_noop:
+            raise ValueError("moe.binary_adoption_supervision requires moe.skip_argmax_noop=true.")
+    route_rate_alignment_cfg = moe_cfg.get("route_rate_alignment_supervision", {}) or {}
+    if not isinstance(route_rate_alignment_cfg, dict):
+        route_rate_alignment_cfg = {"enable": bool(route_rate_alignment_cfg)}
+    route_rate_alignment_enable = (
+        bool(route_rate_alignment_cfg.get("enable", False))
+        and moe_enable
+        and pred_residual_enable
+        and P > 0
+    )
+    route_rate_alignment_weight = (
+        float(route_rate_alignment_cfg.get("weight", 0.0)) if route_rate_alignment_enable else 0.0
+    )
+    route_rate_alignment_min_abs_improvement = float(
+        route_rate_alignment_cfg.get("min_abs_improvement", binary_adoption_min_abs_improvement)
+    )
+    route_rate_alignment_min_rel_improvement = float(
+        route_rate_alignment_cfg.get("min_rel_improvement", binary_adoption_min_rel_improvement)
+    )
+    route_rate_alignment_min_candidate_delta_rms = float(
+        route_rate_alignment_cfg.get(
+            "min_candidate_delta_rms",
+            binary_adoption_min_candidate_delta_rms,
+        )
+    )
+    route_rate_alignment_ignore_abs_gain_below = float(
+        route_rate_alignment_cfg.get("ignore_abs_gain_below", binary_adoption_ignore_abs_gain_below)
+    )
+    route_rate_alignment_require_skip = bool(route_rate_alignment_cfg.get("require_skip", True))
+    route_rate_alignment_require_skip_competes = bool(
+        route_rate_alignment_cfg.get("require_skip_competes", True)
+    )
+    route_rate_alignment_require_skip_argmax_noop = bool(
+        route_rate_alignment_cfg.get("require_skip_argmax_noop", True)
+    )
+    if route_rate_alignment_weight > 0.0:
+        if route_rate_alignment_require_skip and not allow_skip:
+            raise ValueError("moe.route_rate_alignment_supervision requires moe.allow_skip=true.")
+        if route_rate_alignment_require_skip_competes and not skip_competes:
+            raise ValueError(
+                "moe.route_rate_alignment_supervision requires "
+                "moe.skip_competes_with_penalties=true."
+            )
+        if route_rate_alignment_require_skip_argmax_noop and not skip_argmax_noop:
+            raise ValueError(
+                "moe.route_rate_alignment_supervision requires moe.skip_argmax_noop=true."
+            )
+    route_positive_recall_cfg = moe_cfg.get("route_positive_recall_supervision", {}) or {}
+    if not isinstance(route_positive_recall_cfg, dict):
+        route_positive_recall_cfg = {"enable": bool(route_positive_recall_cfg)}
+    route_positive_recall_enable = (
+        bool(route_positive_recall_cfg.get("enable", False))
+        and moe_enable
+        and pred_residual_enable
+        and P > 0
+    )
+    route_positive_recall_weight = (
+        float(route_positive_recall_cfg.get("weight", 0.0)) if route_positive_recall_enable else 0.0
+    )
+    route_positive_recall_min_abs_improvement = float(
+        route_positive_recall_cfg.get("min_abs_improvement", binary_adoption_min_abs_improvement)
+    )
+    route_positive_recall_min_rel_improvement = float(
+        route_positive_recall_cfg.get("min_rel_improvement", binary_adoption_min_rel_improvement)
+    )
+    route_positive_recall_min_candidate_delta_rms = float(
+        route_positive_recall_cfg.get(
+            "min_candidate_delta_rms",
+            binary_adoption_min_candidate_delta_rms,
+        )
+    )
+    route_positive_recall_ignore_abs_gain_below = float(
+        route_positive_recall_cfg.get("ignore_abs_gain_below", binary_adoption_ignore_abs_gain_below)
+    )
+    route_positive_recall_mode = str(route_positive_recall_cfg.get("mode", "ce"))
+    route_positive_recall_target_probability = float(
+        route_positive_recall_cfg.get("target_probability", 1.0)
+    )
+    route_positive_recall_require_skip = bool(route_positive_recall_cfg.get("require_skip", True))
+    route_positive_recall_require_skip_competes = bool(
+        route_positive_recall_cfg.get("require_skip_competes", True)
+    )
+    route_positive_recall_require_skip_argmax_noop = bool(
+        route_positive_recall_cfg.get("require_skip_argmax_noop", True)
+    )
+    if route_positive_recall_weight > 0.0:
+        if route_positive_recall_require_skip and not allow_skip:
+            raise ValueError("moe.route_positive_recall_supervision requires moe.allow_skip=true.")
+        if route_positive_recall_require_skip_competes and not skip_competes:
+            raise ValueError(
+                "moe.route_positive_recall_supervision requires "
+                "moe.skip_competes_with_penalties=true."
+            )
+        if route_positive_recall_require_skip_argmax_noop and not skip_argmax_noop:
+            raise ValueError(
+                "moe.route_positive_recall_supervision requires moe.skip_argmax_noop=true."
+            )
+    route_precision_recall_cfg = moe_cfg.get("route_precision_recall_supervision", {}) or {}
+    if not isinstance(route_precision_recall_cfg, dict):
+        route_precision_recall_cfg = {"enable": bool(route_precision_recall_cfg)}
+    route_precision_recall_enable = (
+        bool(route_precision_recall_cfg.get("enable", False))
+        and moe_enable
+        and pred_residual_enable
+        and P > 0
+    )
+    route_precision_recall_weight = (
+        float(route_precision_recall_cfg.get("weight", 0.0)) if route_precision_recall_enable else 0.0
+    )
+    route_precision_recall_min_abs_improvement = float(
+        route_precision_recall_cfg.get("min_abs_improvement", binary_adoption_min_abs_improvement)
+    )
+    route_precision_recall_min_rel_improvement = float(
+        route_precision_recall_cfg.get("min_rel_improvement", binary_adoption_min_rel_improvement)
+    )
+    route_precision_recall_min_candidate_delta_rms = float(
+        route_precision_recall_cfg.get(
+            "min_candidate_delta_rms",
+            binary_adoption_min_candidate_delta_rms,
+        )
+    )
+    route_precision_recall_ignore_abs_gain_below = float(
+        route_precision_recall_cfg.get("ignore_abs_gain_below", binary_adoption_ignore_abs_gain_below)
+    )
+    route_precision_recall_mode = str(route_precision_recall_cfg.get("recall_mode", "ce"))
+    route_precision_recall_target_probability = float(
+        route_precision_recall_cfg.get("recall_target_probability", 1.0)
+    )
+    route_precision_recall_false_adopt_max_probability = float(
+        route_precision_recall_cfg.get("false_adopt_max_probability", 0.5)
+    )
+    route_precision_recall_false_adopt_weight = float(
+        route_precision_recall_cfg.get("false_adopt_weight", 1.0)
+    )
+    route_precision_recall_require_skip = bool(route_precision_recall_cfg.get("require_skip", True))
+    route_precision_recall_require_skip_competes = bool(
+        route_precision_recall_cfg.get("require_skip_competes", True)
+    )
+    route_precision_recall_require_skip_argmax_noop = bool(
+        route_precision_recall_cfg.get("require_skip_argmax_noop", True)
+    )
+    if route_precision_recall_weight > 0.0:
+        if route_precision_recall_require_skip and not allow_skip:
+            raise ValueError("moe.route_precision_recall_supervision requires moe.allow_skip=true.")
+        if route_precision_recall_require_skip_competes and not skip_competes:
+            raise ValueError(
+                "moe.route_precision_recall_supervision requires "
+                "moe.skip_competes_with_penalties=true."
+            )
+        if route_precision_recall_require_skip_argmax_noop and not skip_argmax_noop:
+            raise ValueError(
+                "moe.route_precision_recall_supervision requires moe.skip_argmax_noop=true."
+            )
     raw_ranks = moe_cfg.get("select_ranks", None)
     if raw_ranks is None:
         select_ranks = [1, 2]
     else:
         select_ranks = [int(x) for x in raw_ranks]
-    gate_feat_dim = get_gate_feature_dim()
+    gate_feat_dim = len(_gate_feature_names_for_mode(gate_feature_mode))
     gate = ClusterwiseMoEGate(
         num_clusters=K,
         feat_dim=gate_feat_dim,
@@ -6251,6 +9388,8 @@ def main():
         topk=int(moe_cfg["topk"]),
         allow_skip=allow_skip,
         skip_init_bias=skip_init_bias,
+        skip_competes=skip_competes,
+        skip_argmax_noop=skip_argmax_noop,
     ).to(device)
     gate.temperature = float(moe_cfg.get("gate_temperature", 1.0))
     gate.noise_std = float(moe_cfg.get("gate_noise_std", 0.0))
@@ -6340,6 +9479,8 @@ def main():
             seasonal_anchor_period=int(pred_residual_cfg.get("seasonal_anchor_period", 96)),
             seasonal_anchor_num_periods=int(pred_residual_cfg.get("seasonal_anchor_num_periods", 1)),
             seasonal_anchor_scale=float(pred_residual_cfg.get("seasonal_anchor_scale", 1.0)),
+            phase_residual_candidate_names=phase_residual_candidate_names,
+            phase_residual_candidate_scale=phase_residual_candidate_scale,
         ).to(device)
         print(
             "Prediction residual MoE enabled: "
@@ -6349,9 +9490,22 @@ def main():
             f"seasonal_anchor_names={list(pred_residual_cfg.get('seasonal_anchor_names', []))}, "
             f"seasonal_anchor_period={int(pred_residual_cfg.get('seasonal_anchor_period', 96))}, "
             f"seasonal_anchor_scale={float(pred_residual_cfg.get('seasonal_anchor_scale', 1.0)):.3f}, "
+            f"phase_residual_candidate={phase_residual_candidate_names}, "
+            f"phase_residual_period={int(phase_residual_candidate_period)}, "
+            f"phase_residual_scale={float(phase_residual_candidate_scale):.3f}, "
             f"specialization_weight={pred_residual_specialization_weight:.6f}, "
             f"norm_weight={pred_residual_norm_weight:.6f}, "
             f"intervention_weight={pred_residual_intervention_weight:.6f}, "
+            f"candidate_supervision_weight={pred_residual_candidate_supervision_weight:.6f}, "
+            f"candidate_supervision_loss={pred_residual_candidate_supervision_loss}, "
+            f"ignore_skip_during_training={pred_residual_ignore_skip_during_training}, "
+            f"intervention_supervision_weight={pred_residual_intervention_supervision_weight:.6f}, "
+            f"route_ce_weight={route_ce_weight:.6f}, "
+            f"route_ce_min_candidate_delta_rms={route_ce_min_candidate_delta_rms:.6g}, "
+            f"binary_adoption_weight={binary_adoption_weight:.6f}, "
+            f"binary_adoption_min_candidate_delta_rms={binary_adoption_min_candidate_delta_rms:.6g}, "
+            f"confidence_gate={bool(pred_residual_confidence_gate_enable)}, "
+            f"freeze_gate_after_epoch={int(pred_residual_freeze_gate_after_epoch)}, "
             f"detach_routed_penalty_pred={pred_residual_detach_routed_penalty_pred}, "
             f"penalty_selector={pred_residual.penalty_selector_enable}, "
             f"fusion_gate={pred_residual.fusion_gate_enable}"
@@ -6381,7 +9535,14 @@ def main():
     )
     cluster_penalty_prior_prob_kp = None
     cluster_penalty_allowed_mask_kp = None
+    cluster_penalty_prior_configured_mask_kp = None
+    cluster_penalty_late_allowed_mask_kp = None
+    cluster_penalty_prior_apply_stage = "train_and_eval"
+    cluster_penalty_prior_late_applied = False
     if cluster_penalty_prior_enable:
+        cluster_penalty_prior_apply_stage = normalize_cluster_penalty_prior_apply_stage(
+            cluster_penalty_prior_cfg.get("apply_stage", "train_and_eval")
+        )
         cluster_penalty_prior_prob_kp = build_gate_prior_from_penalty_portrait(
             penalty_kp=penalty_portrait_kp,
             penalty_scale=penalty_scale,
@@ -6398,19 +9559,21 @@ def main():
             penalty_names,
             K,
             device,
+            allow_empty_clusters=bool(cluster_penalty_prior_cfg.get("allow_empty_clusters", False)),
         )
         if manual_allowed is not None:
-            cluster_penalty_allowed_mask_kp = manual_allowed
-            gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+            cluster_penalty_prior_configured_mask_kp = manual_allowed
         elif topk > 0 and bool(cluster_penalty_prior_cfg.get("hard_topk", True)):
-            cluster_penalty_allowed_mask_kp = build_topk_penalty_mask(cluster_penalty_prior_prob_kp, topk=topk)
-            gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+            cluster_penalty_prior_configured_mask_kp = build_topk_penalty_mask(
+                cluster_penalty_prior_prob_kp,
+                topk=topk,
+            )
         always_include = cluster_penalty_prior_cfg.get("always_include", []) or []
         if isinstance(always_include, str):
             always_include = [always_include]
         if len(always_include) > 0:
-            if cluster_penalty_allowed_mask_kp is None:
-                cluster_penalty_allowed_mask_kp = torch.zeros((K, P), device=device, dtype=torch.float32)
+            if cluster_penalty_prior_configured_mask_kp is None:
+                cluster_penalty_prior_configured_mask_kp = torch.zeros((K, P), device=device, dtype=torch.float32)
             name_to_idx = {str(name): i for i, name in enumerate(penalty_names)}
             for raw_name in always_include:
                 name = str(raw_name)
@@ -6419,31 +9582,64 @@ def main():
                         "cluster_penalty_prior.always_include contains unknown penalty "
                         f"{name!r}; available={penalty_names}"
                     )
-                cluster_penalty_allowed_mask_kp[:, name_to_idx[name]] = 1.0
-            empty = cluster_penalty_allowed_mask_kp.sum(dim=-1, keepdim=True) <= 0.0
+                cluster_penalty_prior_configured_mask_kp[:, name_to_idx[name]] = 1.0
+            empty = cluster_penalty_prior_configured_mask_kp.sum(dim=-1, keepdim=True) <= 0.0
             if bool(empty.any().item()):
-                cluster_penalty_allowed_mask_kp = torch.where(
+                cluster_penalty_prior_configured_mask_kp = torch.where(
                     empty,
-                    torch.ones_like(cluster_penalty_allowed_mask_kp),
-                    cluster_penalty_allowed_mask_kp,
+                    torch.ones_like(cluster_penalty_prior_configured_mask_kp),
+                    cluster_penalty_prior_configured_mask_kp,
                 )
-            gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+        (
+            cluster_penalty_allowed_mask_kp,
+            cluster_penalty_late_allowed_mask_kp,
+            cluster_penalty_prior_apply_stage,
+        ) = split_cluster_penalty_prior_allowed_mask_by_stage(
+            cluster_penalty_prior_configured_mask_kp,
+            cluster_penalty_prior_apply_stage,
+        )
+        gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
         if bool(cluster_penalty_prior_cfg.get("use_as_balance_target", False)):
             gate_balance_target_kp = cluster_penalty_prior_prob_kp
+        pred_residual_allowed_mask_cp = None
+        if (
+            pred_residual is not None
+            and cluster_penalty_allowed_mask_kp is not None
+            and bool(cluster_penalty_prior_cfg.get("apply_to_pred_residual", False))
+        ):
+            pred_residual_allowed_mask_cp = _cluster_penalty_mask_to_channel_mask(
+                cluster_penalty_allowed_mask_kp,
+                cluster_id_c,
+            )
+            pred_residual.set_allowed_penalty_mask(pred_residual_allowed_mask_cp)
         prior_list = (
             cluster_penalty_prior_prob_kp.detach().cpu().tolist()
             if cluster_penalty_prior_prob_kp is not None
             else None
         )
-        mask_list = (
+        configured_mask_list = (
+            cluster_penalty_prior_configured_mask_kp.detach().cpu().tolist()
+            if cluster_penalty_prior_configured_mask_kp is not None
+            else None
+        )
+        active_mask_list = (
             cluster_penalty_allowed_mask_kp.detach().cpu().tolist()
             if cluster_penalty_allowed_mask_kp is not None
+            else None
+        )
+        late_mask_list = (
+            cluster_penalty_late_allowed_mask_kp.detach().cpu().tolist()
+            if cluster_penalty_late_allowed_mask_kp is not None
             else None
         )
         print(
             "Cluster penalty prior enabled: "
             f"topk={topk}, hard_topk={bool(cluster_penalty_prior_cfg.get('hard_topk', True))}, "
-            f"logit_strength={logit_strength:.3f}, prior={prior_list}, allowed_mask={mask_list}"
+            f"logit_strength={logit_strength:.3f}, apply_stage={cluster_penalty_prior_apply_stage}, "
+            f"prior={prior_list}, configured_allowed_mask={configured_mask_list}, "
+            f"active_allowed_mask={active_mask_list}, late_allowed_mask={late_mask_list}, "
+            f"apply_to_pred_residual={bool(cluster_penalty_prior_cfg.get('apply_to_pred_residual', False))}, "
+            f"pred_residual_channel_mask={pred_residual_allowed_mask_cp.detach().cpu().tolist() if pred_residual_allowed_mask_cp is not None else None}"
         )
     if (
         bool(channel_penalty_prior_cfg.get("enable", False))
@@ -6699,6 +9895,7 @@ def main():
 
         source_penalty_names = list(meta.get("penalty_names", []))
         same_penalties = source_penalty_names == penalty_names
+        loaded_pred_residual_state = False
         if bool(ft_cfg.get("load_gate", True)) and "gate_state" in ckpt:
             if not same_penalties:
                 raise ValueError(
@@ -6722,6 +9919,17 @@ def main():
             for k in range(K):
                 src_k = int(target_to_source_k[k].item())
                 gate.load_cluster_state(k, source_gate.get_cluster_state(src_k))
+
+        if bool(ft_cfg.get("load_pred_residual", False)) and pred_residual is not None:
+            loaded_pred_residual_state = _load_finetune_pred_residual_state(
+                pred_residual=pred_residual,
+                checkpoint=ckpt,
+                source_penalty_names=source_penalty_names,
+                target_penalty_names=penalty_names,
+                strict=bool(ft_cfg.get("strict_pred_residual", True)),
+            )
+            if not loaded_pred_residual_state:
+                raise ValueError(f"Fine-tune checkpoint is missing pred_residual_state: {ckpt_path}")
 
         if bool(ft_cfg.get("load_dynamic_lambda", True)) and dynamic_lambda is not None and "dynamic_lambda_state" in ckpt:
             if not same_penalties:
@@ -6773,6 +9981,7 @@ def main():
             "cluster_corr": None if corr_map is None else corr_map.detach().cpu().tolist(),
             "partial_model_state": partial_model_state,
             "partial_model_load": partial_model_summary,
+            "loaded_pred_residual": bool(loaded_pred_residual_state),
         }
         print(f"Fine-tune warm start loaded from: {ckpt_path}")
         print(f"Fine-tune target->source cluster map: {finetune_summary['target_to_source_cluster']}")
@@ -6784,29 +9993,86 @@ def main():
     if freeze_backbone:
         frozen_backbone_params = _freeze_module_params(model)
         print(f"Backbone frozen for MoE training: params={frozen_backbone_params}")
+    pred_residual_train_with_eval_anchors = (
+        pred_residual is not None
+        and bool(pred_residual_cfg.get("train_with_eval_anchors", bool(freeze_backbone)))
+    )
+    if pred_residual_train_with_eval_anchors:
+        print(
+            "Prediction residual training uses the same MoE anchor post-processing modules as eval "
+            "(train-side anchor scales are selected on train only)."
+        )
+    raw_moe_weight_decay = moe_cfg.get("weight_decay", None)
+    if raw_moe_weight_decay is None:
+        raw_moe_weight_decay = moe_cfg.get("optimizer_weight_decay", None)
+    if raw_moe_weight_decay is not None:
+        moe_weight_decay = float(raw_moe_weight_decay)
+    else:
+        moe_weight_decay = None
 
     cluster_params = []
+    cluster_param_groups = []
+    stage2_trainable_param_counts = []
     for k in range(K):
-        params_k = []
+        base_params_k = []
+        gate_params_k = []
+        pred_residual_params_k = []
+        dynamic_lambda_params_k = []
+        learnable_lambda_params_k = []
         if not freeze_backbone:
-            params_k.extend(model.get_cluster_params(k))
+            base_params_k.extend(model.get_cluster_params(k))
         if not (bilevel_enable and bilevel_optimize_gate):
-            params_k.extend([gate.W1[k], gate.b1[k], gate.W2[k], gate.b2[k]])
+            gate_params_k.extend(_gate_cluster_params(gate, k))
         if pred_residual is not None:
-            params_k.extend(pred_residual.get_cluster_params(k))
+            pred_residual_params_k.extend(pred_residual.get_cluster_params(k))
         if dynamic_lambda is not None and (not bilevel_enable):
-            params_k.extend(dynamic_lambda.get_cluster_params(k))
+            dynamic_lambda_params_k.extend(dynamic_lambda.get_cluster_params(k))
         if learnable_lambda is not None and (not bilevel_enable):
-            params_k.append(learnable_lambda.raw[k])
+            learnable_lambda_params_k.append(learnable_lambda.raw[k])
+        if stage2_loss_audit_enable:
+            stage2_trainable_param_counts.append(
+                {
+                    "cluster_id": int(k),
+                    "backbone": int(sum(param.numel() for param in base_params_k)),
+                    "gate": int(sum(param.numel() for param in gate_params_k)),
+                    "pred_residual": int(sum(param.numel() for param in pred_residual_params_k)),
+                    "dynamic_lambda": int(sum(param.numel() for param in dynamic_lambda_params_k)),
+                    "learnable_lambda": int(sum(param.numel() for param in learnable_lambda_params_k)),
+                }
+            )
+        param_groups_k = _make_cluster_optimizer_param_groups(
+            base_params=base_params_k,
+            gate_params=gate_params_k,
+            pred_residual_params=pred_residual_params_k,
+            dynamic_lambda_params=dynamic_lambda_params_k,
+            learnable_lambda_params=learnable_lambda_params_k,
+            base_weight_decay=float(cfg["train"]["weight_decay"]),
+            moe_weight_decay=moe_weight_decay,
+            pred_residual_weight_decay=pred_residual_weight_decay,
+        )
+        params_k = [param for group in param_groups_k for param in group["params"]]
         cluster_params.append(params_k)
+        cluster_param_groups.append(param_groups_k)
+    stage2_trainable_parameter_groups = None
+    if stage2_loss_audit_enable:
+        totals = {
+            "backbone": int(sum(row["backbone"] for row in stage2_trainable_param_counts)),
+            "gate": int(sum(row["gate"] for row in stage2_trainable_param_counts)),
+            "pred_residual": int(sum(row["pred_residual"] for row in stage2_trainable_param_counts)),
+            "dynamic_lambda": int(sum(row["dynamic_lambda"] for row in stage2_trainable_param_counts)),
+            "learnable_lambda": int(sum(row["learnable_lambda"] for row in stage2_trainable_param_counts)),
+        }
+        stage2_trainable_parameter_groups = {
+            "total": totals,
+            "per_cluster": stage2_trainable_param_counts,
+        }
 
     optimizers = [
         torch.optim.Adam(
-            params_k,
+            param_groups_k,
             lr=float(cfg["train"]["lr"]),
-            weight_decay=float(cfg["train"]["weight_decay"]),
         )
-        for params_k in cluster_params
+        for param_groups_k in cluster_param_groups
     ]
     for opt_k in optimizers:
         for group in opt_k.param_groups:
@@ -6923,177 +10189,6 @@ def main():
             dynamic_lambda.load_state_dict(swa_averagers["dynamic_lambda"].module.state_dict())
         if learnable_lambda is not None and "learnable_lambda" in swa_averagers:
             learnable_lambda.load_state_dict(swa_averagers["learnable_lambda"].module.state_dict())
-
-    def _fit_knn_hybrid_bank(
-        x_bank_ncl: torch.Tensor,
-        y_bank_nch: torch.Tensor,
-        start_offsets_n: torch.Tensor,
-    ) -> ShapeKNNHybrid:
-        base_bank_pred = None
-        if knn_requires_base_bank:
-            base_bank_pred = predict_bank_outputs(
-                model=model,
-                x_bank_ncl=x_bank_ncl,
-                cluster_id_c=cluster_id_c,
-                batch_size=max(bs, 64),
-                device=device,
-            )
-        return ShapeKNNHybrid.fit(
-            x_bank_ncl=x_bank_ncl,
-            y_bank_nch=y_bank_nch,
-            cluster_id_c=cluster_id_c,
-            cfg=knn_cfg,
-            start_offsets_n=start_offsets_n,
-            base_bank_pred_nch=base_bank_pred,
-            observed_history_tc=data_window_tc,
-        )
-
-    def _make_knn_bank_windows(start: int, end: int, label: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_bank, y_bank = make_strict_windows(data_window_tc, L, H, start, end)
-        if len(x_bank) == 0:
-            raise ValueError(f"KNN hybrid {label} bank is empty. Increase available history or change knn_hybrid.bank_split.")
-        starts = torch.arange(int(start), int(start) + len(x_bank), dtype=torch.long)
-        return x_bank, y_bank, starts
-
-    def _refresh_knn_hybrids() -> None:
-        nonlocal knn_hybrid_val, knn_hybrid_test, knn_test_bank_windows
-        nonlocal x_hist_val, y_hist_val, starts_hist_val, x_all, y_all, starts_all
-        if not knn_cfg.enable:
-            return
-
-        x_bank_val = xtr
-        y_bank_val = ytr
-        starts_bank_val = train_start_offsets
-        knn_val_bank_split = "train"
-        if knn_cfg.mode == "rolling" and knn_cfg.bank_split in {"pre_test", "history"}:
-            if x_hist_val is None or y_hist_val is None:
-                x_hist_val, y_hist_val, starts_hist_val = _make_knn_bank_windows(0, t_val, "pre_test")
-            if x_hist_val is None or y_hist_val is None or len(x_hist_val) == 0:
-                raise ValueError("knn_hybrid bank_split=pre_test requires non-empty windows before test.")
-            x_bank_val, y_bank_val = x_hist_val, y_hist_val
-            starts_bank_val = starts_hist_val
-            knn_val_bank_split = "pre_test"
-
-        knn_hybrid_val = _fit_knn_hybrid_bank(x_bank_val, y_bank_val, starts_bank_val)
-        knn_hybrid_test = knn_hybrid_val
-        knn_test_bank_windows = int(len(x_bank_val))
-        knn_val_info = knn_hybrid_val.describe()
-        print(
-            "KNN hybrid (val): "
-            f"mode={knn_val_info['mode']}, "
-            f"scope={knn_val_info['scope']}, "
-            f"bank_split={knn_val_bank_split}, "
-            f"k={knn_val_info['k']}, "
-            f"alpha={knn_val_info['alpha']:.3f}, "
-            f"feature_mode={knn_val_info['feature_mode']}, "
-            f"template_mode={knn_val_info['template_mode']}, "
-            f"bank_sizes={knn_val_info['bank_sizes']}"
-        )
-
-        if knn_cfg.bank_split in {"pre_test", "history"}:
-            if x_hist_val is None or y_hist_val is None:
-                x_hist_val, y_hist_val, starts_hist_val = _make_knn_bank_windows(0, t_val, "pre_test")
-            if x_hist_val is None or y_hist_val is None or len(x_hist_val) == 0:
-                raise ValueError("knn_hybrid bank_split=pre_test requires non-empty windows before test.")
-            x_bank_test, y_bank_test = x_hist_val, y_hist_val
-            starts_bank_test = starts_hist_val
-            if knn_cfg.mode == "rolling" and knn_cfg.bank_split == "history":
-                if x_all is None or y_all is None:
-                    x_all, y_all, starts_all = _make_knn_bank_windows(0, T, "full-history")
-                if x_all is None or y_all is None or len(x_all) == 0:
-                    raise ValueError("knn_hybrid mode=rolling bank_split=history requires non-empty full-history windows.")
-                x_bank_test, y_bank_test = x_all, y_all
-                starts_bank_test = starts_all
-            knn_hybrid_test = _fit_knn_hybrid_bank(x_bank_test, y_bank_test, starts_bank_test)
-            knn_test_bank_windows = int(len(x_bank_test))
-            if knn_hybrid_test is not knn_hybrid_val:
-                knn_test_info = knn_hybrid_test.describe()
-                print(
-                    "KNN hybrid (test): "
-                    f"mode={knn_test_info['mode']}, "
-                    f"scope={knn_test_info['scope']}, "
-                    f"bank_split={knn_cfg.bank_split}, "
-                    f"k={knn_test_info['k']}, "
-                    f"alpha={knn_test_info['alpha']:.3f}, "
-                    f"feature_mode={knn_test_info['feature_mode']}, "
-                    f"template_mode={knn_test_info['template_mode']}, "
-                    f"bank_sizes={knn_test_info['bank_sizes']}"
-                )
-
-    def _build_knn_hybrids_for(eval_knn_cfg: KNNShapeConfig) -> Tuple[ShapeKNNHybrid, ShapeKNNHybrid, int]:
-        def _fit_bank_for_cfg(
-            x_bank_ncl: torch.Tensor,
-            y_bank_nch: torch.Tensor,
-            start_offsets_n: torch.Tensor,
-        ) -> ShapeKNNHybrid:
-            base_bank_pred = None
-            if eval_knn_cfg.needs_base_bank_prediction():
-                base_bank_pred = predict_bank_outputs(
-                    model=model,
-                    x_bank_ncl=x_bank_ncl,
-                    cluster_id_c=cluster_id_c,
-                    batch_size=max(bs, 64),
-                    device=device,
-                )
-            return ShapeKNNHybrid.fit(
-                x_bank_ncl=x_bank_ncl,
-                y_bank_nch=y_bank_nch,
-                cluster_id_c=cluster_id_c,
-                cfg=eval_knn_cfg,
-                start_offsets_n=start_offsets_n,
-                base_bank_pred_nch=base_bank_pred,
-                observed_history_tc=data_window_tc,
-            )
-
-        x_bank_val = xtr
-        y_bank_val = ytr
-        starts_bank_val = train_start_offsets
-        knn_val_bank_split = "train"
-        if eval_knn_cfg.mode == "rolling" and eval_knn_cfg.bank_split in {"pre_test", "history"}:
-            x_bank_val, y_bank_val, starts_bank_val = _make_knn_bank_windows(0, t_val, "pre_test")
-            knn_val_bank_split = "pre_test"
-
-        hybrid_val = _fit_bank_for_cfg(x_bank_val, y_bank_val, starts_bank_val)
-        hybrid_test = hybrid_val
-        bank_windows = int(len(x_bank_val))
-        val_info = hybrid_val.describe()
-        print(
-            "KNN sweep (val): "
-            f"mode={val_info['mode']}, "
-            f"scope={val_info['scope']}, "
-            f"bank_split={knn_val_bank_split}, "
-            f"k={val_info['k']}, "
-            f"alpha={val_info['alpha']:.3f}, "
-            f"adaptive_alpha={val_info['adaptive_alpha']}, "
-            f"distance_weight={val_info['distance_weight']}"
-        )
-
-        if eval_knn_cfg.bank_split in {"pre_test", "history"}:
-            x_bank_test, y_bank_test, starts_bank_test = _make_knn_bank_windows(0, t_val, "pre_test")
-            if eval_knn_cfg.mode == "rolling" and eval_knn_cfg.bank_split == "history":
-                x_bank_test, y_bank_test, starts_bank_test = _make_knn_bank_windows(0, T, "full-history")
-            hybrid_test = _fit_bank_for_cfg(x_bank_test, y_bank_test, starts_bank_test)
-            bank_windows = int(len(x_bank_test))
-            test_info = hybrid_test.describe()
-            print(
-                "KNN sweep (test): "
-                f"mode={test_info['mode']}, "
-                f"scope={test_info['scope']}, "
-                f"bank_split={test_info['bank_split']}, "
-                f"k={test_info['k']}, "
-                f"alpha={test_info['alpha']:.3f}, "
-                f"adaptive_alpha={test_info['adaptive_alpha']}, "
-                f"distance_weight={test_info['distance_weight']}"
-            )
-        return hybrid_val, hybrid_test, bank_windows
-
-    if knn_cfg.enable and (not knn_requires_base_bank):
-        _refresh_knn_hybrids()
-    elif knn_cfg.enable:
-        print(
-            "KNN hybrid bank construction is deferred until the best checkpoint is loaded "
-            "because feature_mode=joint or template_mode=residual depends on model predictions."
-        )
 
     monitor_metric = selection_metric
     if len(dva) == 0 and monitor_metric.startswith("val_"):
@@ -7316,8 +10411,7 @@ def main():
                 cluster_id_c=cluster_id_c,
                 K=K,
             )
-            feat_bcf = extract_gate_features(x)  # [B,C,F]
-            feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
+            feat_bkf = _build_gate_routing_features(x, yhat, cluster_id_c, K, mode=gate_feature_mode)
             _, probs_bkp, skip_bk, skip_prob_bk = gate(
                 feat_bkf,
                 straight_through=False,
@@ -7378,12 +10472,70 @@ def main():
         return avg_probs.detach()
 
     @torch.no_grad()
-    def collect_pred_residual_summary(loader: DataLoader) -> Dict[str, object]:
+    def collect_pred_residual_summary(loader: DataLoader, eval_start: int = 0) -> Dict[str, object]:
         cfg_summary = {
             "enabled": bool(pred_residual is not None),
             "specialization_weight": float(pred_residual_specialization_weight),
             "norm_weight": float(pred_residual_norm_weight),
             "intervention_weight": float(pred_residual_intervention_weight),
+            "candidate_supervision_weight": float(pred_residual_candidate_supervision_weight),
+            "candidate_supervision_loss": str(pred_residual_candidate_supervision_loss),
+            "candidate_supervision_min_abs_improvement": float(pred_residual_candidate_supervision_min_abs),
+            "candidate_supervision_min_rel_improvement": float(pred_residual_candidate_supervision_min_rel),
+            "candidate_supervision_only_allowed": bool(pred_residual_candidate_supervision_only_allowed),
+            "candidate_supervision_include_intervention": bool(pred_residual_candidate_supervision_include_intervention),
+            "candidate_supervision_include_selector": bool(pred_residual_candidate_supervision_include_selector),
+            "ignore_skip_during_training": bool(pred_residual_ignore_skip_during_training),
+            "intervention_supervision_weight": float(pred_residual_intervention_supervision_weight),
+            "intervention_supervision_min_gain": float(pred_residual_intervention_supervision_min_gain),
+            "intervention_supervision_pos_weight": float(pred_residual_intervention_supervision_pos_weight),
+            "intervention_supervision_only_allowed": bool(pred_residual_intervention_supervision_only_allowed),
+            "route_ce_supervision_weight": float(route_ce_weight),
+            "route_ce_supervision_min_abs_improvement": float(route_ce_min_abs_improvement),
+            "route_ce_supervision_min_rel_improvement": float(route_ce_min_rel_improvement),
+            "route_ce_supervision_min_candidate_delta_rms": float(route_ce_min_candidate_delta_rms),
+            "route_ce_supervision_ignore_abs_gain_below": float(route_ce_ignore_abs_gain_below),
+            "route_ce_supervision_class_weight": str(route_ce_class_weight_mode),
+            "route_ce_supervision_max_class_weight": float(route_ce_max_class_weight),
+            "binary_adoption_supervision_weight": float(binary_adoption_weight),
+            "binary_adoption_supervision_min_abs_improvement": float(binary_adoption_min_abs_improvement),
+            "binary_adoption_supervision_min_rel_improvement": float(binary_adoption_min_rel_improvement),
+            "binary_adoption_supervision_min_candidate_delta_rms": float(binary_adoption_min_candidate_delta_rms),
+            "binary_adoption_supervision_ignore_abs_gain_below": float(binary_adoption_ignore_abs_gain_below),
+            "binary_adoption_supervision_positive_weight": float(binary_adoption_positive_weight),
+            "binary_adoption_supervision_negative_weight": float(binary_adoption_negative_weight),
+            "route_rate_alignment_supervision_weight": float(route_rate_alignment_weight),
+            "route_rate_alignment_supervision_min_abs_improvement": float(route_rate_alignment_min_abs_improvement),
+            "route_rate_alignment_supervision_min_rel_improvement": float(route_rate_alignment_min_rel_improvement),
+            "route_rate_alignment_supervision_min_candidate_delta_rms": float(route_rate_alignment_min_candidate_delta_rms),
+            "route_rate_alignment_supervision_ignore_abs_gain_below": float(route_rate_alignment_ignore_abs_gain_below),
+            "route_positive_recall_supervision_weight": float(route_positive_recall_weight),
+            "route_positive_recall_supervision_min_abs_improvement": float(route_positive_recall_min_abs_improvement),
+            "route_positive_recall_supervision_min_rel_improvement": float(route_positive_recall_min_rel_improvement),
+            "route_positive_recall_supervision_min_candidate_delta_rms": float(route_positive_recall_min_candidate_delta_rms),
+            "route_positive_recall_supervision_ignore_abs_gain_below": float(route_positive_recall_ignore_abs_gain_below),
+            "route_positive_recall_supervision_mode": str(route_positive_recall_mode),
+            "route_positive_recall_supervision_target_probability": float(route_positive_recall_target_probability),
+            "route_precision_recall_supervision_weight": float(route_precision_recall_weight),
+            "route_precision_recall_supervision_min_abs_improvement": float(route_precision_recall_min_abs_improvement),
+            "route_precision_recall_supervision_min_rel_improvement": float(route_precision_recall_min_rel_improvement),
+            "route_precision_recall_supervision_min_candidate_delta_rms": float(route_precision_recall_min_candidate_delta_rms),
+            "route_precision_recall_supervision_ignore_abs_gain_below": float(route_precision_recall_ignore_abs_gain_below),
+            "route_precision_recall_supervision_recall_mode": str(route_precision_recall_mode),
+            "route_precision_recall_supervision_recall_target_probability": float(route_precision_recall_target_probability),
+            "route_precision_recall_supervision_false_adopt_max_probability": float(route_precision_recall_false_adopt_max_probability),
+            "route_precision_recall_supervision_false_adopt_weight": float(route_precision_recall_false_adopt_weight),
+            "confidence_gate_enable": bool(pred_residual_confidence_gate_enable),
+            "confidence_gate_source_split": str(pred_residual_confidence_gate_source_split),
+            "confidence_gate_threshold": str(pred_residual_confidence_gate_threshold),
+            "confidence_gate_min_abs_improvement": float(pred_residual_confidence_gate_min_abs),
+            "confidence_gate_min_rel_improvement": float(pred_residual_confidence_gate_min_rel),
+            "confidence_gate_min_precision": float(pred_residual_confidence_gate_min_precision),
+            "confidence_gate_max_pred_positive_rate": (
+                None
+                if pred_residual_confidence_gate_max_pred_rate is None
+                else float(pred_residual_confidence_gate_max_pred_rate)
+            ),
             "detach_routed_penalty_pred": bool(pred_residual_detach_routed_penalty_pred),
         }
         if pred_residual is None or P == 0 or len(loader) == 0:
@@ -7398,6 +10550,7 @@ def main():
         branch_sq_sum = 0.0
         branch_numel = 0
         delta_sq_sum = 0.0
+        delta_numel = 0
         base_sq_sum = 0.0
         spec_sum_k = torch.zeros(K, device=device)
         norm_sum_k = torch.zeros(K, device=device)
@@ -7408,9 +10561,11 @@ def main():
         route_numel = 0
         cnt = 0
 
-        for x, y, _ in loader:
+        for x, y, idx in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+            query_start_abs_b = int(eval_start) + idx
             y_base = model(x, cluster_id_c)
             route_pen_bkp = _router_penalty_context_from_history(
                 x_bcl=x,
@@ -7421,8 +10576,7 @@ def main():
                 cluster_id_c=cluster_id_c,
                 K=K,
             )
-            feat_bcf = extract_gate_features(x)
-            feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+            feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
             mask_bkp, probs_bkp, skip_bk, _ = gate(
                 feat_bkf,
                 straight_through=False,
@@ -7440,6 +10594,7 @@ def main():
                 cluster_id_c,
                 mask_bkp,
                 skip_bk=skip_bk if allow_skip else None,
+                query_start_abs_b=query_start_abs_b,
             )
             y_final = pred_out["y_final"]
             terms = _pred_residual_loss_terms(
@@ -7465,6 +10620,7 @@ def main():
             branch_numel += int(branches.numel())
             delta = y_final - y_base
             delta_sq_sum += float(delta.pow(2).sum().item())
+            delta_numel += int(delta.numel())
             base_sq_sum += float(y_base.pow(2).sum().item())
             route_bcp = pred_out["route_bcp"].detach()
             intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp)).detach()
@@ -7502,6 +10658,8 @@ def main():
                 "intervention_loss": float(reduce_cluster_metric(intervention_k, cluster_weight_k).item()),
             }
         )
+        if stage2_loss_audit_enable:
+            cfg_summary["residual_delta_rms"] = float((delta_sq_sum / max(delta_numel, 1)) ** 0.5)
         return cfg_summary
 
     def compute_batch_terms(
@@ -7541,7 +10699,8 @@ def main():
             cfg=model_train_stat_adapter_cfg,
         )
         feat_bcf = extract_gate_features(x)
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        lambda_feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+        gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
         series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)
         probs_bkp = None
         skip_bk = None
@@ -7562,7 +10721,7 @@ def main():
             mask_bkp, probs_bkp, skip_bk, skip_prob_bk = _module_call(
                 gate,
                 gate_params,
-                feat_bkf,
+                gate_feat_bkf,
                 straight_through=straight_through,
                 penalty_context_bkp=route_pen_bkp,
                 penalty_context_mode=router_mode,
@@ -7593,11 +10752,30 @@ def main():
                 yhat_base,
                 cluster_id_c,
                 mask_bkp,
-                skip_bk=skip_bk if allow_skip else None,
+                skip_bk=_pred_residual_training_skip_arg(
+                    skip_bk=skip_bk,
+                    allow_skip=allow_skip,
+                    ignore_skip_during_training=pred_residual_ignore_skip_during_training,
+                ),
             )
-            yhat = pred_out["y_final"]
+            yhat_residual_raw = pred_out["y_final"]
+            yhat = yhat_residual_raw
         else:
+            yhat_residual_raw = yhat_base
             yhat = yhat_base
+        if pred_residual_train_with_eval_anchors:
+            yhat = apply_moe_output_anchor_experts(
+                yhat,
+                base_pred_bch=yhat_base,
+                x_bcl=x,
+                query_start_abs_b=idx,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
 
         err_bch = yhat - y
         abs_err_bch = err_bch.abs()
@@ -7634,7 +10812,7 @@ def main():
         if P > 0:
             lam_bkp = _compute_lambda_bkp(
                 base_lambda_kp=base_lambda_kp,
-                feat_bkf=feat_bkf,
+                feat_bkf=lambda_feat_bkf,
                 series_bkl=series_bkl,
                 dynamic_lambda=dynamic_lambda,
                 dynamic_lambda_params=dynamic_lambda_params,
@@ -7658,7 +10836,7 @@ def main():
         pred_loss_terms = _pred_residual_loss_terms(
             pred_out=pred_out,
             y_base=yhat_base,
-            y_final=yhat,
+            y_final=yhat_residual_raw,
             y=y,
             penalty_names=penalty_names,
             penalty_fns=penalty_fns,
@@ -7669,6 +10847,56 @@ def main():
             norm_weight=pred_residual_norm_weight,
             intervention_weight=pred_residual_intervention_weight,
         )
+        candidate_supervision_loss_bk = None
+        if pred_residual_candidate_supervision_weight > 0.0:
+            candidate_supervision_loss_bk = _pred_residual_candidate_supervision_loss(
+                y_base_bch=yhat_base,
+                pred_out=pred_out,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                only_allowed=pred_residual_candidate_supervision_only_allowed,
+                loss_kind=pred_residual_candidate_supervision_loss,
+                min_abs_improvement=pred_residual_candidate_supervision_min_abs,
+                min_rel_improvement=pred_residual_candidate_supervision_min_rel,
+                include_intervention=pred_residual_candidate_supervision_include_intervention,
+                include_selector=pred_residual_candidate_supervision_include_selector,
+                apply_output_anchors=pred_residual_train_with_eval_anchors,
+                x_bcl=x,
+                query_start_abs_b=idx,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+        intervention_supervision_loss_bk = None
+        if pred_residual_intervention_supervision_weight > 0.0:
+            intervention_supervision_loss_bk = _pred_residual_intervention_supervision_loss(
+                y_base_bch=yhat_base,
+                pred_out=pred_out,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                only_allowed=pred_residual_intervention_supervision_only_allowed,
+                min_gain=pred_residual_intervention_supervision_min_gain,
+                pos_weight=pred_residual_intervention_supervision_pos_weight,
+                apply_output_anchors=pred_residual_train_with_eval_anchors,
+                x_bcl=x,
+                query_start_abs_b=idx,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
         loss_terms_bk, _ = _normalize_loss_terms(
             {
                 "mse": mse_bk,
@@ -7684,18 +10912,206 @@ def main():
             + loss_terms_bk["penalty"]
             + loss_terms_bk["pred_residual"]
         )
+        if candidate_supervision_loss_bk is not None:
+            objective_loss_bk = (
+                objective_loss_bk
+                + pred_residual_candidate_supervision_weight * candidate_supervision_loss_bk
+            )
+        if intervention_supervision_loss_bk is not None:
+            objective_loss_bk = (
+                objective_loss_bk
+                + pred_residual_intervention_supervision_weight * intervention_supervision_loss_bk
+            )
+        utility_base_bch = None
+        utility_cand_bcpH = None
+        if (
+            route_ce_weight > 0.0
+            or binary_adoption_weight > 0.0
+            or route_rate_alignment_weight > 0.0
+            or route_positive_recall_weight > 0.0
+            or route_precision_recall_weight > 0.0
+            or mse_utility_gate_weight > 0.0
+        ):
+            utility_base_bch, utility_cand_bcpH = _pred_residual_candidates_on_eval_path(
+                yhat_base,
+                pred_out,
+                apply_output_anchors=pred_residual_train_with_eval_anchors,
+                x_bcl=x,
+                query_start_abs_b=idx,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+        if route_ce_weight > 0.0 and utility_cand_bcpH is not None:
+            route_labels_bk, route_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                base_bch=utility_base_bch,
+                cand_bcpH=utility_cand_bcpH,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                min_abs_improvement=route_ce_min_abs_improvement,
+                min_rel_improvement=route_ce_min_rel_improvement,
+                min_candidate_delta_rms=route_ce_min_candidate_delta_rms,
+            )
+            route_ce_active_mask_bk = None
+            if route_ce_ignore_abs_gain_below > 0.0:
+                route_ce_active_mask_bk = _route_ce_active_mask_from_gain(
+                    route_gain_bk,
+                    ignore_abs_gain_below=route_ce_ignore_abs_gain_below,
+                )
+            route_ce_loss_bk = _route_ce_loss_from_probs(
+                probs_bkp=probs_bkp,
+                skip_prob_bk=skip_prob_bk if allow_skip else None,
+                labels_bk=route_labels_bk,
+                probs_include_skip_mass=bool(skip_competes),
+                class_weight_q=_route_ce_class_weight_from_labels(
+                    labels_bk=route_labels_bk,
+                    num_classes=P + 1,
+                    mode=route_ce_class_weight_mode,
+                    max_weight=route_ce_max_class_weight,
+                    active_mask_bk=route_ce_active_mask_bk,
+                ),
+            )
+            if route_ce_active_mask_bk is not None:
+                route_ce_loss_bk = route_ce_loss_bk * route_ce_active_mask_bk.to(dtype=route_ce_loss_bk.dtype)
+            objective_loss_bk = objective_loss_bk + route_ce_weight * route_ce_loss_bk
+        if binary_adoption_weight > 0.0 and utility_cand_bcpH is not None:
+            binary_labels_bk, binary_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                base_bch=utility_base_bch,
+                cand_bcpH=utility_cand_bcpH,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                min_abs_improvement=binary_adoption_min_abs_improvement,
+                min_rel_improvement=binary_adoption_min_rel_improvement,
+                min_candidate_delta_rms=binary_adoption_min_candidate_delta_rms,
+            )
+            binary_active_mask_bk = None
+            if binary_adoption_ignore_abs_gain_below > 0.0:
+                binary_active_mask_bk = _route_ce_active_mask_from_gain(
+                    binary_gain_bk,
+                    ignore_abs_gain_below=binary_adoption_ignore_abs_gain_below,
+                )
+            binary_loss_bk = _route_binary_adoption_loss_from_probs(
+                probs_bkp=probs_bkp,
+                skip_prob_bk=skip_prob_bk if allow_skip else None,
+                labels_bk=binary_labels_bk,
+                probs_include_skip_mass=bool(skip_competes),
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                active_mask_bk=binary_active_mask_bk,
+                positive_weight=binary_adoption_positive_weight,
+                negative_weight=binary_adoption_negative_weight,
+            )
+            if binary_loss_bk is not None:
+                objective_loss_bk = objective_loss_bk + binary_adoption_weight * binary_loss_bk
+        if route_rate_alignment_weight > 0.0 and utility_cand_bcpH is not None:
+            rate_labels_bk, rate_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                base_bch=utility_base_bch,
+                cand_bcpH=utility_cand_bcpH,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                min_abs_improvement=route_rate_alignment_min_abs_improvement,
+                min_rel_improvement=route_rate_alignment_min_rel_improvement,
+                min_candidate_delta_rms=route_rate_alignment_min_candidate_delta_rms,
+            )
+            rate_active_mask_bk = None
+            if route_rate_alignment_ignore_abs_gain_below > 0.0:
+                rate_active_mask_bk = _route_ce_active_mask_from_gain(
+                    rate_gain_bk,
+                    ignore_abs_gain_below=route_rate_alignment_ignore_abs_gain_below,
+                )
+            rate_loss_bk = _route_rate_alignment_loss_from_probs(
+                probs_bkp=probs_bkp,
+                skip_prob_bk=skip_prob_bk if allow_skip else None,
+                labels_bk=rate_labels_bk,
+                probs_include_skip_mass=bool(skip_competes),
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                active_mask_bk=rate_active_mask_bk,
+            )
+            objective_loss_bk = objective_loss_bk + route_rate_alignment_weight * rate_loss_bk
+        if route_positive_recall_weight > 0.0 and utility_cand_bcpH is not None:
+            recall_labels_bk, recall_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                base_bch=utility_base_bch,
+                cand_bcpH=utility_cand_bcpH,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                min_abs_improvement=route_positive_recall_min_abs_improvement,
+                min_rel_improvement=route_positive_recall_min_rel_improvement,
+                min_candidate_delta_rms=route_positive_recall_min_candidate_delta_rms,
+            )
+            recall_active_mask_bk = None
+            if route_positive_recall_ignore_abs_gain_below > 0.0:
+                recall_active_mask_bk = _route_ce_active_mask_from_gain(
+                    recall_gain_bk,
+                    ignore_abs_gain_below=route_positive_recall_ignore_abs_gain_below,
+                )
+            recall_loss_bk = _route_positive_recall_loss_from_probs(
+                probs_bkp=probs_bkp,
+                skip_prob_bk=skip_prob_bk if allow_skip else None,
+                labels_bk=recall_labels_bk,
+                probs_include_skip_mass=bool(skip_competes),
+                active_mask_bk=recall_active_mask_bk,
+                mode=route_positive_recall_mode,
+                target_probability=route_positive_recall_target_probability,
+            )
+            objective_loss_bk = objective_loss_bk + route_positive_recall_weight * recall_loss_bk
+        if route_precision_recall_weight > 0.0 and utility_cand_bcpH is not None:
+            precision_labels_bk, precision_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                base_bch=utility_base_bch,
+                cand_bcpH=utility_cand_bcpH,
+                y_bch=y,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                min_abs_improvement=route_precision_recall_min_abs_improvement,
+                min_rel_improvement=route_precision_recall_min_rel_improvement,
+                min_candidate_delta_rms=route_precision_recall_min_candidate_delta_rms,
+            )
+            precision_active_mask_bk = None
+            if route_precision_recall_ignore_abs_gain_below > 0.0:
+                precision_active_mask_bk = _route_ce_active_mask_from_gain(
+                    precision_gain_bk,
+                    ignore_abs_gain_below=route_precision_recall_ignore_abs_gain_below,
+                )
+            precision_loss_bk = _route_precision_constrained_recall_loss_from_probs(
+                probs_bkp=probs_bkp,
+                skip_prob_bk=skip_prob_bk if allow_skip else None,
+                labels_bk=precision_labels_bk,
+                probs_include_skip_mass=bool(skip_competes),
+                active_mask_bk=precision_active_mask_bk,
+                recall_mode=route_precision_recall_mode,
+                recall_target_probability=route_precision_recall_target_probability,
+                false_adopt_max_probability=route_precision_recall_false_adopt_max_probability,
+                false_adopt_weight=route_precision_recall_false_adopt_weight,
+            )
+            objective_loss_bk = objective_loss_bk + route_precision_recall_weight * precision_loss_bk
         if mse_utility_gate_weight > 0.0:
             mse_gate_loss_bk = _mse_utility_gate_supervision_loss(
                 probs_bkp=probs_bkp,
+                skip_prob_bk=skip_prob_bk if allow_skip else None,
                 allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                 y_base_bch=yhat_base,
                 pred_out=pred_out,
                 y_bch=y,
                 cluster_id_c=cluster_id_c,
                 K=K,
+                y_base_eval_bch=utility_base_bch,
+                cand_eval_bcpH=utility_cand_bcpH,
                 temperature=mse_utility_gate_temperature,
                 min_gain=mse_utility_gate_min_gain,
                 target_power=mse_utility_gate_target_power,
+                include_skip=mse_utility_gate_include_skip,
+                probs_include_skip_mass=bool(skip_competes),
+                target_mode=mse_utility_gate_target_mode,
             )
             if mse_gate_loss_bk is not None:
                 objective_loss_bk = objective_loss_bk + mse_utility_gate_weight * mse_gate_loss_bk
@@ -7710,7 +11126,212 @@ def main():
             "lam_bkp": lam_bkp,
             "skip_bk": skip_bk,
             "skip_prob_bk": skip_prob_bk,
+            "candidate_supervision_loss_bk": candidate_supervision_loss_bk,
+            "intervention_supervision_loss_bk": intervention_supervision_loss_bk,
         }
+
+    def _store_anchor_scale_selection(
+        anchor_cfg: dict,
+        anchor_summary: Dict[str, object],
+        scale_selection_cfg: dict,
+        scales_c: torch.Tensor,
+        scores_c: torch.Tensor,
+        selection_count: int,
+        *,
+        source_split: str,
+        score_key: str,
+        default_metric: str,
+        default_max_scale: float,
+        default_steps: int,
+        horizon_segments: int,
+    ) -> None:
+        if int(scales_c.ndim) == 2:
+            alpha_values = [[float(v) for v in row] for row in scales_c.tolist()]
+            anchor_cfg["alpha_by_channel_horizon"] = alpha_values
+            anchor_cfg["alpha_horizon_segments"] = int(horizon_segments)
+            alpha_key = "alpha_by_channel_horizon"
+        else:
+            alpha_values = [float(v) for v in scales_c.tolist()]
+            anchor_cfg["alpha_by_channel"] = alpha_values
+            alpha_key = "alpha_by_channel"
+        score_payload = (
+            [[float(v) for v in row] for row in scores_c.tolist()]
+            if int(scores_c.ndim) == 2
+            else [float(v) for v in scores_c.tolist()]
+        )
+        anchor_summary["scale_selection"] = {
+            "enable": True,
+            "source_split": source_split,
+            "metric": str(scale_selection_cfg.get("metric", default_metric)),
+            "max_scale": float(scale_selection_cfg.get("max_scale", default_max_scale)),
+            "steps": int(scale_selection_cfg.get("steps", default_steps)),
+            "horizon_segments": int(horizon_segments),
+            "num_windows": int(selection_count),
+            alpha_key: alpha_values,
+            score_key: score_payload,
+            "mean_alpha": float(scales_c.mean().item()) if int(scales_c.numel()) > 0 else 0.0,
+        }
+
+    def _prepare_train_anchors_for_pred_residual_training() -> None:
+        nonlocal train_residual_anchor_phc
+        if not pred_residual_train_with_eval_anchors:
+            return
+        if len(dtr) <= 0:
+            return
+        if bool(train_stat_anchor_cfg.get("enable", False)):
+            stat_scale_cfg = train_stat_anchor_cfg.get("scale_selection", {}) or {}
+            if bool(stat_scale_cfg.get("enable", False)) and train_stat_anchor_pc is not None:
+                horizon_segments = int(stat_scale_cfg.get("horizon_segments", 1))
+                scales_c, scores_c, selection_count = select_train_stat_anchor_scales_from_loader(
+                    model=model,
+                    loader=dl_tr,
+                    cluster_id_c=cluster_id_c,
+                    device=device,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=0,
+                    stat_anchor_pc=train_stat_anchor_pc,
+                    train_stat_anchor_cfg=train_stat_anchor_cfg,
+                    metric=str(stat_scale_cfg.get("metric", "mse")),
+                    max_scale=float(stat_scale_cfg.get("max_scale", 0.3)),
+                    steps=int(stat_scale_cfg.get("steps", 13)),
+                    horizon_segments=horizon_segments,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                )
+                _store_anchor_scale_selection(
+                    train_stat_anchor_cfg,
+                    train_stat_anchor_summary,
+                    stat_scale_cfg,
+                    scales_c,
+                    scores_c,
+                    selection_count,
+                    source_split="train_pretrain_for_pred_residual",
+                    score_key="score",
+                    default_metric="mse",
+                    default_max_scale=0.3,
+                    default_steps=13,
+                    horizon_segments=horizon_segments,
+                )
+                print(
+                    "Preselected train-stat anchor scales for pred residual training: "
+                    "source=train, "
+                    f"mean_alpha={train_stat_anchor_summary['scale_selection']['mean_alpha']:.4f}"
+                )
+        if bool(train_residual_anchor_cfg.get("enable", False)):
+            train_residual_anchor_period = int(train_residual_anchor_cfg.get("period", 96))
+            train_residual_anchor_phc, train_residual_anchor_counts, residual_train_count = (
+                build_train_residual_anchor_table_from_loader(
+                    model=model,
+                    loader=dl_tr,
+                    cluster_id_c=cluster_id_c,
+                    device=device,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=0,
+                    period=train_residual_anchor_period,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_stat_anchor_cfg=train_stat_anchor_cfg,
+                )
+            )
+            train_residual_anchor_summary.update(
+                {
+                    "period": int(train_residual_anchor_period),
+                    "source_split": "train_pretrain_for_pred_residual",
+                    "train_windows": int(residual_train_count),
+                    "min_count": int(train_residual_anchor_counts.min().item()),
+                    "max_count": int(train_residual_anchor_counts.max().item()),
+                    "alpha": float(train_residual_anchor_cfg.get("alpha", 0.0) or 0.0),
+                    "blend_target": str(train_residual_anchor_cfg.get("blend_target", "prediction")),
+                }
+            )
+            residual_scale_cfg = train_residual_anchor_cfg.get("scale_selection", {}) or {}
+            if bool(residual_scale_cfg.get("enable", False)):
+                horizon_segments = int(residual_scale_cfg.get("horizon_segments", 1))
+                scales_c, scores_c, selection_count = select_train_residual_anchor_scales_from_loader(
+                    model=model,
+                    loader=dl_tr,
+                    cluster_id_c=cluster_id_c,
+                    device=device,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=0,
+                    residual_anchor_phc=train_residual_anchor_phc,
+                    train_residual_anchor_cfg=train_residual_anchor_cfg,
+                    metric=str(residual_scale_cfg.get("metric", "mse")),
+                    max_scale=float(residual_scale_cfg.get("max_scale", 0.5)),
+                    steps=int(residual_scale_cfg.get("steps", 21)),
+                    horizon_segments=horizon_segments,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_stat_anchor_cfg=train_stat_anchor_cfg,
+                )
+                _store_anchor_scale_selection(
+                    train_residual_anchor_cfg,
+                    train_residual_anchor_summary,
+                    residual_scale_cfg,
+                    scales_c,
+                    scores_c,
+                    selection_count,
+                    source_split="train_pretrain_for_pred_residual",
+                    score_key="score_by_channel",
+                    default_metric="mse",
+                    default_max_scale=0.5,
+                    default_steps=21,
+                    horizon_segments=horizon_segments,
+                )
+                print(
+                    "Preselected train-residual anchor scales for pred residual training: "
+                    "source=train, "
+                    f"mean_alpha={train_residual_anchor_summary['scale_selection']['mean_alpha']:.4f}"
+                )
+
+    def _prepare_phase_residual_candidate_for_pred_residual() -> None:
+        if not phase_residual_candidate_enable or pred_residual is None:
+            return
+        table_phc, counts_p, train_windows = build_train_residual_anchor_table_from_loader(
+            model=model,
+            loader=dl_tr,
+            cluster_id_c=cluster_id_c,
+            device=device,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=data_window_tc,
+            input_len=L,
+            eval_start=0,
+            period=int(phase_residual_candidate_period),
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_stat_anchor_cfg=train_stat_anchor_cfg,
+        )
+        pred_residual.set_phase_residual_candidate_table(table_phc)
+        phase_residual_candidate_summary.update(
+            {
+                "enable": True,
+                "source_split": "train",
+                "train_windows": int(train_windows),
+                "min_count": int(counts_p.min().item()),
+                "max_count": int(counts_p.max().item()),
+                "table_shape": [int(v) for v in table_phc.shape],
+                "train_only": True,
+                "output_anchor_enabled": False,
+            }
+        )
+        print(
+            "Prediction residual phase candidate table built: "
+            f"names={phase_residual_candidate_names}, period={int(phase_residual_candidate_period)}, "
+            f"train_windows={int(train_windows)}, "
+            f"min_count={int(counts_p.min().item())}, max_count={int(counts_p.max().item())}"
+        )
+
+    _prepare_train_anchors_for_pred_residual_training()
+    _prepare_phase_residual_candidate_for_pred_residual()
 
     outer_train_state = [None]
     outer_val_state = [None]
@@ -7857,6 +11478,10 @@ def main():
         unit="batch",
     )
     early_stopped = False
+    mse_gate_train_diag_history: List[Dict[str, object]] = []
+    stage2_loss_audit_history: List[Dict[str, object]] = []
+    stage2_route_audit_history: List[Dict[str, object]] = []
+    stage2_route_audit_frequency = max(1, int(stage2_route_audit_cfg.get("frequency_epochs", 1)))
 
     for ep in range(1, epochs + 1):
         t_ep0 = time.perf_counter()
@@ -7884,6 +11509,36 @@ def main():
         train_mse_sum_k = torch.zeros(K, device=device)
         train_mae_sum_k = torch.zeros(K, device=device)
         train_cnt = 0
+        if stage2_loss_audit_enable:
+            stage2_total_loss_sum_k = torch.zeros(K, device=device)
+            stage2_forecast_loss_sum_k = torch.zeros(K, device=device)
+            stage2_penalty_loss_sum_k = torch.zeros(K, device=device)
+            stage2_pred_residual_aux_loss_sum_k = torch.zeros(K, device=device)
+            stage2_candidate_supervision_loss_sum_k = torch.zeros(K, device=device)
+            stage2_gate_utility_loss_sum_k = torch.zeros(K, device=device)
+            stage2_skip_noop_loss_sum_k = torch.zeros(K, device=device)
+            stage2_intervention_supervision_loss_sum_k = torch.zeros(K, device=device)
+            stage2_other_aux_loss_sum_k = torch.zeros(K, device=device)
+            stage2_route_prob_sum_kp = torch.zeros(K, P, device=device)
+            stage2_route_actual_sum_kp = torch.zeros(K, P, device=device)
+            stage2_route_entropy_sum_k = torch.zeros(K, device=device)
+            stage2_route_count_k = torch.zeros(K, device=device)
+            stage2_skip_prob_sum_k = torch.zeros(K, device=device)
+            stage2_skip_active_sum_k = torch.zeros(K, device=device)
+            stage2_grad_norm_sum = {
+                "backbone": 0.0,
+                "gate": 0.0,
+                "pred_residual": 0.0,
+                "dynamic_lambda": 0.0,
+                "learnable_lambda": 0.0,
+            }
+            stage2_grad_norm_batches = 0
+        mse_gate_loss_sum_k = torch.zeros(K, device=device)
+        mse_gate_valid_sum_k = torch.zeros(K, device=device)
+        mse_gate_skip_target_sum_k = torch.zeros(K, device=device)
+        mse_gate_skip_prob_sum_k = torch.zeros(K, device=device)
+        mse_gate_best_gain_sum_k = torch.zeros(K, device=device)
+        mse_gate_diag_count_k = torch.zeros(K, device=device)
         act_sum_kp = torch.zeros(K, P, device=device)
         active_cnt_k = torch.zeros(K, device=device)
         rank_counts = None
@@ -7924,7 +11579,8 @@ def main():
                 cfg=model_train_stat_adapter_cfg,
             )
             feat_bcf = extract_gate_features(x)  # [B,C,F]
-            feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F]
+            feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F] for dynamic lambda
+            gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
             series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
             skip_bk = None
             pred_out = None
@@ -7941,7 +11597,7 @@ def main():
             if moe_enable and P > 0:
                 straight_through = (not bool(moe_cfg["detach_penalty_grad"])) and (not (bilevel_enable and bilevel_optimize_gate))
                 mask_bkp, probs_bkp, skip_bk, skip_prob_bk = gate(
-                    feat_bkf,
+                    gate_feat_bkf,
                     straight_through=straight_through,
                     penalty_context_bkp=route_pen_bkp,
                     penalty_context_mode=router_mode,
@@ -7975,6 +11631,17 @@ def main():
                             cnt = torch.bincount(pen_idx, minlength=P)
                             rank_counts[:, r] += cnt
                         rank_total += int(order.shape[0] * order.shape[1])
+                if stage2_loss_audit_enable:
+                    with torch.no_grad():
+                        probs_det = probs_bkp.detach()
+                        probs_safe = probs_det.clamp_min(1.0e-8)
+                        stage2_route_prob_sum_kp += probs_det.sum(dim=0)
+                        stage2_route_actual_sum_kp += mask_bkp.detach().sum(dim=0)
+                        stage2_route_entropy_sum_k += (-(probs_safe * probs_safe.log()).sum(dim=-1)).sum(dim=0)
+                        stage2_route_count_k += probs_det.shape[0]
+                        if allow_skip and skip_prob_bk is not None and skip_bk is not None:
+                            stage2_skip_prob_sum_k += skip_prob_bk.detach().sum(dim=0)
+                            stage2_skip_active_sum_k += skip_bk.detach().sum(dim=0)
             else:
                 mask_bkp = torch.zeros_like(route_pen_bkp)
 
@@ -7984,11 +11651,31 @@ def main():
                     yhat_base,
                     cluster_id_c,
                     mask_bkp,
-                    skip_bk=skip_bk if allow_skip else None,
+                    skip_bk=_pred_residual_training_skip_arg(
+                        skip_bk=skip_bk,
+                        allow_skip=allow_skip,
+                        ignore_skip_during_training=pred_residual_ignore_skip_during_training,
+                    ),
+                    query_start_abs_b=idx,
                 )
-                yhat = pred_out["y_final"]
+                yhat_residual_raw = pred_out["y_final"]
+                yhat = yhat_residual_raw
             else:
+                yhat_residual_raw = yhat_base
                 yhat = yhat_base
+            if pred_residual_train_with_eval_anchors:
+                yhat = apply_moe_output_anchor_experts(
+                    yhat,
+                    base_pred_bch=yhat_base,
+                    x_bcl=x,
+                    query_start_abs_b=idx,
+                    input_len=L,
+                    moe_cfg=moe_cfg,
+                    moe_enable=moe_enable,
+                    observed_history_tc=data_window_tc,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                )
 
             err_bch = yhat - y
             abs_err_bch = err_bch.abs()
@@ -8007,6 +11694,8 @@ def main():
             else:
                 mae_objective_bk = torch.zeros_like(mse_bk)
 
+            mse_gate_loss_bk = None
+            mse_gate_diag = None
             if P > 0:
                 if pred_out is not None:
                     yhat_for_penalty = yhat_base + (yhat - yhat_base).detach()
@@ -8054,7 +11743,7 @@ def main():
                 pred_loss_terms = _pred_residual_loss_terms(
                     pred_out=pred_out,
                     y_base=yhat_base,
-                    y_final=yhat,
+                    y_final=yhat_residual_raw,
                     y=y,
                     penalty_names=penalty_names,
                     penalty_fns=penalty_fns,
@@ -8065,6 +11754,56 @@ def main():
                     norm_weight=pred_residual_norm_weight,
                     intervention_weight=pred_residual_intervention_weight,
                 )
+                candidate_supervision_loss_bk = None
+                if pred_residual_candidate_supervision_weight > 0.0:
+                    candidate_supervision_loss_bk = _pred_residual_candidate_supervision_loss(
+                        y_base_bch=yhat_base,
+                        pred_out=pred_out,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        penalty_names=penalty_names,
+                        penalty_fns=penalty_fns,
+                        penalty_scale=penalty_scale,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        only_allowed=pred_residual_candidate_supervision_only_allowed,
+                        loss_kind=pred_residual_candidate_supervision_loss,
+                        min_abs_improvement=pred_residual_candidate_supervision_min_abs,
+                        min_rel_improvement=pred_residual_candidate_supervision_min_rel,
+                        include_intervention=pred_residual_candidate_supervision_include_intervention,
+                        include_selector=pred_residual_candidate_supervision_include_selector,
+                        apply_output_anchors=pred_residual_train_with_eval_anchors,
+                        x_bcl=x,
+                        query_start_abs_b=idx,
+                        input_len=L,
+                        moe_cfg=moe_cfg,
+                        moe_enable=moe_enable,
+                        observed_history_tc=data_window_tc,
+                        train_stat_anchor_pc=train_stat_anchor_pc,
+                        train_residual_anchor_phc=train_residual_anchor_phc,
+                    )
+                intervention_supervision_loss_bk = None
+                if pred_residual_intervention_supervision_weight > 0.0:
+                    intervention_supervision_loss_bk = _pred_residual_intervention_supervision_loss(
+                        y_base_bch=yhat_base,
+                        pred_out=pred_out,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        only_allowed=pred_residual_intervention_supervision_only_allowed,
+                        min_gain=pred_residual_intervention_supervision_min_gain,
+                        pos_weight=pred_residual_intervention_supervision_pos_weight,
+                        apply_output_anchors=pred_residual_train_with_eval_anchors,
+                        x_bcl=x,
+                        query_start_abs_b=idx,
+                        input_len=L,
+                        moe_cfg=moe_cfg,
+                        moe_enable=moe_enable,
+                        observed_history_tc=data_window_tc,
+                        train_stat_anchor_pc=train_stat_anchor_pc,
+                        train_residual_anchor_phc=train_residual_anchor_phc,
+                    )
                 loss_terms_bk, _ = _normalize_loss_terms(
                     {
                         "mse": mse_bk,
@@ -8074,12 +11813,212 @@ def main():
                     },
                     loss_normalization_cfg,
                 )
-                objective_loss_bk = (
+                forecast_loss_component_bk = (
                     (mse_weight * loss_terms_bk["mse"])
                     + _apply_mae_objective_weight(loss_terms_bk["mae_objective"], mae_objective_weight_ep)
-                    + loss_terms_bk["penalty"]
                 )
-                loss_bk = objective_loss_bk + loss_terms_bk["pred_residual"]
+                penalty_loss_component_bk = loss_terms_bk["penalty"]
+                pred_residual_aux_component_bk = loss_terms_bk["pred_residual"]
+                candidate_supervision_component_bk = torch.zeros_like(mse_bk)
+                intervention_supervision_component_bk = torch.zeros_like(mse_bk)
+                skip_noop_component_bk = torch.zeros_like(mse_bk)
+                gate_utility_component_bk = torch.zeros_like(mse_bk)
+                objective_loss_bk = (
+                    forecast_loss_component_bk
+                    + penalty_loss_component_bk
+                )
+                loss_bk = objective_loss_bk + pred_residual_aux_component_bk
+                if candidate_supervision_loss_bk is not None:
+                    candidate_supervision_component_bk = (
+                        pred_residual_candidate_supervision_weight * candidate_supervision_loss_bk
+                    )
+                    loss_bk = loss_bk + candidate_supervision_component_bk
+                if intervention_supervision_loss_bk is not None:
+                    intervention_supervision_component_bk = (
+                        pred_residual_intervention_supervision_weight * intervention_supervision_loss_bk
+                    )
+                    loss_bk = loss_bk + intervention_supervision_component_bk
+                utility_base_bch = None
+                utility_cand_bcpH = None
+                if (
+                    route_ce_weight > 0.0
+                    or binary_adoption_weight > 0.0
+                    or route_rate_alignment_weight > 0.0
+                    or route_positive_recall_weight > 0.0
+                    or route_precision_recall_weight > 0.0
+                    or mse_utility_gate_weight > 0.0
+                ):
+                    utility_base_bch, utility_cand_bcpH = _pred_residual_candidates_on_eval_path(
+                        yhat_base,
+                        pred_out,
+                        apply_output_anchors=pred_residual_train_with_eval_anchors,
+                        x_bcl=x,
+                        query_start_abs_b=idx,
+                        input_len=L,
+                        moe_cfg=moe_cfg,
+                        moe_enable=moe_enable,
+                        observed_history_tc=data_window_tc,
+                        train_stat_anchor_pc=train_stat_anchor_pc,
+                        train_residual_anchor_phc=train_residual_anchor_phc,
+                    )
+                if route_ce_weight > 0.0 and utility_cand_bcpH is not None:
+                    route_labels_bk, route_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                        base_bch=utility_base_bch,
+                        cand_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        min_abs_improvement=route_ce_min_abs_improvement,
+                        min_rel_improvement=route_ce_min_rel_improvement,
+                        min_candidate_delta_rms=route_ce_min_candidate_delta_rms,
+                    )
+                    route_ce_active_mask_bk = None
+                    if route_ce_ignore_abs_gain_below > 0.0:
+                        route_ce_active_mask_bk = _route_ce_active_mask_from_gain(
+                            route_gain_bk,
+                            ignore_abs_gain_below=route_ce_ignore_abs_gain_below,
+                        )
+                    route_ce_loss_bk = _route_ce_loss_from_probs(
+                        probs_bkp=probs_bkp,
+                        skip_prob_bk=skip_prob_bk if allow_skip else None,
+                        labels_bk=route_labels_bk,
+                        probs_include_skip_mass=bool(skip_competes),
+                        class_weight_q=_route_ce_class_weight_from_labels(
+                            labels_bk=route_labels_bk,
+                            num_classes=P + 1,
+                            mode=route_ce_class_weight_mode,
+                            max_weight=route_ce_max_class_weight,
+                            active_mask_bk=route_ce_active_mask_bk,
+                        ),
+                    )
+                    if route_ce_active_mask_bk is not None:
+                        route_ce_loss_bk = route_ce_loss_bk * route_ce_active_mask_bk.to(dtype=route_ce_loss_bk.dtype)
+                    gate_utility_component_bk = gate_utility_component_bk + route_ce_weight * route_ce_loss_bk
+                    loss_bk = loss_bk + route_ce_weight * route_ce_loss_bk
+                if binary_adoption_weight > 0.0 and utility_cand_bcpH is not None:
+                    binary_labels_bk, binary_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                        base_bch=utility_base_bch,
+                        cand_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        min_abs_improvement=binary_adoption_min_abs_improvement,
+                        min_rel_improvement=binary_adoption_min_rel_improvement,
+                        min_candidate_delta_rms=binary_adoption_min_candidate_delta_rms,
+                    )
+                    binary_active_mask_bk = None
+                    if binary_adoption_ignore_abs_gain_below > 0.0:
+                        binary_active_mask_bk = _route_ce_active_mask_from_gain(
+                            binary_gain_bk,
+                            ignore_abs_gain_below=binary_adoption_ignore_abs_gain_below,
+                        )
+                    binary_loss_bk = _route_binary_adoption_loss_from_probs(
+                        probs_bkp=probs_bkp,
+                        skip_prob_bk=skip_prob_bk if allow_skip else None,
+                        labels_bk=binary_labels_bk,
+                        probs_include_skip_mass=bool(skip_competes),
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        active_mask_bk=binary_active_mask_bk,
+                        positive_weight=binary_adoption_positive_weight,
+                        negative_weight=binary_adoption_negative_weight,
+                    )
+                    if binary_loss_bk is not None:
+                        binary_component_bk = binary_adoption_weight * binary_loss_bk
+                        gate_utility_component_bk = gate_utility_component_bk + binary_component_bk
+                        loss_bk = loss_bk + binary_component_bk
+                if route_rate_alignment_weight > 0.0 and utility_cand_bcpH is not None:
+                    rate_labels_bk, rate_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                        base_bch=utility_base_bch,
+                        cand_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        min_abs_improvement=route_rate_alignment_min_abs_improvement,
+                        min_rel_improvement=route_rate_alignment_min_rel_improvement,
+                        min_candidate_delta_rms=route_rate_alignment_min_candidate_delta_rms,
+                    )
+                    rate_active_mask_bk = None
+                    if route_rate_alignment_ignore_abs_gain_below > 0.0:
+                        rate_active_mask_bk = _route_ce_active_mask_from_gain(
+                            rate_gain_bk,
+                            ignore_abs_gain_below=route_rate_alignment_ignore_abs_gain_below,
+                        )
+                    rate_loss_bk = _route_rate_alignment_loss_from_probs(
+                        probs_bkp=probs_bkp,
+                        skip_prob_bk=skip_prob_bk if allow_skip else None,
+                        labels_bk=rate_labels_bk,
+                        probs_include_skip_mass=bool(skip_competes),
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        active_mask_bk=rate_active_mask_bk,
+                    )
+                    rate_component_bk = route_rate_alignment_weight * rate_loss_bk
+                    gate_utility_component_bk = gate_utility_component_bk + rate_component_bk
+                    loss_bk = loss_bk + rate_component_bk
+                if route_positive_recall_weight > 0.0 and utility_cand_bcpH is not None:
+                    recall_labels_bk, recall_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                        base_bch=utility_base_bch,
+                        cand_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        min_abs_improvement=route_positive_recall_min_abs_improvement,
+                        min_rel_improvement=route_positive_recall_min_rel_improvement,
+                        min_candidate_delta_rms=route_positive_recall_min_candidate_delta_rms,
+                    )
+                    recall_active_mask_bk = None
+                    if route_positive_recall_ignore_abs_gain_below > 0.0:
+                        recall_active_mask_bk = _route_ce_active_mask_from_gain(
+                            recall_gain_bk,
+                            ignore_abs_gain_below=route_positive_recall_ignore_abs_gain_below,
+                        )
+                    recall_loss_bk = _route_positive_recall_loss_from_probs(
+                        probs_bkp=probs_bkp,
+                        skip_prob_bk=skip_prob_bk if allow_skip else None,
+                        labels_bk=recall_labels_bk,
+                        probs_include_skip_mass=bool(skip_competes),
+                        active_mask_bk=recall_active_mask_bk,
+                        mode=route_positive_recall_mode,
+                        target_probability=route_positive_recall_target_probability,
+                    )
+                    recall_component_bk = route_positive_recall_weight * recall_loss_bk
+                    gate_utility_component_bk = gate_utility_component_bk + recall_component_bk
+                    loss_bk = loss_bk + recall_component_bk
+                if route_precision_recall_weight > 0.0 and utility_cand_bcpH is not None:
+                    precision_labels_bk, precision_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
+                        base_bch=utility_base_bch,
+                        cand_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        min_abs_improvement=route_precision_recall_min_abs_improvement,
+                        min_rel_improvement=route_precision_recall_min_rel_improvement,
+                        min_candidate_delta_rms=route_precision_recall_min_candidate_delta_rms,
+                    )
+                    precision_active_mask_bk = None
+                    if route_precision_recall_ignore_abs_gain_below > 0.0:
+                        precision_active_mask_bk = _route_ce_active_mask_from_gain(
+                            precision_gain_bk,
+                            ignore_abs_gain_below=route_precision_recall_ignore_abs_gain_below,
+                        )
+                    precision_loss_bk = _route_precision_constrained_recall_loss_from_probs(
+                        probs_bkp=probs_bkp,
+                        skip_prob_bk=skip_prob_bk if allow_skip else None,
+                        labels_bk=precision_labels_bk,
+                        probs_include_skip_mass=bool(skip_competes),
+                        active_mask_bk=precision_active_mask_bk,
+                        recall_mode=route_precision_recall_mode,
+                        recall_target_probability=route_precision_recall_target_probability,
+                        false_adopt_max_probability=route_precision_recall_false_adopt_max_probability,
+                        false_adopt_weight=route_precision_recall_false_adopt_weight,
+                    )
+                    precision_component_bk = route_precision_recall_weight * precision_loss_bk
+                    gate_utility_component_bk = gate_utility_component_bk + precision_component_bk
+                    loss_bk = loss_bk + precision_component_bk
                 if (
                     allow_skip
                     and skip_supervision_weight > 0.0
@@ -8093,6 +12032,7 @@ def main():
                             cluster_id_c,
                             mask_bkp.detach(),
                             skip_bk=None,
+                            query_start_abs_b=idx,
                         )
                         yhat_no_skip = pred_no_skip["y_final"]
                         base_mse_bc_for_skip = (yhat_base - y).pow(2).mean(dim=-1)
@@ -8107,22 +12047,35 @@ def main():
                         skip_label_bk * skip_prob_clamped.log()
                         + (1.0 - skip_label_bk) * (1.0 - skip_prob_clamped).log()
                     )
-                    loss_bk = loss_bk + skip_supervision_weight * skip_bce_bk
+                    skip_noop_component_bk = skip_supervision_weight * skip_bce_bk
+                    loss_bk = loss_bk + skip_noop_component_bk
                 if mse_utility_gate_weight > 0.0:
-                    mse_gate_loss_bk = _mse_utility_gate_supervision_loss(
+                    mse_gate_result = _mse_utility_gate_supervision_loss(
                         probs_bkp=probs_bkp,
+                        skip_prob_bk=skip_prob_bk if allow_skip else None,
                         allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                         y_base_bch=yhat_base,
                         pred_out=pred_out,
                         y_bch=y,
                         cluster_id_c=cluster_id_c,
                         K=K,
+                        y_base_eval_bch=utility_base_bch,
+                        cand_eval_bcpH=utility_cand_bcpH,
                         temperature=mse_utility_gate_temperature,
                         min_gain=mse_utility_gate_min_gain,
                         target_power=mse_utility_gate_target_power,
+                        include_skip=mse_utility_gate_include_skip,
+                        probs_include_skip_mass=bool(skip_competes),
+                        target_mode=mse_utility_gate_target_mode,
+                        return_diagnostics=True,
+                    )
+                    mse_gate_loss_bk, mse_gate_diag = (
+                        mse_gate_result if mse_gate_result is not None else (None, None)
                     )
                     if mse_gate_loss_bk is not None:
-                        loss_bk = loss_bk + mse_utility_gate_weight * mse_gate_loss_bk
+                        mse_gate_component_bk = mse_utility_gate_weight * mse_gate_loss_bk
+                        gate_utility_component_bk = gate_utility_component_bk + mse_gate_component_bk
+                        loss_bk = loss_bk + mse_gate_component_bk
                 if (not bilevel_enable) and learnable_lambda is not None and learnable_lambda_reg_weight > 0.0:
                     loss_bk = loss_bk + learnable_lambda_reg_weight * learnable_lambda.regularization().unsqueeze(0)
                 if (not bilevel_enable) and dynamic_lambda is not None and dynamic_lambda_reg_weight > 0.0:
@@ -8137,6 +12090,16 @@ def main():
                         gate_entropy_target_frac=gate_entropy_target_frac,
                         gate_balance_target_kp=gate_balance_target_kp,
                     )
+                known_component_bk = (
+                    forecast_loss_component_bk
+                    + penalty_loss_component_bk
+                    + pred_residual_aux_component_bk
+                    + candidate_supervision_component_bk
+                    + intervention_supervision_component_bk
+                    + skip_noop_component_bk
+                    + gate_utility_component_bk
+                )
+                other_aux_component_bk = loss_bk - known_component_bk
             else:
                 raw_objective_loss_bk = (
                     (mse_weight * mse_bk)
@@ -8156,9 +12119,37 @@ def main():
                     + _apply_mae_objective_weight(loss_terms_bk["mae_objective"], mae_objective_weight_ep)
                 )
                 loss_bk = objective_loss_bk
+                forecast_loss_component_bk = objective_loss_bk
+                penalty_loss_component_bk = torch.zeros_like(mse_bk)
+                pred_residual_aux_component_bk = torch.zeros_like(mse_bk)
+                candidate_supervision_component_bk = torch.zeros_like(mse_bk)
+                intervention_supervision_component_bk = torch.zeros_like(mse_bk)
+                skip_noop_component_bk = torch.zeros_like(mse_bk)
+                gate_utility_component_bk = torch.zeros_like(mse_bk)
+                other_aux_component_bk = loss_bk - forecast_loss_component_bk
             _accumulate_detached_sum_(train_loss_sum_k, raw_objective_loss_bk)
             _accumulate_detached_sum_(train_mse_sum_k, mse_bk)
             _accumulate_detached_sum_(train_mae_sum_k, mae_bk)
+            if stage2_loss_audit_enable:
+                _accumulate_detached_sum_(stage2_total_loss_sum_k, loss_bk)
+                _accumulate_detached_sum_(stage2_forecast_loss_sum_k, forecast_loss_component_bk)
+                _accumulate_detached_sum_(stage2_penalty_loss_sum_k, penalty_loss_component_bk)
+                _accumulate_detached_sum_(stage2_pred_residual_aux_loss_sum_k, pred_residual_aux_component_bk)
+                _accumulate_detached_sum_(stage2_candidate_supervision_loss_sum_k, candidate_supervision_component_bk)
+                _accumulate_detached_sum_(stage2_gate_utility_loss_sum_k, gate_utility_component_bk)
+                _accumulate_detached_sum_(stage2_skip_noop_loss_sum_k, skip_noop_component_bk)
+                _accumulate_detached_sum_(stage2_intervention_supervision_loss_sum_k, intervention_supervision_component_bk)
+                _accumulate_detached_sum_(stage2_other_aux_loss_sum_k, other_aux_component_bk)
+            if mse_gate_diag is not None:
+                count_bk = torch.ones_like(mse_gate_diag["valid_bk"])
+                _accumulate_detached_sum_(mse_gate_diag_count_k, count_bk)
+                _accumulate_detached_sum_(mse_gate_valid_sum_k, mse_gate_diag["valid_bk"])
+                _accumulate_detached_sum_(mse_gate_skip_target_sum_k, mse_gate_diag["target_skip_bk"])
+                _accumulate_detached_sum_(mse_gate_best_gain_sum_k, mse_gate_diag["best_gain_bk"])
+                if "skip_prob_bk" in mse_gate_diag:
+                    _accumulate_detached_sum_(mse_gate_skip_prob_sum_k, mse_gate_diag["skip_prob_bk"])
+            if mse_gate_loss_bk is not None:
+                _accumulate_detached_sum_(mse_gate_loss_sum_k, mse_gate_loss_bk)
             train_cnt += int(loss_bk.shape[0])
             loss = reduce_cluster_metric(loss_bk, cluster_weight_k).mean()
 
@@ -8175,12 +12166,28 @@ def main():
             model.mask_cluster_grads(stopped)
             if moe_enable:
                 gate.mask_cluster_grads(stopped)
+                _mask_gate_grads_after_epoch(
+                    gate=gate,
+                    epoch=ep,
+                    freeze_after_epoch=pred_residual_freeze_gate_after_epoch,
+                    stopped=stopped,
+                )
             if pred_residual is not None:
                 pred_residual.mask_cluster_grads(stopped)
             if dynamic_lambda is not None:
                 dynamic_lambda.mask_cluster_grads(stopped)
             if learnable_lambda is not None:
                 learnable_lambda.mask_cluster_grads(stopped)
+            if stage2_loss_audit_enable:
+                stage2_grad_norm_sum["backbone"] += _parameter_grad_l2_norm(model.parameters())
+                stage2_grad_norm_sum["gate"] += _parameter_grad_l2_norm(gate.parameters())
+                if pred_residual is not None:
+                    stage2_grad_norm_sum["pred_residual"] += _parameter_grad_l2_norm(pred_residual.parameters())
+                if dynamic_lambda is not None:
+                    stage2_grad_norm_sum["dynamic_lambda"] += _parameter_grad_l2_norm(dynamic_lambda.parameters())
+                if learnable_lambda is not None:
+                    stage2_grad_norm_sum["learnable_lambda"] += _parameter_grad_l2_norm(learnable_lambda.parameters())
+                stage2_grad_norm_batches += 1
             for k, opt_k in enumerate(optimizers):
                 if stopped[k]:
                     continue
@@ -8232,12 +12239,34 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            knn_hybrid=knn_hybrid_val if knn_cfg.use_for_model_selection else None,
             eval_start=val_eval_start,
         )
         train_loss_k = train_loss_sum_k / max(train_cnt, 1)
         train_mse_k = train_mse_sum_k / max(train_cnt, 1)
         train_mae_k = train_mae_sum_k / max(train_cnt, 1)
+        mse_gate_diag_den_k = mse_gate_diag_count_k.clamp_min(1.0)
+        if bool((mse_gate_diag_count_k > 0.0).any().item()):
+            mse_gate_train_diag_history.append(
+                {
+                    "epoch": int(ep),
+                    "weight": float(mse_utility_gate_weight),
+                    "min_gain": float(mse_utility_gate_min_gain),
+                    "target_mode": str(mse_utility_gate_target_mode),
+                    "include_skip": bool(mse_utility_gate_include_skip),
+                    "per_cluster": [
+                        {
+                            "cluster_id": int(k),
+                            "samples": float(mse_gate_diag_count_k[k].detach().cpu().item()),
+                            "mean_loss": float((mse_gate_loss_sum_k[k] / mse_gate_diag_den_k[k]).detach().cpu().item()),
+                            "valid_rate": float((mse_gate_valid_sum_k[k] / mse_gate_diag_den_k[k]).detach().cpu().item()),
+                            "skip_target_rate": float((mse_gate_skip_target_sum_k[k] / mse_gate_diag_den_k[k]).detach().cpu().item()),
+                            "mean_skip_prob": float((mse_gate_skip_prob_sum_k[k] / mse_gate_diag_den_k[k]).detach().cpu().item()),
+                            "mean_best_allowed_gain": float((mse_gate_best_gain_sum_k[k] / mse_gate_diag_den_k[k]).detach().cpu().item()),
+                        }
+                        for k in range(K)
+                    ],
+                }
+            )
         train_mse_hist.append(train_mse_k.detach().cpu())
         val_mse_hist.append(val_mse_k.detach().cpu())
         update_swa_averagers(ep)
@@ -8269,6 +12298,151 @@ def main():
                     sched.step()
         train_loss_agg = float(reduce_cluster_metric(train_loss_k, cluster_weight_k).item())
         val_loss_agg = float(reduce_cluster_metric(val_loss_k, cluster_weight_k).item())
+        if stage2_loss_audit_enable:
+            epoch_loss_summary = _stage2_loss_epoch_summary(
+                epoch=ep,
+                count=train_cnt,
+                cluster_weight_k=cluster_weight_k,
+                total_loss_sum_k=stage2_total_loss_sum_k,
+                forecast_loss_sum_k=stage2_forecast_loss_sum_k,
+                penalty_loss_sum_k=stage2_penalty_loss_sum_k,
+                pred_residual_aux_loss_sum_k=stage2_pred_residual_aux_loss_sum_k,
+                candidate_supervision_loss_sum_k=stage2_candidate_supervision_loss_sum_k,
+                gate_utility_loss_sum_k=stage2_gate_utility_loss_sum_k,
+                skip_noop_loss_sum_k=stage2_skip_noop_loss_sum_k,
+                intervention_supervision_loss_sum_k=stage2_intervention_supervision_loss_sum_k,
+                other_aux_loss_sum_k=stage2_other_aux_loss_sum_k,
+                train_mse_sum_k=train_mse_sum_k,
+                train_mae_sum_k=train_mae_sum_k,
+            )
+            route_summary = _stage2_route_epoch_summary(
+                penalty_names=penalty_names,
+                cluster_weight_k=cluster_weight_k,
+                route_count_k=stage2_route_count_k,
+                route_prob_sum_kp=stage2_route_prob_sum_kp,
+                route_actual_sum_kp=stage2_route_actual_sum_kp,
+                route_entropy_sum_k=stage2_route_entropy_sum_k,
+                skip_prob_sum_k=stage2_skip_prob_sum_k,
+                skip_active_sum_k=stage2_skip_active_sum_k,
+            )
+            grad_den = max(int(stage2_grad_norm_batches), 1)
+            epoch_loss_summary["route"] = route_summary
+            epoch_loss_summary["gradient_l2_mean"] = {
+                name: float(value / grad_den) for name, value in stage2_grad_norm_sum.items()
+            }
+            epoch_loss_summary["val_loss"] = val_loss_agg
+            epoch_loss_summary["val_mse"] = float(reduce_cluster_metric(val_mse_k, cluster_weight_k).item())
+            epoch_loss_summary["val_mae"] = float(reduce_cluster_metric(val_mae_k, cluster_weight_k).item())
+            stage2_loss_audit_history.append(epoch_loss_summary)
+        if (
+            stage2_route_audit_enable
+            and pred_residual is not None
+            and moe_enable
+            and P > 0
+            and (int(ep) % int(stage2_route_audit_frequency) == 0)
+        ):
+            route_audit_max_batches = int(stage2_route_audit_cfg.get("max_batches", 0))
+            route_audit_feature_mode = str(stage2_route_audit_cfg.get("feature_mode", "base"))
+            route_audit_thresholds = _stage2_route_audit_thresholds(
+                stage2_route_audit_cfg=stage2_route_audit_cfg,
+                route_ce_min_abs_improvement=route_ce_min_abs_improvement,
+                route_ce_min_rel_improvement=route_ce_min_rel_improvement,
+                route_ce_min_candidate_delta_rms=route_ce_min_candidate_delta_rms,
+                binary_adoption_weight=binary_adoption_weight,
+                binary_adoption_min_abs_improvement=binary_adoption_min_abs_improvement,
+                binary_adoption_min_rel_improvement=binary_adoption_min_rel_improvement,
+                binary_adoption_min_candidate_delta_rms=binary_adoption_min_candidate_delta_rms,
+            )
+            prior_for_route_audit = (
+                cluster_penalty_prior_prob_kp
+                if cluster_penalty_prior_prob_kp is not None
+                else gate_prior_prob_kp
+            )
+            epoch_route_audit: Dict[str, object] = {
+                "epoch": int(ep),
+                "max_batches": int(route_audit_max_batches),
+                "splits": {},
+                "val_eval_mse": float(reduce_cluster_metric(val_mse_k, cluster_weight_k).item()),
+                "val_eval_mae": float(reduce_cluster_metric(val_mae_k, cluster_weight_k).item()),
+                "selected_scaled_eval_mse": None,
+                "selected_scaled_eval_mae": None,
+                "selected_scaled_note": (
+                    "Per-epoch selected/scaled channel-selection metrics are not computed in this hook; "
+                    "final selected/scaled metrics are reported after residual selection."
+                ),
+                "label_thresholds": route_audit_thresholds,
+            }
+            for split_name, split_loader in stage2_route_audit_loaders.items():
+                route_tensors = _collect_penalty_route_learnability_tensors(
+                    model=model,
+                    gate=gate,
+                    pred_residual=pred_residual,
+                    loader=split_loader,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_names=penalty_names,
+                    penalty_fns=penalty_fns,
+                    penalty_scale=penalty_scale,
+                    select_ranks=select_ranks,
+                    gate_soft_weight=gate_soft_weight,
+                    split_name=split_name,
+                    feature_mode=route_audit_feature_mode,
+                    allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                    min_abs_improvement=float(route_audit_thresholds["min_abs_improvement"]),
+                    min_rel_improvement=float(route_audit_thresholds["min_rel_improvement"]),
+                    min_candidate_delta_rms=float(route_audit_thresholds["min_candidate_delta_rms"]),
+                    max_batches=route_audit_max_batches,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=int(stage2_route_audit_eval_starts.get(split_name, 0)),
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    gate_feature_mode=gate_feature_mode,
+                )
+                if route_tensors is None:
+                    continue
+                explain_payload = evaluate_penalty_explainability(
+                    model=model,
+                    gate=gate,
+                    pred_residual=pred_residual,
+                    loader=split_loader,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_names=penalty_names,
+                    penalty_fns=penalty_fns,
+                    penalty_scale=penalty_scale,
+                    select_ranks=select_ranks,
+                    gate_soft_weight=gate_soft_weight,
+                    split_name=split_name,
+                    penalty_portrait_kp=penalty_portrait_kp,
+                    prior_prob_kp=prior_for_route_audit,
+                    allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                    max_batches=route_audit_max_batches,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=int(stage2_route_audit_eval_starts.get(split_name, 0)),
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    gate_feature_mode=gate_feature_mode,
+                )
+                split_summary = _route_audit_summary_from_tensors(
+                    tensors=route_tensors,
+                    explainability=explain_payload,
+                )
+                cast_splits = epoch_route_audit["splits"]
+                assert isinstance(cast_splits, dict)
+                cast_splits[split_name] = split_summary
+            stage2_route_audit_history.append(epoch_route_audit)
         progress_suffix = (
             f"epoch={ep}/{epochs} loss={train_loss_agg:.6f} val_loss={val_loss_agg:.6f}"
         )
@@ -8337,7 +12511,6 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            knn_hybrid=knn_hybrid_val if knn_cfg.use_for_model_selection else None,
             eval_start=val_eval_start,
         )
         best_swa_metric = _aggregate_val_metric(
@@ -8365,7 +12538,6 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            knn_hybrid=knn_hybrid_val if knn_cfg.use_for_model_selection else None,
             eval_start=val_eval_start,
         )
         swa_metric = _aggregate_val_metric(
@@ -8391,9 +12563,6 @@ def main():
             f"best={best_swa_metric:.6f}, swa={swa_metric:.6f}, "
             f"selected={bool(use_swa)}"
         )
-    if knn_cfg.enable and knn_requires_base_bank:
-        _refresh_knn_hybrids()
-
     def _run_train_stat_anchor_scale_selection() -> bool:
         train_stat_scale_selection_cfg = train_stat_anchor_cfg.get("scale_selection", {}) or {}
         if not (
@@ -8704,6 +12873,151 @@ def main():
                 f"(got {calendar_fit_target!r})."
             )
 
+    pred_residual_confidence_summary = None
+    if pred_residual_confidence_gate_enable and pred_residual is not None and P > 0:
+        confidence_source_split = str(pred_residual_confidence_gate_source_split)
+        confidence_source_range = (0, len(dtr))
+        if confidence_source_split == "train_holdout":
+            ranges = _explainability_train_subsplit_ranges(
+                num_windows=len(dtr),
+                holdout_fraction=pred_residual_confidence_gate_holdout_fraction,
+            )
+            if "train_holdout" in ranges:
+                confidence_source_range = ranges["train_holdout"]
+            else:
+                confidence_source_split = "train"
+        if len(dtr) <= 0:
+            pred_residual_confidence_summary = {
+                "enable": False,
+                "reason": "empty_train_split",
+                "source_requirement": "train_only",
+            }
+        else:
+            start_i, end_i = confidence_source_range
+            start_i = max(0, int(start_i))
+            end_i = min(len(dtr), int(end_i))
+            if end_i <= start_i:
+                start_i, end_i = 0, len(dtr)
+                confidence_source_split = "train"
+            if confidence_source_split == "train" and start_i == 0 and end_i == len(dtr):
+                confidence_loader = DataLoader(
+                    dtr,
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+            else:
+                confidence_loader = DataLoader(
+                    Subset(dtr, range(start_i, end_i)),
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+
+            threshold_raw = pred_residual_confidence_gate_threshold
+            threshold_is_auto = str(threshold_raw).strip().lower() == "auto"
+            if threshold_is_auto:
+                confidence_tensors = _collect_pred_residual_selector_tensors(
+                    model=model,
+                    pred_residual=pred_residual,
+                    loader=confidence_loader,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_count=P,
+                    pred_residual_scale_c=None,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=0,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    candidate_feature_mode="base",
+                )
+                threshold_kp, pred_residual_confidence_summary = (
+                    _select_pred_residual_confidence_thresholds_from_tensors(
+                        tensors=confidence_tensors,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                        penalty_names=penalty_names,
+                        min_abs_improvement=pred_residual_confidence_gate_min_abs,
+                        min_rel_improvement=pred_residual_confidence_gate_min_rel,
+                        max_candidates=pred_residual_confidence_gate_max_candidates,
+                        selection_metric=pred_residual_confidence_gate_selection_metric,
+                        min_precision=pred_residual_confidence_gate_min_precision,
+                        max_pred_positive_rate=pred_residual_confidence_gate_max_pred_rate,
+                    )
+                )
+                pred_residual_confidence_summary["threshold_mode"] = "auto"
+            else:
+                threshold_tensor = torch.as_tensor(threshold_raw, dtype=torch.float32)
+                if int(threshold_tensor.numel()) == 1:
+                    threshold_kp = torch.full((K, P), float(threshold_tensor.reshape(-1)[0].item()), dtype=torch.float32)
+                elif tuple(threshold_tensor.shape) == (K, P):
+                    threshold_kp = threshold_tensor.reshape(K, P).to(dtype=torch.float32)
+                else:
+                    raise ValueError(
+                        "moe.pred_side_residual.confidence_gate.threshold must be 'auto', "
+                        f"a scalar, or shape [{K},{P}], got {tuple(threshold_tensor.shape)}."
+                    )
+                pred_residual_confidence_summary = {
+                    "enable": True,
+                    "source_requirement": "train_only",
+                    "threshold_mode": "fixed",
+                    "threshold_kp": [[float(v) for v in row] for row in threshold_kp.tolist()],
+                    "penalty_names": list(penalty_names),
+                    "selection_metric": str(pred_residual_confidence_gate_selection_metric),
+                    "min_abs_improvement": float(pred_residual_confidence_gate_min_abs),
+                    "min_rel_improvement": float(pred_residual_confidence_gate_min_rel),
+                    "min_precision": float(pred_residual_confidence_gate_min_precision),
+                    "max_pred_positive_rate": (
+                        None
+                        if pred_residual_confidence_gate_max_pred_rate is None
+                        else float(pred_residual_confidence_gate_max_pred_rate)
+                    ),
+                }
+            skip_threshold_raw = pred_residual_confidence_gate_cfg.get("skip_threshold", None)
+            skip_threshold_k = None
+            if skip_threshold_raw is not None:
+                skip_threshold_tensor = torch.as_tensor(skip_threshold_raw, dtype=torch.float32)
+                if int(skip_threshold_tensor.numel()) == 1:
+                    skip_threshold_k = torch.full((K,), float(skip_threshold_tensor.reshape(-1)[0].item()), dtype=torch.float32)
+                elif int(skip_threshold_tensor.numel()) == K:
+                    skip_threshold_k = skip_threshold_tensor.reshape(K).to(dtype=torch.float32)
+                else:
+                    raise ValueError(
+                        "moe.pred_side_residual.confidence_gate.skip_threshold must be scalar "
+                        f"or length {K}, got {int(skip_threshold_tensor.numel())}."
+                    )
+                pred_residual_confidence_summary["skip_threshold_k"] = [
+                    float(v) for v in skip_threshold_k.tolist()
+                ]
+            pred_residual.set_confidence_gate(
+                penalty_threshold_kp=threshold_kp.to(device=device),
+                skip_threshold_k=None if skip_threshold_k is None else skip_threshold_k.to(device=device),
+                enable=True,
+            )
+            pred_residual_confidence_summary.update(
+                {
+                    "enable": True,
+                    "source_split": str(confidence_source_split),
+                    "source_range": [int(start_i), int(end_i)],
+                    "source_windows": int(end_i - start_i),
+                    "test_y_base_used": False,
+                }
+            )
+            print(
+                "Prediction residual confidence gate trained: "
+                f"source={confidence_source_split}[{start_i}:{end_i}], "
+                f"threshold_mode={pred_residual_confidence_summary.get('threshold_mode')}"
+            )
+
     if memory_enable:
         if cluster_memory_bank is not None and cluster_memory_bank.total_updates > 0:
             prototypes_kt = cluster_memory_bank.finalize()
@@ -8739,7 +13053,8 @@ def main():
             "model_cfg": dict(model_cfg),
             "moe_cfg": dict(moe_cfg),
             "gate_feat_dim": gate_feat_dim,
-            "gate_feature_names": list(GATE_FEATURE_NAMES),
+            "gate_feature_mode": str(gate_feature_mode),
+            "gate_feature_names": _gate_feature_names_for_mode(gate_feature_mode),
             "penalty_names": list(penalty_names),
             "best_epoch": best_epoch.detach().cpu(),
         }
@@ -8756,29 +13071,27 @@ def main():
             learnable_lambda_state=learnable_lambda_state,
         )
         print(f"Saved best checkpoint to: {ckpt_path}")
-    if knn_hybrid_test is not None and knn_bank_path is not None:
-        knn_meta = {
-            "kind": "shape_knn_bank",
-            "source_split": str(knn_cfg.bank_split),
-            "input_len": L,
-            "pred_len": H,
-            "num_train_windows": int(len(xtr)),
-            "num_bank_windows": int(knn_test_bank_windows),
-            "rolling_no_future": bool(knn_cfg.mode == "rolling"),
-            "past_context": bool(past_context),
-        }
-        save_shape_knn_bank(
-            knn_bank_path,
-            knn_hybrid_test,
-            cluster_id_c=cluster_id_c,
-            channel_names=channel_names,
-            meta=knn_meta,
+    if cluster_penalty_late_allowed_mask_kp is not None:
+        cluster_penalty_allowed_mask_kp = cluster_penalty_late_allowed_mask_kp
+        gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
+        late_pred_residual_allowed_mask_cp = None
+        if pred_residual is not None and bool(cluster_penalty_prior_cfg.get("apply_to_pred_residual", False)):
+            late_pred_residual_allowed_mask_cp = _cluster_penalty_mask_to_channel_mask(
+                cluster_penalty_allowed_mask_kp,
+                cluster_id_c,
+            )
+            pred_residual.set_allowed_penalty_mask(late_pred_residual_allowed_mask_cp)
+        cluster_penalty_prior_late_applied = True
+        print(
+            "Cluster penalty prior late-eval mask activated: "
+            f"allowed_mask={cluster_penalty_allowed_mask_kp.detach().cpu().tolist()}, "
+            f"pred_residual_channel_mask={late_pred_residual_allowed_mask_cp.detach().cpu().tolist() if late_pred_residual_allowed_mask_cp is not None else None}"
         )
-        print(f"Saved KNN hybrid bank to: {knn_bank_path}")
 
     # print per-cluster penalty selection after training
     summary_loader = dl_va if len(dva) > 0 else dl_tr
     summary_name = "val" if len(dva) > 0 else "train"
+    summary_eval_start = val_eval_start if len(dva) > 0 else 0
     lam_kp_best = lambda_kp_from_epochs(best_epoch)
     lam_kp_summary = average_lambda_kp(summary_loader, lam_kp_best)
     lambda_stats = collect_lambda_stats(summary_loader, lam_kp_best)
@@ -8786,7 +13099,7 @@ def main():
     avg_probs_summary = print_cluster_penalty_summary(summary_loader, title=summary_name, lam_kp=lam_kp_summary, csv_path=summary_csv_path)
     lambda_stats_csv_path = os.path.join(out_dir, "cluster_lambda_stats.csv")
     print_dynamic_lambda_summary(summary_name, lambda_stats, csv_path=lambda_stats_csv_path)
-    moe_residual_summary = collect_pred_residual_summary(summary_loader)
+    moe_residual_summary = collect_pred_residual_summary(summary_loader, eval_start=summary_eval_start)
     if bool(portrait_cfg.get("enable", False)) and (avg_probs_summary is not None) and len(penalty_names) > 0:
         portrait_dir = portrait_cfg.get("out_dir", os.path.join(out_dir, "cluster_portraits"))
         portrait_dpi = int(portrait_cfg.get("dpi", 140))
@@ -8815,34 +13128,15 @@ def main():
         plot_idx = torch.tensor(sorted([int(i) for i in idxs]), device=device, dtype=torch.long)
 
     val_summary = None
-    val_summary_hybrid = None
-    val_hybrid_confidence = None
     val_mse_c_base = None
     val_mae_c_base = None
-    val_mse_c_hybrid = None
-    val_mae_c_hybrid = None
-    knn_fusion_scale_ch = None
-    knn_fusion_summary = None
-    knn_gate_model = None
-    knn_gate_summary = None
-    residual_correction_base_ch = None
-    residual_correction_hybrid_ch = None
     pred_residual_channel_scale_c = None
-    pred_residual_gate_model = None
-    pred_residual_gate_summary = None
     pred_residual_selector_model = None
     pred_residual_selector_summary = None
     pred_residual_selection_summary = None
     moe_gate_penalty_hit_summary = None
     penalty_explainability_summary = None
-    calibration_summary = {
-        "enable": bool(calibration_enable),
-        "method": str(calibration_method),
-        "shrink": float(calibration_shrink),
-        "max_abs": float(calibration_max_abs),
-        "base_mean_abs": None,
-        "hybrid_mean_abs": None,
-    }
+    penalty_route_learnability_summary = None
     mae_eval_weight = _scale_mae_objective_weight(
         mae_objective_weight_final if mae_objective_enable else 0.0,
         mae_objective_multiplier_k,
@@ -8851,36 +13145,6 @@ def main():
         print("eval.skip_test=true: test split windows, evaluation, and metrics are disabled.")
     if len(dva) > 0:
         val_loader_summary = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
-        if calibration_enable:
-            residual_correction_base_ch = estimate_residual_correction(
-                model,
-                val_loader_summary,
-                cluster_id_c,
-                device,
-                method=calibration_method,
-                shrink=calibration_shrink,
-                max_abs=calibration_max_abs,
-                knn_hybrid=None,
-                eval_start=val_eval_start,
-            )
-            if residual_correction_base_ch is not None:
-                calibration_summary["base_mean_abs"] = float(residual_correction_base_ch.abs().mean().item())
-            if knn_hybrid_val is not None:
-                knn_hybrid_val.reset_confidence_stats()
-                residual_correction_hybrid_ch = estimate_residual_correction(
-                    model,
-                    val_loader_summary,
-                    cluster_id_c,
-                    device,
-                    method=calibration_method,
-                    shrink=calibration_shrink,
-                    max_abs=calibration_max_abs,
-                    knn_hybrid=knn_hybrid_val,
-                    eval_start=val_eval_start,
-                )
-                if residual_correction_hybrid_ch is not None:
-                    calibration_summary["hybrid_mean_abs"] = float(residual_correction_hybrid_ch.abs().mean().item())
-                knn_hybrid_val.reset_confidence_stats()
         val_loss_best_k, val_mse_best_k, val_mae_best_k, val_mse_c_base, val_mae_c_base, _, _, _ = eval_loop_with_history(
             model, gate, lam_kp_best,
             penalty_names, penalty_fns,
@@ -8899,8 +13163,6 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            residual_correction_ch=residual_correction_base_ch,
-            knn_hybrid=None,
             eval_start=val_eval_start,
         )
         val_summary = {
@@ -8921,22 +13183,18 @@ def main():
             "val_mse_channel",
             "val_mse_scale",
             "val_mse_scale_holdout",
-            "val_mse_gate",
-            "val_mse_gate_guarded",
-            "val_mae_gate_guarded",
+            "val_mse_candidate_channel",
         }:
             raise ValueError(
                 "Unsupported moe.pred_side_residual.selection_policy="
                 f"'{residual_selection_policy}'. Expected none, val_mse_channel, val_mse_scale, "
-                "val_mse_scale_holdout, val_mse_gate, val_mse_gate_guarded, or val_mae_gate_guarded."
+                "val_mse_scale_holdout, or val_mse_candidate_channel."
             )
         if pred_residual is not None and residual_selection_policy in {
             "val_mse_channel",
             "val_mse_scale",
             "val_mse_scale_holdout",
-            "val_mse_gate",
-            "val_mse_gate_guarded",
-            "val_mae_gate_guarded",
+            "val_mse_candidate_channel",
         }:
             zero_residual_scale_c = torch.zeros(C, device=device, dtype=torch.float32)
             residual_scale_mean_value = 0.0
@@ -8986,12 +13244,11 @@ def main():
                 mae_objective_beta=mae_objective_beta,
                 pred_residual=pred_residual,
                 pred_residual_scale_c=zero_residual_scale_c,
-                residual_correction_ch=residual_correction_base_ch,
-                knn_hybrid=None,
                 eval_start=val_eval_start,
             )
             val_scaled_mse_c = val_mse_c_base
             val_scaled_mae_c = val_mae_c_base
+            candidate_channel_selector_summary = None
             if residual_selection_policy in {"val_mse_scale", "val_mse_scale_holdout"}:
                 scale_min = float(pred_residual_cfg.get("selection_scale_min", 0.0))
                 scale_max = float(pred_residual_cfg.get("selection_scale_max", 1.0))
@@ -9058,9 +13315,7 @@ def main():
                             mae_objective_beta=mae_objective_beta,
                             pred_residual=pred_residual,
                             pred_residual_scale_c=zero_residual_scale_c,
-                            residual_correction_ch=residual_correction_base_ch,
-                            knn_hybrid=None,
-                            eval_start=scale_eval_start,
+                                                    eval_start=scale_eval_start,
                         )
                 selection_eval_base_mse_c = scale_eval_base_mse_c
                 selection_eval_base_mae_c = scale_eval_base_mae_c
@@ -9098,9 +13353,7 @@ def main():
                         mae_objective_beta=mae_objective_beta,
                         pred_residual=pred_residual,
                         pred_residual_scale_c=scale_c,
-                        residual_correction_ch=residual_correction_base_ch,
-                        knn_hybrid=None,
-                        eval_start=val_eval_start,
+                                        eval_start=val_eval_start,
                     )
                     better = cand_mse_c < best_mse_c
                     best_mse_c = torch.where(better, cand_mse_c, best_mse_c)
@@ -9142,9 +13395,7 @@ def main():
                         mae_objective_beta=mae_objective_beta,
                         pred_residual=pred_residual,
                         pred_residual_scale_c=pred_residual_channel_scale_c,
-                        residual_correction_ch=residual_correction_base_ch,
-                        knn_hybrid=None,
-                        eval_start=scale_eval_start,
+                                        eval_start=scale_eval_start,
                     )
                     min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
                     min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
@@ -9194,9 +13445,7 @@ def main():
                                 mae_objective_beta=mae_objective_beta,
                                 pred_residual=pred_residual,
                                 pred_residual_scale_c=zero_residual_scale_c,
-                                residual_correction_ch=residual_correction_base_ch,
-                                knn_hybrid=None,
-                                eval_start=segment_eval_start,
+                                                                eval_start=segment_eval_start,
                             )
                             (
                                 _,
@@ -9226,9 +13475,7 @@ def main():
                                 mae_objective_beta=mae_objective_beta,
                                 pred_residual=pred_residual,
                                 pred_residual_scale_c=pred_residual_channel_scale_c,
-                                residual_correction_ch=residual_correction_base_ch,
-                                knn_hybrid=None,
-                                eval_start=segment_eval_start,
+                                                                eval_start=segment_eval_start,
                             )
                             segment_base_parts.append(segment_base_mse_c.detach().cpu())
                             segment_scaled_parts.append(segment_scaled_mse_c.detach().cpu())
@@ -9286,9 +13533,7 @@ def main():
                         mae_objective_beta=mae_objective_beta,
                         pred_residual=pred_residual,
                         pred_residual_scale_c=pred_residual_channel_scale_c,
-                        residual_correction_ch=residual_correction_base_ch,
-                        knn_hybrid=None,
-                        eval_start=val_eval_start,
+                                        eval_start=val_eval_start,
                     )
                 if selection_max_residual_channels > 0:
                     improvement_c = selection_eval_base_mse_c.detach().cpu() - val_scaled_mse_c.detach().cpu()
@@ -9341,66 +13586,55 @@ def main():
                 use_residual_c = pred_residual_channel_scale_c.detach().cpu() > 1.0e-8
                 scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
-            elif residual_selection_policy in {"val_mse_gate", "val_mse_gate_guarded", "val_mae_gate_guarded"}:
-                gate_calib_cfg = pred_residual_cfg.get("gate_calibrator", {}) or {}
-                gate_calib_source_split = str(gate_calib_cfg.get("source_split", "val")).lower()
-                if gate_calib_source_split in {"train", "training"}:
-                    gate_calib_loader = DataLoader(
-                        dtr,
-                        batch_size=int(cfg["train"]["batch_size"]),
-                        shuffle=False,
-                        num_workers=0,
-                        pin_memory=pin_mem,
-                    )
-                    gate_calib_source_split = "train"
-                    gate_calib_eval_start = 0
-                elif gate_calib_source_split in {"val", "validation"}:
-                    gate_calib_loader = val_loader_summary
-                    gate_calib_source_split = "val"
-                    gate_calib_eval_start = val_eval_start
-                else:
-                    raise ValueError(
-                        "moe.pred_side_residual.gate_calibrator.source_split must be train or val "
-                        f"(got {gate_calib_source_split!r})."
-                    )
-                pred_residual_gate_model, pred_residual_gate_summary = train_pred_residual_gate(
+            elif residual_selection_policy == "val_mse_candidate_channel":
+                min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
+                min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
+                allowed_mask_cp = None
+                if cluster_penalty_allowed_mask_kp is not None and int(cluster_penalty_allowed_mask_kp.numel()) > 0:
+                    allowed_kp = cluster_penalty_allowed_mask_kp.detach().cpu().to(dtype=torch.bool)
+                    cluster_idx = cluster_id_c.detach().cpu().to(dtype=torch.long)
+                    allowed_mask_cp = allowed_kp.index_select(0, cluster_idx)
+                candidate_tensors = _collect_pred_residual_selector_tensors(
                     model=model,
-                    gate=gate,
                     pred_residual=pred_residual,
-                    loader=gate_calib_loader,
+                    loader=val_loader_summary,
                     cluster_id_c=cluster_id_c,
                     K=K,
                     moe_cfg=moe_cfg,
                     device=device,
-                    penalty_names=penalty_names,
-                    penalty_fns=penalty_fns,
-                    penalty_scale=penalty_scale,
-                    select_ranks=select_ranks,
-                    gate_soft_weight=gate_soft_weight,
-                    channel_names=channel_names,
-                    cfg=gate_calib_cfg,
+                    penalty_count=len(penalty_names),
+                    pred_residual_scale_c=None,
                     history_anchor_cfg=history_anchor_cfg,
                     observed_history_tc=data_window_tc,
                     input_len=L,
-                    eval_start=gate_calib_eval_start,
+                    eval_start=val_eval_start,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    candidate_feature_mode="base",
                 )
-                if pred_residual_gate_summary is not None:
-                    pred_residual_gate_summary["source_split"] = gate_calib_source_split
-                if pred_residual_gate_model is None:
-                    pred_residual_channel_scale_c = zero_residual_scale_c
-                    val_scaled_mse_c = val_mse_c_pred_base
-                    val_scaled_mae_c = val_mae_c_pred_base
+                if candidate_tensors is None:
                     use_residual_c = torch.zeros(C, dtype=torch.bool)
-                    pred_residual_channel_scale_c = zero_residual_scale_c
                     scale_values = [0.0 for _ in range(C)]
                     residual_scale_mean_value = 0.0
                 else:
+                    static_selector, candidate_channel_selector_summary = _fit_static_candidate_channel_selector_from_tensors(
+                        tensors=candidate_tensors,
+                        allowed_mask_cp=allowed_mask_cp,
+                        penalty_names=penalty_names,
+                        channel_names=channel_names,
+                        min_abs_improvement=min_abs,
+                        min_rel_improvement=min_rel,
+                    )
+                    pred_residual_selector_model = static_selector.to(device)
+                    pred_residual_channel_scale_c = None
                     (
                         _,
                         _,
                         _,
-                        val_gate_mse_c,
-                        val_gate_mae_c,
+                        val_static_mse_c,
+                        val_static_mae_c,
                         _,
                         _,
                         _,
@@ -9422,124 +13656,19 @@ def main():
                         mae_objective_kind=mae_objective_kind,
                         mae_objective_beta=mae_objective_beta,
                         pred_residual=pred_residual,
-                        pred_residual_gate=pred_residual_gate_model,
-                        residual_correction_ch=residual_correction_base_ch,
-                        knn_hybrid=None,
-                        eval_start=val_eval_start,
+                        pred_residual_selector=pred_residual_selector_model,
+                        pred_residual_scale_c=None,
+                                        eval_start=val_eval_start,
                     )
-                    val_gate_tensors = _collect_pred_residual_gate_tensors(
-                        model=model,
-                        gate=gate,
-                        pred_residual=pred_residual,
-                        loader=val_loader_summary,
-                        cluster_id_c=cluster_id_c,
-                        K=K,
-                        moe_cfg=moe_cfg,
-                        device=device,
-                        penalty_names=penalty_names,
-                        penalty_fns=penalty_fns,
-                        penalty_scale=penalty_scale,
-                        select_ranks=select_ranks,
-                        gate_soft_weight=gate_soft_weight,
-                        history_anchor_cfg=history_anchor_cfg,
-                        observed_history_tc=data_window_tc,
-                        input_len=L,
-                        eval_start=val_eval_start,
+                    val_scaled_mse_c = val_static_mse_c
+                    val_scaled_mae_c = val_static_mae_c
+                    selected_class_c = torch.tensor(
+                        candidate_channel_selector_summary.get("selected_class", []),
+                        dtype=torch.long,
                     )
-                    pred_residual_gate_summary["val_activation"] = _pred_residual_gate_activation_metrics_from_tensors(
-                        tensors=val_gate_tensors,
-                        residual_gate=pred_residual_gate_model,
-                        device=device,
-                        batch_size=int(gate_calib_cfg.get("batch_size", 256)),
-                        activation_threshold=getattr(
-                            pred_residual_gate_model,
-                            "activation_threshold_c",
-                            getattr(
-                                pred_residual_gate_model,
-                                "activation_threshold",
-                                pred_residual_gate_summary.get("activation_threshold", 0.1),
-                            ),
-                        ),
-                        label_min_improvement=float(gate_calib_cfg.get("activation_label_min_improvement", 0.0)),
-                        activation_by_abs_scale=bool(
-                            gate_calib_cfg.get(
-                                "activation_by_abs_scale",
-                                str(gate_calib_cfg.get("scale_mode", "sigmoid")).lower() == "signed_tanh",
-                            )
-                        ),
-                        apply_activation_threshold=bool(
-                            getattr(
-                                pred_residual_gate_model,
-                                "apply_activation_threshold",
-                                gate_calib_cfg.get("apply_activation_threshold", False),
-                            )
-                        ),
-                        channel_names=channel_names,
-                        cluster_id_c=cluster_id_c,
-                    )
-                    val_scaled_mse_c = val_gate_mse_c
-                    val_scaled_mae_c = val_gate_mae_c
-                    hold_scales = pred_residual_gate_summary.get("holdout_mean_scale", [])
-                    min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
-                    min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
-                    max_abs_mse_regression = float(pred_residual_cfg.get("selection_max_abs_mse_regression", 0.0))
-                    max_rel_mse_regression = float(pred_residual_cfg.get("selection_max_rel_mse_regression", 0.0))
-                    use_residual_c = _pred_residual_channel_keep_mask(
-                        residual_selection_policy,
-                        val_mse_c_pred_base,
-                        val_scaled_mse_c,
-                        val_mae_c_pred_base,
-                        val_scaled_mae_c,
-                        min_abs_improvement=min_abs,
-                        min_rel_improvement=min_rel,
-                        max_abs_mse_regression=max_abs_mse_regression,
-                        max_rel_mse_regression=max_rel_mse_regression,
-                    )
-                    if residual_selection_policy in {"val_mse_gate_guarded", "val_mae_gate_guarded"}:
-                        pred_residual_channel_scale_c = use_residual_c.to(device=device, dtype=torch.float32)
-                        (
-                            _,
-                            _,
-                            _,
-                            val_guarded_mse_c,
-                            val_guarded_mae_c,
-                            _,
-                            _,
-                            _,
-                        ) = eval_loop_with_history(
-                            model, gate, lam_kp_best,
-                            penalty_names, penalty_fns,
-                            val_loader_summary, cluster_id_c, K, moe_cfg, device,
-                            select_ranks=select_ranks,
-                            collect_plot=False, channel_count=C,
-                            mse_weight=mse_weight,
-                            gate_entropy_weight=gate_entropy_weight,
-                            gate_balance_weight=gate_balance_weight,
-                            gate_soft_weight=gate_soft_weight,
-                            gate_entropy_target_frac=gate_entropy_target_frac,
-                            penalty_scale=penalty_scale,
-                            dynamic_lambda=dynamic_lambda,
-                            lambda_min_kp=lambda_min_kp,
-                            mae_objective_weight=mae_eval_weight,
-                            mae_objective_kind=mae_objective_kind,
-                            mae_objective_beta=mae_objective_beta,
-                            pred_residual=pred_residual,
-                            pred_residual_gate=pred_residual_gate_model,
-                            pred_residual_scale_c=pred_residual_channel_scale_c,
-                            residual_correction_ch=residual_correction_base_ch,
-                            knn_hybrid=None,
-                            eval_start=val_eval_start,
-                        )
-                        val_scaled_mse_c = val_guarded_mse_c
-                        val_scaled_mae_c = val_guarded_mae_c
-                        scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
-                        residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
-                    else:
-                        pred_residual_channel_scale_c = None
-                        scale_values = [float(v) for v in hold_scales] if len(hold_scales) == C else []
-                        residual_scale_mean_value = (
-                            float(sum(scale_values) / max(len(scale_values), 1)) if len(scale_values) > 0 else 1.0
-                        )
+                    use_residual_c = selected_class_c > 0
+                    scale_values = [float(v) for v in selected_class_c.tolist()]
+                    residual_scale_mean_value = float(use_residual_c.to(dtype=torch.float32).mean().item())
             else:
                 min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
                 min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
@@ -9586,7 +13715,6 @@ def main():
                 "val_pred_base_mae_per_channel": [float(v) for v in val_mae_c_pred_base.detach().cpu().tolist()],
                 "val_residual_mae_per_channel": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
                 "val_scaled_mae_per_channel": [float(v) for v in val_scaled_mae_c.detach().cpu().tolist()],
-                "gate_calibrator": pred_residual_gate_summary,
             }
             if val_scaled_full_mse_c is not None and val_scaled_full_mae_c is not None:
                 pred_residual_selection_summary.update(
@@ -9601,6 +13729,8 @@ def main():
                         ],
                     }
                 )
+            if candidate_channel_selector_summary is not None:
+                pred_residual_selection_summary["candidate_channel_selector"] = candidate_channel_selector_summary
             if selection_segment_improvement_mse_sc is not None:
                 pred_residual_selection_summary.update(
                     {
@@ -9660,7 +13790,11 @@ def main():
                     "moe.pred_side_residual.candidate_selector.source_split must be train or val "
                     f"(got {selector_source_split!r})."
                 )
-            pred_residual_selector_model, pred_residual_selector_summary = train_pred_residual_candidate_selector(
+            selector_candidate_scale_c, selector_candidate_scale_mode = _candidate_selector_candidate_scale(
+                pred_residual_scale_c=pred_residual_channel_scale_c,
+                selector_cfg=selector_cfg,
+            )
+            candidate_selector_model, pred_residual_selector_summary = train_pred_residual_candidate_selector(
                 model=model,
                 pred_residual=pred_residual,
                 loader=selector_loader,
@@ -9671,15 +13805,22 @@ def main():
                 penalty_names=penalty_names,
                 channel_names=channel_names,
                 cfg=selector_cfg,
-                pred_residual_scale_c=pred_residual_channel_scale_c,
+                pred_residual_scale_c=selector_candidate_scale_c,
                 history_anchor_cfg=history_anchor_cfg,
                 observed_history_tc=data_window_tc,
                 input_len=L,
                 eval_start=selector_eval_start,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                gate_feature_mode=gate_feature_mode,
             )
             if pred_residual_selector_summary is not None:
                 pred_residual_selector_summary["source_split"] = selector_source_split
-            if pred_residual_selector_model is not None:
+                pred_residual_selector_summary["candidate_scale_mode"] = selector_candidate_scale_mode
+            if candidate_selector_model is not None:
                 (
                     val_selector_loss_k,
                     val_selector_mse_k,
@@ -9707,31 +13848,84 @@ def main():
                     mae_objective_kind=mae_objective_kind,
                     mae_objective_beta=mae_objective_beta,
                     pred_residual=pred_residual,
-                    pred_residual_selector=pred_residual_selector_model,
-                    pred_residual_scale_c=pred_residual_channel_scale_c,
-                    residual_correction_ch=residual_correction_base_ch,
-                    knn_hybrid=None,
-                    eval_start=val_eval_start,
+                    pred_residual_selector=candidate_selector_model,
+                    pred_residual_scale_c=selector_candidate_scale_c,
+                            eval_start=val_eval_start,
                 )
-                val_mse_c_base = val_selector_mse_c
-                val_mae_c_base = val_selector_mae_c
-                val_summary = {
+                selector_val_summary = {
                     "avg_loss": float(reduce_cluster_metric(val_selector_loss_k, cluster_weight_k).item()),
                     "avg_mse": float(reduce_cluster_metric(val_selector_mse_k, cluster_weight_k).item()),
                     "avg_mae": float(reduce_cluster_metric(val_selector_mae_k, cluster_weight_k).item()),
                     "per_cluster_loss": [float(v) for v in val_selector_loss_k.detach().cpu().tolist()],
                     "per_cluster_mse": [float(v) for v in val_selector_mse_k.detach().cpu().tolist()],
                     "per_cluster_mae": [float(v) for v in val_selector_mae_k.detach().cpu().tolist()],
+                    "per_channel_mse": [float(v) for v in val_selector_mse_c.detach().cpu().tolist()],
+                    "per_channel_mae": [float(v) for v in val_selector_mae_c.detach().cpu().tolist()],
                 }
                 if pred_residual_selection_summary is None:
-                    pred_residual_selection_summary = {"policy": residual_selection_policy}
+                    pred_residual_selection_summary = {
+                        "policy": "candidate_selector",
+                        "num_residual_channels": int(C),
+                    }
+                current_selector_ref_mse = float(
+                    pred_residual_selection_summary.get(
+                        "val_scaled_avg_mse",
+                        (val_summary or {}).get("avg_mse", selector_val_summary["avg_mse"]),
+                    )
+                )
+                current_selector_ref_mae = float(
+                    pred_residual_selection_summary.get(
+                        "val_scaled_avg_mae",
+                        (val_summary or {}).get("avg_mae", selector_val_summary["avg_mae"]),
+                    )
+                )
+                selector_adoption = _candidate_selector_adoption_decision(
+                    current_mse=current_selector_ref_mse,
+                    current_mae=current_selector_ref_mae,
+                    selector_mse=float(selector_val_summary["avg_mse"]),
+                    selector_mae=float(selector_val_summary["avg_mae"]),
+                    min_abs_improvement=float(
+                        selector_cfg.get(
+                            "adopt_min_abs_improvement",
+                            pred_residual_cfg.get("selection_min_abs_improvement", 0.0),
+                        )
+                    ),
+                    min_rel_improvement=float(
+                        selector_cfg.get(
+                            "adopt_min_rel_improvement",
+                            pred_residual_cfg.get("selection_min_rel_improvement", 0.0),
+                        )
+                    ),
+                    max_rel_mae_regression=float(selector_cfg.get("adopt_max_rel_mae_regression", 0.0)),
+                )
+                pred_residual_selector_summary["adoption"] = selector_adoption
                 pred_residual_selection_summary["candidate_selector"] = pred_residual_selector_summary
-                pred_residual_selection_summary["val_selector_avg_mse"] = float(val_selector_mse_c.mean().item())
-                pred_residual_selection_summary["val_selector_avg_mae"] = float(val_selector_mae_c.mean().item())
+                pred_residual_selection_summary["val_selector_avg_mse"] = float(selector_val_summary["avg_mse"])
+                pred_residual_selection_summary["val_selector_avg_mae"] = float(selector_val_summary["avg_mae"])
+                pred_residual_selection_summary["candidate_selector_adopted"] = bool(selector_adoption["adopt"])
+                if bool(selector_adoption["adopt"]):
+                    pred_residual_selector_model = candidate_selector_model
+                    pred_residual_channel_scale_c = selector_candidate_scale_c
+                    val_mse_c_base = val_selector_mse_c
+                    val_mae_c_base = val_selector_mae_c
+                    val_summary = selector_val_summary
+                    pred_residual_selection_summary["selected_residual_evaluator"] = "candidate_selector"
+                    pred_residual_selection_summary["val_scaled_avg_mse"] = float(selector_val_summary["avg_mse"])
+                    pred_residual_selection_summary["val_scaled_avg_mae"] = float(selector_val_summary["avg_mae"])
+                    pred_residual_selection_summary["val_scaled_mse_per_channel"] = [
+                        float(v) for v in val_selector_mse_c.detach().cpu().tolist()
+                    ]
+                    pred_residual_selection_summary["val_scaled_mae_per_channel"] = [
+                        float(v) for v in val_selector_mae_c.detach().cpu().tolist()
+                    ]
+                else:
+                    pred_residual_selector_model = None
+                    pred_residual_selection_summary.setdefault("selected_residual_evaluator", "channel_scale")
                 print(
                     "Prediction residual candidate selector: "
                     f"source={selector_source_split}, "
-                    f"val_MSE={val_summary['avg_mse']:.6f}, "
+                    f"val_MSE={selector_val_summary['avg_mse']:.6f}, "
+                    f"adopted={bool(selector_adoption['adopt'])}, "
                     f"holdout_gain={((pred_residual_selector_summary or {}).get('holdout') or {}).get('selected_gain_pct_vs_base')}"
                 )
         gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
@@ -9761,6 +13955,12 @@ def main():
                 observed_history_tc=data_window_tc,
                 input_len=L,
                 eval_start=val_eval_start,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                gate_feature_mode=gate_feature_mode,
             )
             moe_gate_penalty_hit_summary = {"val": val_penalty_hit, "test": None}
             if val_penalty_hit is not None:
@@ -9770,39 +13970,6 @@ def main():
                     f"positive_top1={val_penalty_hit['top1_hit_rate_on_positive_oracle']:.3f}, "
                     f"selected_gain={val_penalty_hit['selected_top1_gain_pct_vs_base']:.3f}%"
                 )
-        if knn_hybrid_val is not None:
-            knn_hybrid_val.reset_confidence_stats()
-            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop_with_history(
-                model, gate, lam_kp_best,
-                penalty_names, penalty_fns,
-                val_loader_summary, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                pred_residual=pred_residual,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=knn_hybrid_val,
-                eval_start=val_eval_start,
-            )
-            val_summary_hybrid = {
-                "avg_loss": float(reduce_cluster_metric(val_loss_hybrid_k, cluster_weight_k).item()),
-                "avg_mse": float(reduce_cluster_metric(val_mse_hybrid_k, cluster_weight_k).item()),
-                "avg_mae": float(reduce_cluster_metric(val_mae_hybrid_k, cluster_weight_k).item()),
-                "per_cluster_loss": [float(v) for v in val_loss_hybrid_k.detach().cpu().tolist()],
-                "per_cluster_mse": [float(v) for v in val_mse_hybrid_k.detach().cpu().tolist()],
-                "per_cluster_mae": [float(v) for v in val_mae_hybrid_k.detach().cpu().tolist()],
-            }
-            val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
 
     if (
         bool(calendar_residual_cfg.get("enable", False))
@@ -9844,11 +14011,8 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            pred_residual_gate=pred_residual_gate_model,
             pred_residual_selector=pred_residual_selector_model,
             pred_residual_scale_c=pred_residual_channel_scale_c,
-            residual_correction_ch=residual_correction_base_ch,
-            knn_hybrid=None,
             eval_start=0,
             history_anchor_cfg=history_anchor_cfg,
             observed_history_tc=data_window_tc,
@@ -9916,67 +14080,11 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            pred_residual_gate=pred_residual_gate_model,
             pred_residual_selector=pred_residual_selector_model,
             pred_residual_scale_c=pred_residual_channel_scale_c,
-            residual_correction_ch=residual_correction_base_ch,
-            knn_hybrid=None,
             eval_start=test_eval_start,
             diagnostic_collector=prediction_diag_collector,
         )
-        if pred_residual_gate_model is not None and pred_residual_gate_summary is not None:
-            test_gate_tensors = _collect_pred_residual_gate_tensors(
-                model=model,
-                gate=gate,
-                pred_residual=pred_residual,
-                loader=dl_te,
-                cluster_id_c=cluster_id_c,
-                K=K,
-                moe_cfg=moe_cfg,
-                device=device,
-                penalty_names=penalty_names,
-                penalty_fns=penalty_fns,
-                penalty_scale=penalty_scale,
-                select_ranks=select_ranks,
-                gate_soft_weight=gate_soft_weight,
-                history_anchor_cfg=history_anchor_cfg,
-                observed_history_tc=data_window_tc,
-                input_len=L,
-                eval_start=test_eval_start,
-            )
-            gate_calib_cfg_for_report = pred_residual_cfg.get("gate_calibrator", {}) or {}
-            pred_residual_gate_summary["test_activation"] = _pred_residual_gate_activation_metrics_from_tensors(
-                tensors=test_gate_tensors,
-                residual_gate=pred_residual_gate_model,
-                device=device,
-                batch_size=int(gate_calib_cfg_for_report.get("batch_size", 256)),
-                activation_threshold=getattr(
-                    pred_residual_gate_model,
-                    "activation_threshold_c",
-                    getattr(
-                        pred_residual_gate_model,
-                        "activation_threshold",
-                        pred_residual_gate_summary.get("activation_threshold", 0.1),
-                    ),
-                ),
-                label_min_improvement=float(gate_calib_cfg_for_report.get("activation_label_min_improvement", 0.0)),
-                activation_by_abs_scale=bool(
-                    gate_calib_cfg_for_report.get(
-                        "activation_by_abs_scale",
-                        str(gate_calib_cfg_for_report.get("scale_mode", "sigmoid")).lower() == "signed_tanh",
-                    )
-                ),
-                apply_activation_threshold=bool(
-                    getattr(
-                        pred_residual_gate_model,
-                        "apply_activation_threshold",
-                        gate_calib_cfg_for_report.get("apply_activation_threshold", False),
-                    )
-                ),
-                channel_scale_c=pred_residual_channel_scale_c,
-                channel_names=channel_names,
-                cluster_id_c=cluster_id_c,
-            )
         gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
         gate_penalty_hit_enable = bool(gate_penalty_hit_cfg.get("enable", True))
         if gate_penalty_hit_enable and pred_residual is not None and moe_enable and P > 0:
@@ -10004,6 +14112,12 @@ def main():
                 observed_history_tc=data_window_tc,
                 input_len=L,
                 eval_start=test_eval_start,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                allowed_mask_kp=cluster_penalty_allowed_mask_kp,
+                gate_feature_mode=gate_feature_mode,
             )
             if moe_gate_penalty_hit_summary is None:
                 moe_gate_penalty_hit_summary = {"val": None, "test": test_penalty_hit}
@@ -10022,6 +14136,8 @@ def main():
         max_batches = int(explain_cfg.get("max_batches", 0))
         requested_splits = [str(x).lower() for x in explain_cfg.get("splits", ["train", "val", "test"])]
         split_loaders: Dict[str, DataLoader] = {}
+        split_eval_starts: Dict[str, int] = {}
+        train_subsplit_ranges: Dict[str, Tuple[int, int]] = {}
         if "train" in requested_splits and len(dtr) > 0:
             split_loaders["train"] = DataLoader(
                 dtr,
@@ -10030,6 +14146,33 @@ def main():
                 num_workers=0,
                 pin_memory=pin_mem,
             )
+            split_eval_starts["train"] = 0
+        train_subsplit_names = {"train_fit", "train_holdout"}
+        if any(name in requested_splits for name in train_subsplit_names) and len(dtr) > 0:
+            holdout_fraction = float(
+                explain_cfg.get(
+                    "train_holdout_fraction",
+                    explain_cfg.get("holdout_fraction", 0.30),
+                )
+            )
+            train_subsplit_ranges = _explainability_train_subsplit_ranges(
+                num_windows=len(dtr),
+                holdout_fraction=holdout_fraction,
+            )
+            for split_name in ("train_fit", "train_holdout"):
+                if split_name not in requested_splits or split_name not in train_subsplit_ranges:
+                    continue
+                start_i, end_i = train_subsplit_ranges[split_name]
+                if int(end_i) <= int(start_i):
+                    continue
+                split_loaders[split_name] = DataLoader(
+                    Subset(dtr, range(int(start_i), int(end_i))),
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+                split_eval_starts[split_name] = 0
         if "val" in requested_splits and len(dva) > 0:
             split_loaders["val"] = DataLoader(
                 dva,
@@ -10038,8 +14181,10 @@ def main():
                 num_workers=0,
                 pin_memory=pin_mem,
             )
+            split_eval_starts["val"] = int(val_eval_start)
         if "test" in requested_splits and (not skip_test) and len(dte) > 0:
             split_loaders["test"] = dl_te
+            split_eval_starts["test"] = int(test_eval_start)
 
         prior_for_explain = cluster_penalty_prior_prob_kp if cluster_penalty_prior_prob_kp is not None else gate_prior_prob_kp
         allowed_for_explain = cluster_penalty_allowed_mask_kp
@@ -10064,6 +14209,15 @@ def main():
                 prior_prob_kp=prior_for_explain,
                 allowed_mask_kp=allowed_for_explain,
                 max_batches=max_batches,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                input_len=L,
+                eval_start=int(split_eval_starts.get(split_name, 0)),
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                gate_feature_mode=gate_feature_mode,
             )
             if payload is not None:
                 split_payloads[split_name] = payload
@@ -10073,9 +14227,141 @@ def main():
                     f"selected_events={payload['selected_penalty_events']}, "
                     f"oracle_positive_events={payload['oracle_positive_events']}"
                 )
+        route_probe_cfg = explain_cfg.get("route_learnability_probe", {}) or {}
+        if not isinstance(route_probe_cfg, dict):
+            route_probe_cfg = {"enable": bool(route_probe_cfg)}
+        if bool(route_probe_cfg.get("enable", False)):
+            train_split_name = str(route_probe_cfg.get("train_split", "train_fit")).lower()
+            if train_split_name not in split_loaders and "train" in split_loaders:
+                train_split_name = "train"
+            eval_split_names = [
+                str(name).lower()
+                for name in (route_probe_cfg.get("eval_splits", ["train_holdout", "val"]) or [])
+            ]
+            allow_test_probe = bool(route_probe_cfg.get("allow_test", False))
+            probe_split_names = []
+            for name in [train_split_name] + eval_split_names:
+                if name == "test" and not allow_test_probe:
+                    continue
+                if name in split_loaders and name not in probe_split_names:
+                    probe_split_names.append(name)
+            route_tensors_by_split: Dict[str, Dict[str, object]] = {}
+            route_feature_mode = str(route_probe_cfg.get("feature_mode", "base"))
+            route_max_batches = int(route_probe_cfg.get("max_batches", max_batches))
+            for split_name in probe_split_names:
+                tensors = _collect_penalty_route_learnability_tensors(
+                    model=model,
+                    gate=gate,
+                    pred_residual=pred_residual,
+                    loader=split_loaders[split_name],
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_names=penalty_names,
+                    penalty_fns=penalty_fns,
+                    penalty_scale=penalty_scale,
+                    select_ranks=select_ranks,
+                    gate_soft_weight=gate_soft_weight,
+                    split_name=split_name,
+                    feature_mode=route_feature_mode,
+                    allowed_mask_kp=allowed_for_explain,
+                    max_batches=route_max_batches,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=int(split_eval_starts.get(split_name, 0)),
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    gate_feature_mode=gate_feature_mode,
+                )
+                if tensors is not None:
+                    route_tensors_by_split[split_name] = tensors
+            artifact_paths: Dict[str, object] = {}
+            if train_split_name in route_tensors_by_split:
+                train_route_tensors = route_tensors_by_split[train_split_name]
+                eval_route_tensors = {
+                    name: tensors
+                    for name, tensors in route_tensors_by_split.items()
+                    if name != train_split_name
+                }
+                head_cfg = route_probe_cfg.get("head", route_probe_cfg) or {}
+                if not isinstance(head_cfg, dict):
+                    head_cfg = {}
+                penalty_route_learnability_summary, route_head_artifact = _fit_penalty_route_learnability_head_from_tensors(
+                    train_tensors=train_route_tensors,  # type: ignore[arg-type]
+                    eval_tensors_by_split=eval_route_tensors,  # type: ignore[arg-type]
+                    label_names=list(train_route_tensors["label_names"]),  # type: ignore[index]
+                    feature_names=list(train_route_tensors["feature_names"]),  # type: ignore[index]
+                    cfg=head_cfg,
+                    device=device,
+                )
+                penalty_route_learnability_summary["train_split"] = train_split_name
+                penalty_route_learnability_summary["eval_splits"] = list(eval_route_tensors.keys())
+                penalty_route_learnability_summary["feature_mode"] = route_feature_mode
+                penalty_route_learnability_summary["max_batches"] = int(route_max_batches)
+                head_path = os.path.join(out_dir, "penalty_route_learnability_head.pt")
+                torch.save(route_head_artifact, head_path)
+                artifact_paths["head"] = head_path
+                label_names = list(train_route_tensors["label_names"])  # type: ignore[index]
+                for split_name, tensors in route_tensors_by_split.items():
+                    tensor_path = os.path.join(out_dir, f"penalty_route_learnability_{split_name}.pt")
+                    torch.save(tensors, tensor_path)
+                    artifact_paths[f"{split_name}_tensors"] = tensor_path
+                    labels_cpu = tensors["labels"].detach().cpu().to(dtype=torch.long)  # type: ignore[index]
+                    current_cpu = tensors["current_pred"].detach().cpu().to(dtype=torch.long)  # type: ignore[index]
+                    query_cpu = tensors["query_start_abs"].detach().cpu().to(dtype=torch.long)  # type: ignore[index]
+                    gain_cpu = tensors["oracle_gain_mse"].detach().cpu().to(dtype=torch.float32)  # type: ignore[index]
+                    label_df = pd.DataFrame(
+                        {
+                            "split": split_name,
+                            "row": list(range(int(labels_cpu.numel()))),
+                            "query_start_abs": [int(v) for v in query_cpu.tolist()],
+                            "oracle_class": [int(v) for v in labels_cpu.tolist()],
+                            "oracle_label": [
+                                label_names[int(v)] if 0 <= int(v) < len(label_names) else ""
+                                for v in labels_cpu.tolist()
+                            ],
+                            "current_class": [int(v) for v in current_cpu.tolist()],
+                            "current_label": [
+                                label_names[int(v)] if 0 <= int(v) < len(label_names) else ""
+                                for v in current_cpu.tolist()
+                            ],
+                            "oracle_gain_mse": [float(v) for v in gain_cpu.tolist()],
+                        }
+                    )
+                    csv_path = os.path.join(out_dir, f"penalty_route_oracle_labels_{split_name}.csv")
+                    label_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                    artifact_paths[f"{split_name}_labels_csv"] = csv_path
+                summary_path = os.path.join(out_dir, "penalty_route_learnability.json")
+                artifact_paths["summary"] = summary_path
+                penalty_route_learnability_summary["artifact_paths"] = artifact_paths
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    json.dump(penalty_route_learnability_summary, f, ensure_ascii=False, indent=2)
+                val_metrics = (penalty_route_learnability_summary.get("splits", {}) or {}).get("val")
+                if isinstance(val_metrics, dict):
+                    print(
+                        "Penalty route learnability(val): "
+                        f"head_acc={float(val_metrics.get('accuracy_all', 0.0)):.3f}, "
+                        f"current_acc={float(val_metrics.get('current_accuracy_all', 0.0)):.3f}, "
+                        f"majority_acc={float(val_metrics.get('majority_accuracy_all', 0.0)):.3f}"
+                    )
+            else:
+                penalty_route_learnability_summary = {
+                    "enable": True,
+                    "skipped": True,
+                    "reason": f"train_split {train_split_name!r} was not available",
+                    "available_splits": list(split_loaders.keys()),
+                }
         penalty_explainability_summary = {
             "enable": True,
             "max_batches": int(max_batches),
+            "train_subsplits": {
+                name: {"start": int(start_i), "end": int(end_i)}
+                for name, (start_i, end_i) in train_subsplit_ranges.items()
+            },
             "splits": split_payloads,
             "train_only_prior": {
                 "source": "train_split_penalty_portrait" if penalty_portrait_kp is not None else None,
@@ -10101,656 +14387,33 @@ def main():
             out_dir,
             penalty_explainability_summary,
         )
-    test_loss_hybrid_k = None
-    test_mse_hybrid_k = None
-    test_mae_hybrid_k = None
-    mse_c_hybrid = None
-    mae_c_hybrid = None
-    test_hybrid_confidence = None
-    if knn_hybrid_test is not None and not skip_test:
-        knn_hybrid_test.reset_confidence_stats()
-        test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop_with_history(
-            model, gate, lam_kp_test,
-            penalty_names, penalty_fns,
-            dl_te, cluster_id_c, K, moe_cfg, device,
-            select_ranks=select_ranks,
-            collect_plot=False, plot_idx=None, channel_count=C,
-            mse_weight=mse_weight,
-            gate_entropy_weight=gate_entropy_weight,
-            gate_balance_weight=gate_balance_weight,
-            gate_soft_weight=gate_soft_weight,
-            gate_entropy_target_frac=gate_entropy_target_frac,
-            penalty_scale=penalty_scale,
-            dynamic_lambda=dynamic_lambda,
-            lambda_min_kp=lambda_min_kp,
-            mae_objective_weight=mae_eval_weight,
-            mae_objective_kind=mae_objective_kind,
-            mae_objective_beta=mae_objective_beta,
-            pred_residual=pred_residual,
-            residual_correction_ch=residual_correction_hybrid_ch,
-            knn_hybrid=knn_hybrid_test,
-            eval_start=test_eval_start,
-        )
-        test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
-
-    knn_sweep_results = []
-    knn_sweep_cfgs = cfg.get("knn_hybrid", {}).get("sweep", []) or []
-    if (not skip_test) and knn_cfg.enable and len(knn_sweep_cfgs) > 0 and len(dva) > 0 and val_summary is not None:
-        base_knn_dict = dict(cfg.get("knn_hybrid", {}))
-        base_knn_dict.pop("sweep", None)
-        base_knn_dict.pop("path", None)
-        val_loader_sweep = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
-        best_sweep_val_mae = float("inf") if val_summary_hybrid is None else float(val_summary_hybrid["avg_mae"])
-        best_sweep_payload = None
-        sweep_guard = float(cfg.get("knn_hybrid", {}).get("selection_max_rel_mse_regression", 0.03))
-        base_val_mse_for_guard = float(val_summary["avg_mse"])
-        allowed_sweep_val_mse = base_val_mse_for_guard * (1.0 + max(0.0, sweep_guard))
-        for sweep_idx, sweep_override in enumerate(knn_sweep_cfgs):
-            if sweep_override is None:
-                sweep_override = {}
-            sweep_override = dict(sweep_override)
-            sweep_name = str(sweep_override.pop("name", f"sweep_{sweep_idx:02d}"))
-            cand_knn_dict = dict(base_knn_dict)
-            cand_knn_dict.update(sweep_override)
-            cand_knn_cfg = KNNShapeConfig.from_dict(cand_knn_dict).resolved_for_horizon(H)
-            cand_val_hybrid, cand_test_hybrid, cand_bank_windows = _build_knn_hybrids_for(cand_knn_cfg)
-
-            cand_val_hybrid.reset_confidence_stats()
-            cand_val_loss_k, cand_val_mse_k, cand_val_mae_k, cand_val_mse_c, cand_val_mae_c, _, _, _ = eval_loop_with_history(
-                model, gate, lam_kp_best,
-                penalty_names, penalty_fns,
-                val_loader_sweep, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                pred_residual=pred_residual,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=cand_val_hybrid,
-                eval_start=val_eval_start,
-            )
-            cand_val_confidence = cand_val_hybrid.get_confidence_stats()
-
-            cand_test_hybrid.reset_confidence_stats()
-            cand_test_loss_k, cand_test_mse_k, cand_test_mae_k, cand_mse_c, cand_mae_c, _, _, _ = eval_loop_with_history(
-                model, gate, lam_kp_test,
-                penalty_names, penalty_fns,
-                dl_te, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, plot_idx=None, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                pred_residual=pred_residual,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=cand_test_hybrid,
-                eval_start=test_eval_start,
-            )
-            cand_test_confidence = cand_test_hybrid.get_confidence_stats()
-            cand_val_summary = {
-                "avg_loss": float(reduce_cluster_metric(cand_val_loss_k, cluster_weight_k).item()),
-                "avg_mse": float(reduce_cluster_metric(cand_val_mse_k, cluster_weight_k).item()),
-                "avg_mae": float(reduce_cluster_metric(cand_val_mae_k, cluster_weight_k).item()),
-                "per_cluster_loss": [float(v) for v in cand_val_loss_k.detach().cpu().tolist()],
-                "per_cluster_mse": [float(v) for v in cand_val_mse_k.detach().cpu().tolist()],
-                "per_cluster_mae": [float(v) for v in cand_val_mae_k.detach().cpu().tolist()],
-            }
-            cand_test_summary = {
-                "avg_mae": float(cand_mae_c.mean().item()),
-                "avg_mse": float(reduce_cluster_metric(cand_test_mse_k, cluster_weight_k).item()),
-                "per_cluster_loss": [float(v) for v in cand_test_loss_k.detach().cpu().tolist()],
-                "per_cluster_mse": [float(v) for v in cand_test_mse_k.detach().cpu().tolist()],
-                "per_cluster_mae": [float(v) for v in cand_test_mae_k.detach().cpu().tolist()],
-            }
-            cand_result = {
-                "name": sweep_name,
-                "config": cand_test_hybrid.describe(),
-                "val": cand_val_summary,
-                "test": cand_test_summary,
-                "val_hybrid_confidence": cand_val_confidence,
-                "test_hybrid_confidence": cand_test_confidence,
-                "selected_by_val_mae_guard": bool(
-                    cand_val_summary["avg_mae"] < best_sweep_val_mae
-                    and cand_val_summary["avg_mse"] <= allowed_sweep_val_mse
-                ),
-            }
-            knn_sweep_results.append(cand_result)
-            print(
-                f"KNN sweep {sweep_name}: "
-                f"val_MAE={cand_val_summary['avg_mae']:.6f}, "
-                f"val_MSE={cand_val_summary['avg_mse']:.6f}, "
-                f"test_MAE={cand_test_summary['avg_mae']:.6f}, "
-                f"test_MSE={cand_test_summary['avg_mse']:.6f}"
-            )
-
-            if cand_result["selected_by_val_mae_guard"]:
-                best_sweep_val_mae = float(cand_val_summary["avg_mae"])
-                best_sweep_payload = {
-                    "val_hybrid": cand_val_summary,
-                    "test_loss_hybrid_k": cand_test_loss_k,
-                    "test_mse_hybrid_k": cand_test_mse_k,
-                    "test_mae_hybrid_k": cand_test_mae_k,
-                    "mse_c_hybrid": cand_mse_c,
-                    "mae_c_hybrid": cand_mae_c,
-                    "val_mse_c_hybrid": cand_val_mse_c,
-                    "val_mae_c_hybrid": cand_val_mae_c,
-                    "val_hybrid_confidence": cand_val_confidence,
-                    "test_hybrid_confidence": cand_test_confidence,
-                    "knn_hybrid_val": cand_val_hybrid,
-                    "knn_hybrid_test": cand_test_hybrid,
-                    "knn_test_bank_windows": cand_bank_windows,
-                }
-
-        if best_sweep_payload is not None:
-            val_summary_hybrid = best_sweep_payload["val_hybrid"]
-            test_loss_hybrid_k = best_sweep_payload["test_loss_hybrid_k"]
-            test_mse_hybrid_k = best_sweep_payload["test_mse_hybrid_k"]
-            test_mae_hybrid_k = best_sweep_payload["test_mae_hybrid_k"]
-            mse_c_hybrid = best_sweep_payload["mse_c_hybrid"]
-            mae_c_hybrid = best_sweep_payload["mae_c_hybrid"]
-            val_mse_c_hybrid = best_sweep_payload["val_mse_c_hybrid"]
-            val_mae_c_hybrid = best_sweep_payload["val_mae_c_hybrid"]
-            val_hybrid_confidence = best_sweep_payload["val_hybrid_confidence"]
-            test_hybrid_confidence = best_sweep_payload["test_hybrid_confidence"]
-            knn_hybrid_val = best_sweep_payload["knn_hybrid_val"]
-            knn_hybrid_test = best_sweep_payload["knn_hybrid_test"]
-            knn_test_bank_windows = int(best_sweep_payload["knn_test_bank_windows"])
-
-    fusion_cfg = cfg.get("knn_hybrid", {}).get("fusion_calibrator", {}) or {}
-    if bool(dict(fusion_cfg).get("enable", False)) and knn_hybrid_val is not None and len(dva) > 0:
-        val_loader_fusion = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
-        knn_hybrid_val.reset_confidence_stats()
-        knn_fusion_scale_ch, knn_fusion_summary = estimate_knn_fusion_scale(
-            model=model,
-            loader=val_loader_fusion,
-            cluster_id_c=cluster_id_c,
-            device=device,
-            knn_hybrid=knn_hybrid_val,
-            eval_start=val_eval_start,
-            metric=str(dict(fusion_cfg).get("metric", "mae")),
-            min_scale=float(dict(fusion_cfg).get("min_scale", 0.0)),
-            max_scale=float(dict(fusion_cfg).get("max_scale", 1.5)),
-            grid_steps=int(dict(fusion_cfg).get("grid_steps", 31)),
-        )
-        if knn_fusion_scale_ch is not None:
-            knn_fusion_summary["channel_names"] = list(channel_names)
-            print(
-                "KNN fusion calibrator: "
-                f"metric={knn_fusion_summary['metric']}, "
-                f"mean_scale={knn_fusion_summary['mean_scale']:.3f}, "
-                f"range=[{knn_fusion_summary['min_fitted_scale']:.3f}, {knn_fusion_summary['max_fitted_scale']:.3f}]"
-            )
-
-            knn_hybrid_val.reset_confidence_stats()
-            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop_with_history(
-                model, gate, lam_kp_best,
-                penalty_names, penalty_fns,
-                val_loader_fusion, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                pred_residual=pred_residual,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=knn_hybrid_val,
-                knn_fusion_scale_ch=knn_fusion_scale_ch,
-                eval_start=val_eval_start,
-            )
-            val_summary_hybrid = {
-                "avg_loss": float(reduce_cluster_metric(val_loss_hybrid_k, cluster_weight_k).item()),
-                "avg_mse": float(reduce_cluster_metric(val_mse_hybrid_k, cluster_weight_k).item()),
-                "avg_mae": float(reduce_cluster_metric(val_mae_hybrid_k, cluster_weight_k).item()),
-                "per_cluster_loss": [float(v) for v in val_loss_hybrid_k.detach().cpu().tolist()],
-                "per_cluster_mse": [float(v) for v in val_mse_hybrid_k.detach().cpu().tolist()],
-                "per_cluster_mae": [float(v) for v in val_mae_hybrid_k.detach().cpu().tolist()],
-            }
-            val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
-
-            if knn_hybrid_test is not None and not skip_test:
-                knn_hybrid_test.reset_confidence_stats()
-                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop_with_history(
-                    model, gate, lam_kp_test,
-                    penalty_names, penalty_fns,
-                    dl_te, cluster_id_c, K, moe_cfg, device,
-                    select_ranks=select_ranks,
-                    collect_plot=False, plot_idx=None, channel_count=C,
-                    mse_weight=mse_weight,
-                    gate_entropy_weight=gate_entropy_weight,
-                    gate_balance_weight=gate_balance_weight,
-                    gate_soft_weight=gate_soft_weight,
-                    gate_entropy_target_frac=gate_entropy_target_frac,
-                    penalty_scale=penalty_scale,
-                    dynamic_lambda=dynamic_lambda,
-                    lambda_min_kp=lambda_min_kp,
-                    mae_objective_weight=mae_eval_weight,
-                    mae_objective_kind=mae_objective_kind,
-                    mae_objective_beta=mae_objective_beta,
-                    pred_residual=pred_residual,
-                    residual_correction_ch=residual_correction_hybrid_ch,
-                    knn_hybrid=knn_hybrid_test,
-                    knn_fusion_scale_ch=knn_fusion_scale_ch,
-                    eval_start=test_eval_start,
-                )
-                test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
-
-    gate_calib_cfg = cfg.get("knn_hybrid", {}).get("gate_calibrator", {}) or {}
-    if bool(dict(gate_calib_cfg).get("enable", False)) and knn_hybrid_val is not None and len(dva) > 0:
-        val_loader_gate = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
-        knn_hybrid_val.reset_confidence_stats()
-        knn_gate_model, knn_gate_summary = train_knn_residual_gate(
-            model=model,
-            loader=val_loader_gate,
-            cluster_id_c=cluster_id_c,
-            device=device,
-            knn_hybrid=knn_hybrid_val,
-            eval_start=val_eval_start,
-            channel_names=channel_names,
-            cfg=dict(gate_calib_cfg),
-        )
-        if knn_gate_model is not None:
-            print(
-                "KNN residual gate: "
-                f"holdout_MAE={knn_gate_summary['holdout_mae']:.6f}, "
-                f"holdout_MSE={knn_gate_summary['holdout_mse']:.6f}, "
-                f"best_epoch={knn_gate_summary['best_epoch']}"
-            )
-
-            knn_hybrid_val.reset_confidence_stats()
-            val_loss_hybrid_k, val_mse_hybrid_k, val_mae_hybrid_k, val_mse_c_hybrid, val_mae_c_hybrid, _, _, _ = eval_loop_with_history(
-                model, gate, lam_kp_best,
-                penalty_names, penalty_fns,
-                val_loader_gate, cluster_id_c, K, moe_cfg, device,
-                select_ranks=select_ranks,
-                collect_plot=False, channel_count=C,
-                mse_weight=mse_weight,
-                gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight,
-                gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac,
-                penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda,
-                lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight,
-                mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta,
-                pred_residual=pred_residual,
-                residual_correction_ch=residual_correction_hybrid_ch,
-                knn_hybrid=knn_hybrid_val,
-                knn_fusion_gate=knn_gate_model,
-                eval_start=val_eval_start,
-            )
-            val_summary_hybrid = {
-                "avg_loss": float(reduce_cluster_metric(val_loss_hybrid_k, cluster_weight_k).item()),
-                "avg_mse": float(reduce_cluster_metric(val_mse_hybrid_k, cluster_weight_k).item()),
-                "avg_mae": float(reduce_cluster_metric(val_mae_hybrid_k, cluster_weight_k).item()),
-                "per_cluster_loss": [float(v) for v in val_loss_hybrid_k.detach().cpu().tolist()],
-                "per_cluster_mse": [float(v) for v in val_mse_hybrid_k.detach().cpu().tolist()],
-                "per_cluster_mae": [float(v) for v in val_mae_hybrid_k.detach().cpu().tolist()],
-            }
-            val_hybrid_confidence = knn_hybrid_val.get_confidence_stats()
-
-            if knn_hybrid_test is not None and not skip_test:
-                knn_hybrid_test.reset_confidence_stats()
-                test_loss_hybrid_k, test_mse_hybrid_k, test_mae_hybrid_k, mse_c_hybrid, mae_c_hybrid, _, _, _ = eval_loop_with_history(
-                    model, gate, lam_kp_test,
-                    penalty_names, penalty_fns,
-                    dl_te, cluster_id_c, K, moe_cfg, device,
-                    select_ranks=select_ranks,
-                    collect_plot=False, plot_idx=None, channel_count=C,
-                    mse_weight=mse_weight,
-                    gate_entropy_weight=gate_entropy_weight,
-                    gate_balance_weight=gate_balance_weight,
-                    gate_soft_weight=gate_soft_weight,
-                    gate_entropy_target_frac=gate_entropy_target_frac,
-                    penalty_scale=penalty_scale,
-                    dynamic_lambda=dynamic_lambda,
-                    lambda_min_kp=lambda_min_kp,
-                    mae_objective_weight=mae_eval_weight,
-                    mae_objective_kind=mae_objective_kind,
-                    mae_objective_beta=mae_objective_beta,
-                    pred_residual=pred_residual,
-                    residual_correction_ch=residual_correction_hybrid_ch,
-                    knn_hybrid=knn_hybrid_test,
-                    knn_fusion_gate=knn_gate_model,
-                    eval_start=test_eval_start,
-                )
-                test_hybrid_confidence = knn_hybrid_test.get_confidence_stats()
-
     df = None
     avg_mae = None
     avg_mse = None
-    avg_mae_hybrid = None
-    avg_mse_hybrid = None
+    selected_variant = "base"
+    selected_criterion = "base"
+    selected_selection_policy = "base"
+    selected_avg_mae = None
+    selected_avg_mse = None
     if not skip_test:
         df = pd.DataFrame({
             "channel": channel_names,
             "MAE": mae_c.numpy(),
             "MSE": mse_c.numpy(),
-            "cluster_id": cluster_id_c.detach().cpu().numpy()
+            "cluster_id": cluster_id_c.detach().cpu().numpy(),
         })
-        if mse_c_hybrid is not None and mae_c_hybrid is not None:
-            df["MAE_hybrid"] = mae_c_hybrid.numpy()
-            df["MSE_hybrid"] = mse_c_hybrid.numpy()
         avg_mae = float(df["MAE"].mean())
         avg_mse = float(reduce_cluster_metric(test_mse_k, cluster_weight_k).item())
-        if mse_c_hybrid is not None and mae_c_hybrid is not None and test_mse_hybrid_k is not None:
-            avg_mae_hybrid = float(df["MAE_hybrid"].mean())
-            avg_mse_hybrid = float(reduce_cluster_metric(test_mse_hybrid_k, cluster_weight_k).item())
+        selected_avg_mae = avg_mae
+        selected_avg_mse = avg_mse
 
-    # --- Post-hoc calibration shrink sweep (single model, no retraining) ---
-    # Calibration is eval-only, so all shrink values share the same trained model
-    # and the same unit (shrink=1) median residual. We estimate that unit once on
-    # val, then linearly rescale per shrink and re-run val/test evaluation. This
-    # mirrors the per-split metric conventions of the reported val/test blocks
-    # (val: cluster-reduced; test: per-channel-mean MAE) so numbers are directly
-    # comparable, at ~1/N the cost of N separate runs.
-    if (
-        calibration_enable
-        and calibration_method == "median"
-        and not skip_test
-        and len(calibration_shrink_sweep) > 0
-        and len(dva) > 0
-    ):
-        sweep_val_loader = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
-        unit_corr_ch = estimate_residual_correction(
-            model, sweep_val_loader, cluster_id_c, device,
-            method=calibration_method, shrink=1.0, max_abs=0.0,
-            knn_hybrid=None, eval_start=val_eval_start,
-        )
-        if unit_corr_ch is not None:
-            common_sweep_kwargs = dict(
-                select_ranks=select_ranks, collect_plot=False, channel_count=C,
-                mse_weight=mse_weight, gate_entropy_weight=gate_entropy_weight,
-                gate_balance_weight=gate_balance_weight, gate_soft_weight=gate_soft_weight,
-                gate_entropy_target_frac=gate_entropy_target_frac, penalty_scale=penalty_scale,
-                dynamic_lambda=dynamic_lambda, lambda_min_kp=lambda_min_kp,
-                mae_objective_weight=mae_eval_weight, mae_objective_kind=mae_objective_kind,
-                mae_objective_beta=mae_objective_beta, pred_residual=pred_residual,
-                knn_hybrid=None,
-            )
-            sweep_rows = []
-            for s in calibration_shrink_sweep:
-                corr_s = unit_corr_ch * float(s)
-                if calibration_max_abs and float(calibration_max_abs) > 0.0:
-                    corr_s = corr_s.clamp(min=-float(calibration_max_abs), max=float(calibration_max_abs))
-                # val mirrors the reported val eval (no pred_residual gate/selector/scale)
-                _, v_mse_k, v_mae_k, _, _, _, _, _ = eval_loop_with_history(
-                    model, gate, lam_kp_best, penalty_names, penalty_fns,
-                    sweep_val_loader, cluster_id_c, K, moe_cfg, device,
-                    residual_correction_ch=corr_s, eval_start=val_eval_start,
-                    **common_sweep_kwargs,
-                )
-                # test mirrors the reported test eval (includes gate/selector/scale)
-                _, t_mse_k, _, _, t_mae_c, _, _, _ = eval_loop_with_history(
-                    model, gate, lam_kp_test, penalty_names, penalty_fns,
-                    dl_te, cluster_id_c, K, moe_cfg, device,
-                    pred_residual_gate=pred_residual_gate_model,
-                    pred_residual_selector=pred_residual_selector_model,
-                    pred_residual_scale_c=pred_residual_channel_scale_c,
-                    residual_correction_ch=corr_s, eval_start=test_eval_start,
-                    **common_sweep_kwargs,
-                )
-                sweep_rows.append({
-                    "shrink": float(s),
-                    "val_mse": float(reduce_cluster_metric(v_mse_k, cluster_weight_k).item()),
-                    "val_mae": float(reduce_cluster_metric(v_mae_k, cluster_weight_k).item()),
-                    "test_mse": float(reduce_cluster_metric(t_mse_k, cluster_weight_k).item()),
-                    "test_mae": float(t_mae_c.mean().item()),
-                })
-            calibration_summary["shrink_sweep"] = sweep_rows
-            calibration_summary["shrink_sweep_unit_mean_abs"] = float(unit_corr_ch.abs().mean().item())
-            # Leakage-free pick: lowest val_mae, MSE-primary tiebreak on val_mse.
-            best_sweep = min(sweep_rows, key=lambda r: (r["val_mae"], r["val_mse"]))
-            calibration_summary["shrink_sweep_best_by_val_mae"] = float(best_sweep["shrink"])
-            print("\nCalibration shrink sweep (single model, post-hoc):")
-            print(f"  {'shrink':>7} {'val_mse':>10} {'val_mae':>10} {'test_mse':>10} {'test_mae':>10}")
-            for r in sweep_rows:
-                print(
-                    f"  {r['shrink']:>7.3f} {r['val_mse']:>10.6f} {r['val_mae']:>10.6f} "
-                    f"{r['test_mse']:>10.6f} {r['test_mae']:>10.6f}"
-                )
-            print(f"  -> best shrink by val_mae (val_mse tiebreak): {best_sweep['shrink']:.3f}")
-
-            # --- Per-channel guarded shrink (richer, still MSE-capped) ---
-            if per_channel_shrink_enable:
-                pc = estimate_per_channel_guarded_shrink_correction(
-                    model, sweep_val_loader, cluster_id_c, device,
-                    grid=per_channel_shrink_grid,
-                    max_rel_mse_regression=per_channel_shrink_max_rel_mse,
-                    max_abs=calibration_max_abs,
-                    eval_start=val_eval_start,
-                )
-                if pc is not None:
-                    corr_pc_ch, chosen_shrink_c = pc
-                    _, vpc_mse_k, vpc_mae_k, _, _, _, _, _ = eval_loop_with_history(
-                        model, gate, lam_kp_best, penalty_names, penalty_fns,
-                        sweep_val_loader, cluster_id_c, K, moe_cfg, device,
-                        residual_correction_ch=corr_pc_ch, eval_start=val_eval_start,
-                        **common_sweep_kwargs,
-                    )
-                    _, tpc_mse_k, _, _, tpc_mae_c, _, _, _ = eval_loop_with_history(
-                        model, gate, lam_kp_test, penalty_names, penalty_fns,
-                        dl_te, cluster_id_c, K, moe_cfg, device,
-                        pred_residual_gate=pred_residual_gate_model,
-                        pred_residual_selector=pred_residual_selector_model,
-                        pred_residual_scale_c=pred_residual_channel_scale_c,
-                        residual_correction_ch=corr_pc_ch, eval_start=test_eval_start,
-                        **common_sweep_kwargs,
-                    )
-                    pc_summary = {
-                        "val_mse": float(reduce_cluster_metric(vpc_mse_k, cluster_weight_k).item()),
-                        "val_mae": float(reduce_cluster_metric(vpc_mae_k, cluster_weight_k).item()),
-                        "test_mse": float(reduce_cluster_metric(tpc_mse_k, cluster_weight_k).item()),
-                        "test_mae": float(tpc_mae_c.mean().item()),
-                        "grid": [float(g) for g in per_channel_shrink_grid],
-                        "max_rel_mse_regression": float(per_channel_shrink_max_rel_mse),
-                        "chosen_shrink_per_channel": [float(s) for s in chosen_shrink_c.tolist()],
-                        "mean_shrink": float(chosen_shrink_c.mean().item()),
-                    }
-                    calibration_summary["per_channel_shrink"] = pc_summary
-                    print("Per-channel guarded shrink (cap on val MSE regression "
-                          f"<= {per_channel_shrink_max_rel_mse:.3%}):")
-                    print(f"  mean_shrink={pc_summary['mean_shrink']:.3f}  "
-                          f"val_mse={pc_summary['val_mse']:.6f}  val_mae={pc_summary['val_mae']:.6f}  "
-                          f"test_mse={pc_summary['test_mse']:.6f}  test_mae={pc_summary['test_mae']:.6f}")
-
-    channel_selection_summary = None
-    channel_selected_avg_mae = None
-    channel_selected_avg_mse = None
-    channel_use_hybrid = None
-    channel_selection_policy = str(cfg.get("knn_hybrid", {}).get("channel_selection_policy", "none")).lower()
-    if channel_selection_policy in {"false", "off", "disable", "disabled"}:
-        channel_selection_policy = "none"
-    if channel_selection_policy not in {"none", "val_mae_guarded"}:
-        raise ValueError(
-            "Unsupported knn_hybrid.channel_selection_policy="
-            f"'{channel_selection_policy}'. Expected none or val_mae_guarded."
-        )
-    if (
-        channel_selection_policy == "val_mae_guarded"
-        and val_mae_c_base is not None
-        and val_mae_c_hybrid is not None
-        and val_mse_c_base is not None
-        and not skip_test
-        and val_mse_c_hybrid is not None
-        and mae_c_hybrid is not None
-        and mse_c_hybrid is not None
-    ):
-        channel_min_rel = float(cfg.get("knn_hybrid", {}).get("channel_selection_min_rel_improvement", 0.0))
-        channel_max_mse_reg = float(
-            cfg.get(
-                "knn_hybrid",
-                {},
-            ).get(
-                "channel_selection_max_rel_mse_regression",
-                cfg.get("knn_hybrid", {}).get("selection_max_rel_mse_regression", 0.03),
-            )
-        )
-        required_mae_drop = channel_min_rel * val_mae_c_base.abs().clamp_min(1.0e-12)
-        mae_ok = (val_mae_c_base - val_mae_c_hybrid) > required_mae_drop
-        mse_ok = (val_mse_c_hybrid - val_mse_c_base) <= (
-            channel_max_mse_reg * val_mse_c_base.abs().clamp_min(1.0e-12)
-        )
-        channel_use_hybrid = (mae_ok & mse_ok).detach().cpu()
-        selected_mae_c = torch.where(channel_use_hybrid, mae_c_hybrid.cpu(), mae_c.cpu())
-        selected_mse_c = torch.where(channel_use_hybrid, mse_c_hybrid.cpu(), mse_c.cpu())
-        df["use_hybrid_by_val"] = channel_use_hybrid.numpy().astype(bool)
-        df["MAE_selected_channel"] = selected_mae_c.numpy()
-        df["MSE_selected_channel"] = selected_mse_c.numpy()
-        channel_selected_avg_mae = float(selected_mae_c.mean().item())
-        channel_selected_avg_mse = float(selected_mse_c.mean().item())
-        channel_selection_summary = {
-            "policy": channel_selection_policy,
-            "min_rel_mae_improvement": float(channel_min_rel),
-            "max_rel_mse_regression": float(channel_max_mse_reg),
-            "num_hybrid_channels": int(channel_use_hybrid.sum().item()),
-            "hybrid_channels": [
-                channel_names[i] for i, use_hybrid in enumerate(channel_use_hybrid.tolist()) if bool(use_hybrid)
-            ],
-            "base_channels": [
-                channel_names[i] for i, use_hybrid in enumerate(channel_use_hybrid.tolist()) if not bool(use_hybrid)
-            ],
-            "avg_mae": channel_selected_avg_mae,
-            "avg_mse": channel_selected_avg_mse,
-            "val_base_mae_per_channel": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
-            "val_hybrid_mae_per_channel": [float(v) for v in val_mae_c_hybrid.detach().cpu().tolist()],
-            "val_base_mse_per_channel": [float(v) for v in val_mse_c_base.detach().cpu().tolist()],
-            "val_hybrid_mse_per_channel": [float(v) for v in val_mse_c_hybrid.detach().cpu().tolist()],
-        }
-
-    selected_variant = "base"
-    selected_avg_mae = avg_mae
-    selected_avg_mse = avg_mse
-    selected_base_val_mse = None if val_summary is None else val_summary.get("avg_mse")
-    selected_hybrid_val_mse = None if val_summary_hybrid is None else val_summary_hybrid.get("avg_mse")
-    selected_base_val_mae = None if val_summary is None else val_summary.get("avg_mae")
-    selected_hybrid_val_mae = None if val_summary_hybrid is None else val_summary_hybrid.get("avg_mae")
-    knn_selection_policy = str(cfg.get("knn_hybrid", {}).get("selection_policy", "hybrid")).lower()
-    if knn_selection_policy == "val_mse":
-        knn_selection_policy = "val_mse_margin"
-    if knn_selection_policy not in {"hybrid", "val_mse_margin", "val_mae_guarded", "base"}:
-        raise ValueError(
-            "Unsupported knn_hybrid.selection_policy="
-            f"'{knn_selection_policy}'. Expected hybrid, val_mse_margin, val_mae_guarded, val_mse, or base."
-        )
-    knn_selection_min_abs_improvement = float(cfg.get("knn_hybrid", {}).get("selection_min_abs_improvement", 0.0))
-    knn_selection_min_rel_improvement = float(cfg.get("knn_hybrid", {}).get("selection_min_rel_improvement", 0.0))
-    knn_selection_max_rel_mse_regression = float(cfg.get("knn_hybrid", {}).get("selection_max_rel_mse_regression", 0.03))
-    selected_val_mse_improvement = None
-    selected_val_mse_improvement_pct = None
-    required_val_mse_improvement = None
-    selected_val_mae_improvement = None
-    selected_val_mae_improvement_pct = None
-    required_val_mae_improvement = None
-    selected_val_mse_regression = None
-    selected_val_mse_regression_pct = None
-    allowed_val_mse_regression = None
-    if selected_base_val_mse is not None and selected_hybrid_val_mse is not None:
-        selected_val_mse_improvement = float(selected_base_val_mse) - float(selected_hybrid_val_mse)
-        selected_val_mse_improvement_pct = (
-            100.0 * selected_val_mse_improvement / max(abs(float(selected_base_val_mse)), 1.0e-12)
-        )
-        required_val_mse_improvement = max(
-            knn_selection_min_abs_improvement,
-            knn_selection_min_rel_improvement * max(abs(float(selected_base_val_mse)), 1.0e-12),
-        )
-        selected_val_mse_regression = float(selected_hybrid_val_mse) - float(selected_base_val_mse)
-        selected_val_mse_regression_pct = (
-            100.0 * selected_val_mse_regression / max(abs(float(selected_base_val_mse)), 1.0e-12)
-        )
-        allowed_val_mse_regression = (
-            knn_selection_max_rel_mse_regression * max(abs(float(selected_base_val_mse)), 1.0e-12)
-        )
-    if selected_base_val_mae is not None and selected_hybrid_val_mae is not None:
-        selected_val_mae_improvement = float(selected_base_val_mae) - float(selected_hybrid_val_mae)
-        selected_val_mae_improvement_pct = (
-            100.0 * selected_val_mae_improvement / max(abs(float(selected_base_val_mae)), 1.0e-12)
-        )
-        required_val_mae_improvement = max(
-            knn_selection_min_abs_improvement,
-            knn_selection_min_rel_improvement * max(abs(float(selected_base_val_mae)), 1.0e-12),
-        )
-    selected_criterion = knn_selection_policy
-    selected_selection_policy = knn_selection_policy
     moe_residual_variant = "none"
-    if knn_selection_policy == "hybrid":
-        if avg_mae_hybrid is not None and avg_mse_hybrid is not None:
-            selected_variant = "hybrid"
-            selected_avg_mae = avg_mae_hybrid
-            selected_avg_mse = avg_mse_hybrid
-        else:
-            selected_criterion = "hybrid_fallback_base"
-    elif (
-        knn_selection_policy == "val_mse_margin"
-        and selected_base_val_mse is not None
-        and selected_hybrid_val_mse is not None
-        and avg_mae_hybrid is not None
-        and avg_mse_hybrid is not None
-        and selected_val_mse_improvement is not None
-        and required_val_mse_improvement is not None
-        and selected_val_mse_improvement > required_val_mse_improvement
-    ):
-        selected_variant = "hybrid"
-        selected_avg_mae = avg_mae_hybrid
-        selected_avg_mse = avg_mse_hybrid
-    elif (
-        knn_selection_policy == "val_mae_guarded"
-        and selected_base_val_mae is not None
-        and selected_hybrid_val_mae is not None
-        and selected_base_val_mse is not None
-        and selected_hybrid_val_mse is not None
-        and avg_mae_hybrid is not None
-        and avg_mse_hybrid is not None
-        and selected_val_mae_improvement is not None
-        and required_val_mae_improvement is not None
-        and selected_val_mse_regression is not None
-        and allowed_val_mse_regression is not None
-        and selected_val_mae_improvement > required_val_mae_improvement
-        and selected_val_mse_regression <= allowed_val_mse_regression
-    ):
-        selected_variant = "hybrid"
-        selected_avg_mae = avg_mae_hybrid
-        selected_avg_mse = avg_mse_hybrid
-
     if pred_residual_selection_summary is not None:
-        moe_residual_variant = (
-            "moe_residual_gate"
-            if str(pred_residual_selection_summary.get("policy", "")) == "val_mse_gate"
-            else "moe_residual_channel"
-        )
-
-    if channel_selection_summary is not None:
-        selected_variant = "channel_hybrid" if int(channel_selection_summary["num_hybrid_channels"]) > 0 else "base"
-        selected_avg_mae = float(channel_selected_avg_mae)
-        selected_avg_mse = float(channel_selected_avg_mse)
-        selected_criterion = channel_selection_policy
-        selected_selection_policy = channel_selection_policy
+        moe_residual_variant = "moe_residual_channel"
+        if int(pred_residual_selection_summary.get("num_residual_channels", 0) or 0) > 0:
+            selected_variant = moe_residual_variant
+            selected_criterion = str(pred_residual_selection_summary.get("policy", selected_criterion))
+            selected_selection_policy = str(pred_residual_selection_summary.get("policy", selected_selection_policy))
 
     if skip_test:
         val_mse_print = None if val_summary is None else val_summary.get("avg_mse")
@@ -10778,27 +14441,6 @@ def main():
                 "val_MAE=nan val_MSE=nan test_MAE=skipped test_MSE=skipped",
                 flush=True,
             )
-    elif avg_mae_hybrid is not None and avg_mse_hybrid is not None:
-        print(f"\nOverall(base): test_MAE={avg_mae:.6f}, test_MSE={avg_mse:.6f}")
-        print(f"Overall(hybrid): test_MAE={avg_mae_hybrid:.6f}, test_MSE={avg_mse_hybrid:.6f}")
-        if channel_selection_summary is not None:
-            print(
-                f"Overall(channel_hybrid): test_MAE={channel_selected_avg_mae:.6f}, "
-                f"test_MSE={channel_selected_avg_mse:.6f}, "
-                f"hybrid_channels={channel_selection_summary['num_hybrid_channels']}/{C}"
-            )
-        print(
-            f"Overall(selected={selected_variant}, moe_residual={moe_residual_variant}): "
-            f"test_MAE={selected_avg_mae:.6f}, test_MSE={selected_avg_mse:.6f}"
-        )
-        final_print(
-            "FINAL_TEST "
-            f"selected={selected_variant} "
-            f"moe_residual={moe_residual_variant} "
-            f"test_MAE={selected_avg_mae:.6f} "
-            f"test_MSE={selected_avg_mse:.6f}",
-            flush=True,
-        )
     else:
         print(
             f"\nOverall(selected={selected_variant}, moe_residual={moe_residual_variant}): "
@@ -10832,7 +14474,6 @@ def main():
                 "sample_strategy": str(prediction_diag_collector.get("strategy", "first")),
                 "sample_seed": int(prediction_diag_collector.get("seed", 0)),
                 "relative_indices": [int(v) for v in prediction_diag_collector.get("relative_indices", [])],
-                "note": "Rows are test windows; y_residual_raw is before residual gate scaling, y_final is after selected residual/calibration before optional KNN.",
             }
             with open(os.path.join(out_dir, "prediction_intermediates_meta.json"), "w", encoding="utf-8") as f:
                 json.dump(diag_meta, f, ensure_ascii=False, indent=2)
@@ -10861,6 +14502,72 @@ def main():
         gpu_reserved_mb = float(torch.cuda.max_memory_reserved()) / (1024.0 * 1024.0)
     out_dir_mb = _dir_size_mb(out_dir)
     cluster_embedding_summary = _save_cluster_embedding_artifacts(model, out_dir)
+    stage2_loss_diagnostics_summary = None
+    if stage2_loss_audit_enable:
+        residual_selection = pred_residual_selection_summary or {}
+        moe_residual_diag = moe_residual_summary or {}
+        latest_route = (
+            stage2_loss_audit_history[-1].get("route", {})
+            if len(stage2_loss_audit_history) > 0
+            else {}
+        )
+        val_base_mse = residual_selection.get("val_pred_base_avg_mse", (val_summary or {}).get("avg_mse"))
+        val_base_mae = residual_selection.get("val_pred_base_avg_mae", (val_summary or {}).get("avg_mae"))
+        val_raw_moe_mse = residual_selection.get("val_residual_avg_mse", (val_summary or {}).get("avg_mse"))
+        val_raw_moe_mae = residual_selection.get("val_residual_avg_mae", (val_summary or {}).get("avg_mae"))
+        val_scaled_mse = residual_selection.get("val_scaled_avg_mse", (val_summary or {}).get("avg_mse"))
+        val_scaled_mae = residual_selection.get("val_scaled_avg_mae", (val_summary or {}).get("avg_mae"))
+        stage2_loss_diagnostics_summary = {
+            "enabled": True,
+            "losses_are_stage2_only": True,
+            "do_not_compare_to_stage1_training_loss": True,
+            "trainable_parameter_groups": stage2_trainable_parameter_groups,
+            "epochs": stage2_loss_audit_history,
+            "final_eval": {
+                "val_base_mse": val_base_mse,
+                "val_base_mae": val_base_mae,
+                "val_raw_moe_mse": val_raw_moe_mse,
+                "val_raw_moe_mae": val_raw_moe_mae,
+                "val_scaled_or_selected_moe_mse": val_scaled_mse,
+                "val_scaled_or_selected_moe_mae": val_scaled_mae,
+                "residual_delta_rms": moe_residual_diag.get("residual_delta_rms"),
+                "residual_base_rms_ratio": moe_residual_diag.get("residual_base_rms_ratio"),
+                "route_entropy": latest_route.get("route_entropy"),
+                "actual_route_distribution": moe_residual_diag.get(
+                    "effective_route_by_penalty",
+                    latest_route.get("actual_route_distribution"),
+                ),
+                "skip_noop_rate": latest_route.get("skip_noop_rate"),
+                "skip_prob": latest_route.get("skip_prob"),
+            },
+        }
+    stage2_route_audit_summary = None
+    if stage2_route_audit_enable:
+        residual_selection = pred_residual_selection_summary or {}
+        final_scaled_mse = residual_selection.get("val_scaled_avg_mse", (val_summary or {}).get("avg_mse"))
+        final_scaled_mae = residual_selection.get("val_scaled_avg_mae", (val_summary or {}).get("avg_mae"))
+        stage2_route_audit_summary = {
+            "enabled": True,
+            "splits": list(stage2_route_audit_loaders.keys()),
+            "train_subsplits": {
+                name: {"start": int(start_i), "end": int(end_i)}
+                for name, (start_i, end_i) in stage2_route_audit_train_subsplits.items()
+            },
+            "max_batches": int(stage2_route_audit_cfg.get("max_batches", 0)),
+            "frequency_epochs": int(stage2_route_audit_frequency),
+            "skip_noop_is_class_zero": True,
+            "test_read": False,
+            "final_selected_scaled_eval": {
+                "val_scaled_or_selected_moe_mse": final_scaled_mse,
+                "val_scaled_or_selected_moe_mae": final_scaled_mae,
+                "source": "final_moe_residual_selection",
+            },
+            "epochs": stage2_route_audit_history,
+        }
+        route_audit_path = os.path.join(out_dir, "stage2_route_audit.json")
+        with open(route_audit_path, "w", encoding="utf-8") as f:
+            json.dump(stage2_route_audit_summary, f, ensure_ascii=False, indent=2)
+        stage2_route_audit_summary["artifact_path"] = route_audit_path
 
     summary = {
         "config_path": args.config,
@@ -10901,17 +14608,44 @@ def main():
         "eval": {
             "skip_test": bool(skip_test),
         },
-        "calibration": calibration_summary,
         "calendar_residual": calendar_residual_summary,
         "moe_residual": moe_residual_summary,
+        "moe_residual_phase_candidate": phase_residual_candidate_summary,
+        "moe_residual_confidence_gate": pred_residual_confidence_summary,
         "moe_residual_selection": pred_residual_selection_summary,
-        "moe_residual_gate_calibrator": pred_residual_gate_summary,
         "moe_residual_candidate_selector": pred_residual_selector_summary,
+        "cluster_penalty_prior": {
+            "enable": bool(cluster_penalty_prior_enable),
+            "apply_stage": str(cluster_penalty_prior_apply_stage),
+            "late_eval_applied": bool(cluster_penalty_prior_late_applied),
+            "apply_to_pred_residual": bool(cluster_penalty_prior_cfg.get("apply_to_pred_residual", False)),
+            "prior": (
+                cluster_penalty_prior_prob_kp.detach().cpu().tolist()
+                if cluster_penalty_prior_prob_kp is not None
+                else None
+            ),
+            "configured_allowed_mask": (
+                cluster_penalty_prior_configured_mask_kp.detach().cpu().tolist()
+                if cluster_penalty_prior_configured_mask_kp is not None
+                else None
+            ),
+            "active_allowed_mask": (
+                cluster_penalty_allowed_mask_kp.detach().cpu().tolist()
+                if cluster_penalty_allowed_mask_kp is not None
+                else None
+            ),
+            "late_allowed_mask": (
+                cluster_penalty_late_allowed_mask_kp.detach().cpu().tolist()
+                if cluster_penalty_late_allowed_mask_kp is not None
+                else None
+            ),
+        },
         "model_train_stat_adapter": model_train_stat_adapter_summary,
         "train_stat_anchor_expert": train_stat_anchor_summary,
         "train_residual_anchor_expert": train_residual_anchor_summary,
         "moe_gate_penalty_hit": moe_gate_penalty_hit_summary,
         "penalty_explainability": penalty_explainability_summary,
+        "penalty_route_learnability": penalty_route_learnability_summary,
         "moe_router": {
             "mode": str(router_mode),
             "penalty_context_weight": float(router_penalty_context_weight),
@@ -10919,15 +14653,92 @@ def main():
             "detach_penalty_context": bool(router_detach_penalty_context),
             "context_applied_inside_gate_logits": True,
             "allow_skip": bool(allow_skip),
+            "skip_competes_with_penalties": bool(skip_competes),
+            "skip_argmax_noop": bool(skip_argmax_noop),
             "skip_cost": float(skip_cost),
             "skip_supervision_weight": float(skip_supervision_weight),
             "skip_supervision_margin": float(skip_supervision_margin),
+            "freeze_gate_after_epoch": int(pred_residual_freeze_gate_after_epoch),
+            "route_ce_supervision": {
+                "enable": bool(route_ce_enable),
+                "weight": float(route_ce_weight),
+                "min_abs_improvement": float(route_ce_min_abs_improvement),
+                "min_rel_improvement": float(route_ce_min_rel_improvement),
+                "min_candidate_delta_rms": float(route_ce_min_candidate_delta_rms),
+                "ignore_abs_gain_below": float(route_ce_ignore_abs_gain_below),
+                "class_weight": str(route_ce_class_weight_mode),
+                "max_class_weight": float(route_ce_max_class_weight),
+                "require_skip": bool(route_ce_require_skip),
+                "require_skip_competes": bool(route_ce_require_skip_competes),
+                "require_skip_argmax_noop": bool(route_ce_require_skip_argmax_noop),
+                "probs_include_skip_mass": bool(skip_competes),
+            },
+            "binary_adoption_supervision": {
+                "enable": bool(binary_adoption_enable),
+                "weight": float(binary_adoption_weight),
+                "min_abs_improvement": float(binary_adoption_min_abs_improvement),
+                "min_rel_improvement": float(binary_adoption_min_rel_improvement),
+                "min_candidate_delta_rms": float(binary_adoption_min_candidate_delta_rms),
+                "ignore_abs_gain_below": float(binary_adoption_ignore_abs_gain_below),
+                "positive_weight": float(binary_adoption_positive_weight),
+                "negative_weight": float(binary_adoption_negative_weight),
+                "require_skip": bool(binary_adoption_require_skip),
+                "require_skip_competes": bool(binary_adoption_require_skip_competes),
+                "require_skip_argmax_noop": bool(binary_adoption_require_skip_argmax_noop),
+                "probs_include_skip_mass": bool(skip_competes),
+            },
+            "route_rate_alignment_supervision": {
+                "enable": bool(route_rate_alignment_enable),
+                "weight": float(route_rate_alignment_weight),
+                "min_abs_improvement": float(route_rate_alignment_min_abs_improvement),
+                "min_rel_improvement": float(route_rate_alignment_min_rel_improvement),
+                "min_candidate_delta_rms": float(route_rate_alignment_min_candidate_delta_rms),
+                "ignore_abs_gain_below": float(route_rate_alignment_ignore_abs_gain_below),
+                "require_skip": bool(route_rate_alignment_require_skip),
+                "require_skip_competes": bool(route_rate_alignment_require_skip_competes),
+                "require_skip_argmax_noop": bool(route_rate_alignment_require_skip_argmax_noop),
+                "probs_include_skip_mass": bool(skip_competes),
+            },
+            "route_positive_recall_supervision": {
+                "enable": bool(route_positive_recall_enable),
+                "weight": float(route_positive_recall_weight),
+                "min_abs_improvement": float(route_positive_recall_min_abs_improvement),
+                "min_rel_improvement": float(route_positive_recall_min_rel_improvement),
+                "min_candidate_delta_rms": float(route_positive_recall_min_candidate_delta_rms),
+                "ignore_abs_gain_below": float(route_positive_recall_ignore_abs_gain_below),
+                "mode": str(route_positive_recall_mode),
+                "target_probability": float(route_positive_recall_target_probability),
+                "require_skip": bool(route_positive_recall_require_skip),
+                "require_skip_competes": bool(route_positive_recall_require_skip_competes),
+                "require_skip_argmax_noop": bool(route_positive_recall_require_skip_argmax_noop),
+                "probs_include_skip_mass": bool(skip_competes),
+            },
+            "route_precision_recall_supervision": {
+                "enable": bool(route_precision_recall_enable),
+                "weight": float(route_precision_recall_weight),
+                "min_abs_improvement": float(route_precision_recall_min_abs_improvement),
+                "min_rel_improvement": float(route_precision_recall_min_rel_improvement),
+                "min_candidate_delta_rms": float(route_precision_recall_min_candidate_delta_rms),
+                "ignore_abs_gain_below": float(route_precision_recall_ignore_abs_gain_below),
+                "recall_mode": str(route_precision_recall_mode),
+                "recall_target_probability": float(route_precision_recall_target_probability),
+                "false_adopt_max_probability": float(route_precision_recall_false_adopt_max_probability),
+                "false_adopt_weight": float(route_precision_recall_false_adopt_weight),
+                "require_skip": bool(route_precision_recall_require_skip),
+                "require_skip_competes": bool(route_precision_recall_require_skip_competes),
+                "require_skip_argmax_noop": bool(route_precision_recall_require_skip_argmax_noop),
+                "probs_include_skip_mass": bool(skip_competes),
+            },
             "mse_utility_gate_supervision": {
                 "enable": bool(mse_utility_gate_enable),
                 "weight": float(mse_utility_gate_weight),
                 "temperature": float(mse_utility_gate_temperature),
                 "min_gain": float(mse_utility_gate_min_gain),
                 "target_power": float(mse_utility_gate_target_power),
+                "target_mode": str(mse_utility_gate_target_mode),
+                "include_skip": bool(mse_utility_gate_include_skip),
+                "probs_include_skip_mass": bool(skip_competes),
+                "train_diagnostics": list(mse_gate_train_diag_history),
             },
         },
         "val": val_summary,
@@ -10947,26 +14758,9 @@ def main():
             "selection_policy": selected_selection_policy,
             "avg_mae": selected_avg_mae,
             "avg_mse": selected_avg_mse,
-            "base_val_mse": selected_base_val_mse,
-            "hybrid_val_mse": selected_hybrid_val_mse,
-            "base_val_mae": selected_base_val_mae,
-            "hybrid_val_mae": selected_hybrid_val_mae,
-            "val_mse_improvement": selected_val_mse_improvement,
-            "val_mse_improvement_pct": selected_val_mse_improvement_pct,
-            "required_val_mse_improvement": required_val_mse_improvement,
-            "val_mae_improvement": selected_val_mae_improvement,
-            "val_mae_improvement_pct": selected_val_mae_improvement_pct,
-            "required_val_mae_improvement": required_val_mae_improvement,
-            "val_mse_regression": selected_val_mse_regression,
-            "val_mse_regression_pct": selected_val_mse_regression_pct,
-            "allowed_val_mse_regression": allowed_val_mse_regression,
-            "selection_min_abs_improvement": knn_selection_min_abs_improvement,
-            "selection_min_rel_improvement": knn_selection_min_rel_improvement,
-            "selection_max_rel_mse_regression": knn_selection_max_rel_mse_regression,
+            "base_val_mse": None if val_summary is None else val_summary.get("avg_mse"),
+            "base_val_mae": None if val_summary is None else val_summary.get("avg_mae"),
         },
-        "channel_selection": channel_selection_summary,
-        "knn_fusion_calibrator": knn_fusion_summary,
-        "knn_gate_calibrator": knn_gate_summary,
         "timing": {
             "total_sec": float(total_time),
             "avg_epoch_sec": float(avg_epoch_time),
@@ -10978,32 +14772,12 @@ def main():
             "out_dir_size_mb": float(out_dir_mb),
         },
     }
-    if knn_hybrid_test is not None and not skip_test:
-        summary["knn_hybrid"] = knn_hybrid_test.describe()
-    if len(knn_sweep_results) > 0:
-        summary["knn_sweep"] = knn_sweep_results
+    if stage2_loss_diagnostics_summary is not None:
+        summary["stage2_loss_diagnostics"] = stage2_loss_diagnostics_summary
+    if stage2_route_audit_summary is not None:
+        summary["stage2_route_audit"] = stage2_route_audit_summary
     if finetune_summary is not None:
         summary["finetune"] = finetune_summary
-    if val_summary_hybrid is not None:
-        summary["val_hybrid"] = val_summary_hybrid
-    if val_hybrid_confidence is not None:
-        summary["val_hybrid_confidence"] = val_hybrid_confidence
-    if (
-        avg_mae_hybrid is not None
-        and avg_mse_hybrid is not None
-        and test_loss_hybrid_k is not None
-        and test_mse_hybrid_k is not None
-        and test_mae_hybrid_k is not None
-    ):
-        summary["test_hybrid"] = {
-            "avg_mae": avg_mae_hybrid,
-            "avg_mse": avg_mse_hybrid,
-            "per_cluster_loss": [float(v) for v in test_loss_hybrid_k.detach().cpu().tolist()],
-            "per_cluster_mse": [float(v) for v in test_mse_hybrid_k.detach().cpu().tolist()],
-            "per_cluster_mae": [float(v) for v in test_mae_hybrid_k.detach().cpu().tolist()],
-        }
-    if test_hybrid_confidence is not None:
-        summary["test_hybrid_confidence"] = test_hybrid_confidence
     summary_path = os.path.join(out_dir, "run_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

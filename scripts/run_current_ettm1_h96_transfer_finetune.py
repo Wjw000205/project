@@ -84,10 +84,6 @@ def prepare_source_checkpoint(
     cfg["memory"]["checkpoint_path"] = str(source_run_dir / "best_checkpoint.pt")
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = False
-    cfg.setdefault("knn_hybrid", {})
-    cfg["knn_hybrid"]["enable"] = False
-    cfg["knn_hybrid"]["use_for_model_selection"] = False
-    cfg["calibration"] = {"enable": False}
     write_yaml(cfg_path, cfg)
 
     checkpoint_path = source_run_dir / "best_checkpoint.pt"

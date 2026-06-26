@@ -8,10 +8,23 @@ import pytest
 import src.train as train_module
 from src.train import (
     PredResidualCandidateSelector,
+    StaticPredResidualCandidateSelector,
+    _candidate_selector_adoption_decision,
+    _candidate_selector_candidate_scale,
+    _candidate_selector_feature_gain_diagnostics,
+    _candidate_selector_feature_standardization_stats,
+    _candidate_selector_feature_names,
+    _candidate_selector_features,
     _candidate_selector_targets,
-    _collect_pred_residual_gate_tensors,
+    _collect_pred_residual_selector_tensors,
+    _fit_static_candidate_channel_selector_from_tensors,
+    _cluster_penalty_mask_to_channel_mask,
+    _load_finetune_pred_residual_state,
+    _pred_residual_selector_metrics_from_tensors,
     _normalize_history_anchor_cfg,
     _validate_strict_history_anchor_scope,
+    apply_default_moe_output_anchor_cfg,
+    apply_moe_output_anchor_experts,
     apply_moe_history_anchor_expert,
     apply_history_anchor_adapter,
     apply_train_stat_anchor_expert,
@@ -22,11 +35,13 @@ from src.train import (
     build_train_phase_anchor_table,
     build_train_phase_residual_anchor_table,
     build_train_residual_anchor_table_from_loader,
+    default_moe_output_anchor_cfg,
     select_channel_anchor_scales,
     select_channel_horizon_anchor_scales,
     select_train_stat_anchor_scales_from_loader,
     select_train_residual_anchor_scales_from_loader,
 )
+from src.models.residual_moe import ClusterwisePredResidualMoE
 
 
 class _ZeroBackbone(torch.nn.Module):
@@ -47,21 +62,79 @@ class _MeanBackbone(torch.nn.Module):
         return x.mean(dim=-1, keepdim=True).expand(-1, -1, self.pred_len)
 
 
-class _OnePenaltyGate(torch.nn.Module):
-    def forward(
-        self,
-        feat_bkf: torch.Tensor,
-        straight_through: bool = False,
-        penalty_context_bkp: torch.Tensor | None = None,
-        penalty_context_mode: str = "learned",
-        penalty_context_weight: float = 0.0,
-        penalty_context_detach: bool = True,
-        penalty_context_score: str = "high_violation",
-    ):
-        b, k, _ = feat_bkf.shape
-        mask = torch.ones(b, k, 1, device=feat_bkf.device, dtype=feat_bkf.dtype)
-        probs = torch.ones_like(mask)
-        return mask, probs, None, {}
+def test_finetune_pred_residual_state_load_restores_checkpoint_weights() -> None:
+    torch.manual_seed(12)
+    source = ClusterwisePredResidualMoE(
+        num_clusters=2,
+        num_penalties=2,
+        input_len=4,
+        pred_len=2,
+        hidden_dim=3,
+        init_alpha=2.0,
+        alpha_scale=1.0,
+        intervention_enable=False,
+        penalty_selector_enable=False,
+        fusion_gate_enable=False,
+    )
+    target = ClusterwisePredResidualMoE(
+        num_clusters=2,
+        num_penalties=2,
+        input_len=4,
+        pred_len=2,
+        hidden_dim=3,
+        init_alpha=-5.0,
+        alpha_scale=1.0,
+        intervention_enable=False,
+        penalty_selector_enable=False,
+        fusion_gate_enable=False,
+    )
+    with torch.no_grad():
+        for i, param in enumerate(source.parameters()):
+            param.fill_(0.01 * float(i + 1))
+        for param in target.parameters():
+            param.zero_()
+
+    loaded = _load_finetune_pred_residual_state(
+        pred_residual=target,
+        checkpoint={"pred_residual_state": source.state_dict()},
+        source_penalty_names=["a", "b"],
+        target_penalty_names=["a", "b"],
+        strict=True,
+    )
+
+    assert loaded is True
+    x = torch.randn(2, 2, 4)
+    y_base = torch.randn(2, 2, 2)
+    cluster_id = torch.tensor([0, 1], dtype=torch.long)
+    route = torch.ones(2, 2, 2)
+    source_out = source(x, y_base, cluster_id, route)
+    target_out = target(x, y_base, cluster_id, route)
+    for key, source_value in source_out.items():
+        assert torch.equal(target_out[key], source_value), key
+
+
+def test_cluster_penalty_mask_broadcasts_to_channel_penalty_mask() -> None:
+    allowed_kp = torch.tensor(
+        [
+            [True, False, True],
+            [False, True, False],
+        ]
+    )
+    cluster_id_c = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+
+    allowed_cp = _cluster_penalty_mask_to_channel_mask(allowed_kp, cluster_id_c)
+
+    assert torch.equal(
+        allowed_cp,
+        torch.tensor(
+            [
+                [False, True, False],
+                [True, False, True],
+                [False, True, False],
+                [True, False, True],
+            ]
+        ),
+    )
 
 
 class _NoopPredResidual(torch.nn.Module):
@@ -72,6 +145,7 @@ class _NoopPredResidual(torch.nn.Module):
         cluster_id_c: torch.Tensor,
         mask_bkp: torch.Tensor,
         skip_bk: torch.Tensor | None = None,
+        **_: object,
     ):
         b, c, h = y_base.shape
         p = mask_bkp.shape[-1]
@@ -191,25 +265,22 @@ def test_strict_history_anchor_rejects_all_observed_scope() -> None:
         _validate_strict_history_anchor_scope(cfg, source="model.history_anchor")
 
 
-def test_pred_residual_gate_tensor_collection_uses_history_anchored_base() -> None:
+def test_pred_residual_selector_tensor_collection_uses_history_anchored_base() -> None:
     x = torch.ones(1, 1, 4)
     y = torch.zeros(1, 1, 2)
     idx = torch.tensor([1])
     loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x, y, idx), batch_size=1)
     observed = torch.arange(20, dtype=torch.float32).view(20, 1)
 
-    tensors = _collect_pred_residual_gate_tensors(
+    tensors = _collect_pred_residual_selector_tensors(
         model=_ZeroBackbone(pred_len=2),
-        gate=_OnePenaltyGate(),
         pred_residual=_NoopPredResidual(),
         loader=loader,
         cluster_id_c=torch.tensor([0]),
         K=1,
         moe_cfg={"enable": True},
         device=torch.device("cpu"),
-        penalty_names=["zero"],
-        penalty_fns={"zero": lambda yhat, yref: torch.zeros_like(yhat[..., 0])},
-        penalty_scale=None,
+        penalty_count=1,
         history_anchor_cfg={"enable": True, "lags": [4], "alpha": 1.0, "blend_target": "prediction"},
         observed_history_tc=observed,
         input_len=4,
@@ -348,7 +419,7 @@ def test_main_passes_history_anchor_context_to_gate_penalty_hit_metrics() -> Non
 
 
 def test_eval_loop_defers_train_residual_anchor_until_table_exists() -> None:
-    source = inspect.getsource(train_module.eval_loop)
+    source = inspect.getsource(train_module.apply_moe_output_anchor_experts)
 
     assert "train_residual_anchor_phc is not None" in source
 
@@ -375,6 +446,28 @@ def test_candidate_selector_targets_require_positive_gain_over_skip() -> None:
     assert torch.equal(target, torch.zeros(1, 2, dtype=torch.long))
 
 
+def test_candidate_selector_targets_respect_allowed_penalties() -> None:
+    base = torch.ones(1, 2, 2)
+    y = torch.zeros(1, 2, 2)
+    cand = torch.stack(
+        [
+            torch.ones(1, 2, 2),
+            torch.zeros(1, 2, 2),
+        ],
+        dim=2,
+    )
+    allowed_mask_cp = torch.tensor([[True, False], [False, True]])
+
+    target = _candidate_selector_targets(
+        base_bch=base,
+        cand_bcpH=cand,
+        y_bch=y,
+        allowed_mask_cp=allowed_mask_cp,
+    )
+
+    assert torch.equal(target, torch.tensor([[0, 2]]))
+
+
 def test_candidate_selector_can_hard_select_penalty_candidate() -> None:
     selector = PredResidualCandidateSelector(feat_dim=13, num_channels=1, num_penalties=2, hidden_dim=2)
     with torch.no_grad():
@@ -392,6 +485,26 @@ def test_candidate_selector_can_hard_select_penalty_candidate() -> None:
 
     assert torch.equal(selected_class, torch.tensor([[2]]))
     assert torch.allclose(selected, torch.tensor([[[2.0, 2.0]]]))
+
+
+def test_candidate_selector_hard_selection_masks_disallowed_penalties() -> None:
+    selector = PredResidualCandidateSelector(feat_dim=13, num_channels=1, num_penalties=2, hidden_dim=2)
+    selector.set_allowed_penalty_mask(torch.tensor([[True, False]]))
+    with torch.no_grad():
+        selector.skip_bias.fill_(0.0)
+        selector.penalty_bias[:] = torch.tensor([1.0, 5.0])
+        selector.net[-1].weight.zero_()
+        selector.net[-1].bias.zero_()
+        selector.skip_net[-1].weight.zero_()
+        selector.skip_net[-1].bias.zero_()
+
+    x = torch.zeros(1, 1, 2)
+    base = torch.zeros(1, 1, 2)
+    cand = torch.tensor([[[[1.0, 1.0], [9.0, 9.0]]]])
+    selected, selected_class = selector.select_prediction(x, base, cand)
+
+    assert torch.equal(selected_class, torch.tensor([[1]]))
+    assert torch.allclose(selected, torch.tensor([[[1.0, 1.0]]]))
 
 
 def test_candidate_selector_margin_can_force_skip_when_penalty_edge_is_small() -> None:
@@ -432,6 +545,368 @@ def test_candidate_selector_can_append_penalty_identity_features() -> None:
     assert logits.shape == (1, 1, 3)
 
 
+def test_candidate_selector_metrics_oracle_respects_allowed_penalties() -> None:
+    selector = PredResidualCandidateSelector(feat_dim=13, num_channels=2, num_penalties=2, hidden_dim=2)
+    allowed_mask_cp = torch.tensor([[True, False], [False, True]])
+    selector.set_allowed_penalty_mask(allowed_mask_cp)
+
+    base = torch.ones(1, 2, 2)
+    y = torch.zeros(1, 2, 2)
+    cand = torch.stack(
+        [
+            torch.ones(1, 2, 2),
+            torch.zeros(1, 2, 2),
+        ],
+        dim=2,
+    )
+    tensors = {
+        "skip_feat": torch.zeros(1, 2, 13),
+        "cand_feat": torch.zeros(1, 2, 2, 13),
+        "base": base,
+        "cand": cand,
+        "y": y,
+    }
+
+    metrics = _pred_residual_selector_metrics_from_tensors(
+        tensors=tensors,
+        selector=selector,
+        device=torch.device("cpu"),
+        batch_size=1,
+        min_abs_improvement=0.0,
+        min_rel_improvement=0.0,
+        allowed_mask_cp=allowed_mask_cp,
+        penalty_names=["allowed0", "allowed1"],
+    )
+
+    assert metrics is not None
+    assert metrics["oracle_gain_pct_vs_base"] == pytest.approx(50.0)
+    assert metrics["target_class_rate"]["skip"] == pytest.approx(0.5)
+    assert metrics["target_class_rate"]["allowed1"] == pytest.approx(0.5)
+    assert metrics["oracle_class_rate"]["skip"] == pytest.approx(0.5)
+    assert metrics["oracle_class_rate"]["allowed1"] == pytest.approx(0.5)
+
+
+def test_candidate_selector_adoption_rejects_mse_regression_even_if_mae_improves() -> None:
+    decision = _candidate_selector_adoption_decision(
+        current_mse=0.2136176,
+        current_mae=0.3190942,
+        selector_mse=0.2165933,
+        selector_mae=0.3173998,
+        min_abs_improvement=0.0,
+        min_rel_improvement=0.0,
+        max_rel_mae_regression=0.0,
+    )
+
+    assert decision["adopt"] is False
+    assert decision["mse_improvement"] < 0.0
+
+
+def test_candidate_selector_adoption_accepts_mse_win_without_mae_regression() -> None:
+    decision = _candidate_selector_adoption_decision(
+        current_mse=0.2136176,
+        current_mae=0.3190942,
+        selector_mse=0.209,
+        selector_mae=0.318,
+        min_abs_improvement=0.0,
+        min_rel_improvement=0.001,
+        max_rel_mae_regression=0.0,
+    )
+
+    assert decision["adopt"] is True
+    assert decision["mse_improvement"] > decision["required_mse_improvement"]
+
+
+def test_candidate_selector_candidate_scale_can_use_unscaled_candidates() -> None:
+    scale = torch.tensor([1.0, 0.0])
+
+    chosen, mode = _candidate_selector_candidate_scale(
+        pred_residual_scale_c=scale,
+        selector_cfg={"use_channel_scale_for_candidates": False},
+    )
+
+    assert chosen is None
+    assert mode == "unscaled"
+
+
+def test_candidate_selector_candidate_scale_defaults_to_channel_scale() -> None:
+    scale = torch.tensor([1.0, 0.0])
+
+    chosen, mode = _candidate_selector_candidate_scale(
+        pred_residual_scale_c=scale,
+        selector_cfg={},
+    )
+
+    assert chosen is scale
+    assert mode == "channel_scale"
+
+
+def test_candidate_selector_feature_gain_diagnostic_finds_signal_and_masks_disallowed() -> None:
+    base = torch.ones(1, 2, 2)
+    y = torch.zeros(1, 2, 2)
+    cand = torch.stack(
+        [
+            torch.tensor([[[0.0, 0.0], [0.5, 0.5]]]),
+            torch.full((1, 2, 2), 3.0),
+        ],
+        dim=2,
+    )
+    cand_feat = torch.zeros(1, 2, 2, 2)
+    cand_feat[..., 0] = torch.tensor([[[1.0, 999.0], [0.75, 999.0]]])
+    cand_feat[..., 1] = torch.tensor([[[0.0, 5.0], [0.0, 5.0]]])
+    tensors = {
+        "skip_feat": torch.zeros(1, 2, 2),
+        "cand_feat": cand_feat,
+        "base": base,
+        "cand": cand,
+        "y": y,
+    }
+
+    diag = _candidate_selector_feature_gain_diagnostics(
+        tensors=tensors,
+        feature_names=["signal", "noise"],
+        penalty_names=["allowed", "blocked"],
+        allowed_mask_cp=torch.tensor([[True, False], [True, False]]),
+        topk=2,
+    )
+
+    assert diag is not None
+    assert diag["samples"] == 2
+    assert diag["positive_rate"] == pytest.approx(1.0)
+    assert diag["top_abs_gain_corr"][0]["feature"] == "signal"
+    assert diag["top_abs_gain_corr"][0]["corr"] == pytest.approx(1.0)
+    assert diag["by_penalty"]["allowed"]["samples"] == 2
+    assert diag["by_penalty"]["blocked"]["samples"] == 0
+
+
+def test_candidate_selector_robust_standardization_resists_outlier_and_clip_applies() -> None:
+    selector = PredResidualCandidateSelector(feat_dim=1, num_channels=1, num_penalties=1, hidden_dim=2)
+    skip_feat = torch.tensor([[[0.0]], [[0.0]], [[0.0]], [[0.0]], [[1000.0]]])
+    cand_feat = torch.tensor([[[[0.0]]], [[[1.0]]], [[[1.0]]], [[[0.0]]], [[[1000.0]]]])
+    train_idx = torch.arange(5)
+    mean_std_mean, mean_std_std, mean_std_summary = _candidate_selector_feature_standardization_stats(
+        skip_feat=skip_feat,
+        cand_feat=cand_feat,
+        selector=selector,
+        train_idx=train_idx,
+        mode="mean_std",
+    )
+    robust_mean, robust_std, robust_summary = _candidate_selector_feature_standardization_stats(
+        skip_feat=skip_feat,
+        cand_feat=cand_feat,
+        selector=selector,
+        train_idx=train_idx,
+        mode="robust",
+    )
+
+    assert mean_std_summary["mode"] == "mean_std"
+    assert robust_summary["mode"] == "robust"
+    assert robust_mean.item() < mean_std_mean.item()
+    assert robust_std.item() < mean_std_std.item()
+
+    selector.set_feature_standardization(robust_mean, robust_std)
+    selector.set_feature_standardize_clip(2.0)
+    standardized = selector._standardize_feat(torch.tensor([[[1000.0]]]))
+
+    assert standardized.max().item() == pytest.approx(2.0)
+
+
+def test_candidate_selector_history_proxy_features_measure_candidate_distance_to_history() -> None:
+    x = torch.tensor([[[0.0, 1.0, 2.0, 3.0]]])
+    base = torch.tensor([[[2.0, 3.0]]])
+    cand = torch.tensor([[[4.0, 6.0]]])
+
+    names = _candidate_selector_feature_names("history_proxy")
+    feat = _candidate_selector_features(x, base, cand, feature_mode="history_proxy")
+    proxy_mse_delta_idx = names.index("proxy_mse_delta")
+    proxy_mae_delta_idx = names.index("proxy_mae_delta")
+
+    assert feat.shape[-1] == len(names)
+    assert feat[0, 0, proxy_mse_delta_idx].item() > 0.0
+    assert feat[0, 0, proxy_mae_delta_idx].item() > 0.0
+
+
+def test_candidate_selector_shape_proxy_features_are_target_free_shape_descriptors() -> None:
+    x = torch.tensor([[[0.0, 1.0, 2.0, 3.0]]])
+    base = torch.tensor([[[3.0, 4.0]]])
+    cand = torch.tensor([[[3.0, 5.0]]])
+
+    names = _candidate_selector_feature_names("shape_proxy")
+    feat = _candidate_selector_features(x, base, cand, feature_mode="shape_proxy")
+
+    assert feat.shape[-1] == len(names)
+    assert len(names) > len(_candidate_selector_feature_names("history_proxy"))
+    assert "hybrid_base_slope_delta" in names
+    assert "hybrid_hist_corr" in names
+    assert "hybrid_diff_rms" in names
+    assert torch.isfinite(feat).all()
+    assert feat[0, 0, names.index("hybrid_base_slope_delta")].item() > 0.0
+
+
+def test_static_candidate_channel_selector_uses_only_allowed_improving_candidates() -> None:
+    base = torch.ones(2, 2, 2)
+    y = torch.zeros(2, 2, 2)
+    cand = torch.stack(
+        [
+            torch.zeros(2, 2, 2),
+            torch.full((2, 2, 2), 0.5),
+        ],
+        dim=2,
+    )
+    tensors = {
+        "skip_feat": torch.zeros(2, 2, 1),
+        "cand_feat": torch.zeros(2, 2, 2, 1),
+        "base": base,
+        "cand": cand,
+        "y": y,
+    }
+
+    selector, summary = _fit_static_candidate_channel_selector_from_tensors(
+        tensors=tensors,
+        allowed_mask_cp=torch.tensor([[False, True], [True, False]]),
+        penalty_names=["blocked_best", "allowed_second"],
+        channel_names=["ch0", "ch1"],
+        min_abs_improvement=0.01,
+    )
+    selected, selected_class = selector.select_prediction(torch.zeros(2, 2, 2), base, cand)
+
+    assert isinstance(selector, StaticPredResidualCandidateSelector)
+    assert summary["selected_class"] == [2, 1]
+    assert summary["selected_penalty_by_channel"] == ["allowed_second", "blocked_best"]
+    assert torch.equal(selected_class, torch.tensor([[2, 1], [2, 1]]))
+    assert torch.allclose(selected[:, 0], torch.full((2, 2), 0.5))
+    assert torch.allclose(selected[:, 1], torch.zeros(2, 2))
+
+
+def test_static_candidate_channel_selector_keeps_base_without_required_gain() -> None:
+    base = torch.zeros(1, 1, 2)
+    y = torch.zeros(1, 1, 2)
+    cand = torch.ones(1, 1, 1, 2)
+    tensors = {
+        "skip_feat": torch.zeros(1, 1, 1),
+        "cand_feat": torch.zeros(1, 1, 1, 1),
+        "base": base,
+        "cand": cand,
+        "y": y,
+    }
+
+    selector, summary = _fit_static_candidate_channel_selector_from_tensors(
+        tensors=tensors,
+        allowed_mask_cp=torch.ones(1, 1, dtype=torch.bool),
+        penalty_names=["bad"],
+        channel_names=["ch0"],
+        min_abs_improvement=0.01,
+    )
+
+    selected, selected_class = selector.select_prediction(torch.zeros(1, 1, 2), base, cand)
+
+    assert summary["selected_class"] == [0]
+    assert summary["num_candidate_channels"] == 0
+    assert torch.equal(selected_class, torch.zeros(1, 1, dtype=torch.long))
+    assert torch.allclose(selected, base)
+
+
+def test_default_moe_output_anchor_cfg_uses_pems_main_table_defaults() -> None:
+    cfg = default_moe_output_anchor_cfg("data/PEMS08.csv", 96)
+
+    assert cfg["history_anchor_expert"] == {"enable": False}
+    assert cfg["train_stat_anchor_expert"]["period"] == 288
+    assert cfg["train_stat_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": "mse",
+        "max_scale": 0.2,
+        "steps": 9,
+    }
+    assert cfg["train_residual_anchor_expert"]["period"] == 288
+    assert cfg["train_residual_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": "mse",
+        "max_scale": 1.2,
+        "steps": 49,
+        "horizon_segments": 4,
+    }
+
+
+def test_default_moe_output_anchor_cfg_uses_ettm2_h96_best_defaults() -> None:
+    cfg = default_moe_output_anchor_cfg("ETTm2_H96", 96)
+
+    assert cfg["history_anchor_expert"] == {"enable": False}
+    assert cfg["train_stat_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": "mae",
+        "max_scale": 0.18,
+        "steps": 8,
+    }
+    assert cfg["train_residual_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": "mae",
+        "max_scale": 1.2,
+        "steps": 49,
+        "horizon_segments": 7,
+    }
+
+
+@pytest.mark.parametrize(
+    ("horizon", "period", "metric", "stat_max", "stat_steps", "resid_max", "resid_steps", "segments"),
+    [
+        (96, 144, "mse", 0.4, 13, 0.8, 25, 8),
+        (192, 144, "mae", 0.5, 13, 1.0, 25, 8),
+        (336, 96, "mae", 0.2, 9, 1.2, 49, 7),
+        (720, 96, "mae", 0.2, 9, 1.2, 49, 7),
+    ],
+)
+def test_default_moe_output_anchor_cfg_uses_weather_best_anchor_defaults(
+    horizon: int,
+    period: int,
+    metric: str,
+    stat_max: float,
+    stat_steps: int,
+    resid_max: float,
+    resid_steps: int,
+    segments: int,
+) -> None:
+    cfg = default_moe_output_anchor_cfg("data/weather.csv", horizon)
+
+    assert cfg["history_anchor_expert"] == {"enable": False}
+    assert cfg["train_stat_anchor_expert"]["period"] == period
+    assert cfg["train_stat_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": metric,
+        "max_scale": stat_max,
+        "steps": stat_steps,
+    }
+    assert cfg["train_residual_anchor_expert"]["period"] == period
+    assert cfg["train_residual_anchor_expert"]["scale_selection"] == {
+        "enable": True,
+        "metric": metric,
+        "max_scale": resid_max,
+        "steps": resid_steps,
+        "horizon_segments": segments,
+    }
+
+
+def test_default_moe_output_anchor_cfg_normalizes_weather_horizon_suffix() -> None:
+    assert default_moe_output_anchor_cfg("weather_H192", 192)["train_stat_anchor_expert"]["period"] == 144
+
+
+def test_default_moe_output_anchor_cfg_preserves_disabled_residual_cell() -> None:
+    cfg = default_moe_output_anchor_cfg("ETTh2", 720)
+
+    assert cfg["train_stat_anchor_expert"]["scale_selection"]["max_scale"] == 0.4
+    assert cfg["train_residual_anchor_expert"] == {"enable": False}
+
+
+def test_apply_default_moe_output_anchor_cfg_merges_explicit_experiment_override() -> None:
+    cfg = apply_default_moe_output_anchor_cfg(
+        {"train_residual_anchor_expert": {"enable": False}},
+        dataset_name="ETTm1",
+        pred_len=96,
+    )
+
+    assert cfg["train_stat_anchor_expert"]["enable"] is True
+    assert cfg["train_residual_anchor_expert"]["enable"] is False
+    assert cfg["train_residual_anchor_expert"]["scale_selection"]["max_scale"] == 1.6
+
+
 def test_moe_history_anchor_expert_is_disabled_when_moe_side_config_is_off() -> None:
     observed = torch.arange(12, dtype=torch.float32).view(12, 1)
     pred = torch.zeros(1, 1, 2)
@@ -445,6 +920,31 @@ def test_moe_history_anchor_expert_is_disabled_when_moe_side_config_is_off() -> 
     )
 
     assert torch.allclose(out, pred)
+
+
+def test_moe_output_anchor_experts_apply_when_penalty_moe_is_disabled() -> None:
+    pred = torch.zeros(1, 1, 2)
+    residual_anchor_phc = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+
+    out = apply_moe_output_anchor_experts(
+        pred,
+        base_pred_bch=pred,
+        x_bcl=torch.zeros(1, 1, 2),
+        query_start_abs_b=torch.tensor([0]),
+        input_len=0,
+        moe_cfg={
+            "train_residual_anchor_expert": {
+                "enable": True,
+                "period": 2,
+                "alpha": 1.0,
+                "blend_target": "prediction",
+            }
+        },
+        moe_enable=False,
+        train_residual_anchor_phc=residual_anchor_phc,
+    )
+
+    assert torch.allclose(out, torch.tensor([[[1.0, 2.0]]]))
 
 
 def test_moe_history_anchor_expert_applies_anchor_when_enabled() -> None:

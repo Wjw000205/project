@@ -9,7 +9,7 @@ Modes (`--mode`):
   E. adapter_gi_moe_loss               -- v1 adapter bank, masked-visibility GI loss
   + adapter_mse_only / adapter_ordinary_penalty (v1 baselines)
 
-No cluster, no KNN, no dynamic prototype, no neuron-mask gradient hook.
+No cluster, no dynamic prototype, no neuron-mask gradient hook.
 """
 from __future__ import annotations
 import argparse
