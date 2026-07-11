@@ -49,9 +49,12 @@ class ClusterwiseMoEGate(nn.Module):
         skip_init_bias: float = -2.0,
         skip_competes: bool = False,
         skip_argmax_noop: bool = False,
+        shared_across_clusters: bool = False,
     ):
         super().__init__()
         self.K = num_clusters
+        self.shared_across_clusters = bool(shared_across_clusters)
+        self.param_K = 1 if self.shared_across_clusters else self.K
         self.F = feat_dim
         self.P = num_penalties
         self.topk = topk
@@ -73,23 +76,23 @@ class ClusterwiseMoEGate(nn.Module):
 
         # 每个簇一个 gate（参数按簇存矩阵），避免 python 循环
         self.W1 = nn.ParameterList([
-            nn.Parameter(torch.empty(feat_dim, hidden_dim)) for _ in range(num_clusters)
+            nn.Parameter(torch.empty(feat_dim, hidden_dim)) for _ in range(self.param_K)
         ])
         self.b1 = nn.ParameterList([
-            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_clusters)
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(self.param_K)
         ])
         self.W2 = nn.ParameterList([
-            nn.Parameter(torch.empty(hidden_dim, num_penalties)) for _ in range(num_clusters)
+            nn.Parameter(torch.empty(hidden_dim, num_penalties)) for _ in range(self.param_K)
         ])
         self.b2 = nn.ParameterList([
-            nn.Parameter(torch.zeros(num_penalties)) for _ in range(num_clusters)
+            nn.Parameter(torch.zeros(num_penalties)) for _ in range(self.param_K)
         ])
         if self.allow_skip:
             self.W_skip = nn.ParameterList([
-                nn.Parameter(torch.empty(hidden_dim)) for _ in range(num_clusters)
+                nn.Parameter(torch.empty(hidden_dim)) for _ in range(self.param_K)
             ])
             self.b_skip = nn.ParameterList([
-                nn.Parameter(torch.full((), self.skip_init_bias)) for _ in range(num_clusters)
+                nn.Parameter(torch.full((), self.skip_init_bias)) for _ in range(self.param_K)
             ])
         else:
             self.W_skip = None
@@ -105,6 +108,24 @@ class ClusterwiseMoEGate(nn.Module):
         if self.W_skip is not None:
             for w in self.W_skip:
                 nn.init.normal_(w, mean=0.0, std=0.02)
+
+    def _param_cluster(self, k: int) -> int:
+        return 0 if self.shared_across_clusters else int(k)
+
+    def _stack_cluster_params(self, params: nn.ParameterList) -> torch.Tensor:
+        stacked = torch.stack(list(params), dim=0)
+        if self.shared_across_clusters and self.K != 1:
+            return stacked.expand(self.K, *stacked.shape[1:])
+        return stacked
+
+    def get_cluster_params(self, k: int):
+        if self.shared_across_clusters and int(k) != 0:
+            return []
+        idx = self._param_cluster(k)
+        params = [self.W1[idx], self.b1[idx], self.W2[idx], self.b2[idx]]
+        if self.W_skip is not None and self.b_skip is not None:
+            params.extend([self.W_skip[idx], self.b_skip[idx]])
+        return params
 
     def set_penalty_prior(self, prior_kp: Optional[torch.Tensor], strength: float = 0.0):
         self.penalty_prior_strength = float(max(strength, 0.0))
@@ -158,10 +179,10 @@ class ClusterwiseMoEGate(nn.Module):
           skip_bk: [B,K]
           skip_prob_bk: [B,K]
         """
-        W1 = torch.stack(list(self.W1), dim=0)
-        b1 = torch.stack(list(self.b1), dim=0)
-        W2 = torch.stack(list(self.W2), dim=0)
-        b2 = torch.stack(list(self.b2), dim=0)
+        W1 = self._stack_cluster_params(self.W1)
+        b1 = self._stack_cluster_params(self.b1)
+        W2 = self._stack_cluster_params(self.W2)
+        b2 = self._stack_cluster_params(self.b2)
         h = torch.einsum("bkf,kfh->bkh", feat_bkf, W1) + b1.unsqueeze(0)  # [B,K,H]
         h = self.act(h)
         logits = torch.einsum("bkh,khp->bkp", h, W2) + b2.unsqueeze(0)    # [B,K,P]
@@ -201,8 +222,8 @@ class ClusterwiseMoEGate(nn.Module):
         if self.training and self.noise_std > 0.0:
             logits = logits + torch.randn_like(logits) * self.noise_std
         if self.allow_skip:
-            W_skip = torch.stack(list(self.W_skip), dim=0)
-            b_skip = torch.stack(list(self.b_skip), dim=0)
+            W_skip = self._stack_cluster_params(self.W_skip)
+            b_skip = self._stack_cluster_params(self.b_skip)
             skip_logits = torch.einsum("bkh,kh->bk", h, W_skip) + b_skip.unsqueeze(0)
             if self.logit_clip > 0.0:
                 skip_logits = self.logit_clip * torch.tanh(skip_logits / self.logit_clip)
@@ -271,43 +292,52 @@ class ClusterwiseMoEGate(nn.Module):
         return mask, probs, skip, skip_prob
 
     def mask_cluster_grads(self, stopped_k: torch.Tensor):
+        if self.shared_across_clusters:
+            if not bool(stopped_k.detach().to(dtype=torch.bool).all().item()):
+                return
+            stopped_k = torch.ones((self.param_K,), dtype=torch.bool, device=stopped_k.device)
         for k in range(self.K):
             if not bool(stopped_k[k].item()):
                 continue
-            if self.W1[k].grad is not None:
-                self.W1[k].grad.zero_()
-            if self.b1[k].grad is not None:
-                self.b1[k].grad.zero_()
-            if self.W2[k].grad is not None:
-                self.W2[k].grad.zero_()
-            if self.b2[k].grad is not None:
-                self.b2[k].grad.zero_()
-            if self.W_skip is not None and self.W_skip[k].grad is not None:
-                self.W_skip[k].grad.zero_()
-            if self.b_skip is not None and self.b_skip[k].grad is not None:
-                self.b_skip[k].grad.zero_()
+            idx = self._param_cluster(k)
+            if self.W1[idx].grad is not None:
+                self.W1[idx].grad.zero_()
+            if self.b1[idx].grad is not None:
+                self.b1[idx].grad.zero_()
+            if self.W2[idx].grad is not None:
+                self.W2[idx].grad.zero_()
+            if self.b2[idx].grad is not None:
+                self.b2[idx].grad.zero_()
+            if self.W_skip is not None and self.W_skip[idx].grad is not None:
+                self.W_skip[idx].grad.zero_()
+            if self.b_skip is not None and self.b_skip[idx].grad is not None:
+                self.b_skip[idx].grad.zero_()
+            if self.shared_across_clusters:
+                break
 
     def get_cluster_state(self, k: int):
+        idx = self._param_cluster(k)
         state = {
-            "W1": self.W1[k].detach().cpu(),
-            "b1": self.b1[k].detach().cpu(),
-            "W2": self.W2[k].detach().cpu(),
-            "b2": self.b2[k].detach().cpu(),
+            "W1": self.W1[idx].detach().cpu(),
+            "b1": self.b1[idx].detach().cpu(),
+            "W2": self.W2[idx].detach().cpu(),
+            "b2": self.b2[idx].detach().cpu(),
         }
         if self.W_skip is not None:
-            state["W_skip"] = self.W_skip[k].detach().cpu()
-            state["b_skip"] = self.b_skip[k].detach().cpu()
+            state["W_skip"] = self.W_skip[idx].detach().cpu()
+            state["b_skip"] = self.b_skip[idx].detach().cpu()
         return state
 
     def load_cluster_state(self, k: int, state):
-        device = self.W1[k].device
-        self.W1[k].data.copy_(state["W1"].to(device))
-        self.b1[k].data.copy_(state["b1"].to(device))
-        self.W2[k].data.copy_(state["W2"].to(device))
-        self.b2[k].data.copy_(state["b2"].to(device))
+        idx = self._param_cluster(k)
+        device = self.W1[idx].device
+        self.W1[idx].data.copy_(state["W1"].to(device))
+        self.b1[idx].data.copy_(state["b1"].to(device))
+        self.W2[idx].data.copy_(state["W2"].to(device))
+        self.b2[idx].data.copy_(state["b2"].to(device))
         if self.W_skip is not None and ("W_skip" in state) and ("b_skip" in state):
-            self.W_skip[k].data.copy_(state["W_skip"].to(device))
-            self.b_skip[k].data.copy_(state["b_skip"].to(device))
+            self.W_skip[idx].data.copy_(state["W_skip"].to(device))
+            self.b_skip[idx].data.copy_(state["b_skip"].to(device))
 
 
 

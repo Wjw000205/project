@@ -13,6 +13,7 @@ from src.train import (
     _fit_penalty_route_learnability_head_from_tensors,
     _mse_utility_gate_supervision_loss,
     _normalize_confidence_gate_source_split,
+    _normalize_pred_residual_selection_policy,
     _pred_residual_candidate_supervision_loss,
     _pred_residual_intervention_supervision_loss,
     _penalty_route_learnability_metrics_from_scores,
@@ -26,6 +27,14 @@ from src.train import (
     evaluate_penalty_explainability,
 )
 from src.models.residual_moe import ClusterwisePredResidualMoE
+
+
+def test_pred_residual_selection_policy_accepts_guarded_alias() -> None:
+    assert (
+        _normalize_pred_residual_selection_policy("val_mse_candidate_channel_guarded")
+        == "val_mse_candidate_channel"
+    )
+    assert _normalize_pred_residual_selection_policy("off") == "none"
 
 
 class _ZeroBackbone(torch.nn.Module):

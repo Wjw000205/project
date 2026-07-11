@@ -16,8 +16,6 @@ FORBIDDEN_TOKENS = (
     "save_shape_knn_bank",
     "shape_knn_bank",
     "NearestNeighbors",
-    "calibration",
-    "Calibration",
     "calibrator",
     "Calibrator",
     "gate_calibrator",

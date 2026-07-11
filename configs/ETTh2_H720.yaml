@@ -45,32 +45,136 @@ model:
   anchor_detail_scale: 0.45
   anchor_residual: true
 moe:
-  topk: 2
   enable: true
+  shared_across_clusters: true
+  topk: 2
+  freeze_backbone: true
   freeze_lambda: false
-  gate_hidden_dim: 32
+  gate_hidden_dim: 96
+  min_k_for_extensions: 3
+  safeguard_hidden_dim: 64
   select_ranks:
   - 1
   detach_penalty_grad: false
   lambda_init:
-    jump: 0.0
-    amp_under: 0.0
     level: 0.0
     delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_min:
+    level: 0.0
+    delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_schedule:
+    level: none
+    delta: none
+    d2_match: none
+    diff_amp: none
   pred_side_residual:
     enable: true
-    corrector_hidden: 32
-    init_alpha: -3.0
-    alpha_scale: 1.6
-    specialization_weight: 0.1
+    train_with_eval_anchors: true
+    feature_mode: safe_augmented
+    residual_clip: 5.0
+    corrector_hidden: 64
+    init_alpha: -1.8
+    alpha_scale: 1.5
+    specialization_weight: 0.0
     norm_weight: 0.0
     use_y_base_input: true
     intervention_enable: false
     intervention_init: -2.0
-    intervention_weight: 0.001
+    intervention_weight: 0.0
     detach_routed_penalty_pred: false
-    selection_min_abs_improvement: 0.0
-    selection_min_rel_improvement: 0.0
+    selection_policy: none
+    patch_router:
+      enable: true
+      patch_len: 24
+      hidden_dim: 64
+      topk: 1
+      temperature: 1.0
+      noise_std: 0.0
+      allow_skip: true
+      skip_init_bias: -2.0
+      feature_clip: 8.0
+      use_base_forecast: true
+      fixed_penalty_index_by_channel:
+      - -1
+      - 2
+      - -1
+      - 2
+      - 2
+      - 0
+      - 0
+      candidate_scale_by_channel:
+      - 0.0
+      - 1.0
+      - 0.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      regime_context:
+        enable: true
+        lengths:
+        - 192
+        - 384
+        - 672
+      expected_mse_weight: 1.0
+      oracle_ce_weight: 0.0
+      oracle_ce_warmup_epochs: 0
+      freeze_experts_after_warmup: true
+      supervision_only: true
+      oracle_min_abs_improvement: 0.0
+      hierarchical_recall:
+        enable: true
+        mask_inactive_fixed_channels: true
+        adopt_threshold: 0.5
+        adopt_init_bias: 0.0
+        supervision_weight: 1.0
+        warmup_epochs: 0
+        min_abs_improvement: 0.0
+        adoption_bce_weight: 0.0
+        proposal_bce_weight: 0.0
+        proposal_gain_listwise_weight: 0.0
+        proposal_rescue_ce_weight: 0.0
+        ranking_ce_weight: 0.0
+        utility_regression_weight: 0.0
+        risk_sign_bce_weight: 0.0
+        risk_magnitude_weight: 0.0
+        selected_utility_policy_weight: 0.0
+        selected_adoption_bce_weight: 0.5
+        selected_adoption_recall_weight: 0.0
+        selected_false_adopt_weight: 0.0
+        expert_conditional_risk:
+          enable: true
+          decoupled_encoder: true
+          candidate_aware: true
+          proposal_candidate_aware: true
+          proposal_topk: 2
+          proposal_rescue: false
+          temperature: 0.25
+          adoption_source: benefit_probability
+          adopt_threshold: 0.5
+          pairwise_rank:
+            enable: false
+            detach_features: false
+            freeze_other_parameters: false
+            temperature: 1.0
+            loss_weight: 0.0
+          lower_quantile:
+            enable: false
+            quantile: 0.2
+            loss_weight: 0.0
+        adoption_recall_weight: 0.0
+        false_adopt_weight: 0.0
+        penalty_recall_weight: 0.0
+        false_penalty_weight: 0.0
+        target_adopt_probability: 0.8
+        false_adopt_max_probability: 0.2
+        target_penalty_probability: 0.7
+        false_penalty_max_probability: 0.3
+      short_history_mode: cycle
     penalty_guard:
       enable: false
       metric: mse
@@ -86,9 +190,9 @@ moe:
       min_rel_improvement: 0.002
     diagnostics:
       enable: true
-    feature_mode: legacy
-    residual_clip: 0.0
-    selection_policy: val_mse_candidate_channel_guarded
+      train_oracle: true
+      score_threshold_curve: true
+      validation_temporal_blocks: 6
   dynamic_lambda:
     enable: false
   learnable_lambda:
@@ -104,127 +208,135 @@ moe:
   skip_init_bias: -2.0
   gate_temperature: 1.0
   gate_noise_std: 0.2
-  gate_soft_weight: 0.0
-  gate_prob_floor: 0.0
-  gate_entropy_target_frac: 0.7
-  lambda_min:
-    jump: 0.0
-    amp_under: 0.0
-    level: 0.0
-    delta: 0.0
-  lambda_schedule:
-    jump: none
-    amp_under: none
-    level: none
-    delta: none
-  gate_logit_clip: 5.0
   gate_init_bias:
     enable: true
     values:
+      level: 2.0
       default: 0.0
-  freeze_backbone: true
+  gate_soft_weight: 0.0
+  gate_prob_floor: 0.0
+  gate_entropy_target_frac: 0.7
+  residual_gate:
+    enable: true
+    alpha: 0.7
+  pred_aware:
+    enable: true
+    use_pred_features: true
+    use_penalty_input: false
+  penalty_ema:
+    enable: true
+    decay: 0.9
+  sigmoid_branch:
+    enable: true
+    gamma: 0.2
+    init_bias: -2.0
+  gate_logit_clip: 5.0
   router_penalty_context_score: high_violation
   gate_penalty_hit:
     enable: false
   mse_utility_gate_supervision:
-    enable: true
-    weight: 0.02
+    enable: false
+    weight: 0.0
     temperature: 0.5
     min_gain: 0.0
     target_power: 1.0
   cluster_penalty_prior:
     enable: true
-    topk: 2
+    topk: 0
     hard_topk: true
-    logit_strength: 0.4
+    logit_strength: 0.3
     temperature: 1.0
     smoothing: 0.02
     use_normalized_penalty: true
     use_as_balance_target: false
+  train_stat_anchor_expert:
+    enable: true
+    period: 96
+    alpha: 0.0
+    alpha_by_channel:
+    - 0.325
+    - 0.0
+    - 0.3
+    - 0.0
+    - 0.2
+    - 0.4
+    - 0.15
+    mode: phase_mean
+    reference: last
+    blend_target: prediction
+    scale_selection:
+      enable: false
+      metric: mse
+      max_scale: 0.4
+      steps: 17
+  train_residual_anchor_expert:
+    enable: false
   channel_penalty_prior:
     enable: false
-    topk: 0
-    hard_topk: true
-    temperature: 1.0
-    smoothing: 0.02
-    use_normalized_penalty: true
   explainability:
     enable: false
-    splits:
-    - val
-    max_batches: 0
 penalties:
   enabled:
-  - jump
-  - amp_under
   - level
   - delta
+  - d2_match
+  - diff_amp
   jump_threshold: 0.6
 train:
-  epochs: 1
+  epochs: 12
   batch_size: 64
   lr: 0.001
   mse_weight: 0.9
-  mae_objective:
-    enable: true
-    kind: l1
-    weight: 0.6
-    warmup_epochs: 5
   selection_metric: val_mse
-  weight_decay: 0.001
+  weight_decay: 0.0001
   grad_clip: 1.0
-  shuffle_seed: 2026
-  loss_normalization:
-    enable: true
-    mode: std
-    eps: 0.001
-    terms:
-    - mse
-    - mae_objective
-    - penalty
-    - pred_residual
-  lr_scheduler:
-    name: cosine
-    t_max: 95
-    min_lr: 1.0e-06
+  penalty_warmup_epochs: 0
+  model_selection_start_epoch: 1
+  fixed_shuffle_seed: true
+  overfit_diagnostic:
+    enable: false
+  mae_objective:
+    enable: false
+    kind: l1
+    weight: 0.3
     warmup_epochs: 5
-    warmup_start_factor: 0.2
-  penalty_warmup_epochs: 15
-  swa:
-    enable: true
-    start_epoch: 15
-    update_every: 1
-    selection_metric: val_mse
-    min_delta: 0.0
+  lr_scheduler:
+    name: plateau
+    factor: 0.5
+    patience: 3
+    min_lr: 1.0e-06
 early_stop:
-  patience: 10
+  patience: 12
   min_delta: 1.0e-06
 plot:
   enable: false
-  random_n: 3
-  dpi: 140
 portrait:
   enable: false
   out_dir: outputs/ETTh2_H720/cluster_portraits
-  dpi: 140
-  max_points: 2000
-  jump_threshold: 0.6
 eval:
   skip_test: false
 memory:
-  enable: false
-  save_checkpoint: false
   path: outputs/ETTh2_H720/cluster_memory.pt
   checkpoint_path: outputs/ETTh2_H720/best_checkpoint.pt
+  enable: false
+  save_checkpoint: true
 finetune:
   enable: true
-  checkpoint_path: outputs\fresh_input_len96_20260610_etth2_mlp_adapter_search\runs\ETTh2\H720\backbone\long_anchor_h128_detail045\best_checkpoint.pt
+  checkpoint_path: outputs/shared_pkr_patch_gate_bestconfig_20260710/runs/ETTh2/H720/shared_four_pkr_bank_anchorpath_ep6_valonly/best_checkpoint.pt
   strict_window: true
   strict_model: true
+  strict_pred_residual: false
   cluster_map: index
   load_model: true
   load_gate: false
+  load_pred_residual: true
   load_dynamic_lambda: false
   load_learnable_lambda: false
 calendar_residual:
   enable: false
+diagnostics:
+  stage2_loss_audit:
+    enable: true
+    objective_overlap:
+      enable: true
+      max_batches: 4

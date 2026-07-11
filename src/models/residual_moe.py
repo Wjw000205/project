@@ -1,10 +1,1452 @@
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from ..utils.cluster_memory import scatter_mean_bcl_to_bkl
+
+
+class ChannelPatchPenaltyRouter(nn.Module):
+    """Route shared penalty experts from causal input patches."""
+
+    def __init__(
+        self,
+        *,
+        input_len: int,
+        pred_len: int,
+        num_penalties: int,
+        cfg: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__()
+        cfg = cfg or {}
+        self.L = int(input_len)
+        self.H = int(pred_len)
+        self.P = int(num_penalties)
+        self.patch_len = int(cfg.get("patch_len", 24))
+        self.hidden_dim = int(cfg.get("hidden_dim", 32))
+        self.topk = int(cfg.get("topk", 1))
+        self.temperature = max(float(cfg.get("temperature", 1.0)), 1.0e-6)
+        self.noise_std = max(float(cfg.get("noise_std", 0.0)), 0.0)
+        self.allow_skip = bool(cfg.get("allow_skip", True))
+        self.skip_init_bias = float(cfg.get("skip_init_bias", -2.0))
+        self.feature_clip = max(float(cfg.get("feature_clip", 8.0)), 0.0)
+        self.use_base_forecast = bool(cfg.get("use_base_forecast", False))
+        raw_fixed_penalty = cfg.get("fixed_penalty_index_by_channel", None)
+        if raw_fixed_penalty is None:
+            fixed_penalty_c = torch.empty(0, dtype=torch.long)
+        else:
+            fixed_penalty_c = torch.as_tensor(
+                raw_fixed_penalty,
+                dtype=torch.long,
+            ).reshape(-1)
+            if bool(((fixed_penalty_c < -1) | (fixed_penalty_c >= self.P)).any().item()):
+                raise ValueError(
+                    "patch_router fixed_penalty_index_by_channel values must be -1 "
+                    f"or in [0,{self.P - 1}]."
+                )
+        self.register_buffer(
+            "fixed_penalty_index_by_channel_c",
+            fixed_penalty_c,
+            persistent=False,
+        )
+        regime_context_cfg = cfg.get("regime_context", {}) or {}
+        if not isinstance(regime_context_cfg, dict):
+            regime_context_cfg = {"enable": bool(regime_context_cfg)}
+        self.regime_context_enable = bool(regime_context_cfg.get("enable", False))
+        raw_regime_lengths = regime_context_cfg.get(
+            "lengths",
+            [192, 384, 672],
+        )
+        self.regime_context_lengths = sorted(
+            {
+                int(value)
+                for value in raw_regime_lengths
+                if int(value) > 0
+            }
+        ) if self.regime_context_enable else []
+        hierarchical_cfg = cfg.get("hierarchical_recall", {}) or {}
+        if not isinstance(hierarchical_cfg, dict):
+            hierarchical_cfg = {"enable": bool(hierarchical_cfg)}
+        self.hierarchical_recall_enable = bool(hierarchical_cfg.get("enable", False))
+        self.adopt_threshold = float(hierarchical_cfg.get("adopt_threshold", 0.5))
+        self.adopt_init_bias = float(hierarchical_cfg.get("adopt_init_bias", 0.0))
+        utility_verifier_cfg = hierarchical_cfg.get("utility_verifier", {}) or {}
+        if not isinstance(utility_verifier_cfg, dict):
+            utility_verifier_cfg = {"enable": bool(utility_verifier_cfg)}
+        self.utility_verifier_enable = bool(utility_verifier_cfg.get("enable", False))
+        self.utility_verifier_temperature = max(
+            float(utility_verifier_cfg.get("temperature", 0.25)),
+            1.0e-6,
+        )
+        expert_risk_cfg = hierarchical_cfg.get("expert_conditional_risk", {}) or {}
+        if not isinstance(expert_risk_cfg, dict):
+            expert_risk_cfg = {"enable": bool(expert_risk_cfg)}
+        self.expert_conditional_risk_enable = bool(expert_risk_cfg.get("enable", False))
+        self.expert_risk_decoupled_encoder = bool(
+            expert_risk_cfg.get("decoupled_encoder", True)
+        )
+        self.expert_risk_candidate_aware = bool(
+            expert_risk_cfg.get("candidate_aware", True)
+        )
+        self.expert_risk_candidate_compatibility = bool(
+            expert_risk_cfg.get("candidate_compatibility", False)
+        )
+        temporal_domain_cfg = expert_risk_cfg.get(
+            "temporal_domain_ensemble",
+            {},
+        ) or {}
+        if not isinstance(temporal_domain_cfg, dict):
+            temporal_domain_cfg = {"enable": bool(temporal_domain_cfg)}
+        self.expert_risk_temporal_domain_enable = bool(
+            self.expert_conditional_risk_enable
+            and temporal_domain_cfg.get("enable", False)
+        )
+        self.expert_risk_temporal_domain_count = max(
+            2,
+            int(temporal_domain_cfg.get("num_domains", 6)),
+        )
+        self.expert_risk_temporal_domain_train_windows = int(
+            temporal_domain_cfg.get("train_window_count", 0)
+        )
+        self.expert_risk_temporal_domain_combine = str(
+            temporal_domain_cfg.get("combine", "mean")
+        ).strip().lower()
+        if self.expert_risk_temporal_domain_enable:
+            if self.expert_risk_temporal_domain_train_windows <= 0:
+                raise ValueError(
+                    "temporal_domain_ensemble.train_window_count must be positive."
+                )
+            if self.expert_risk_temporal_domain_combine != "mean":
+                raise ValueError(
+                    "temporal_domain_ensemble.combine currently supports only mean."
+                )
+        self.expert_risk_proposal_candidate_aware = bool(
+            self.expert_conditional_risk_enable
+            and expert_risk_cfg.get(
+                "proposal_candidate_aware",
+                self.expert_risk_candidate_aware,
+            )
+        )
+        self.expert_risk_proposal_threshold = float(
+            expert_risk_cfg.get("proposal_threshold", 0.5)
+        )
+        self.expert_risk_proposal_topk = int(expert_risk_cfg.get("proposal_topk", 2))
+        self.expert_risk_proposal_rescue_enable = bool(
+            expert_risk_cfg.get("proposal_rescue", False)
+        )
+        self.expert_risk_temperature = max(
+            float(expert_risk_cfg.get("temperature", 0.25)),
+            1.0e-6,
+        )
+        lower_quantile_cfg = expert_risk_cfg.get("lower_quantile", {}) or {}
+        if not isinstance(lower_quantile_cfg, dict):
+            lower_quantile_cfg = {"enable": bool(lower_quantile_cfg)}
+        self.expert_risk_lower_quantile_enable = bool(
+            lower_quantile_cfg.get("enable", False)
+        )
+        self.expert_risk_lower_quantile = float(
+            lower_quantile_cfg.get("quantile", 0.2)
+        )
+        default_adoption_source = (
+            "lower_quantile"
+            if self.expert_risk_lower_quantile_enable
+            else "expected_utility"
+        )
+        self.expert_risk_adoption_source = str(
+            expert_risk_cfg.get("adoption_source", default_adoption_source)
+        ).strip().lower()
+        utility_veto_cfg = expert_risk_cfg.get("utility_veto", {}) or {}
+        if not isinstance(utility_veto_cfg, dict):
+            utility_veto_cfg = {"enable": bool(utility_veto_cfg)}
+        self.expert_risk_utility_veto_enable = bool(
+            utility_veto_cfg.get("enable", False)
+        )
+        self.expert_risk_utility_veto_detach_features = bool(
+            utility_veto_cfg.get("detach_features", True)
+        )
+        default_adopt_threshold = (
+            0.5
+            if self.expert_risk_adoption_source in {
+                "benefit_probability",
+                "utility_veto",
+            }
+            else 0.0
+        )
+        temporal_calibration_cfg = expert_risk_cfg.get("temporal_calibration", {}) or {}
+        if not isinstance(temporal_calibration_cfg, dict):
+            temporal_calibration_cfg = {"enable": bool(temporal_calibration_cfg)}
+        raw_adopt_threshold_by_penalty = expert_risk_cfg.get(
+            "adopt_threshold_by_penalty",
+            None,
+        )
+        self.expert_risk_per_penalty_threshold_enable = bool(
+            self.expert_conditional_risk_enable
+            and (
+                raw_adopt_threshold_by_penalty is not None
+                or temporal_calibration_cfg.get("per_penalty", False)
+            )
+        )
+        if raw_adopt_threshold_by_penalty is None:
+            adopt_threshold_by_penalty = torch.full(
+                (self.P,),
+                float(expert_risk_cfg.get("adopt_threshold", default_adopt_threshold)),
+            )
+        else:
+            adopt_threshold_by_penalty = torch.as_tensor(
+                raw_adopt_threshold_by_penalty,
+                dtype=torch.float32,
+            ).reshape(-1)
+            if int(adopt_threshold_by_penalty.numel()) != self.P:
+                raise ValueError(
+                    "patch_router adopt_threshold_by_penalty must have one value "
+                    f"per penalty ({self.P}), got {int(adopt_threshold_by_penalty.numel())}."
+                )
+        self.expert_risk_adopt_threshold = (
+            nn.Parameter(
+                torch.tensor(
+                    float(
+                        expert_risk_cfg.get(
+                            "adopt_threshold",
+                            default_adopt_threshold,
+                        )
+                    )
+                ),
+                requires_grad=False,
+            )
+            if self.expert_conditional_risk_enable
+            else None
+        )
+        self.expert_risk_adopt_threshold_by_penalty = (
+            nn.Parameter(adopt_threshold_by_penalty, requires_grad=False)
+            if self.expert_risk_per_penalty_threshold_enable
+            else None
+        )
+        pairwise_rank_cfg = expert_risk_cfg.get("pairwise_rank", {}) or {}
+        if not isinstance(pairwise_rank_cfg, dict):
+            pairwise_rank_cfg = {"enable": bool(pairwise_rank_cfg)}
+        self.expert_risk_pairwise_rank_enable = bool(
+            pairwise_rank_cfg.get("enable", False)
+        )
+        self.expert_risk_pairwise_detach_features = bool(
+            pairwise_rank_cfg.get("detach_features", True)
+        )
+        self.expert_risk_pairwise_temperature = max(
+            float(pairwise_rank_cfg.get("temperature", 1.0)),
+            1.0e-6,
+        )
+        self.feature_source = "input_base" if self.use_base_forecast else "input_only"
+        self.short_history_mode = str(
+            cfg.get("short_history_mode", "error")
+        ).strip().lower()
+        if self.patch_len <= 0:
+            raise ValueError("patch_router.patch_len must be positive.")
+        if self.H % self.patch_len != 0:
+            raise ValueError("patch_router.patch_len must divide pred_len exactly.")
+        if self.short_history_mode not in {"error", "cycle"}:
+            raise ValueError(
+                "patch_router.short_history_mode must be error or cycle."
+            )
+        if self.L < self.H and self.short_history_mode == "error":
+            raise ValueError(
+                "patch_router with input_len < pred_len requires "
+                "short_history_mode=cycle."
+            )
+        if self.L < self.H and self.L < self.patch_len:
+            raise ValueError(
+                "patch_router cycle mode requires input_len >= patch_len."
+            )
+        if self.P <= 0:
+            raise ValueError("patch_router requires at least one penalty expert.")
+        if self.hidden_dim <= 0:
+            raise ValueError("patch_router.hidden_dim must be positive.")
+        if self.regime_context_enable and len(self.regime_context_lengths) == 0:
+            raise ValueError("patch_router regime_context requires at least one positive length.")
+        if self.hierarchical_recall_enable and not self.allow_skip:
+            raise ValueError("patch_router hierarchical recall gate requires allow_skip=true.")
+        if self.expert_conditional_risk_enable and not self.hierarchical_recall_enable:
+            raise ValueError(
+                "patch_router expert_conditional_risk requires hierarchical_recall.enable=true."
+            )
+        if self.expert_conditional_risk_enable and self.utility_verifier_enable:
+            raise ValueError(
+                "patch_router utility_verifier and expert_conditional_risk are mutually exclusive."
+            )
+        if not 0.0 < self.adopt_threshold < 1.0:
+            raise ValueError("patch_router hierarchical adopt_threshold must be in (0,1).")
+        if not 0.0 < self.expert_risk_proposal_threshold < 1.0:
+            raise ValueError(
+                "patch_router expert_conditional_risk proposal_threshold must be in (0,1)."
+            )
+        if self.expert_risk_proposal_topk <= 0:
+            raise ValueError(
+                "patch_router expert_conditional_risk proposal_topk must be positive."
+            )
+        if self.expert_risk_proposal_rescue_enable and self.expert_risk_proposal_topk != 2:
+            raise ValueError(
+                "patch_router proposal_rescue currently requires proposal_topk=2."
+            )
+        if not 0.0 < self.expert_risk_lower_quantile < 0.5:
+            raise ValueError(
+                "patch_router expert risk lower quantile must be in (0,0.5)."
+            )
+        if self.expert_risk_adoption_source not in {
+            "benefit_probability",
+            "expected_utility",
+            "lower_quantile",
+            "utility_veto",
+        }:
+            raise ValueError(
+                "patch_router expert risk adoption_source must be benefit_probability, "
+                "expected_utility, lower_quantile, or utility_veto."
+            )
+        if (
+            self.expert_risk_adoption_source == "lower_quantile"
+            and not self.expert_risk_lower_quantile_enable
+        ):
+            raise ValueError(
+                "patch_router lower_quantile adoption_source requires lower_quantile.enable=true."
+            )
+        if (
+            self.expert_risk_adoption_source == "utility_veto"
+            and not self.expert_risk_utility_veto_enable
+        ):
+            raise ValueError(
+                "patch_router utility_veto adoption_source requires utility_veto.enable=true."
+            )
+        if (
+            self.expert_conditional_risk_enable
+            and self.expert_risk_adoption_source
+            in {"benefit_probability", "utility_veto"}
+            and not 0.0 < float(self.expert_risk_adopt_threshold.item()) < 1.0
+        ):
+            raise ValueError(
+                "patch_router probability adopt_threshold must be in (0,1)."
+            )
+        if (
+            self.expert_risk_adopt_threshold_by_penalty is not None
+            and self.expert_risk_adoption_source
+            in {"benefit_probability", "utility_veto"}
+            and not bool(
+                (
+                    (self.expert_risk_adopt_threshold_by_penalty > 0.0)
+                    & (self.expert_risk_adopt_threshold_by_penalty < 1.0)
+                ).all().item()
+            )
+        ):
+            raise ValueError(
+                "patch_router probability adopt_threshold_by_penalty values must be in (0,1)."
+            )
+        self.num_patches = self.H // self.patch_len
+        self.history_patch_projection = "tail" if self.L >= self.H else "cycle"
+        # Local patch shape plus level/scale/slope/diff/d2/endpoint context.
+        self.feature_dim = self.patch_len + 6
+        if self.use_base_forecast:
+            self.feature_dim += self.patch_len + 3
+        self.regime_feature_dim = 6 * len(self.regime_context_lengths)
+        self.feature_dim += self.regime_feature_dim
+        self.level_feature_index = self.patch_len
+        output_dim = self.P if self.hierarchical_recall_enable else self.P + (1 if self.allow_skip else 0)
+        self.W1 = nn.Parameter(torch.empty(self.feature_dim, self.hidden_dim))
+        self.b1 = nn.Parameter(torch.zeros(self.hidden_dim))
+        self.W2 = nn.Parameter(torch.empty(self.hidden_dim, output_dim))
+        self.b2 = nn.Parameter(torch.zeros(output_dim))
+        self.W_adopt = (
+            nn.Parameter(torch.empty(self.hidden_dim, 1))
+            if self.hierarchical_recall_enable
+            else None
+        )
+        self.b_adopt = (
+            nn.Parameter(torch.full((1,), self.adopt_init_bias))
+            if self.hierarchical_recall_enable
+            else None
+        )
+        self.W_benefit = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.hierarchical_recall_enable
+            else None
+        )
+        self.b_benefit = (
+            nn.Parameter(torch.zeros(self.P))
+            if self.hierarchical_recall_enable
+            else None
+        )
+        self.W_proposal1 = (
+            nn.Parameter(torch.empty(self.feature_dim, self.hidden_dim))
+            if self.expert_conditional_risk_enable and self.expert_risk_decoupled_encoder
+            else None
+        )
+        self.b_proposal1 = (
+            nn.Parameter(torch.zeros(self.hidden_dim))
+            if self.expert_conditional_risk_enable and self.expert_risk_decoupled_encoder
+            else None
+        )
+        self.W_risk_sign = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable
+            else None
+        )
+        self.b_risk_sign = (
+            nn.Parameter(torch.zeros(self.P)) if self.expert_conditional_risk_enable else None
+        )
+        self.W_risk_sign_domain_delta = (
+            nn.Parameter(
+                torch.zeros(
+                    self.expert_risk_temporal_domain_count,
+                    self.hidden_dim,
+                    self.P,
+                )
+            )
+            if self.expert_risk_temporal_domain_enable
+            else None
+        )
+        self.b_risk_sign_domain_delta = (
+            nn.Parameter(
+                torch.zeros(self.expert_risk_temporal_domain_count, self.P)
+            )
+            if self.expert_risk_temporal_domain_enable
+            else None
+        )
+        self.W_risk_gain = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable
+            else None
+        )
+        self.b_risk_gain = (
+            nn.Parameter(torch.zeros(self.P)) if self.expert_conditional_risk_enable else None
+        )
+        self.W_risk_cost = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable
+            else None
+        )
+        self.b_risk_cost = (
+            nn.Parameter(torch.zeros(self.P)) if self.expert_conditional_risk_enable else None
+        )
+        self.W_risk_lower_quantile = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable and self.expert_risk_lower_quantile_enable
+            else None
+        )
+        self.b_risk_lower_quantile = (
+            nn.Parameter(torch.zeros(self.P))
+            if self.expert_conditional_risk_enable and self.expert_risk_lower_quantile_enable
+            else None
+        )
+        self.W_risk_utility_veto = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable
+            and self.expert_risk_utility_veto_enable
+            else None
+        )
+        self.b_risk_utility_veto = (
+            nn.Parameter(torch.zeros(self.P))
+            if self.expert_conditional_risk_enable
+            and self.expert_risk_utility_veto_enable
+            else None
+        )
+        self.W_pairwise_rank = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable and self.expert_risk_pairwise_rank_enable
+            else None
+        )
+        self.b_pairwise_rank = (
+            nn.Parameter(torch.zeros(self.P))
+            if self.expert_conditional_risk_enable and self.expert_risk_pairwise_rank_enable
+            else None
+        )
+        self.candidate_feature_dim = (
+            2 * self.patch_len + 19
+            if self.expert_risk_candidate_compatibility
+            else self.patch_len + 6
+        )
+        self.W_candidate = (
+            nn.Parameter(torch.empty(self.candidate_feature_dim, self.hidden_dim))
+            if self.expert_conditional_risk_enable and self.expert_risk_candidate_aware
+            else None
+        )
+        self.b_candidate = (
+            nn.Parameter(torch.zeros(self.hidden_dim))
+            if self.expert_conditional_risk_enable and self.expert_risk_candidate_aware
+            else None
+        )
+        self.penalty_embedding = (
+            nn.Parameter(torch.empty(self.P, self.hidden_dim))
+            if self.expert_conditional_risk_enable and self.expert_risk_candidate_aware
+            else None
+        )
+        self.W_proposal_candidate = (
+            nn.Parameter(torch.empty(self.candidate_feature_dim, self.hidden_dim))
+            if (
+                self.expert_conditional_risk_enable
+                and self.expert_risk_candidate_aware
+                and self.expert_risk_proposal_candidate_aware
+            )
+            else None
+        )
+        self.b_proposal_candidate = (
+            nn.Parameter(torch.zeros(self.hidden_dim))
+            if (
+                self.expert_conditional_risk_enable
+                and self.expert_risk_candidate_aware
+                and self.expert_risk_proposal_candidate_aware
+            )
+            else None
+        )
+        self.proposal_penalty_embedding = (
+            nn.Parameter(torch.empty(self.P, self.hidden_dim))
+            if (
+                self.expert_conditional_risk_enable
+                and self.expert_risk_candidate_aware
+                and self.expert_risk_proposal_candidate_aware
+            )
+            else None
+        )
+        self.W_proposal_rescue = (
+            nn.Parameter(torch.empty(self.hidden_dim, self.P))
+            if self.expert_conditional_risk_enable and self.expert_risk_proposal_rescue_enable
+            else None
+        )
+        self.b_proposal_rescue = (
+            nn.Parameter(torch.zeros(self.P))
+            if self.expert_conditional_risk_enable and self.expert_risk_proposal_rescue_enable
+            else None
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.W1)
+        nn.init.normal_(self.W2, mean=0.0, std=0.02)
+        nn.init.zeros_(self.b1)
+        nn.init.zeros_(self.b2)
+        if self.hierarchical_recall_enable:
+            assert (
+                self.W_adopt is not None
+                and self.b_adopt is not None
+                and self.W_benefit is not None
+                and self.b_benefit is not None
+            )
+            nn.init.normal_(self.W_adopt, mean=0.0, std=0.02)
+            nn.init.constant_(self.b_adopt, self.adopt_init_bias)
+            nn.init.normal_(self.W_benefit, mean=0.0, std=0.02)
+            nn.init.zeros_(self.b_benefit)
+            if self.expert_conditional_risk_enable:
+                assert (
+                    self.W_risk_sign is not None
+                    and self.b_risk_sign is not None
+                    and self.W_risk_gain is not None
+                    and self.b_risk_gain is not None
+                    and self.W_risk_cost is not None
+                    and self.b_risk_cost is not None
+                )
+                nn.init.normal_(self.W_risk_sign, mean=0.0, std=0.02)
+                nn.init.zeros_(self.b_risk_sign)
+                if self.expert_risk_temporal_domain_enable:
+                    assert (
+                        self.W_risk_sign_domain_delta is not None
+                        and self.b_risk_sign_domain_delta is not None
+                    )
+                    nn.init.zeros_(self.W_risk_sign_domain_delta)
+                    nn.init.zeros_(self.b_risk_sign_domain_delta)
+                nn.init.normal_(self.W_risk_gain, mean=0.0, std=0.02)
+                nn.init.constant_(self.b_risk_gain, -2.0)
+                nn.init.normal_(self.W_risk_cost, mean=0.0, std=0.02)
+                nn.init.constant_(self.b_risk_cost, -2.0)
+                if self.expert_risk_lower_quantile_enable:
+                    assert (
+                        self.W_risk_lower_quantile is not None
+                        and self.b_risk_lower_quantile is not None
+                    )
+                    nn.init.normal_(self.W_risk_lower_quantile, mean=0.0, std=0.02)
+                    nn.init.zeros_(self.b_risk_lower_quantile)
+                if self.expert_risk_utility_veto_enable:
+                    assert (
+                        self.W_risk_utility_veto is not None
+                        and self.b_risk_utility_veto is not None
+                    )
+                    nn.init.normal_(self.W_risk_utility_veto, mean=0.0, std=0.02)
+                    nn.init.zeros_(self.b_risk_utility_veto)
+                if self.expert_risk_pairwise_rank_enable:
+                    assert self.W_pairwise_rank is not None and self.b_pairwise_rank is not None
+                    nn.init.normal_(self.W_pairwise_rank, mean=0.0, std=0.02)
+                    nn.init.zeros_(self.b_pairwise_rank)
+                if self.expert_risk_candidate_aware:
+                    assert (
+                        self.W_candidate is not None
+                        and self.b_candidate is not None
+                        and self.penalty_embedding is not None
+                    )
+                    nn.init.xavier_uniform_(self.W_candidate)
+                    nn.init.zeros_(self.b_candidate)
+                    nn.init.normal_(self.penalty_embedding, mean=0.0, std=0.02)
+                    if self.expert_risk_proposal_candidate_aware:
+                        assert (
+                            self.W_proposal_candidate is not None
+                            and self.b_proposal_candidate is not None
+                            and self.proposal_penalty_embedding is not None
+                        )
+                        nn.init.xavier_uniform_(self.W_proposal_candidate)
+                        nn.init.zeros_(self.b_proposal_candidate)
+                        nn.init.normal_(
+                            self.proposal_penalty_embedding,
+                            mean=0.0,
+                            std=0.02,
+                        )
+                if self.expert_risk_proposal_rescue_enable:
+                    assert (
+                        self.W_proposal_rescue is not None
+                        and self.b_proposal_rescue is not None
+                    )
+                    nn.init.normal_(self.W_proposal_rescue, mean=0.0, std=0.02)
+                    nn.init.zeros_(self.b_proposal_rescue)
+                if self.expert_risk_decoupled_encoder:
+                    assert self.W_proposal1 is not None and self.b_proposal1 is not None
+                    nn.init.xavier_uniform_(self.W_proposal1)
+                    nn.init.zeros_(self.b_proposal1)
+        elif self.allow_skip:
+            with torch.no_grad():
+                self.b2[0] = self.skip_init_bias
+
+    def _regime_features(
+        self,
+        x_bcl: torch.Tensor,
+        regime_context_bcl: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if not self.regime_context_enable:
+            return None
+        if regime_context_bcl is None or regime_context_bcl.ndim != 3:
+            raise ValueError(
+                "patch_router regime_context requires causal history with shape [B,C,S]."
+            )
+        if tuple(regime_context_bcl.shape[:2]) != tuple(x_bcl.shape[:2]):
+            raise ValueError("patch_router regime context batch/channel shape does not match input.")
+        required = max(self.regime_context_lengths)
+        if int(regime_context_bcl.shape[-1]) < required:
+            raise ValueError(
+                "patch_router regime context is shorter than the configured maximum: "
+                f"got {int(regime_context_bcl.shape[-1])}, need {required}."
+            )
+
+        eps = 1.0e-6
+        recent_mean = x_bcl.mean(dim=-1, keepdim=True)
+        recent_std = x_bcl.std(dim=-1, unbiased=False, keepdim=True).clamp_min(eps)
+        recent_range = (
+            x_bcl.amax(dim=-1, keepdim=True) - x_bcl.amin(dim=-1, keepdim=True)
+        ).clamp_min(eps)
+        recent_d1 = x_bcl.diff(dim=-1)
+        recent_mad1 = recent_d1.abs().mean(dim=-1, keepdim=True).clamp_min(eps)
+        recent_mad2 = (
+            recent_d1.diff(dim=-1).abs().mean(dim=-1, keepdim=True).clamp_min(eps)
+            if int(x_bcl.shape[-1]) >= 3
+            else torch.full_like(recent_mean, eps)
+        )
+        recent_endpoint = x_bcl[..., -1:] - x_bcl[..., :1]
+
+        parts = []
+        for context_len in self.regime_context_lengths:
+            context = regime_context_bcl[..., -int(context_len) :]
+            context_mean = context.mean(dim=-1, keepdim=True)
+            context_std = context.std(dim=-1, unbiased=False, keepdim=True).clamp_min(eps)
+            context_range = (
+                context.amax(dim=-1, keepdim=True)
+                - context.amin(dim=-1, keepdim=True)
+            ).clamp_min(eps)
+            context_d1 = context.diff(dim=-1)
+            context_mad1 = context_d1.abs().mean(dim=-1, keepdim=True).clamp_min(eps)
+            context_mad2 = (
+                context_d1.diff(dim=-1).abs().mean(dim=-1, keepdim=True).clamp_min(eps)
+                if int(context.shape[-1]) >= 3
+                else torch.full_like(context_mean, eps)
+            )
+            scale_features = torch.cat(
+                [
+                    (recent_mean - context_mean) / context_std,
+                    torch.log(recent_std / context_std),
+                    torch.log(recent_range / context_range),
+                    torch.log(recent_mad1 / context_mad1),
+                    torch.log(recent_mad2 / context_mad2),
+                    recent_endpoint / context_std,
+                ],
+                dim=-1,
+            ).unsqueeze(2).expand(-1, -1, self.num_patches, -1)
+            parts.append(scale_features)
+        return torch.cat(parts, dim=-1)
+
+    def _history_patches(self, x_bcl: torch.Tensor) -> torch.Tensor:
+        """Align causal input patches to forecast patches without future labels."""
+        if x_bcl.ndim != 3:
+            raise ValueError("patch_router input must have shape [B,C,L].")
+        batch, channels, observed_len = map(int, x_bcl.shape)
+        if observed_len >= self.H:
+            return x_bcl[..., -self.H :].reshape(
+                batch,
+                channels,
+                self.num_patches,
+                self.patch_len,
+            )
+        if self.short_history_mode != "cycle":
+            raise ValueError(
+                "patch_router input history is shorter than pred_len and "
+                "short_history_mode is not cycle."
+            )
+        input_patch_count = observed_len // self.patch_len
+        if input_patch_count <= 0:
+            raise ValueError(
+                "patch_router cycle mode requires at least one complete input patch."
+            )
+        usable_len = input_patch_count * self.patch_len
+        input_patches = x_bcl[..., -usable_len:].reshape(
+            batch,
+            channels,
+            input_patch_count,
+            self.patch_len,
+        )
+        forecast_patch_index = torch.arange(
+            self.num_patches,
+            device=x_bcl.device,
+        ).remainder(input_patch_count)
+        return input_patches.index_select(2, forecast_patch_index)
+
+    def _features(
+        self,
+        x_bcl: torch.Tensor,
+        y_base_bch: Optional[torch.Tensor] = None,
+        regime_context_bcl: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if x_bcl.ndim != 3:
+            raise ValueError("patch_router input must have shape [B,C,L].")
+        eps = 1.0e-6
+        batch, channels = int(x_bcl.shape[0]), int(x_bcl.shape[1])
+        x_tail = self._history_patches(x_bcl)
+        full_mean = x_bcl.mean(dim=-1, keepdim=True)
+        full_std = x_bcl.std(dim=-1, unbiased=False, keepdim=True).clamp_min(eps)
+        patch_mean = x_tail.mean(dim=-1, keepdim=True)
+        patch_std = x_tail.std(dim=-1, unbiased=False, keepdim=True).clamp_min(eps)
+        local_shape = (x_tail - patch_mean) / patch_std
+
+        time = torch.linspace(
+            -1.0,
+            1.0,
+            steps=self.patch_len,
+            device=x_bcl.device,
+            dtype=x_bcl.dtype,
+        ).view(1, 1, 1, self.patch_len)
+        time_energy = time.square().mean().clamp_min(eps)
+        level = (patch_mean - full_mean.unsqueeze(2)) / full_std.unsqueeze(2)
+        scale = patch_std / full_std.unsqueeze(2)
+        slope = ((x_tail - patch_mean) * time).mean(dim=-1, keepdim=True)
+        slope = slope / (time_energy * full_std.unsqueeze(2))
+        endpoint = (x_tail[..., -1:] - x_tail[..., :1]) / full_std.unsqueeze(2)
+        if self.patch_len >= 2:
+            diff = x_tail.diff(dim=-1)
+            mad1 = diff.abs().mean(dim=-1, keepdim=True) / full_std.unsqueeze(2)
+        else:
+            diff = None
+            mad1 = torch.zeros_like(level)
+        if diff is not None and self.patch_len >= 3:
+            mad2 = diff.diff(dim=-1).abs().mean(dim=-1, keepdim=True) / full_std.unsqueeze(2)
+        else:
+            mad2 = torch.zeros_like(level)
+        parts = [local_shape, level, scale, slope, mad1, mad2, endpoint]
+        if self.use_base_forecast:
+            if y_base_bch is None or tuple(y_base_bch.shape) != (batch, channels, self.H):
+                raise ValueError(
+                    "patch_router.use_base_forecast requires y_base with shape [B,C,H]."
+                )
+            base_patch = y_base_bch.reshape(batch, channels, self.num_patches, self.patch_len)
+            base_local = (base_patch - patch_mean) / patch_std
+            base_mean_shift = (base_patch.mean(dim=-1, keepdim=True) - patch_mean) / full_std.unsqueeze(2)
+            base_scale = base_patch.std(dim=-1, unbiased=False, keepdim=True) / full_std.unsqueeze(2)
+            base_endpoint = (base_patch[..., -1:] - base_patch[..., :1]) / full_std.unsqueeze(2)
+            parts.extend([base_local, base_mean_shift, base_scale, base_endpoint])
+        regime_features = self._regime_features(x_bcl, regime_context_bcl)
+        if regime_features is not None:
+            parts.append(regime_features)
+        features = torch.cat(parts, dim=-1)
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.feature_clip > 0.0:
+            features = features.clamp(-self.feature_clip, self.feature_clip)
+        return features
+
+    def _candidate_features(
+        self,
+        x_bcl: torch.Tensor,
+        y_base_bch: torch.Tensor,
+        candidate_delta_bcpH: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, channels = int(x_bcl.shape[0]), int(x_bcl.shape[1])
+        if tuple(y_base_bch.shape) != (batch, channels, self.H):
+            raise ValueError("patch_router y_base must have shape [B,C,H].")
+        if tuple(candidate_delta_bcpH.shape) != (batch, channels, self.P, self.H):
+            raise ValueError(
+                "patch_router candidate_delta must have shape [B,C,P,H]."
+            )
+        eps = 1.0e-6
+        full_std = x_bcl.std(dim=-1, unbiased=False).clamp_min(eps)
+        delta = candidate_delta_bcpH.reshape(
+            batch,
+            channels,
+            self.P,
+            self.num_patches,
+            self.patch_len,
+        ).permute(0, 1, 3, 2, 4)
+        scale = full_std[:, :, None, None, None]
+        delta_scaled = delta / scale
+        mean = delta_scaled.mean(dim=-1, keepdim=True)
+        std = delta_scaled.std(dim=-1, unbiased=False, keepdim=True)
+        time = torch.linspace(
+            -1.0,
+            1.0,
+            steps=self.patch_len,
+            device=x_bcl.device,
+            dtype=x_bcl.dtype,
+        ).view(1, 1, 1, 1, self.patch_len)
+        slope = ((delta_scaled - mean) * time).mean(dim=-1, keepdim=True)
+        slope = slope / time.square().mean().clamp_min(eps)
+        endpoint = delta_scaled[..., -1:] - delta_scaled[..., :1]
+        if self.patch_len >= 2:
+            diff = delta_scaled.diff(dim=-1)
+            mad1 = diff.abs().mean(dim=-1, keepdim=True)
+        else:
+            diff = None
+            mad1 = torch.zeros_like(mean)
+        if diff is not None and self.patch_len >= 3:
+            mad2 = diff.diff(dim=-1).abs().mean(dim=-1, keepdim=True)
+        else:
+            mad2 = torch.zeros_like(mean)
+        parts = [delta_scaled, mean, std, slope, mad1, mad2, endpoint]
+        if self.expert_risk_candidate_compatibility:
+            history = self._history_patches(x_bcl)
+            candidate_full = y_base_bch.unsqueeze(2) + candidate_delta_bcpH
+            candidate = candidate_full.reshape(
+                batch,
+                channels,
+                self.P,
+                self.num_patches,
+                self.patch_len,
+            ).permute(0, 1, 3, 2, 4)
+            history_scaled = history.unsqueeze(3) / scale
+            candidate_scaled = candidate / scale
+            compatibility = candidate_scaled - history_scaled
+            history_mean = history_scaled.mean(dim=-1, keepdim=True)
+            candidate_mean = candidate_scaled.mean(dim=-1, keepdim=True)
+            history_std = history_scaled.std(dim=-1, unbiased=False, keepdim=True)
+            candidate_std = candidate_scaled.std(dim=-1, unbiased=False, keepdim=True)
+            history_slope = (
+                (history_scaled - history_mean) * time
+            ).mean(dim=-1, keepdim=True) / time.square().mean().clamp_min(eps)
+            candidate_slope = (
+                (candidate_scaled - candidate_mean) * time
+            ).mean(dim=-1, keepdim=True) / time.square().mean().clamp_min(eps)
+            if self.patch_len >= 2:
+                history_diff = history_scaled.diff(dim=-1)
+                candidate_diff = candidate_scaled.diff(dim=-1)
+                history_mad1 = history_diff.abs().mean(dim=-1, keepdim=True)
+                candidate_mad1 = candidate_diff.abs().mean(dim=-1, keepdim=True)
+            else:
+                history_diff = None
+                candidate_diff = None
+                history_mad1 = torch.zeros_like(history_mean)
+                candidate_mad1 = torch.zeros_like(candidate_mean)
+            if history_diff is not None and candidate_diff is not None and self.patch_len >= 3:
+                history_mad2 = history_diff.diff(dim=-1).abs().mean(dim=-1, keepdim=True)
+                candidate_mad2 = candidate_diff.diff(dim=-1).abs().mean(dim=-1, keepdim=True)
+            else:
+                history_mad2 = torch.zeros_like(history_mean)
+                candidate_mad2 = torch.zeros_like(candidate_mean)
+            candidate_bcpqr = candidate_full.reshape(
+                batch,
+                channels,
+                self.P,
+                self.num_patches,
+                self.patch_len,
+            )
+            previous_end = torch.cat(
+                [
+                    x_bcl[..., -1:].unsqueeze(2).expand(-1, -1, self.P, -1),
+                    candidate_bcpqr[..., :-1, -1],
+                ],
+                dim=-1,
+            ).permute(0, 1, 3, 2).unsqueeze(-1)
+            boundary_jump = (
+                candidate_bcpqr[..., 0].permute(0, 1, 3, 2).unsqueeze(-1)
+                - previous_end
+            ) / scale
+            compatibility_scalars = [
+                compatibility.square().mean(dim=-1, keepdim=True).sqrt(),
+                candidate_mean - history_mean,
+                candidate_std - history_std,
+                candidate_slope - history_slope,
+                candidate_mad1 - history_mad1,
+                candidate_mad2 - history_mad2,
+                boundary_jump,
+            ]
+
+            full_scale = full_std[:, :, None, None]
+            full_delta = candidate_delta_bcpH / full_scale
+            full_mean = full_delta.mean(dim=-1, keepdim=True)
+            full_std_delta = full_delta.std(dim=-1, unbiased=False, keepdim=True)
+            full_time = torch.linspace(
+                -1.0,
+                1.0,
+                steps=self.H,
+                device=x_bcl.device,
+                dtype=x_bcl.dtype,
+            ).view(1, 1, 1, self.H)
+            full_slope = (
+                (full_delta - full_mean) * full_time
+            ).mean(dim=-1, keepdim=True) / full_time.square().mean().clamp_min(eps)
+            if self.H >= 2:
+                full_diff = full_delta.diff(dim=-1)
+                full_mad1 = full_diff.abs().mean(dim=-1, keepdim=True)
+            else:
+                full_diff = None
+                full_mad1 = torch.zeros_like(full_mean)
+            if full_diff is not None and self.H >= 3:
+                full_mad2 = full_diff.diff(dim=-1).abs().mean(dim=-1, keepdim=True)
+            else:
+                full_mad2 = torch.zeros_like(full_mean)
+            full_range = full_delta.amax(dim=-1, keepdim=True) - full_delta.amin(
+                dim=-1,
+                keepdim=True,
+            )
+            full_summary = torch.cat(
+                [
+                    full_mean,
+                    full_std_delta,
+                    full_slope,
+                    full_mad1,
+                    full_mad2,
+                    full_range,
+                ],
+                dim=-1,
+            ).unsqueeze(2).expand(-1, -1, self.num_patches, -1, -1)
+            parts.extend([compatibility, *compatibility_scalars, full_summary])
+        features = torch.cat(parts, dim=-1)
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.feature_clip > 0.0:
+            features = features.clamp(-self.feature_clip, self.feature_clip)
+        return features
+
+    def forward(
+        self,
+        x_bcl: torch.Tensor,
+        *,
+        y_base_bch: Optional[torch.Tensor] = None,
+        candidate_delta_bcpH: Optional[torch.Tensor] = None,
+        regime_context_bcl: Optional[torch.Tensor] = None,
+        query_start_abs_b: Optional[torch.Tensor] = None,
+        straight_through: bool,
+    ) -> Dict[str, torch.Tensor]:
+        features = self._features(
+            x_bcl,
+            y_base_bch,
+            regime_context_bcl=regime_context_bcl,
+        )
+        hidden = F.gelu(torch.einsum("bcqd,dm->bcqm", features, self.W1) + self.b1)
+        logits = torch.einsum("bcqm,mp->bcqp", hidden, self.W2) + self.b2
+        selected_risk_score = None
+        selected_risk_benefit_prob = None
+        risk_domain_std = None
+        fixed_penalty_active_bcq = None
+        if self.training and self.noise_std > 0.0:
+            logits = logits + torch.randn_like(logits) * self.noise_std
+        if self.hierarchical_recall_enable:
+            assert (
+                self.W_adopt is not None
+                and self.b_adopt is not None
+                and self.W_benefit is not None
+                and self.b_benefit is not None
+            )
+            proposal_hidden = hidden
+            if self.W_proposal1 is not None and self.b_proposal1 is not None:
+                proposal_hidden = F.gelu(
+                    torch.einsum("bcqd,dm->bcqm", features, self.W_proposal1)
+                    + self.b_proposal1
+                )
+            candidate_features = None
+            if self.expert_conditional_risk_enable and self.expert_risk_candidate_aware:
+                if candidate_delta_bcpH is None:
+                    raise ValueError(
+                        "candidate-aware patch risk gate requires candidate_delta_bcpH."
+                    )
+                candidate_features = self._candidate_features(
+                    x_bcl,
+                    y_base_bch,
+                    candidate_delta_bcpH.detach(),
+                )
+            adopt_logits = (
+                torch.einsum("bcqm,mr->bcqr", proposal_hidden, self.W_adopt).squeeze(-1)
+                + self.b_adopt
+            )
+            proposal_expert_hidden = proposal_hidden.unsqueeze(3).expand(
+                -1,
+                -1,
+                -1,
+                self.P,
+                -1,
+            )
+            if self.expert_risk_proposal_candidate_aware:
+                if candidate_features is None:
+                    raise ValueError(
+                        "candidate-aware proposal gate requires candidate features."
+                    )
+                assert (
+                    self.W_proposal_candidate is not None
+                    and self.b_proposal_candidate is not None
+                    and self.proposal_penalty_embedding is not None
+                )
+                proposal_candidate_hidden = (
+                    torch.einsum(
+                        "bcqpd,dm->bcqpm",
+                        candidate_features,
+                        self.W_proposal_candidate,
+                    )
+                    + self.b_proposal_candidate
+                    + self.proposal_penalty_embedding.view(
+                        1,
+                        1,
+                        1,
+                        self.P,
+                        self.hidden_dim,
+                    )
+                )
+                proposal_expert_hidden = F.gelu(
+                    proposal_hidden.unsqueeze(3) + proposal_candidate_hidden
+                )
+                benefit_logits = (
+                    torch.einsum(
+                        "bcqpm,mp->bcqp",
+                        proposal_expert_hidden,
+                        self.W_benefit,
+                    )
+                    + self.b_benefit
+                )
+            else:
+                benefit_logits = (
+                    torch.einsum("bcqm,mp->bcqp", proposal_hidden, self.W_benefit)
+                    + self.b_benefit
+                )
+            if self.expert_risk_proposal_rescue_enable:
+                assert (
+                    self.W_proposal_rescue is not None
+                    and self.b_proposal_rescue is not None
+                )
+                rescue_logits = (
+                    torch.einsum(
+                        "bcqpm,mp->bcqp",
+                        proposal_expert_hidden,
+                        self.W_proposal_rescue,
+                    )
+                    + self.b_proposal_rescue
+                )
+            else:
+                rescue_logits = benefit_logits
+            if self.training and self.noise_std > 0.0:
+                adopt_logits = adopt_logits + torch.randn_like(adopt_logits) * self.noise_std
+                benefit_logits = benefit_logits + torch.randn_like(benefit_logits) * self.noise_std
+                if self.expert_risk_proposal_rescue_enable:
+                    rescue_logits = rescue_logits + torch.randn_like(rescue_logits) * self.noise_std
+            proposal_adopt_prob = torch.sigmoid(adopt_logits)
+            penalty_benefit_probs = torch.sigmoid(benefit_logits / self.temperature)
+            utility_scores = torch.tanh(logits / self.temperature)
+            risk_benefit_prob = penalty_benefit_probs
+            risk_positive_magnitude = utility_scores.clamp_min(0.0)
+            risk_negative_magnitude = (-utility_scores).clamp_min(0.0)
+            risk_lower_quantile_scores = utility_scores
+            risk_utility_veto_prob = risk_benefit_prob
+            pairwise_rank_scores = utility_scores
+            proposal_mask = penalty_benefit_probs > self.expert_risk_proposal_threshold
+            if self.expert_conditional_risk_enable:
+                assert (
+                    self.W_risk_sign is not None
+                    and self.b_risk_sign is not None
+                    and self.W_risk_gain is not None
+                    and self.b_risk_gain is not None
+                    and self.W_risk_cost is not None
+                    and self.b_risk_cost is not None
+                )
+                risk_hidden = hidden.unsqueeze(3).expand(-1, -1, -1, self.P, -1)
+                if self.expert_risk_candidate_aware:
+                    assert candidate_features is not None
+                    assert (
+                        self.W_candidate is not None
+                        and self.b_candidate is not None
+                        and self.penalty_embedding is not None
+                    )
+                    candidate_hidden = (
+                        torch.einsum("bcqpd,dm->bcqpm", candidate_features, self.W_candidate)
+                        + self.b_candidate
+                        + self.penalty_embedding.view(1, 1, 1, self.P, self.hidden_dim)
+                    )
+                    risk_hidden = F.gelu(risk_hidden + candidate_hidden)
+                risk_sign_logits = (
+                    torch.einsum("bcqpm,mp->bcqp", risk_hidden, self.W_risk_sign)
+                    + self.b_risk_sign
+                )
+                if self.expert_risk_temporal_domain_enable:
+                    assert (
+                        self.W_risk_sign_domain_delta is not None
+                        and self.b_risk_sign_domain_delta is not None
+                    )
+                    domain_sign_logits = (
+                        risk_sign_logits.unsqueeze(0)
+                        + torch.einsum(
+                            "bcqpm,dmp->dbcqp",
+                            risk_hidden,
+                            self.W_risk_sign_domain_delta,
+                        )
+                        + self.b_risk_sign_domain_delta[:, None, None, None, :]
+                    )
+                    domain_risk_prob = torch.sigmoid(domain_sign_logits)
+                    risk_domain_std = domain_risk_prob.std(
+                        dim=0,
+                        unbiased=False,
+                    )
+                    if self.training:
+                        if query_start_abs_b is None:
+                            raise ValueError(
+                                "temporal domain risk training requires query indices."
+                            )
+                        query_index_b = query_start_abs_b.reshape(-1).to(
+                            device=x_bcl.device,
+                            dtype=torch.long,
+                        )
+                        if int(query_index_b.numel()) != int(x_bcl.shape[0]):
+                            raise ValueError(
+                                "temporal domain risk query indices must match batch size."
+                            )
+                        domain_id_b = torch.div(
+                            query_index_b
+                            * int(self.expert_risk_temporal_domain_count),
+                            int(self.expert_risk_temporal_domain_train_windows),
+                            rounding_mode="floor",
+                        ).clamp(
+                            0,
+                            int(self.expert_risk_temporal_domain_count) - 1,
+                        )
+                        domain_risk_prob_bdcqp = domain_risk_prob.permute(
+                            1,
+                            0,
+                            2,
+                            3,
+                            4,
+                        )
+                        risk_benefit_prob = domain_risk_prob_bdcqp[
+                            torch.arange(
+                                int(x_bcl.shape[0]),
+                                device=x_bcl.device,
+                            ),
+                            domain_id_b,
+                        ]
+                    else:
+                        risk_benefit_prob = domain_risk_prob.mean(dim=0)
+                else:
+                    risk_benefit_prob = torch.sigmoid(risk_sign_logits)
+                risk_gain_logits = (
+                    torch.einsum("bcqpm,mp->bcqp", risk_hidden, self.W_risk_gain)
+                    + self.b_risk_gain
+                )
+                risk_cost_logits = (
+                    torch.einsum("bcqpm,mp->bcqp", risk_hidden, self.W_risk_cost)
+                    + self.b_risk_cost
+                )
+                risk_positive_magnitude = torch.sigmoid(risk_gain_logits)
+                risk_negative_magnitude = torch.sigmoid(risk_cost_logits)
+                utility_scores = (
+                    risk_benefit_prob * risk_positive_magnitude
+                    - (1.0 - risk_benefit_prob) * risk_negative_magnitude
+                )
+                if self.expert_risk_utility_veto_enable:
+                    assert (
+                        self.W_risk_utility_veto is not None
+                        and self.b_risk_utility_veto is not None
+                    )
+                    veto_hidden = (
+                        risk_hidden.detach()
+                        if self.expert_risk_utility_veto_detach_features
+                        else risk_hidden
+                    )
+                    risk_utility_veto_prob = torch.sigmoid(
+                        torch.einsum(
+                            "bcqpm,mp->bcqp",
+                            veto_hidden,
+                            self.W_risk_utility_veto,
+                        )
+                        + self.b_risk_utility_veto
+                    )
+                else:
+                    risk_utility_veto_prob = risk_benefit_prob
+                if self.expert_risk_lower_quantile_enable:
+                    assert (
+                        self.W_risk_lower_quantile is not None
+                        and self.b_risk_lower_quantile is not None
+                    )
+                    risk_lower_quantile_scores = torch.tanh(
+                        torch.einsum(
+                            "bcqpm,mp->bcqp",
+                            risk_hidden,
+                            self.W_risk_lower_quantile,
+                        )
+                        + self.b_risk_lower_quantile
+                    )
+                else:
+                    risk_lower_quantile_scores = utility_scores
+                if self.expert_risk_pairwise_rank_enable:
+                    assert self.W_pairwise_rank is not None and self.b_pairwise_rank is not None
+                    pairwise_hidden = (
+                        risk_hidden.detach()
+                        if self.expert_risk_pairwise_detach_features
+                        else risk_hidden
+                    )
+                    pairwise_rank_scores = (
+                        torch.einsum(
+                            "bcqpm,mp->bcqp",
+                            pairwise_hidden,
+                            self.W_pairwise_rank,
+                        )
+                        + self.b_pairwise_rank
+                    )
+                else:
+                    pairwise_rank_scores = utility_scores
+                proposal_mask = torch.zeros_like(penalty_benefit_probs, dtype=torch.bool)
+                if self.expert_risk_proposal_rescue_enable:
+                    primary_idx = benefit_logits.argmax(dim=-1, keepdim=True)
+                    proposal_mask.scatter_(-1, primary_idx, True)
+                    rescue_rank_logits = rescue_logits.masked_fill(proposal_mask, -1.0e4)
+                    rescue_idx = rescue_rank_logits.argmax(dim=-1, keepdim=True)
+                    proposal_mask.scatter_(-1, rescue_idx, True)
+                else:
+                    proposal_topk = min(self.expert_risk_proposal_topk, self.P)
+                    proposal_idx = penalty_benefit_probs.topk(
+                        k=proposal_topk,
+                        dim=-1,
+                    ).indices
+                    proposal_mask.scatter_(-1, proposal_idx, True)
+                rank_temperature = (
+                    self.expert_risk_pairwise_temperature
+                    if self.expert_risk_pairwise_rank_enable
+                    else self.expert_risk_temperature
+                )
+                combined_rank_logits = (
+                    pairwise_rank_scores / rank_temperature
+                ).masked_fill(~proposal_mask, -1.0e4)
+                penalty_conditional_probs = torch.softmax(combined_rank_logits, dim=-1)
+                selected_penalty = combined_rank_logits.argmax(dim=-1, keepdim=True)
+                if int(self.fixed_penalty_index_by_channel_c.numel()) > 0:
+                    if int(self.fixed_penalty_index_by_channel_c.numel()) != int(x_bcl.shape[1]):
+                        raise ValueError(
+                            "patch_router fixed_penalty_index_by_channel length must match "
+                            f"the channel count ({int(x_bcl.shape[1])})."
+                        )
+                    fixed_penalty_c = self.fixed_penalty_index_by_channel_c.to(
+                        device=x_bcl.device,
+                    )
+                    fixed_penalty_active_bcq = (
+                        fixed_penalty_c >= 0
+                    ).view(1, -1, 1).expand(
+                        int(x_bcl.shape[0]),
+                        -1,
+                        self.num_patches,
+                    )
+                    selected_penalty = fixed_penalty_c.clamp_min(0).view(
+                        1,
+                        -1,
+                        1,
+                        1,
+                    ).expand(
+                        int(x_bcl.shape[0]),
+                        -1,
+                        self.num_patches,
+                        1,
+                    )
+                    penalty_conditional_probs = torch.zeros_like(
+                        penalty_conditional_probs
+                    ).scatter(
+                        -1,
+                        selected_penalty,
+                        1.0,
+                    )
+                selected_utility = utility_scores.gather(-1, selected_penalty).squeeze(-1)
+                selected_lower_quantile = risk_lower_quantile_scores.gather(
+                    -1,
+                    selected_penalty,
+                ).squeeze(-1)
+                selected_risk_benefit_prob = risk_benefit_prob.gather(
+                    -1,
+                    selected_penalty,
+                ).squeeze(-1)
+                assert self.expert_risk_adopt_threshold is not None
+                if self.expert_risk_adoption_source == "benefit_probability":
+                    selected_risk_score = selected_risk_benefit_prob
+                    adopt_prob = selected_risk_benefit_prob
+                elif self.expert_risk_adoption_source == "expected_utility":
+                    selected_risk_score = selected_utility
+                    adopt_prob = torch.sigmoid(
+                        selected_utility / self.utility_verifier_temperature
+                    )
+                elif self.expert_risk_adoption_source == "utility_veto":
+                    selected_risk_score = risk_utility_veto_prob.gather(
+                        -1,
+                        selected_penalty,
+                    ).squeeze(-1)
+                    adopt_prob = selected_risk_score
+                else:
+                    selected_risk_score = selected_lower_quantile
+                    adopt_prob = torch.sigmoid(
+                        selected_lower_quantile / self.utility_verifier_temperature
+                    )
+                if self.expert_risk_adopt_threshold_by_penalty is not None:
+                    selected_risk_threshold = self.expert_risk_adopt_threshold_by_penalty[
+                        selected_penalty.squeeze(-1)
+                    ]
+                else:
+                    selected_risk_threshold = self.expert_risk_adopt_threshold
+                utility_rejected = selected_risk_score <= selected_risk_threshold
+                if fixed_penalty_active_bcq is not None:
+                    utility_rejected = utility_rejected | (~fixed_penalty_active_bcq)
+            else:
+                combined_rank_logits = (
+                    utility_scores + penalty_benefit_probs.clamp_min(1.0e-8).log()
+                )
+                penalty_conditional_probs = torch.softmax(combined_rank_logits, dim=-1)
+            if self.utility_verifier_enable and not self.expert_conditional_risk_enable:
+                max_utility = utility_scores.max(dim=-1).values
+                adopt_prob = torch.sigmoid(
+                    adopt_logits + max_utility / self.utility_verifier_temperature
+                )
+                utility_rejected = max_utility <= 0.0
+            elif not self.expert_conditional_risk_enable:
+                adopt_prob = proposal_adopt_prob
+                utility_rejected = torch.zeros_like(adopt_prob, dtype=torch.bool)
+            skip_prob = 1.0 - adopt_prob
+            penalty_probs = adopt_prob.unsqueeze(-1) * penalty_conditional_probs
+            skip_hard = (
+                utility_rejected
+                if self.expert_conditional_risk_enable
+                else (proposal_adopt_prob < self.adopt_threshold) | utility_rejected
+            ).to(dtype=adopt_prob.dtype)
+        else:
+            route_probs = torch.softmax(logits / self.temperature, dim=-1)
+            if self.allow_skip:
+                skip_prob = route_probs[..., 0]
+                penalty_probs = route_probs[..., 1:]
+                skip_hard = (route_probs.argmax(dim=-1) == 0).to(dtype=route_probs.dtype)
+            else:
+                skip_prob = torch.zeros_like(route_probs[..., 0])
+                penalty_probs = route_probs
+                skip_hard = torch.zeros_like(skip_prob)
+            adopt_prob = 1.0 - skip_prob
+            proposal_adopt_prob = adopt_prob
+            penalty_conditional_probs = penalty_probs / adopt_prob.unsqueeze(-1).clamp_min(1.0e-8)
+            penalty_benefit_probs = penalty_conditional_probs
+            utility_scores = logits[..., -self.P :] / self.temperature
+            risk_benefit_prob = penalty_benefit_probs
+            risk_positive_magnitude = utility_scores.clamp_min(0.0)
+            risk_negative_magnitude = (-utility_scores).clamp_min(0.0)
+            risk_lower_quantile_scores = utility_scores
+            risk_utility_veto_prob = risk_benefit_prob
+            pairwise_rank_scores = utility_scores
+            proposal_mask = penalty_benefit_probs > self.expert_risk_proposal_threshold
+
+        selected_penalty_index = penalty_conditional_probs.argmax(dim=-1)
+        if risk_domain_std is None:
+            risk_domain_std = torch.zeros_like(risk_benefit_prob)
+        if selected_risk_benefit_prob is None:
+            selected_risk_benefit_prob = risk_benefit_prob.gather(
+                dim=-1,
+                index=selected_penalty_index.unsqueeze(-1),
+            ).squeeze(-1)
+        if selected_risk_score is None:
+            selected_risk_score = risk_lower_quantile_scores.gather(
+                dim=-1,
+                index=selected_penalty_index.unsqueeze(-1),
+            ).squeeze(-1)
+
+        topk = max(1, min(self.topk, self.P))
+        top_idx = penalty_probs.topk(k=topk, dim=-1).indices
+        hard = torch.zeros_like(penalty_probs)
+        hard.scatter_(-1, top_idx, 1.0)
+        hard = hard * (1.0 - skip_hard.unsqueeze(-1))
+        if straight_through:
+            patch_route = hard - penalty_probs.detach() + penalty_probs
+            patch_skip = skip_hard - skip_prob.detach() + skip_prob
+        else:
+            patch_route = hard
+            patch_skip = skip_hard
+
+        route_bcpq = patch_route.permute(0, 1, 3, 2).contiguous()
+        route_bcph = route_bcpq.unsqueeze(-1).expand(
+            -1,
+            -1,
+            -1,
+            -1,
+            self.patch_len,
+        ).reshape(*route_bcpq.shape[:3], self.H)
+        return {
+            "patch_route_bcph": route_bcph,
+            "patch_probs_bcqp": penalty_probs,
+            "patch_skip_bcq": patch_skip,
+            "patch_skip_prob_bcq": skip_prob,
+            "patch_adopt_prob_bcq": adopt_prob,
+            "patch_fixed_penalty_active_bcq": (
+                fixed_penalty_active_bcq
+                if fixed_penalty_active_bcq is not None
+                else torch.ones_like(adopt_prob, dtype=torch.bool)
+            ),
+            "patch_proposal_adopt_prob_bcq": proposal_adopt_prob,
+            "patch_penalty_conditional_probs_bcqp": penalty_conditional_probs,
+            "patch_penalty_benefit_probs_bcqp": penalty_benefit_probs,
+            "patch_penalty_proposal_logits_bcqp": benefit_logits if self.hierarchical_recall_enable else logits[..., -self.P :],
+            "patch_penalty_proposal_rescue_logits_bcqp": rescue_logits if self.hierarchical_recall_enable else logits[..., -self.P :],
+            "patch_penalty_utility_scores_bcqp": utility_scores,
+            "patch_penalty_risk_benefit_probs_bcqp": risk_benefit_prob,
+            "patch_penalty_risk_domain_std_bcqp": risk_domain_std,
+            "patch_penalty_risk_positive_magnitude_bcqp": risk_positive_magnitude,
+            "patch_penalty_risk_negative_magnitude_bcqp": risk_negative_magnitude,
+            "patch_penalty_risk_lower_quantile_scores_bcqp": risk_lower_quantile_scores,
+            "patch_penalty_risk_utility_veto_probs_bcqp": risk_utility_veto_prob,
+            "patch_penalty_pairwise_rank_scores_bcqp": pairwise_rank_scores,
+            "patch_penalty_proposal_mask_bcqp": proposal_mask,
+            "patch_selected_penalty_index_bcq": selected_penalty_index,
+            "patch_selected_risk_score_bcq": selected_risk_score,
+            "patch_selected_risk_benefit_prob_bcq": selected_risk_benefit_prob,
+            "patch_selected_risk_domain_std_bcq": risk_domain_std.gather(
+                dim=-1,
+                index=selected_penalty_index.unsqueeze(-1),
+            ).squeeze(-1),
+            "patch_selected_utility_veto_prob_bcq": risk_utility_veto_prob.gather(
+                dim=-1,
+                index=selected_penalty_index.unsqueeze(-1),
+            ).squeeze(-1),
+        }
+
+    def set_expert_risk_adopt_threshold(self, threshold: float) -> None:
+        if self.expert_risk_adopt_threshold is None:
+            raise ValueError("expert risk adopt threshold requires expert_conditional_risk.")
+        with torch.no_grad():
+            self.expert_risk_adopt_threshold.fill_(float(threshold))
+
+    def set_expert_risk_adopt_threshold_by_penalty(
+        self,
+        threshold_by_penalty: torch.Tensor | List[float],
+    ) -> None:
+        if self.expert_risk_adopt_threshold_by_penalty is None:
+            raise ValueError(
+                "per-penalty expert risk thresholds require "
+                "temporal_calibration.per_penalty=true or adopt_threshold_by_penalty."
+            )
+        threshold = torch.as_tensor(
+            threshold_by_penalty,
+            dtype=self.expert_risk_adopt_threshold_by_penalty.dtype,
+            device=self.expert_risk_adopt_threshold_by_penalty.device,
+        ).reshape(-1)
+        if int(threshold.numel()) != self.P:
+            raise ValueError(
+                f"expected {self.P} per-penalty thresholds, got {int(threshold.numel())}."
+            )
+        with torch.no_grad():
+            self.expert_risk_adopt_threshold_by_penalty.copy_(threshold)
 
 
 class ClusterwisePredResidualMoE(nn.Module):
@@ -48,12 +1490,55 @@ class ClusterwisePredResidualMoE(nn.Module):
         seasonal_anchor_scale: float = 1.0,
         phase_residual_candidate_names: Optional[List[str]] = None,
         phase_residual_candidate_scale: float = 1.0,
+        shared_across_clusters: bool = False,
+        patch_router_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.K = int(num_clusters)
+        self.shared_across_clusters = bool(shared_across_clusters)
+        self.param_K = 1 if self.shared_across_clusters else self.K
         self.P = int(num_penalties)
         self.L = int(input_len)
         self.H = int(pred_len)
+        patch_router_cfg = patch_router_cfg or {}
+        self.patch_router_enable = bool(patch_router_cfg.get("enable", False))
+        if self.patch_router_enable and not self.shared_across_clusters:
+            raise ValueError("patch_router requires shared_across_clusters=true.")
+        self.patch_router = (
+            ChannelPatchPenaltyRouter(
+                input_len=self.L,
+                pred_len=self.H,
+                num_penalties=self.P,
+                cfg=patch_router_cfg,
+            )
+            if self.patch_router_enable
+            else None
+        )
+        raw_patch_candidate_scale = patch_router_cfg.get(
+            "candidate_scale_by_channel",
+            None,
+        )
+        if raw_patch_candidate_scale is None:
+            patch_candidate_scale_c = torch.empty(0, dtype=torch.float32)
+        else:
+            patch_candidate_scale_c = torch.as_tensor(
+                raw_patch_candidate_scale,
+                dtype=torch.float32,
+            ).reshape(-1)
+            if int(patch_candidate_scale_c.numel()) != int(num_channels or 0):
+                raise ValueError(
+                    "patch_router candidate_scale_by_channel length must match "
+                    f"num_channels ({int(num_channels or 0)})."
+                )
+            if bool((patch_candidate_scale_c < 0.0).any().item()):
+                raise ValueError(
+                    "patch_router candidate_scale_by_channel values must be nonnegative."
+                )
+        self.register_buffer(
+            "patch_candidate_scale_c",
+            patch_candidate_scale_c,
+            persistent=False,
+        )
         self.hidden_dim = int(hidden_dim)
         self.alpha_scale = float(alpha_scale)
         self.residual_clip = float(max(0.0, residual_clip))
@@ -87,6 +1572,8 @@ class ClusterwisePredResidualMoE(nn.Module):
                 f"got {int(parent.numel())} vs {self.C_channel}"
             )
         self.channel_expert_enable = bool(mask.any().item())
+        if self.shared_across_clusters and self.channel_expert_enable:
+            raise ValueError("shared_across_clusters does not support channel_expert_adapters.")
         self.channel_expert_mode = str(channel_expert_mode or "override").lower()
         if self.channel_expert_mode not in {"override", "delta"}:
             raise ValueError("channel_expert_mode must be 'override' or 'delta'.")
@@ -139,7 +1626,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         # Use one real Parameter object per (cluster, penalty) expert. Keeping
         # penalty experts physically separate makes gradient isolation and
         # diagnostics unambiguous.
-        num_experts = self.K * self.P
+        num_experts = self.param_K * self.P
         self.W1 = nn.ParameterList(
             [nn.Parameter(torch.empty(self.input_dim, self.hidden_dim)) for _ in range(num_experts)]
         )
@@ -163,20 +1650,20 @@ class ClusterwisePredResidualMoE(nn.Module):
         )
         if self.penalty_selector_enable:
             self.W_selector = nn.ParameterList(
-                [nn.Parameter(torch.empty(self.selector_input_dim, self.P)) for _ in range(self.K)]
+                [nn.Parameter(torch.empty(self.selector_input_dim, self.P)) for _ in range(self.param_K)]
             )
             self.b_selector = nn.ParameterList(
-                [nn.Parameter(torch.zeros(self.P)) for _ in range(self.K)]
+                [nn.Parameter(torch.zeros(self.P)) for _ in range(self.param_K)]
             )
         else:
             self.W_selector = nn.ParameterList()
             self.b_selector = nn.ParameterList()
         if self.fusion_gate_enable:
             self.W_fusion = nn.ParameterList(
-                [nn.Parameter(torch.empty(self.fusion_input_dim)) for _ in range(self.K)]
+                [nn.Parameter(torch.empty(self.fusion_input_dim)) for _ in range(self.param_K)]
             )
             self.b_fusion = nn.ParameterList(
-                [nn.Parameter(torch.tensor(float(fusion_init))) for _ in range(self.K)]
+                [nn.Parameter(torch.tensor(float(fusion_init))) for _ in range(self.param_K)]
             )
         else:
             self.W_fusion = nn.ParameterList()
@@ -222,11 +1709,27 @@ class ClusterwisePredResidualMoE(nn.Module):
         self.register_buffer("phase_residual_candidate_table_phc", torch.empty(0), persistent=False)
         self.register_buffer("confidence_threshold_kp", torch.empty(0), persistent=False)
         self.register_buffer("confidence_skip_threshold_k", torch.empty(0), persistent=False)
+        self.register_buffer("patch_router_observed_history_tc", torch.empty(0), persistent=False)
         self.confidence_gate_enable = False
         self.reset_parameters()
 
     def _idx(self, k: int, p: int) -> int:
-        return int(k) * self.P + int(p)
+        return self._param_cluster(k) * self.P + int(p)
+
+    def _param_cluster(self, k: int) -> int:
+        return 0 if self.shared_across_clusters else int(k)
+
+    def _stack_expert_params(self, params: nn.ParameterList) -> torch.Tensor:
+        stacked = torch.stack(list(params), dim=0).reshape(self.param_K, self.P, *params[0].shape)
+        if self.shared_across_clusters and self.K != 1:
+            return stacked.expand(self.K, self.P, *stacked.shape[2:])
+        return stacked
+
+    def _stack_cluster_params(self, params: nn.ParameterList) -> torch.Tensor:
+        stacked = torch.stack(list(params), dim=0)
+        if self.shared_across_clusters and self.K != 1:
+            return stacked.expand(self.K, *stacked.shape[1:])
+        return stacked
 
     def _ch_idx(self, c: int, p: int) -> int:
         return int(c) * self.P + int(p)
@@ -256,6 +1759,65 @@ class ClusterwisePredResidualMoE(nn.Module):
                 f"got {tuple(table.shape)} with H={self.H}"
             )
         self.phase_residual_candidate_table_phc = table
+
+    def set_patch_router_observed_history(self, observed_history_tc: torch.Tensor) -> None:
+        if self.patch_router is None or not self.patch_router.regime_context_enable:
+            self.patch_router_observed_history_tc = torch.empty(
+                0,
+                device=next(self.parameters()).device,
+            )
+            return
+        if observed_history_tc.ndim != 2:
+            raise ValueError("patch router observed history must have shape [T,C].")
+        reference = next(self.parameters())
+        self.patch_router_observed_history_tc = observed_history_tc.detach().to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    def _patch_router_regime_context(
+        self,
+        x_bcl: torch.Tensor,
+        query_start_abs_b: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.patch_router is None or not self.patch_router.regime_context_enable:
+            return None
+        if query_start_abs_b is None:
+            raise ValueError(
+                "query_start_abs_b is required when patch_router.regime_context is enabled."
+            )
+        history = self.patch_router_observed_history_tc
+        if history.ndim != 2 or int(history.numel()) == 0:
+            raise ValueError("patch router regime context history has not been initialized.")
+        if int(history.shape[1]) != int(x_bcl.shape[1]):
+            raise ValueError("patch router regime context channel count does not match input.")
+        context_len = max(self.patch_router.regime_context_lengths)
+        query_start = torch.as_tensor(
+            query_start_abs_b,
+            device=history.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if int(query_start.numel()) != int(x_bcl.shape[0]):
+            raise ValueError("patch router regime context query count does not match batch size.")
+        forecast_origin = query_start + int(self.L)
+        if bool((forecast_origin > int(history.shape[0])).any().item()):
+            raise ValueError("patch router regime context query exceeds observed history.")
+        offsets = torch.arange(
+            -int(context_len),
+            0,
+            device=history.device,
+            dtype=torch.long,
+        )
+        indices = (forecast_origin.unsqueeze(-1) + offsets.unsqueeze(0)).clamp(
+            0,
+            int(history.shape[0]) - 1,
+        )
+        context = history.index_select(0, indices.reshape(-1)).reshape(
+            int(x_bcl.shape[0]),
+            int(context_len),
+            int(history.shape[1]),
+        )
+        return context.permute(0, 2, 1).to(device=x_bcl.device, dtype=x_bcl.dtype)
 
     def set_confidence_gate(
         self,
@@ -468,12 +2030,12 @@ class ClusterwisePredResidualMoE(nn.Module):
         feat_bcd = self._input_features(x_bcl, y_base_bch)
         cluster_id_c = cluster_id_c.to(device=x_bcl.device, dtype=torch.long)
 
-        W1_kpdm = torch.stack(list(self.W1), dim=0).reshape(self.K, self.P, self.input_dim, self.hidden_dim)
-        b1_kpm = torch.stack(list(self.b1), dim=0).reshape(self.K, self.P, self.hidden_dim)
-        W2_kpmh = torch.stack(list(self.W2), dim=0).reshape(self.K, self.P, self.hidden_dim, self.H)
-        b2_kph = torch.stack(list(self.b2), dim=0).reshape(self.K, self.P, self.H)
-        Wg_kpm = torch.stack(list(self.W_gate), dim=0).reshape(self.K, self.P, self.hidden_dim)
-        bg_kp = torch.stack(list(self.b_gate), dim=0).reshape(self.K, self.P)
+        W1_kpdm = self._stack_expert_params(self.W1)
+        b1_kpm = self._stack_expert_params(self.b1)
+        W2_kpmh = self._stack_expert_params(self.W2)
+        b2_kph = self._stack_expert_params(self.b2)
+        Wg_kpm = self._stack_expert_params(self.W_gate)
+        bg_kp = self._stack_expert_params(self.b_gate)
         W1 = W1_kpdm.index_select(0, cluster_id_c)  # [C,P,D,M]
         b1 = b1_kpm.index_select(0, cluster_id_c)  # [C,P,M]
         W2 = W2_kpmh.index_select(0, cluster_id_c)  # [C,P,M,H]
@@ -549,9 +2111,39 @@ class ClusterwisePredResidualMoE(nn.Module):
             )
             ch_mask_cp = self.channel_expert_mask_c.to(device=x_bcl.device).view(-1, 1)
             alpha_cp = torch.where(ch_mask_cp, ch_alpha_cp, alpha_cp)
-        route_bcp = mask_bkp[:, cluster_id_c, :]
-        if skip_bk is not None:
-            route_bcp = route_bcp * (1.0 - skip_bk[:, cluster_id_c].unsqueeze(-1))
+        patch_router_out: Optional[Dict[str, torch.Tensor]] = None
+        route_bcph: Optional[torch.Tensor] = None
+        if self.patch_router is not None:
+            patch_candidate_scale_bc = None
+            if int(self.patch_candidate_scale_c.numel()) > 0:
+                patch_candidate_scale_bc = self.patch_candidate_scale_c.to(
+                    device=x_bcl.device,
+                    dtype=residuals.dtype,
+                ).view(1, -1)
+            candidate_delta_bcpH = alpha_cp.unsqueeze(0).unsqueeze(-1) * residuals
+            if patch_candidate_scale_bc is not None:
+                candidate_delta_bcpH = (
+                    candidate_delta_bcpH
+                    * patch_candidate_scale_bc.unsqueeze(-1).unsqueeze(-1)
+                )
+            regime_context_bcl = self._patch_router_regime_context(
+                x_bcl,
+                query_start_abs_b,
+            )
+            patch_router_out = self.patch_router(
+                x_bcl,
+                y_base_bch=y_base_bch,
+                candidate_delta_bcpH=candidate_delta_bcpH,
+                regime_context_bcl=regime_context_bcl,
+                query_start_abs_b=query_start_abs_b,
+                straight_through=self.training,
+            )
+            route_bcph = patch_router_out["patch_route_bcph"]
+            route_bcp = route_bcph.mean(dim=-1)
+        else:
+            route_bcp = mask_bkp[:, cluster_id_c, :]
+            if skip_bk is not None:
+                route_bcp = route_bcp * (1.0 - skip_bk[:, cluster_id_c].unsqueeze(-1))
         if self.channel_penalty_allowed_mask_cp.numel() > 0:
             channel_mask_cp = self.channel_penalty_allowed_mask_cp.to(device=x_bcl.device, dtype=route_bcp.dtype)
             if channel_mask_cp.shape != route_bcp.shape[1:]:
@@ -560,6 +2152,8 @@ class ClusterwisePredResidualMoE(nn.Module):
                     f"got {tuple(channel_mask_cp.shape)} vs {tuple(route_bcp.shape[1:])}"
                 )
             route_bcp = route_bcp * channel_mask_cp.unsqueeze(0)
+            if route_bcph is not None:
+                route_bcph = route_bcph * channel_mask_cp.unsqueeze(0).unsqueeze(-1)
         if self.intervention_enable:
             gate_logits = torch.einsum("bcpm,cpm->bcp", h, Wg) + bg.unsqueeze(0)
             if self.channel_expert_enable:
@@ -582,8 +2176,8 @@ class ClusterwisePredResidualMoE(nn.Module):
                 cluster_id_c,
                 self.selector_use_cluster_context,
             )
-            Ws = torch.stack(list(self.W_selector), dim=0).index_select(0, cluster_id_c)
-            bs = torch.stack(list(self.b_selector), dim=0).index_select(0, cluster_id_c)
+            Ws = self._stack_cluster_params(self.W_selector).index_select(0, cluster_id_c)
+            bs = self._stack_cluster_params(self.b_selector).index_select(0, cluster_id_c)
             selector_logits = torch.einsum("bcd,cdp->bcp", selector_feat, Ws) + bs.unsqueeze(0)
             selector_bcp = torch.sigmoid(selector_logits / self.selector_temperature)
         else:
@@ -611,9 +2205,22 @@ class ClusterwisePredResidualMoE(nn.Module):
                 ).index_select(0, cluster_id_c)
                 skip_active_bc = skip_confidence_bc >= skip_threshold_c.unsqueeze(0)
                 confidence_active_bcp = confidence_active_bcp * (~skip_active_bc).unsqueeze(-1).to(dtype=route_bcp.dtype)
-        effective_route_bcp = route_bcp * intervention_bcp * selector_bcp * confidence_active_bcp
-        scale_bcp = effective_route_bcp * alpha_cp.unsqueeze(0)
-        branches = scale_bcp.unsqueeze(-1) * residuals
+        route_gate_bcp = intervention_bcp * selector_bcp * confidence_active_bcp
+        effective_route_bcph = None
+        if route_bcph is not None:
+            effective_route_bcph = route_bcph * route_gate_bcp.unsqueeze(-1)
+            scale_bcph = effective_route_bcph * alpha_cp.unsqueeze(0).unsqueeze(-1)
+            if int(self.patch_candidate_scale_c.numel()) > 0:
+                scale_bcph = scale_bcph * self.patch_candidate_scale_c.to(
+                    device=x_bcl.device,
+                    dtype=scale_bcph.dtype,
+                ).view(1, -1, 1, 1)
+            branches = scale_bcph * residuals
+            effective_route_bcp = effective_route_bcph.mean(dim=-1)
+        else:
+            effective_route_bcp = route_bcp * route_gate_bcp
+            scale_bcp = effective_route_bcp * alpha_cp.unsqueeze(0)
+            branches = scale_bcp.unsqueeze(-1) * residuals
         branch_sum_bch = branches.sum(dim=2)
         if self.fusion_gate_enable:
             fusion_feat = self._cluster_context_features(
@@ -621,14 +2228,14 @@ class ClusterwisePredResidualMoE(nn.Module):
                 cluster_id_c,
                 self.fusion_use_cluster_context,
             )
-            Wf = torch.stack(list(self.W_fusion), dim=0).index_select(0, cluster_id_c)
-            bf = torch.stack(list(self.b_fusion), dim=0).index_select(0, cluster_id_c)
+            Wf = self._stack_cluster_params(self.W_fusion).index_select(0, cluster_id_c)
+            bf = self._stack_cluster_params(self.b_fusion).index_select(0, cluster_id_c)
             fusion_bc = torch.sigmoid(torch.einsum("bcd,cd->bc", fusion_feat, Wf) + bf.unsqueeze(0))
         else:
             fusion_bc = torch.ones_like(route_bcp[..., 0])
         y_final = y_base_bch + fusion_bc.unsqueeze(-1) * branch_sum_bch
 
-        return {
+        result = {
             "y_final": y_final,
             "residuals": residuals,
             "branches": branches,
@@ -641,11 +2248,23 @@ class ClusterwisePredResidualMoE(nn.Module):
             "fusion_bc": fusion_bc,
             "alpha_cp": alpha_cp,
         }
+        if patch_router_out is not None:
+            result.update(patch_router_out)
+            result["effective_route_bcph"] = effective_route_bcph
+            result["patch_candidate_scale_c"] = self.patch_candidate_scale_c
+        return result
 
     def alpha_values(self) -> torch.Tensor:
-        return self.alpha_scale * torch.sigmoid(torch.stack(list(self.log_alpha), dim=0).reshape(self.K, self.P))
+        alpha = self.alpha_scale * torch.sigmoid(
+            torch.stack(list(self.log_alpha), dim=0).reshape(self.param_K, self.P)
+        )
+        if self.shared_across_clusters and self.K != 1:
+            return alpha.expand(self.K, self.P)
+        return alpha
 
     def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        if self.shared_across_clusters and int(k) != 0:
+            return []
         params: List[nn.Parameter] = []
         for p in range(self.P):
             idx = self._idx(k, p)
@@ -659,9 +2278,13 @@ class ClusterwisePredResidualMoE(nn.Module):
                 self.b_gate[idx],
             ])
         if self.penalty_selector_enable:
-            params.extend([self.W_selector[k], self.b_selector[k]])
+            idx = self._param_cluster(k)
+            params.extend([self.W_selector[idx], self.b_selector[idx]])
         if self.fusion_gate_enable:
-            params.extend([self.W_fusion[k], self.b_fusion[k]])
+            idx = self._param_cluster(k)
+            params.extend([self.W_fusion[idx], self.b_fusion[idx]])
+        if self.patch_router is not None:
+            params.extend(list(self.patch_router.parameters()))
         if self.channel_expert_enable and self.channel_expert_cluster_id_c.numel() > 0:
             idx = ((self.channel_expert_cluster_id_c == int(k)) & self.channel_expert_mask_c).nonzero(
                 as_tuple=False
@@ -682,12 +2305,18 @@ class ClusterwisePredResidualMoE(nn.Module):
         return params
 
     def mask_cluster_grads(self, stopped_k: torch.Tensor):
+        if self.shared_across_clusters:
+            if not bool(stopped_k.detach().to(dtype=torch.bool).all().item()):
+                return
+            stopped_k = torch.ones((self.param_K,), dtype=torch.bool, device=stopped_k.device)
         for k in range(self.K):
             if not bool(stopped_k[k].item()):
                 continue
             for param in self.get_cluster_params(k):
                 if param.grad is not None:
                     param.grad.zero_()
+            if self.shared_across_clusters:
+                break
 
     def get_cluster_state(self, k: int) -> Dict[str, torch.Tensor]:
         state = {
@@ -742,11 +2371,16 @@ class ClusterwisePredResidualMoE(nn.Module):
                 state["channel_W_gate"] = torch.empty(0, self.P, self.hidden_dim)
                 state["channel_b_gate"] = torch.empty(0, self.P)
         if self.penalty_selector_enable:
-            state["W_selector"] = self.W_selector[k].detach().cpu()
-            state["b_selector"] = self.b_selector[k].detach().cpu()
+            idx = self._param_cluster(k)
+            state["W_selector"] = self.W_selector[idx].detach().cpu()
+            state["b_selector"] = self.b_selector[idx].detach().cpu()
         if self.fusion_gate_enable:
-            state["W_fusion"] = self.W_fusion[k].detach().cpu()
-            state["b_fusion"] = self.b_fusion[k].detach().cpu()
+            idx = self._param_cluster(k)
+            state["W_fusion"] = self.W_fusion[idx].detach().cpu()
+            state["b_fusion"] = self.b_fusion[idx].detach().cpu()
+        if self.patch_router is not None:
+            for name, param in self.patch_router.named_parameters():
+                state[f"patch_router.{name}"] = param.detach().cpu().clone()
         return state
 
     def load_cluster_state(self, k: int, state: Dict[str, torch.Tensor]):
@@ -763,13 +2397,22 @@ class ClusterwisePredResidualMoE(nn.Module):
             if "b_gate" in state:
                 self.b_gate[idx].data.copy_(state["b_gate"][p].to(device))
         if self.penalty_selector_enable and "W_selector" in state:
-            self.W_selector[k].data.copy_(state["W_selector"].to(self.W_selector[k].device))
+            idx = self._param_cluster(k)
+            self.W_selector[idx].data.copy_(state["W_selector"].to(self.W_selector[idx].device))
         if self.penalty_selector_enable and "b_selector" in state:
-            self.b_selector[k].data.copy_(state["b_selector"].to(self.b_selector[k].device))
+            idx = self._param_cluster(k)
+            self.b_selector[idx].data.copy_(state["b_selector"].to(self.b_selector[idx].device))
         if self.fusion_gate_enable and "W_fusion" in state:
-            self.W_fusion[k].data.copy_(state["W_fusion"].to(self.W_fusion[k].device))
+            idx = self._param_cluster(k)
+            self.W_fusion[idx].data.copy_(state["W_fusion"].to(self.W_fusion[idx].device))
         if self.fusion_gate_enable and "b_fusion" in state:
-            self.b_fusion[k].data.copy_(state["b_fusion"].to(self.b_fusion[k].device))
+            idx = self._param_cluster(k)
+            self.b_fusion[idx].data.copy_(state["b_fusion"].to(self.b_fusion[idx].device))
+        if self.patch_router is not None:
+            for name, param in self.patch_router.named_parameters():
+                key = f"patch_router.{name}"
+                if key in state:
+                    param.data.copy_(state[key].to(param.device))
         if self.channel_expert_enable and "channel_idx" in state:
             saved_idx = state["channel_idx"].detach().cpu().to(dtype=torch.long)
             current_idx = ((self.channel_expert_cluster_id_c == int(k)) & self.channel_expert_mask_c).nonzero(

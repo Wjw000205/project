@@ -1,3 +1,4 @@
+"""PKR-MoE training CLI and run orchestration."""
 from __future__ import annotations
 
 import os
@@ -7,11 +8,11 @@ import time
 import math
 import sys
 import builtins
-from typing import Dict, Iterable, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 import pandas as pd
 try:
     from torch.func import functional_call as _torch_functional_call
@@ -47,11 +48,11 @@ from .utils.pearson import pearson_corr_matrix
 from .utils.clustering import cluster_channels_by_corr
 from .models.cluster_predictor import build_cluster_predictor
 from .models.dynamic_lambda import ClusterwiseDynamicLambda
+from .models.learnable_anchor import ClusterwiseLearnableOutputAnchor
 from .models.learnable_lambda import ClusterwiseLearnableLambda
 from .models.moe_gate import ClusterwiseMoEGate, scatter_mean_bc_to_bk, scatter_mean_bcf_to_bkf
 from .models.penalties import build_penalty_bank, normalize_penalties
 from .models.residual_moe import ClusterwisePredResidualMoE
-from .utils.metrics import accumulate_channel_errors, mse_mae_from_sums
 from .utils.plotting import save_channel_plots, save_cluster_metric_curves
 from .utils.cluster_portrait import save_cluster_portraits
 from .utils.cluster_memory import (
@@ -67,8309 +68,9 @@ from .utils.console_progress import PurpleProgressBar
 from .utils.diagnostic_sampling import select_prediction_sample_indices
 
 
-def _get_rss_mb() -> float:
-    if psutil is None:
-        return -1.0
-    try:
-        proc = psutil.Process(os.getpid())
-        return float(proc.memory_info().rss) / (1024.0 * 1024.0)
-    except Exception:
-        return -1.0
 
-def _dir_size_mb(path: str) -> float:
-    total = 0
-    for root, _, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                continue
-    return float(total) / (1024.0 * 1024.0)
-
-
-def _shape_tuple(tensor: torch.Tensor) -> Tuple[int, ...]:
-    return tuple(int(v) for v in tensor.shape)
-
-
-@torch.no_grad()
-def _partial_load_matching_state_dict(
-    module: nn.Module,
-    source_state: Dict[str, torch.Tensor],
-    *,
-    max_report: int = 40,
-) -> Dict[str, object]:
-    """Copy only source tensors whose names and shapes match the target module."""
-    target_state = module.state_dict()
-    loaded: List[str] = []
-    skipped_shape: List[Dict[str, object]] = []
-    skipped_missing: List[str] = []
-    skipped_non_tensor: List[str] = []
-
-    for name, src_tensor in source_state.items():
-        if not torch.is_tensor(src_tensor):
-            skipped_non_tensor.append(str(name))
-            continue
-        if name not in target_state:
-            skipped_missing.append(str(name))
-            continue
-        dst_tensor = target_state[name]
-        if _shape_tuple(dst_tensor) != _shape_tuple(src_tensor):
-            skipped_shape.append(
-                {
-                    "name": str(name),
-                    "source_shape": list(_shape_tuple(src_tensor)),
-                    "target_shape": list(_shape_tuple(dst_tensor)),
-                }
-            )
-            continue
-        dst_tensor.copy_(src_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype))
-        loaded.append(str(name))
-
-    return {
-        "loaded_count": len(loaded),
-        "skipped_shape_count": len(skipped_shape),
-        "skipped_missing_count": len(skipped_missing),
-        "skipped_non_tensor_count": len(skipped_non_tensor),
-        "loaded": loaded[:max_report],
-        "skipped_shape": skipped_shape[:max_report],
-        "skipped_missing": skipped_missing[:max_report],
-        "skipped_non_tensor": skipped_non_tensor[:max_report],
-    }
-
-def print_clusters(clusters: Dict[int, List[int]], channel_names: List[str]):
-    for k in sorted(clusters.keys()):
-        chs = [channel_names[i] for i in clusters[k]]
-        print(f"Cluster {k}: [" + ", ".join(chs) + "]")
-
-
-def _make_torch_generator(seed: Optional[int]) -> Optional[torch.Generator]:
-    if seed is None:
-        return None
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
-    return generator
-
-
-def _freeze_module_params(module: nn.Module) -> int:
-    frozen = 0
-    for param in module.parameters():
-        param.requires_grad_(False)
-        frozen += int(param.numel())
-    return frozen
-
-
-def _validation_holdout_split_counts(total: int, holdout_fraction: float, min_holdout: int) -> Tuple[int, int]:
-    total = int(total)
-    if total <= 0:
-        return 0, 0
-    holdout_fraction = float(holdout_fraction)
-    min_holdout = max(0, int(min_holdout))
-    if holdout_fraction <= 0.0:
-        return total, 0
-    holdout_n = max(min_holdout, int(round(total * holdout_fraction)))
-    if holdout_n <= 0 or holdout_n >= total:
-        return total, 0
-    select_n = total - holdout_n
-    if select_n <= 0:
-        return total, 0
-    return select_n, holdout_n
-
-
-def _normalize_confidence_gate_source_split(source_split: object) -> str:
-    value = str(source_split or "train_holdout").strip().lower()
-    if value in {"train", "training"}:
-        return "train"
-    if value in {"train_holdout", "train-holdout", "holdout"}:
-        return "train_holdout"
-    raise ValueError(
-        "moe.pred_side_residual.confidence_gate.source_split must be train or train_holdout "
-    )
-
-
-def _contiguous_segment_ranges(total: int, segment_count: int) -> List[Tuple[int, int]]:
-    total = int(total)
-    if total <= 0:
-        return []
-    segment_count = max(1, min(int(segment_count), total))
-    base = total // segment_count
-    extra = total % segment_count
-    ranges: List[Tuple[int, int]] = []
-    start = 0
-    for idx in range(segment_count):
-        length = base + (1 if idx < extra else 0)
-        end = start + length
-        if end > start:
-            ranges.append((start, end))
-        start = end
-    return ranges
-
-
-def _top_positive_improvement_mask(improvement_c: torch.Tensor, max_channels: int) -> torch.Tensor:
-    improvement_c = improvement_c.detach().cpu()
-    positive_c = improvement_c > 0
-    max_channels = int(max_channels)
-    if max_channels <= 0 or int(positive_c.sum().item()) <= max_channels:
-        return positive_c
-    scores = torch.where(positive_c, improvement_c, torch.full_like(improvement_c, float("-inf")))
-    keep_idx = torch.topk(scores, k=max_channels).indices
-    keep_c = torch.zeros_like(positive_c, dtype=torch.bool)
-    keep_c[keep_idx] = True
-    return keep_c
-
-
-def _loss_normalization_enabled(cfg: object) -> bool:
-    if isinstance(cfg, bool):
-        return bool(cfg)
-    if not isinstance(cfg, dict):
-        return False
-    return bool(cfg.get("enable", False))
-
-
-def _loss_normalization_term_set(cfg: object, names: List[str]) -> set:
-    if not isinstance(cfg, dict):
-        return set(names)
-    raw_terms = cfg.get("terms", "all")
-    if raw_terms is None or str(raw_terms).lower() == "all":
-        return set(names)
-    if isinstance(raw_terms, str):
-        return {part.strip() for part in raw_terms.split(",") if part.strip()}
-    return {str(part) for part in raw_terms}
-
-
-def _normalize_loss_terms(
-    terms: Dict[str, torch.Tensor],
-    cfg: object,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Optional[torch.Tensor]]]:
-    if not _loss_normalization_enabled(cfg):
-        return dict(terms), {name: None for name in terms}
-
-    cfg_dict = cfg if isinstance(cfg, dict) else {}
-    mode = str(cfg_dict.get("mode", "std")).lower()
-    eps = float(cfg_dict.get("eps", 1.0e-6))
-    min_scale = float(cfg_dict.get("min_scale", eps))
-    max_scale = float(cfg_dict.get("max_scale", 0.0))
-    include = _loss_normalization_term_set(cfg, list(terms.keys()))
-
-    normalized: Dict[str, torch.Tensor] = {}
-    scales: Dict[str, Optional[torch.Tensor]] = {}
-    for name, value in terms.items():
-        if name not in include:
-            normalized[name] = value
-            scales[name] = None
-            continue
-        ref = value.detach().to(dtype=torch.float32)
-        if ref.numel() == 0:
-            scale = torch.tensor(min_scale, device=value.device, dtype=torch.float32)
-        elif mode in {"std", "batch_std"}:
-            scale = ref.std(unbiased=False)
-        elif mode in {"mean_abs", "abs_mean", "mean"}:
-            scale = ref.abs().mean()
-        elif mode == "rms":
-            scale = ref.pow(2).mean().sqrt()
-        else:
-            raise ValueError(
-                f"Unsupported train.loss_normalization.mode='{mode}'. "
-                "Expected std, mean_abs, or rms."
-            )
-        scale = scale.clamp_min(max(eps, min_scale))
-        if max_scale > 0.0:
-            scale = scale.clamp_max(max_scale)
-        normalized[name] = value / scale.to(device=value.device, dtype=value.dtype)
-        scales[name] = scale.detach().cpu()
-    return normalized, scales
-
-
-def _accumulate_detached_sum_(
-    accumulator: torch.Tensor,
-    values: torch.Tensor,
-    *,
-    dim: int = 0,
-) -> torch.Tensor:
-    accumulator.add_(values.detach().sum(dim=dim).to(device=accumulator.device, dtype=accumulator.dtype))
-    return accumulator
-
-
-def _lr_warmup_scale(epoch: int, warmup_epochs: int, start_factor: float = 0.1) -> float:
-    warmup_epochs = int(warmup_epochs)
-    if warmup_epochs <= 0 or int(epoch) > warmup_epochs:
-        return 1.0
-    if warmup_epochs == 1:
-        return 1.0
-    start = min(max(float(start_factor), 0.0), 1.0)
-    progress = max(0.0, min(1.0, float(int(epoch) - 1) / float(warmup_epochs - 1)))
-    return round(start + (1.0 - start) * progress, 12)
-
-
-def _set_optimizer_lr_scale(optimizers: List[torch.optim.Optimizer], scale: float) -> None:
-    scale = float(scale)
-    for optimizer in optimizers:
-        for group in optimizer.param_groups:
-            group.setdefault("initial_lr", float(group["lr"]))
-            group["lr"] = float(group["initial_lr"]) * scale
-
-
-def _should_update_swa(epoch: int, start_epoch: int, update_every: int) -> bool:
-    update_every = max(1, int(update_every))
-    epoch = int(epoch)
-    start_epoch = int(start_epoch)
-    return epoch >= start_epoch and ((epoch - start_epoch) % update_every == 0)
-
-
-def _make_cluster_optimizer_param_groups(
-    *,
-    base_params: List[nn.Parameter],
-    gate_params: List[nn.Parameter],
-    pred_residual_params: List[nn.Parameter],
-    dynamic_lambda_params: List[nn.Parameter],
-    learnable_lambda_params: List[nn.Parameter],
-    base_weight_decay: float,
-    moe_weight_decay: Optional[float],
-    pred_residual_weight_decay: Optional[float],
-) -> List[Dict[str, object]]:
-    moe_params: List[nn.Parameter] = []
-    moe_params.extend(gate_params)
-    moe_params.extend(dynamic_lambda_params)
-    moe_params.extend(learnable_lambda_params)
-
-    groups: List[Dict[str, object]] = []
-    if moe_weight_decay is None:
-        common_params: List[nn.Parameter] = []
-        common_params.extend(base_params)
-        common_params.extend(moe_params)
-        if len(common_params) > 0:
-            groups.append({
-                "params": common_params,
-                "weight_decay": float(base_weight_decay),
-            })
-    else:
-        if len(base_params) > 0:
-            groups.append({
-                "params": base_params,
-                "weight_decay": float(base_weight_decay),
-            })
-    if moe_weight_decay is not None and len(moe_params) > 0:
-        groups.append({
-            "params": moe_params,
-            "weight_decay": float(moe_weight_decay),
-        })
-    if len(pred_residual_params) > 0:
-        residual_wd = pred_residual_weight_decay
-        if residual_wd is None:
-            residual_wd = moe_weight_decay if moe_weight_decay is not None else base_weight_decay
-        groups.append({
-            "params": pred_residual_params,
-            "weight_decay": float(residual_wd),
-        })
-    return groups
-
-
-def _load_finetune_pred_residual_state(
-    *,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    checkpoint: Dict[str, object],
-    source_penalty_names: List[str],
-    target_penalty_names: List[str],
-    strict: bool = True,
-) -> bool:
-    if pred_residual is None or "pred_residual_state" not in checkpoint:
-        return False
-    if list(source_penalty_names) != list(target_penalty_names):
-        raise ValueError(
-            "Fine-tune pred_residual loading requires identical penalty_names: "
-            f"source={list(source_penalty_names)}, target={list(target_penalty_names)}"
-        )
-    pred_residual.load_state_dict(checkpoint["pred_residual_state"], strict=bool(strict))
-    return True
-
-
-def _cluster_penalty_mask_to_channel_mask(
-    allowed_mask_kp: Optional[torch.Tensor],
-    cluster_id_c: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    if allowed_mask_kp is None or int(allowed_mask_kp.numel()) == 0:
-        return None
-    if int(allowed_mask_kp.ndim) != 2:
-        raise ValueError(f"cluster penalty mask must have shape [K,P], got {tuple(allowed_mask_kp.shape)}")
-    allowed_kp = allowed_mask_kp.detach().to(dtype=torch.bool)
-    cid_c = cluster_id_c.detach().to(device=allowed_kp.device, dtype=torch.long).view(-1)
-    if int(cid_c.numel()) <= 0:
-        return torch.empty(0, int(allowed_kp.shape[1]), device=allowed_kp.device, dtype=torch.bool)
-    if int(cid_c.min().item()) < 0 or int(cid_c.max().item()) >= int(allowed_kp.shape[0]):
-        raise ValueError(
-            "cluster_id_c contains ids outside the cluster penalty mask range "
-            f"[0,{int(allowed_kp.shape[0]) - 1}]"
-        )
-    return allowed_kp.index_select(0, cid_c).detach().clone()
-
-
-def _gate_cluster_params(gate: ClusterwiseMoEGate, k: int) -> List[nn.Parameter]:
-    params: List[nn.Parameter] = [gate.W1[k], gate.b1[k], gate.W2[k], gate.b2[k]]
-    if gate.W_skip is not None and gate.b_skip is not None:
-        params.extend([gate.W_skip[k], gate.b_skip[k]])
-    return params
-
-
-def _mask_gate_grads_after_epoch(
-    *,
-    gate: ClusterwiseMoEGate,
-    epoch: int,
-    freeze_after_epoch: int,
-    stopped: torch.Tensor,
-) -> bool:
-    if int(freeze_after_epoch) <= 0 or int(epoch) <= int(freeze_after_epoch):
-        return False
-    freeze_mask = torch.ones(
-        gate.K,
-        dtype=torch.bool,
-        device=stopped.device if isinstance(stopped, torch.Tensor) else None,
-    )
-    gate.mask_cluster_grads(freeze_mask)
-    return True
-
-
-def compute_channel_shape_features(data_tc: torch.Tensor, acf_lags: Optional[List[int]] = None) -> torch.Tensor:
-    """
-    Train-only channel descriptors for feature-aware clustering.
-    Returns [C,F], one row per channel. These descriptors use only the
-    clustering fit segment and never inspect validation/test targets.
-    """
-    if data_tc.ndim != 2:
-        raise ValueError(f"Expected data_tc [T,C], got {tuple(data_tc.shape)}")
-    T, C = data_tc.shape
-    x = data_tc.to(dtype=torch.float32)
-    device = x.device
-    eps = 1.0e-6
-    mean_c = x.mean(dim=0)
-    std_c = x.std(dim=0).clamp_min(eps)
-    centered = x - mean_c.view(1, C)
-    t = torch.linspace(-1.0, 1.0, steps=max(T, 1), device=device, dtype=x.dtype).view(T, 1)
-    trend_c = (centered * t).mean(dim=0) / t.pow(2).mean().clamp_min(eps)
-    range_c = (x.max(dim=0).values - x.min(dim=0).values) / std_c
-    q95_c = torch.quantile(x, 0.95, dim=0)
-    q05_c = torch.quantile(x, 0.05, dim=0)
-    iqr90_c = (q95_c - q05_c) / std_c
-    if T > 1:
-        d1 = x[1:] - x[:-1]
-        d1_abs_c = d1.abs().mean(dim=0) / std_c
-        d1_std_c = d1.std(dim=0) / std_c
-        jump_thr = d1.abs().mean(dim=0, keepdim=True) + 2.0 * d1.std(dim=0, keepdim=True).clamp_min(eps)
-        jump_rate_c = (d1.abs() > jump_thr).to(dtype=x.dtype).mean(dim=0)
-    else:
-        d1_abs_c = torch.zeros(C, device=device, dtype=x.dtype)
-        d1_std_c = torch.zeros_like(d1_abs_c)
-        jump_rate_c = torch.zeros_like(d1_abs_c)
-    if T > 2:
-        d2 = x[2:] - (2.0 * x[1:-1]) + x[:-2]
-        d2_abs_c = d2.abs().mean(dim=0) / std_c
-        curvature_c = d2.abs().mean(dim=0) / (d1_abs_c * std_c + eps)
-    else:
-        d2_abs_c = torch.zeros(C, device=device, dtype=x.dtype)
-        curvature_c = torch.zeros_like(d2_abs_c)
-    feats = [
-        mean_c,
-        std_c,
-        trend_c,
-        range_c,
-        iqr90_c,
-        d1_abs_c,
-        d1_std_c,
-        d2_abs_c,
-        curvature_c,
-        jump_rate_c,
-    ]
-    lags = acf_lags if acf_lags is not None else [1, 24, 96]
-    for lag in lags:
-        lag = int(lag)
-        if lag <= 0 or T <= lag + 1:
-            feats.append(torch.zeros(C, device=device, dtype=x.dtype))
-            continue
-        a = centered[:-lag]
-        b = centered[lag:]
-        cov = (a * b).mean(dim=0)
-        var = centered.pow(2).mean(dim=0).clamp_min(eps)
-        feats.append((cov / var).clamp(-1.0, 1.0))
-    return torch.stack(feats, dim=1)
-
-
-GATE_FEATURE_NAMES = [
-    "mean",
-    "std",
-    "last_centered",
-    "trend_slope",
-    "range_over_std",
-    "mad1",
-    "mad2",
-    "jump_rate",
-    "acf1",
-    "curvature_ratio",
-]
-
-
-BASE_FORECAST_GATE_FEATURE_NAMES = [
-    "base_mean_shift_over_hist_std",
-    "base_first_shift_over_hist_std",
-    "base_last_shift_over_hist_std",
-    "base_std_over_hist_std",
-    "base_range_over_hist_std",
-    "base_slope_over_hist_std",
-    "base_mad1_over_hist_std",
-    "base_mad2_over_hist_std",
-    "base_last_minus_first_over_hist_std",
-]
-
-
-def _normalize_gate_feature_mode(mode: str) -> str:
-    value = str(mode or "history").lower()
-    if value in {"history", "input", "legacy"}:
-        return "history"
-    if value in {"history_base", "history+base", "input_base", "safe_augmented"}:
-        return "history_base"
-    raise ValueError("moe.gate_feature_mode must be 'history' or 'history_base'.")
-
-
-def _gate_feature_names_for_mode(mode: str = "history") -> List[str]:
-    mode = _normalize_gate_feature_mode(mode)
-    if mode == "history":
-        return list(GATE_FEATURE_NAMES)
-    return list(GATE_FEATURE_NAMES) + list(BASE_FORECAST_GATE_FEATURE_NAMES)
-
-
-def get_gate_feature_dim() -> int:
-    return len(GATE_FEATURE_NAMES)
-
-
-def reduce_cluster_metric(x: torch.Tensor, weight_k: torch.Tensor) -> torch.Tensor:
-    """
-    Weighted reduction over cluster dimension.
-    x: [..., K]
-    weight_k: [K], sum to 1
-    returns: [...] with cluster dimension reduced
-    """
-    w = weight_k.to(device=x.device, dtype=x.dtype)
-    view_shape = [1] * x.dim()
-    view_shape[-1] = w.shape[0]
-    return (x * w.view(*view_shape)).sum(dim=-1)
-
-
-def _weighted_cluster_sum_mean(
-    sum_k: torch.Tensor,
-    count: int,
-    cluster_weight_k: torch.Tensor,
-) -> float:
-    count = max(int(count), 1)
-    mean_k = sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / float(count)
-    return float(reduce_cluster_metric(mean_k, cluster_weight_k).detach().cpu().item())
-
-
-def _stage2_loss_epoch_summary(
-    *,
-    epoch: int,
-    count: int,
-    cluster_weight_k: torch.Tensor,
-    total_loss_sum_k: torch.Tensor,
-    forecast_loss_sum_k: torch.Tensor,
-    penalty_loss_sum_k: torch.Tensor,
-    pred_residual_aux_loss_sum_k: torch.Tensor,
-    candidate_supervision_loss_sum_k: torch.Tensor,
-    gate_utility_loss_sum_k: torch.Tensor,
-    skip_noop_loss_sum_k: torch.Tensor,
-    intervention_supervision_loss_sum_k: torch.Tensor,
-    other_aux_loss_sum_k: torch.Tensor,
-    train_mse_sum_k: torch.Tensor,
-    train_mae_sum_k: torch.Tensor,
-) -> Dict[str, float]:
-    return {
-        "epoch": int(epoch),
-        "total_train_loss": _weighted_cluster_sum_mean(total_loss_sum_k, count, cluster_weight_k),
-        "forecast_loss_only": _weighted_cluster_sum_mean(forecast_loss_sum_k, count, cluster_weight_k),
-        "aux_penalty_loss": _weighted_cluster_sum_mean(penalty_loss_sum_k, count, cluster_weight_k),
-        "pred_residual_aux_loss": _weighted_cluster_sum_mean(pred_residual_aux_loss_sum_k, count, cluster_weight_k),
-        "candidate_supervision_loss": _weighted_cluster_sum_mean(candidate_supervision_loss_sum_k, count, cluster_weight_k),
-        "gate_utility_loss": _weighted_cluster_sum_mean(gate_utility_loss_sum_k, count, cluster_weight_k),
-        "skip_noop_loss": _weighted_cluster_sum_mean(skip_noop_loss_sum_k, count, cluster_weight_k),
-        "intervention_supervision_loss": _weighted_cluster_sum_mean(intervention_supervision_loss_sum_k, count, cluster_weight_k),
-        "other_aux_loss": _weighted_cluster_sum_mean(other_aux_loss_sum_k, count, cluster_weight_k),
-        "train_mse": _weighted_cluster_sum_mean(train_mse_sum_k, count, cluster_weight_k),
-        "train_mae": _weighted_cluster_sum_mean(train_mae_sum_k, count, cluster_weight_k),
-    }
-
-
-def _stage2_route_epoch_summary(
-    *,
-    penalty_names: List[str],
-    cluster_weight_k: torch.Tensor,
-    route_count_k: torch.Tensor,
-    route_prob_sum_kp: torch.Tensor,
-    route_actual_sum_kp: torch.Tensor,
-    route_entropy_sum_k: torch.Tensor,
-    skip_prob_sum_k: torch.Tensor,
-    skip_active_sum_k: torch.Tensor,
-) -> Dict[str, object]:
-    if route_prob_sum_kp.numel() == 0:
-        return {
-            "route_entropy": 0.0,
-            "prob_distribution": {},
-            "actual_route_distribution": {},
-            "skip_prob": 0.0,
-            "skip_noop_rate": 0.0,
-            "per_cluster": [],
-        }
-    denom_k = route_count_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype).clamp_min(1.0)
-    prob_kp = route_prob_sum_kp.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k.view(-1, 1)
-    actual_kp = route_actual_sum_kp.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k.view(-1, 1)
-    entropy_k = route_entropy_sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k
-    skip_prob_k = skip_prob_sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k
-    skip_active_k = skip_active_sum_k.detach().to(device=cluster_weight_k.device, dtype=cluster_weight_k.dtype) / denom_k
-    route_entropy = float(reduce_cluster_metric(entropy_k, cluster_weight_k).detach().cpu().item())
-    skip_prob = float(reduce_cluster_metric(skip_prob_k, cluster_weight_k).detach().cpu().item())
-    skip_rate = float(reduce_cluster_metric(skip_active_k, cluster_weight_k).detach().cpu().item())
-    prob_p = reduce_cluster_metric(prob_kp.transpose(0, 1), cluster_weight_k).detach().cpu()
-    actual_p = reduce_cluster_metric(actual_kp.transpose(0, 1), cluster_weight_k).detach().cpu()
-    per_cluster = []
-    for k in range(int(prob_kp.shape[0])):
-        per_cluster.append(
-            {
-                "cluster_id": int(k),
-                "route_entropy": float(entropy_k[k].detach().cpu().item()),
-                "skip_prob": float(skip_prob_k[k].detach().cpu().item()),
-                "skip_noop_rate": float(skip_active_k[k].detach().cpu().item()),
-                "prob_distribution": {
-                    penalty_names[p]: float(prob_kp[k, p].detach().cpu().item())
-                    for p in range(min(len(penalty_names), int(prob_kp.shape[1])))
-                },
-                "actual_distribution": {
-                    penalty_names[p]: float(actual_kp[k, p].detach().cpu().item())
-                    for p in range(min(len(penalty_names), int(actual_kp.shape[1])))
-                },
-            }
-        )
-    return {
-        "route_entropy": route_entropy,
-        "prob_distribution": {
-            penalty_names[p]: float(prob_p[p].item())
-            for p in range(min(len(penalty_names), int(prob_p.numel())))
-        },
-        "actual_route_distribution": {
-            penalty_names[p]: float(actual_p[p].item())
-            for p in range(min(len(penalty_names), int(actual_p.numel())))
-        },
-        "skip_prob": skip_prob,
-        "skip_noop_rate": skip_rate,
-        "per_cluster": per_cluster,
-    }
-
-
-def _safe_ratio(num: float, den: float) -> float:
-    return float(num) / float(den) if float(den) > 0.0 else 0.0
-
-
-def _route_accuracy_summary_from_labels(
-    *,
-    labels: torch.Tensor,
-    current_pred: torch.Tensor,
-    label_names: List[str],
-    features: Optional[torch.Tensor] = None,
-    feature_names: Optional[List[str]] = None,
-) -> Dict[str, object]:
-    label_count = int(len(label_names))
-    if label_count <= 0:
-        raise ValueError("label_names must be non-empty.")
-    labels_cpu = labels.detach().cpu().to(dtype=torch.long).view(-1)
-    current_cpu = current_pred.detach().cpu().to(dtype=torch.long).view(-1)
-    if int(labels_cpu.numel()) != int(current_cpu.numel()):
-        raise ValueError("labels and current_pred must have the same length.")
-    valid = (labels_cpu >= 0) & (labels_cpu < label_count)
-    if int(valid.sum().item()) <= 0:
-        return {
-            "samples": 0,
-            "current_accuracy_all": 0.0,
-            "majority_accuracy_all": 0.0,
-            "lift_vs_majority": 0.0,
-            "oracle_skip_rate": 0.0,
-            "actual_skip_rate": 0.0,
-            "skip_recall": 0.0,
-            "skip_precision": 0.0,
-            "penalty_accuracy_on_oracle_penalty": 0.0,
-            "penalty_adoption_recall_on_oracle_penalty": 0.0,
-            "penalty_adoption_precision": 0.0,
-            "penalty_exact_precision": 0.0,
-            "oracle_penalty_rate": 0.0,
-            "penalty_adoption_rate": 0.0,
-            "penalty_adoption_rate_gap_vs_oracle": 0.0,
-            "missed_positive_adoption_rate": 0.0,
-            "confusion_matrix_counts": [[0 for _ in range(label_count)] for _ in range(label_count)],
-            "label_rates": {str(name): 0.0 for name in label_names},
-            "current_prediction_rates": {str(name): 0.0 for name in label_names},
-        }
-    labels_v = labels_cpu[valid]
-    current_v = current_cpu[valid].clamp(0, label_count - 1)
-    samples = int(labels_v.numel())
-    label_counts = torch.bincount(labels_v, minlength=label_count)[:label_count]
-    current_counts = torch.bincount(current_v, minlength=label_count)[:label_count]
-    confusion = torch.zeros(label_count, label_count, dtype=torch.long)
-    for label, pred in zip(labels_v.tolist(), current_v.tolist()):
-        confusion[int(label), int(pred)] += 1
-    correct = current_v == labels_v
-    accuracy = float(correct.to(dtype=torch.float32).mean().item())
-    majority = _safe_ratio(float(label_counts.max().item()), float(samples))
-    oracle_skip = labels_v == 0
-    actual_skip = current_v == 0
-    oracle_penalty = labels_v > 0
-    actual_penalty = current_v > 0
-    oracle_skip_count = int(oracle_skip.sum().item())
-    actual_skip_count = int(actual_skip.sum().item())
-    oracle_penalty_count = int(oracle_penalty.sum().item())
-    actual_penalty_count = int(actual_penalty.sum().item())
-    skip_true_positive = int((oracle_skip & actual_skip).sum().item())
-    correct_penalty = int((oracle_penalty & (current_v == labels_v)).sum().item())
-    adopted_penalty = int((oracle_penalty & actual_penalty).sum().item())
-    wrong_penalty = int((oracle_penalty & actual_penalty & (current_v != labels_v)).sum().item())
-    oracle_penalty_to_skip = int((oracle_penalty & actual_skip).sum().item())
-    oracle_penalty_rate = _safe_ratio(oracle_penalty_count, samples)
-    penalty_adoption_rate = _safe_ratio(actual_penalty_count, samples)
-    summary: Dict[str, object] = {
-        "samples": samples,
-        "current_accuracy_all": accuracy,
-        "majority_accuracy_all": majority,
-        "lift_vs_majority": float(accuracy - majority),
-        "oracle_skip_count": oracle_skip_count,
-        "oracle_skip_rate": _safe_ratio(oracle_skip_count, samples),
-        "actual_skip_count": actual_skip_count,
-        "actual_skip_rate": _safe_ratio(actual_skip_count, samples),
-        "skip_recall": _safe_ratio(skip_true_positive, oracle_skip_count),
-        "skip_precision": _safe_ratio(skip_true_positive, actual_skip_count),
-        "oracle_penalty_samples": oracle_penalty_count,
-        "penalty_accuracy_on_oracle_penalty": _safe_ratio(correct_penalty, oracle_penalty_count),
-        "penalty_adoption_recall_on_oracle_penalty": _safe_ratio(adopted_penalty, oracle_penalty_count),
-        "penalty_adoption_precision": _safe_ratio(adopted_penalty, actual_penalty_count),
-        "penalty_exact_precision": _safe_ratio(correct_penalty, actual_penalty_count),
-        "oracle_penalty_rate": oracle_penalty_rate,
-        "penalty_adoption_count": actual_penalty_count,
-        "penalty_adoption_rate": penalty_adoption_rate,
-        "penalty_adoption_rate_gap_vs_oracle": float(penalty_adoption_rate - oracle_penalty_rate),
-        "missed_positive_adoption_rate": _safe_ratio(oracle_penalty_to_skip, oracle_penalty_count),
-        "oracle_penalty_routed_to_skip_rate": _safe_ratio(oracle_penalty_to_skip, oracle_penalty_count),
-        "oracle_penalty_routed_to_wrong_penalty_rate": _safe_ratio(wrong_penalty, oracle_penalty_count),
-        "oracle_skip_routed_to_penalty_rate": _safe_ratio(int((oracle_skip & actual_penalty).sum().item()), oracle_skip_count),
-        "label_counts": {str(name): int(label_counts[i].item()) for i, name in enumerate(label_names)},
-        "label_rates": {
-            str(name): _safe_ratio(int(label_counts[i].item()), samples)
-            for i, name in enumerate(label_names)
-        },
-        "current_prediction_counts": {
-            str(name): int(current_counts[i].item())
-            for i, name in enumerate(label_names)
-        },
-        "current_prediction_rates": {
-            str(name): _safe_ratio(int(current_counts[i].item()), samples)
-            for i, name in enumerate(label_names)
-        },
-        "confusion_matrix_counts": confusion.tolist(),
-        "confusion_matrix_rows": list(label_names),
-        "confusion_matrix_cols": list(label_names),
-    }
-    if features is not None and feature_names is not None and "skip_prob" in feature_names:
-        idx = int(feature_names.index("skip_prob"))
-        feat_cpu = features.detach().cpu().to(dtype=torch.float32)
-        if feat_cpu.dim() == 3 and int(feat_cpu.shape[0]) == int(valid.numel()) and int(feat_cpu.shape[-1]) > idx:
-            skip_prob = feat_cpu[:, 0, idx].reshape(-1)[valid]
-            finite = torch.isfinite(skip_prob)
-            if int(finite.sum().item()) > 0:
-                skip_prob = skip_prob[finite]
-                summary["skip_probability"] = {
-                    "available": True,
-                    "mean": float(skip_prob.mean().item()),
-                    "p50": float(skip_prob.quantile(0.50).item()),
-                    "p95": float(skip_prob.quantile(0.95).item()),
-                    "max": float(skip_prob.max().item()),
-                    "gt_0_5_rate": float((skip_prob > 0.5).to(dtype=torch.float32).mean().item()),
-                }
-    return summary
-
-
-def _route_distribution_entropy_from_rates(rates: Dict[str, float]) -> float:
-    total = float(sum(max(0.0, float(v)) for v in rates.values()))
-    if total <= 0.0:
-        return 0.0
-    entropy = 0.0
-    for value in rates.values():
-        p = max(0.0, float(value)) / total
-        if p > 0.0:
-            entropy -= p * math.log(p)
-    return float(entropy)
-
-
-def _route_audit_summary_from_tensors(
-    *,
-    tensors: Dict[str, object],
-    explainability: Optional[Dict[str, object]] = None,
-) -> Dict[str, object]:
-    label_names = list(tensors.get("label_names", []))
-    summary = _route_accuracy_summary_from_labels(
-        labels=tensors["labels"],  # type: ignore[arg-type,index]
-        current_pred=tensors["current_pred"],  # type: ignore[arg-type,index]
-        label_names=label_names,
-        features=tensors.get("features"),  # type: ignore[arg-type]
-        feature_names=list(tensors.get("feature_names", [])),
-    )
-    summary["oracle_route_distribution"] = dict(summary.get("label_rates", {}))
-    summary["current_route_distribution"] = dict(summary.get("current_prediction_rates", {}))
-    summary["oracle_route_entropy"] = _route_distribution_entropy_from_rates(
-        summary.get("label_rates", {})  # type: ignore[arg-type]
-    )
-    summary["current_route_entropy"] = _route_distribution_entropy_from_rates(
-        summary.get("current_prediction_rates", {})  # type: ignore[arg-type]
-    )
-    if explainability is not None:
-        summary["candidate_oracle_gain_pct_vs_base"] = explainability.get("oracle_gain_pct_vs_base")
-        summary["cluster_penalty_oracle_gain_pct_vs_base"] = explainability.get(
-            "cluster_penalty_oracle_gain_pct_vs_base"
-        )
-        summary["cluster_route_oracle_gain_pct_vs_base"] = explainability.get(
-            "cluster_route_oracle_gain_pct_vs_base"
-        )
-        summary["current_raw_routed_gain_pct_vs_base"] = explainability.get("final_gain_pct_vs_base")
-        summary["base_mse"] = explainability.get("base_mse")
-        summary["raw_routed_mse"] = explainability.get("final_mse")
-    return summary
-
-
-def _stage2_route_audit_thresholds(
-    *,
-    stage2_route_audit_cfg: Dict[str, object],
-    route_ce_min_abs_improvement: float,
-    route_ce_min_rel_improvement: float,
-    route_ce_min_candidate_delta_rms: float,
-    binary_adoption_weight: float,
-    binary_adoption_min_abs_improvement: float,
-    binary_adoption_min_rel_improvement: float,
-    binary_adoption_min_candidate_delta_rms: float,
-) -> Dict[str, object]:
-    cfg = stage2_route_audit_cfg if isinstance(stage2_route_audit_cfg, dict) else {}
-    explicit_keys = {
-        "min_abs_improvement",
-        "min_rel_improvement",
-        "min_candidate_delta_rms",
-        "candidate_action_floor",
-    }
-    if any(key in cfg for key in explicit_keys):
-        default_abs = (
-            binary_adoption_min_abs_improvement
-            if float(binary_adoption_weight) > 0.0
-            else route_ce_min_abs_improvement
-        )
-        default_rel = (
-            binary_adoption_min_rel_improvement
-            if float(binary_adoption_weight) > 0.0
-            else route_ce_min_rel_improvement
-        )
-        default_delta = (
-            binary_adoption_min_candidate_delta_rms
-            if float(binary_adoption_weight) > 0.0
-            else route_ce_min_candidate_delta_rms
-        )
-        return {
-            "min_abs_improvement": float(cfg.get("min_abs_improvement", default_abs)),
-            "min_rel_improvement": float(cfg.get("min_rel_improvement", default_rel)),
-            "min_candidate_delta_rms": float(
-                cfg.get(
-                    "min_candidate_delta_rms",
-                    cfg.get("candidate_action_floor", default_delta),
-                )
-            ),
-            "source": "diagnostics.stage2_route_audit",
-        }
-    if float(binary_adoption_weight) > 0.0:
-        return {
-            "min_abs_improvement": float(binary_adoption_min_abs_improvement),
-            "min_rel_improvement": float(binary_adoption_min_rel_improvement),
-            "min_candidate_delta_rms": float(binary_adoption_min_candidate_delta_rms),
-            "source": "moe.binary_adoption_supervision",
-        }
-    return {
-        "min_abs_improvement": float(route_ce_min_abs_improvement),
-        "min_rel_improvement": float(route_ce_min_rel_improvement),
-        "min_candidate_delta_rms": float(route_ce_min_candidate_delta_rms),
-        "source": "moe.route_ce_supervision",
-    }
-
-
-@torch.no_grad()
-def _cluster_route_oracle_labels_and_gain_from_candidates(
-    *,
-    base_bch: torch.Tensor,
-    cand_bcpH: Optional[torch.Tensor],
-    y_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    min_candidate_delta_rms: float = 0.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return route labels and raw best-penalty gain with 0=no-op and 1..P=penalty."""
-    B = int(base_bch.shape[0])
-    if cand_bcpH is None or int(cand_bcpH.numel()) == 0:
-        labels = torch.zeros((B, int(K)), device=base_bch.device, dtype=torch.long)
-        gain = torch.zeros((B, int(K)), device=base_bch.device, dtype=base_bch.dtype)
-        return labels, gain
-    P = int(cand_bcpH.shape[2])
-    if P <= 0:
-        labels = torch.zeros((B, int(K)), device=base_bch.device, dtype=torch.long)
-        gain = torch.zeros((B, int(K)), device=base_bch.device, dtype=base_bch.dtype)
-        return labels, gain
-    base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
-    cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
-    base_err_bk = scatter_mean_bc_to_bk(base_err_bc, cluster_id_c, int(K))
-    cand_err_bkp = scatter_mean_bcf_to_bkf(cand_err_bcp, cluster_id_c, int(K))
-    min_delta = max(0.0, float(min_candidate_delta_rms))
-    cand_delta_bkp = None
-    if min_delta > 0.0:
-        cand_delta_bcp = (cand_bcpH - base_bch.unsqueeze(2)).pow(2).mean(dim=-1).sqrt()
-        cand_delta_bkp = scatter_mean_bcf_to_bkf(cand_delta_bcp, cluster_id_c, int(K))
-    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
-        allowed = allowed_mask_kp.to(device=cand_err_bkp.device, dtype=torch.bool)
-        if tuple(allowed.shape) != (int(K), P):
-            raise ValueError(
-                "cluster route oracle allowed mask must have shape [K,P], "
-                f"got {tuple(allowed.shape)} vs {(int(K), P)}."
-            )
-    else:
-        allowed = torch.ones((int(K), P), device=cand_err_bkp.device, dtype=torch.bool)
-    masked_err_bkp = cand_err_bkp.masked_fill(~allowed.unsqueeze(0), float("inf"))
-    if cand_delta_bkp is not None:
-        masked_err_bkp = masked_err_bkp.masked_fill(cand_delta_bkp < min_delta, float("inf"))
-    best_err_bk, best_idx_bk = masked_err_bkp.min(dim=-1)
-    has_candidate_bk = torch.isfinite(best_err_bk)
-    gain_bk = torch.where(has_candidate_bk, base_err_bk - best_err_bk, torch.zeros_like(base_err_bk))
-    required_bk = torch.maximum(
-        torch.full_like(base_err_bk, max(0.0, float(min_abs_improvement))),
-        max(0.0, float(min_rel_improvement)) * base_err_bk.abs().clamp_min(1.0e-12),
-    )
-    use_penalty_bk = has_candidate_bk & (gain_bk > required_bk)
-    labels_bk = torch.where(
-        use_penalty_bk,
-        best_idx_bk.to(dtype=torch.long) + 1,
-        torch.zeros_like(best_idx_bk, dtype=torch.long),
-    )
-    return labels_bk, gain_bk
-
-
-@torch.no_grad()
-def _cluster_route_oracle_labels_from_candidates(
-    *,
-    base_bch: torch.Tensor,
-    cand_bcpH: Optional[torch.Tensor],
-    y_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    min_candidate_delta_rms: float = 0.0,
-) -> torch.Tensor:
-    """Return cluster route labels with 0=no-op and 1..P=penalty index + 1."""
-    labels_bk, _ = _cluster_route_oracle_labels_and_gain_from_candidates(
-        base_bch=base_bch,
-        cand_bcpH=cand_bcpH,
-        y_bch=y_bch,
-        cluster_id_c=cluster_id_c,
-        K=K,
-        allowed_mask_kp=allowed_mask_kp,
-        min_abs_improvement=min_abs_improvement,
-        min_rel_improvement=min_rel_improvement,
-        min_candidate_delta_rms=min_candidate_delta_rms,
-    )
-    return labels_bk
-
-
-@torch.no_grad()
-def _route_ce_active_mask_from_gain(
-    best_penalty_gain_bk: torch.Tensor,
-    *,
-    ignore_abs_gain_below: float = 0.0,
-) -> torch.Tensor:
-    if best_penalty_gain_bk.dim() != 2:
-        raise ValueError("best_penalty_gain_bk must have shape [B,K].")
-    if float(ignore_abs_gain_below) <= 0.0:
-        return torch.ones_like(best_penalty_gain_bk, dtype=torch.bool)
-    gain = best_penalty_gain_bk.detach()
-    return torch.isfinite(gain) & (gain.abs() > float(ignore_abs_gain_below))
-
-
-def _pred_residual_training_skip_arg(
-    *,
-    skip_bk: Optional[torch.Tensor],
-    allow_skip: bool,
-    ignore_skip_during_training: bool = False,
-) -> Optional[torch.Tensor]:
-    if not bool(allow_skip):
-        return None
-    if bool(ignore_skip_during_training):
-        return None
-    return skip_bk
-
-
-def _route_probs_with_skip_class(
-    *,
-    probs_bkp: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    probs_include_skip_mass: bool = False,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    if probs_bkp.dim() != 3:
-        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
-    if skip_prob_bk is None:
-        skip_mass_bk = torch.zeros(probs_bkp.shape[:2], device=probs_bkp.device, dtype=probs_bkp.dtype)
-        penalty_mass_bkp = probs_bkp
-    else:
-        if tuple(skip_prob_bk.shape) != tuple(probs_bkp.shape[:2]):
-            raise ValueError(
-                "skip_prob_bk must have shape [B,K], "
-                f"got {tuple(skip_prob_bk.shape)} vs {tuple(probs_bkp.shape[:2])}."
-            )
-        skip_mass_bk = skip_prob_bk
-        if bool(probs_include_skip_mass):
-            penalty_mass_bkp = probs_bkp
-        else:
-            penalty_mass_bkp = (1.0 - skip_prob_bk).unsqueeze(-1) * probs_bkp
-    route_probs_bkq = torch.cat([skip_mass_bk.unsqueeze(-1), penalty_mass_bkp], dim=-1)
-    route_probs_bkq = torch.nan_to_num(route_probs_bkq, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    return route_probs_bkq / route_probs_bkq.sum(dim=-1, keepdim=True).clamp_min(float(eps))
-
-
-def _route_ce_loss_from_probs(
-    *,
-    probs_bkp: torch.Tensor,
-    labels_bk: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    probs_include_skip_mass: bool = False,
-    class_weight_q: Optional[torch.Tensor] = None,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    route_probs_bkq = _route_probs_with_skip_class(
-        probs_bkp=probs_bkp,
-        skip_prob_bk=skip_prob_bk,
-        probs_include_skip_mass=probs_include_skip_mass,
-        eps=eps,
-    )
-    labels = labels_bk.to(device=route_probs_bkq.device, dtype=torch.long)
-    if tuple(labels.shape) != tuple(route_probs_bkq.shape[:2]):
-        raise ValueError(
-            "route CE labels must have shape [B,K], "
-            f"got {tuple(labels.shape)} vs {tuple(route_probs_bkq.shape[:2])}."
-        )
-    if int(labels.min().item()) < 0 or int(labels.max().item()) >= int(route_probs_bkq.shape[-1]):
-        raise ValueError(
-            "route CE labels must be in [0,P], "
-            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, "
-            f"P={int(route_probs_bkq.shape[-1]) - 1}."
-        )
-    target_prob_bk = route_probs_bkq.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    loss_bk = -target_prob_bk.clamp_min(float(eps)).log()
-    if class_weight_q is not None and int(class_weight_q.numel()) > 0:
-        weight_q = class_weight_q.to(device=loss_bk.device, dtype=loss_bk.dtype).view(-1)
-        if int(weight_q.numel()) != int(route_probs_bkq.shape[-1]):
-            raise ValueError(
-                "route CE class_weight_q must have P+1 entries, "
-                f"got {int(weight_q.numel())} vs {int(route_probs_bkq.shape[-1])}."
-            )
-        loss_bk = loss_bk * weight_q.index_select(0, labels.reshape(-1)).reshape_as(labels).to(dtype=loss_bk.dtype)
-    return loss_bk
-
-
-def _route_binary_adoption_loss_from_probs(
-    *,
-    probs_bkp: torch.Tensor,
-    labels_bk: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    probs_include_skip_mass: bool = False,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    active_mask_bk: Optional[torch.Tensor] = None,
-    positive_weight: float = 1.0,
-    negative_weight: float = 1.0,
-    eps: float = 1.0e-8,
-) -> Optional[torch.Tensor]:
-    if probs_bkp.dim() != 3:
-        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
-    B, K, P = [int(v) for v in probs_bkp.shape]
-    if P <= 0:
-        return None
-    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
-    if tuple(labels.shape) != (B, K):
-        raise ValueError(
-            "binary adoption labels must have shape [B,K], "
-            f"got {tuple(labels.shape)} vs {(B, K)}."
-        )
-    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
-        raise ValueError(
-            "binary adoption labels must be in [0,P], "
-            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
-        )
-
-    route_probs_bkq = _route_probs_with_skip_class(
-        probs_bkp=probs_bkp,
-        skip_prob_bk=skip_prob_bk,
-        probs_include_skip_mass=probs_include_skip_mass,
-        eps=eps,
-    )
-    penalty_mass_bkp = route_probs_bkq[..., 1:].clamp(float(eps), 1.0 - float(eps))
-    target_bkp = torch.zeros_like(penalty_mass_bkp)
-    positive_bk = labels > 0
-    if bool(positive_bk.any().item()):
-        target_bkp.scatter_(
-            dim=-1,
-            index=(labels.clamp_min(1) - 1).unsqueeze(-1),
-            src=positive_bk.to(dtype=target_bkp.dtype).unsqueeze(-1),
-        )
-
-    weight_bkp = torch.ones_like(penalty_mass_bkp)
-    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
-        allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
-        if tuple(allowed.shape) != (K, P):
-            raise ValueError(
-                "binary adoption allowed mask must have shape [K,P], "
-                f"got {tuple(allowed.shape)} vs {(K, P)}."
-            )
-        empty = allowed.sum(dim=-1, keepdim=True) <= 0
-        allowed = torch.where(empty, torch.ones_like(allowed), allowed)
-        weight_bkp = allowed.unsqueeze(0).to(dtype=penalty_mass_bkp.dtype).expand(B, K, P)
-        target_bkp = target_bkp * weight_bkp
-
-    pos_w = max(0.0, float(positive_weight))
-    neg_w = max(0.0, float(negative_weight))
-    bce_bkp = -(
-        (pos_w * target_bkp * penalty_mass_bkp.log())
-        + (neg_w * (1.0 - target_bkp) * (1.0 - penalty_mass_bkp).clamp_min(float(eps)).log())
-    )
-    denom_bk = weight_bkp.sum(dim=-1).clamp_min(1.0)
-    loss_bk = (bce_bkp * weight_bkp).sum(dim=-1) / denom_bk
-    if active_mask_bk is not None:
-        active = active_mask_bk.to(device=loss_bk.device, dtype=torch.bool)
-        if tuple(active.shape) != (B, K):
-            raise ValueError(
-                "binary adoption active_mask_bk must have shape [B,K], "
-                f"got {tuple(active.shape)} vs {(B, K)}."
-            )
-        loss_bk = loss_bk * active.to(dtype=loss_bk.dtype)
-    return loss_bk
-
-
-def _route_rate_alignment_loss_from_probs(
-    *,
-    probs_bkp: torch.Tensor,
-    labels_bk: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    probs_include_skip_mass: bool = False,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    active_mask_bk: Optional[torch.Tensor] = None,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    """Match batch/cluster predicted route rates to oracle route-label rates.
-
-    This is intentionally a low-capacity aggregate loss. It does not introduce new
-    labels beyond the existing 0=no-op, 1..P=penalty oracle labels; it only
-    discourages the gate from drifting to an adoption rate that disagrees with
-    the train batch's own label distribution.
-    """
-    if probs_bkp.dim() != 3:
-        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
-    B, K, P = [int(v) for v in probs_bkp.shape]
-    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
-    if tuple(labels.shape) != (B, K):
-        raise ValueError(
-            "route-rate labels must have shape [B,K], "
-            f"got {tuple(labels.shape)} vs {(B, K)}."
-        )
-    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
-        raise ValueError(
-            "route-rate labels must be in [0,P], "
-            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
-        )
-
-    route_probs_bkq = _route_probs_with_skip_class(
-        probs_bkp=probs_bkp,
-        skip_prob_bk=skip_prob_bk,
-        probs_include_skip_mass=probs_include_skip_mass,
-        eps=eps,
-    )
-    Q = int(route_probs_bkq.shape[-1])
-    target_bkq = torch.zeros_like(route_probs_bkq)
-    target_bkq.scatter_(dim=-1, index=labels.unsqueeze(-1), src=torch.ones_like(labels, dtype=route_probs_bkq.dtype).unsqueeze(-1))
-
-    active_bk = torch.ones((B, K), device=probs_bkp.device, dtype=route_probs_bkq.dtype)
-    if active_mask_bk is not None:
-        active = active_mask_bk.to(device=probs_bkp.device, dtype=torch.bool)
-        if tuple(active.shape) != (B, K):
-            raise ValueError(
-                "route-rate active_mask_bk must have shape [B,K], "
-                f"got {tuple(active.shape)} vs {(B, K)}."
-            )
-        active_bk = active.to(dtype=route_probs_bkq.dtype)
-
-    class_mask_kq = torch.ones((K, Q), device=probs_bkp.device, dtype=route_probs_bkq.dtype)
-    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
-        allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
-        if tuple(allowed.shape) != (K, P):
-            raise ValueError(
-                "route-rate allowed mask must have shape [K,P], "
-                f"got {tuple(allowed.shape)} vs {(K, P)}."
-            )
-        empty = allowed.sum(dim=-1, keepdim=True) <= 0
-        allowed = torch.where(empty, torch.ones_like(allowed), allowed)
-        class_mask_kq = torch.cat(
-            [
-                torch.ones((K, 1), device=probs_bkp.device, dtype=torch.bool),
-                allowed,
-            ],
-            dim=-1,
-        ).to(dtype=route_probs_bkq.dtype)
-
-    denom_k = active_bk.sum(dim=0).clamp_min(1.0)
-    pred_rate_kq = (route_probs_bkq * active_bk.unsqueeze(-1)).sum(dim=0) / denom_k.unsqueeze(-1)
-    target_rate_kq = (target_bkq * active_bk.unsqueeze(-1)).sum(dim=0) / denom_k.unsqueeze(-1)
-    diff_kq = (pred_rate_kq - target_rate_kq).pow(2) * class_mask_kq
-    loss_k = diff_kq.sum(dim=-1) / class_mask_kq.sum(dim=-1).clamp_min(1.0)
-    has_active_k = (active_bk.sum(dim=0) > 0).to(dtype=loss_k.dtype)
-    loss_k = loss_k * has_active_k
-    return loss_k.unsqueeze(0).expand(B, K)
-
-
-def _route_positive_recall_loss_from_probs(
-    *,
-    probs_bkp: torch.Tensor,
-    labels_bk: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    probs_include_skip_mass: bool = False,
-    active_mask_bk: Optional[torch.Tensor] = None,
-    mode: str = "ce",
-    target_probability: float = 1.0,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    """Positive-only route CE that trains recall of the oracle penalty class."""
-    if probs_bkp.dim() != 3:
-        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
-    B, K, P = [int(v) for v in probs_bkp.shape]
-    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
-    if tuple(labels.shape) != (B, K):
-        raise ValueError(
-            "positive-recall labels must have shape [B,K], "
-            f"got {tuple(labels.shape)} vs {(B, K)}."
-        )
-    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
-        raise ValueError(
-            "positive-recall labels must be in [0,P], "
-            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
-        )
-    route_probs_bkq = _route_probs_with_skip_class(
-        probs_bkp=probs_bkp,
-        skip_prob_bk=skip_prob_bk,
-        probs_include_skip_mass=probs_include_skip_mass,
-        eps=eps,
-    )
-    target_prob_bk = route_probs_bkq.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    positive_bk = (labels > 0).to(dtype=target_prob_bk.dtype)
-    if active_mask_bk is not None:
-        active = active_mask_bk.to(device=probs_bkp.device, dtype=torch.bool)
-        if tuple(active.shape) != (B, K):
-            raise ValueError(
-                "positive-recall active_mask_bk must have shape [B,K], "
-                f"got {tuple(active.shape)} vs {(B, K)}."
-            )
-        positive_bk = positive_bk * active.to(dtype=target_prob_bk.dtype)
-    mode_l = str(mode or "ce").lower()
-    if mode_l in {"margin", "hinge", "floor"}:
-        target = min(1.0, max(0.0, float(target_probability)))
-        return (target - target_prob_bk).clamp_min(0.0).pow(2) * positive_bk
-    if mode_l not in {"ce", "cross_entropy", "nll"}:
-        raise ValueError(f"Unsupported positive recall loss mode: {mode}")
-    return -target_prob_bk.clamp_min(float(eps)).log() * positive_bk
-
-
-def _route_precision_constrained_recall_loss_from_probs(
-    *,
-    probs_bkp: torch.Tensor,
-    labels_bk: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    probs_include_skip_mass: bool = False,
-    active_mask_bk: Optional[torch.Tensor] = None,
-    recall_mode: str = "ce",
-    recall_target_probability: float = 1.0,
-    false_adopt_max_probability: float = 0.5,
-    false_adopt_weight: float = 1.0,
-    eps: float = 1.0e-8,
-) -> torch.Tensor:
-    """Recall oracle-positive penalties while capping false adoption on no-op labels."""
-    if probs_bkp.dim() != 3:
-        raise ValueError(f"probs_bkp must have shape [B,K,P], got {tuple(probs_bkp.shape)}.")
-    B, K, P = [int(v) for v in probs_bkp.shape]
-    labels = labels_bk.to(device=probs_bkp.device, dtype=torch.long)
-    if tuple(labels.shape) != (B, K):
-        raise ValueError(
-            "precision-recall labels must have shape [B,K], "
-            f"got {tuple(labels.shape)} vs {(B, K)}."
-        )
-    if int(labels.min().item()) < 0 or int(labels.max().item()) > P:
-        raise ValueError(
-            "precision-recall labels must be in [0,P], "
-            f"got min={int(labels.min().item())}, max={int(labels.max().item())}, P={P}."
-        )
-    recall_loss_bk = _route_positive_recall_loss_from_probs(
-        probs_bkp=probs_bkp,
-        skip_prob_bk=skip_prob_bk,
-        labels_bk=labels,
-        probs_include_skip_mass=probs_include_skip_mass,
-        active_mask_bk=active_mask_bk,
-        mode=recall_mode,
-        target_probability=recall_target_probability,
-        eps=eps,
-    )
-    route_probs_bkq = _route_probs_with_skip_class(
-        probs_bkp=probs_bkp,
-        skip_prob_bk=skip_prob_bk,
-        probs_include_skip_mass=probs_include_skip_mass,
-        eps=eps,
-    )
-    penalty_mass_bk = route_probs_bkq[..., 1:].sum(dim=-1)
-    skip_label_bk = (labels == 0).to(dtype=penalty_mass_bk.dtype)
-    max_prob = min(1.0, max(0.0, float(false_adopt_max_probability)))
-    skip_guard_bk = (penalty_mass_bk - max_prob).clamp_min(0.0).pow(2) * skip_label_bk
-    if active_mask_bk is not None:
-        active = active_mask_bk.to(device=probs_bkp.device, dtype=torch.bool)
-        if tuple(active.shape) != (B, K):
-            raise ValueError(
-                "precision-recall active_mask_bk must have shape [B,K], "
-                f"got {tuple(active.shape)} vs {(B, K)}."
-            )
-        skip_guard_bk = skip_guard_bk * active.to(dtype=skip_guard_bk.dtype)
-    return recall_loss_bk + max(0.0, float(false_adopt_weight)) * skip_guard_bk
-
-
-@torch.no_grad()
-def _route_ce_class_weight_from_labels(
-    *,
-    labels_bk: torch.Tensor,
-    num_classes: int,
-    mode: str = "none",
-    max_weight: float = 0.0,
-    active_mask_bk: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    mode_l = str(mode or "none").lower()
-    if mode_l in {"", "none", "off", "false", "0"}:
-        return None
-    if mode_l not in {"balanced", "inverse_frequency", "inverse_freq"}:
-        raise ValueError(f"Unsupported route CE class_weight mode {mode!r}.")
-    labels = labels_bk.detach().to(dtype=torch.long).reshape(-1)
-    valid = (labels >= 0) & (labels < int(num_classes))
-    if active_mask_bk is not None:
-        active = active_mask_bk.detach().to(device=labels_bk.device, dtype=torch.bool).reshape(-1)
-        if int(active.numel()) != int(labels.numel()):
-            raise ValueError("route CE active_mask_bk must have the same number of elements as labels_bk.")
-        valid = valid & active.to(device=valid.device)
-    if int(valid.sum().item()) <= 0:
-        return None
-    counts = torch.bincount(labels[valid], minlength=int(num_classes)).to(dtype=torch.float32)
-    weights = torch.zeros(int(num_classes), device=labels_bk.device, dtype=torch.float32)
-    present = counts > 0.0
-    if not bool(present.any().item()):
-        return None
-    weights[present] = float(valid.sum().item()) / (
-        float(int(present.sum().item())) * counts[present].clamp_min(1.0)
-    )
-    if float(max_weight) > 0.0:
-        weights = weights.clamp_max(float(max_weight))
-    return weights.to(device=labels_bk.device)
-
-
-def _parameter_grad_l2_norm(params: Iterable[nn.Parameter]) -> float:
-    total = 0.0
-    for param in params:
-        if param.grad is None:
-            continue
-        grad = param.grad.detach()
-        total += float(grad.pow(2).sum().item())
-    return float(total ** 0.5)
-
-
-def extract_gate_features(x_bcl: torch.Tensor) -> torch.Tensor:
-    """
-    Extract lightweight but shape-aware per-channel descriptors for gate routing.
-    Returns x_bcf: [B, C, F]
-    """
-    B, C, L = x_bcl.shape
-    mean = x_bcl.mean(dim=-1)
-    std = x_bcl.std(dim=-1)
-    eps = 1.0e-6
-
-    last_centered = x_bcl[..., -1] - mean
-    x_min = x_bcl.min(dim=-1).values
-    x_max = x_bcl.max(dim=-1).values
-    range_over_std = (x_max - x_min) / std.clamp_min(eps)
-
-    t = torch.linspace(-1.0, 1.0, steps=L, device=x_bcl.device, dtype=x_bcl.dtype).view(1, 1, L)
-    slope = ((x_bcl - mean.unsqueeze(-1)) * t).mean(dim=-1) / t.pow(2).mean(dim=-1).clamp_min(eps)
-
-    if L >= 2:
-        d1 = x_bcl[..., 1:] - x_bcl[..., :-1]
-        mad1 = d1.abs().mean(dim=-1)
-        jump_thr = 1.5 * std.unsqueeze(-1).clamp_min(eps)
-        jump_rate = (d1.abs() > jump_thr).to(x_bcl.dtype).mean(dim=-1)
-
-        # ACF lag-1: 用全局均值去中心化，分子=E[(x_t-μ)(x_{t-1}-μ)]，分母=Var(x)
-        x_centered = x_bcl - mean.unsqueeze(-1)
-        acf1_num = (x_centered[..., 1:] * x_centered[..., :-1]).mean(dim=-1)
-        acf1_den = x_centered.pow(2).mean(dim=-1)
-        acf1 = acf1_num / acf1_den.clamp_min(eps)
-    else:
-        d1 = None
-        mad1 = torch.zeros_like(mean)
-        jump_rate = torch.zeros_like(mean)
-        acf1 = torch.zeros_like(mean)
-
-    if L >= 3:
-        d2 = x_bcl[..., 2:] - 2 * x_bcl[..., 1:-1] + x_bcl[..., :-2]
-        mad2 = d2.abs().mean(dim=-1)
-        curvature_ratio = d2.pow(2).mean(dim=-1) / d1.pow(2).mean(dim=-1).clamp_min(eps)
-    else:
-        mad2 = torch.zeros_like(mean)
-        curvature_ratio = torch.zeros_like(mean)
-
-    feat = torch.stack(
-        [
-            mean,
-            std,
-            last_centered,
-            slope,
-            range_over_std,
-            mad1,
-            mad2,
-            jump_rate,
-            acf1,
-            curvature_ratio,
-        ],
-        dim=-1,
-    )  # [B,C,F]
-    return feat
-
-
-def _extract_base_forecast_gate_features(
-    x_bcl: torch.Tensor,
-    y_base_bch: torch.Tensor,
-    eps: float = 1.0e-6,
-) -> torch.Tensor:
-    hist_std = x_bcl.std(dim=-1).clamp_min(eps)
-    hist_last = x_bcl[..., -1]
-    base_mean = y_base_bch.mean(dim=-1)
-    base_first = y_base_bch[..., 0]
-    base_last = y_base_bch[..., -1]
-    base_std = y_base_bch.std(dim=-1) if y_base_bch.shape[-1] > 1 else torch.zeros_like(base_mean)
-    base_range = y_base_bch.max(dim=-1).values - y_base_bch.min(dim=-1).values
-    t = torch.linspace(-1.0, 1.0, steps=y_base_bch.shape[-1], device=y_base_bch.device, dtype=y_base_bch.dtype).view(1, 1, -1)
-    base_center = y_base_bch - base_mean.unsqueeze(-1)
-    base_slope = (base_center * t).mean(dim=-1) / t.pow(2).mean(dim=-1).clamp_min(eps)
-    if y_base_bch.shape[-1] >= 2:
-        d1 = y_base_bch[..., 1:] - y_base_bch[..., :-1]
-        base_mad1 = d1.abs().mean(dim=-1)
-    else:
-        d1 = None
-        base_mad1 = torch.zeros_like(base_mean)
-    if y_base_bch.shape[-1] >= 3:
-        d2 = y_base_bch[..., 2:] - 2 * y_base_bch[..., 1:-1] + y_base_bch[..., :-2]
-        base_mad2 = d2.abs().mean(dim=-1)
-    else:
-        base_mad2 = torch.zeros_like(base_mean)
-    return torch.stack(
-        [
-            (base_mean - hist_last) / hist_std,
-            (base_first - hist_last) / hist_std,
-            (base_last - hist_last) / hist_std,
-            base_std / hist_std,
-            base_range / hist_std,
-            base_slope / hist_std,
-            base_mad1 / hist_std,
-            base_mad2 / hist_std,
-            (base_last - base_first) / hist_std,
-        ],
-        dim=-1,
-    )
-
-
-def _build_gate_routing_features(
-    x_bcl: torch.Tensor,
-    y_base_bch: Optional[torch.Tensor],
-    cluster_id_c: torch.Tensor,
-    K: int,
-    mode: str = "history",
-) -> torch.Tensor:
-    mode = _normalize_gate_feature_mode(mode)
-    feat_bcf = extract_gate_features(x_bcl)
-    if mode == "history_base":
-        if y_base_bch is None:
-            raise ValueError("history_base gate features require y_base_bch.")
-        base_feat_bcf = _extract_base_forecast_gate_features(x_bcl, y_base_bch)
-        feat_bcf = torch.cat([feat_bcf, base_feat_bcf], dim=-1)
-    return scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
-
-
-def build_gate_prior_from_penalty_portrait(
-    penalty_kp: Optional[torch.Tensor],
-    penalty_scale: Optional[torch.Tensor],
-    temperature: float = 1.0,
-    smoothing: float = 0.0,
-    use_normalized_penalty: bool = True,
-) -> Optional[torch.Tensor]:
-    if penalty_kp is None or penalty_kp.numel() == 0:
-        return None
-    prior = penalty_kp.detach().clone().to(dtype=torch.float32)
-    if use_normalized_penalty and penalty_scale is not None and penalty_scale.numel() == prior.shape[-1]:
-        scale = penalty_scale.detach().to(device=prior.device, dtype=prior.dtype).view(1, -1).clamp_min(1.0e-6)
-        prior = prior / scale
-    prior = prior.clamp_min(1.0e-8)
-    temp = max(float(temperature), 1.0e-6)
-    prior = torch.softmax(prior.log() / temp, dim=-1)
-    smooth = float(max(0.0, min(smoothing, 0.99)))
-    if smooth > 0.0:
-        prior = (1.0 - smooth) * prior + smooth * (1.0 / float(prior.shape[-1]))
-    prior = prior / prior.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-    return prior
-
-
-def build_topk_penalty_mask(prior_kp: Optional[torch.Tensor], topk: int) -> Optional[torch.Tensor]:
-    if prior_kp is None or prior_kp.numel() == 0:
-        return None
-    K, P = prior_kp.shape
-    if P <= 0:
-        return torch.zeros_like(prior_kp)
-    k = max(1, min(int(topk), P))
-    idx = prior_kp.topk(k=k, dim=-1).indices
-    mask = torch.zeros_like(prior_kp, dtype=torch.float32)
-    mask.scatter_(-1, idx, 1.0)
-    return mask
-
-
-def build_named_penalty_mask(
-    allowed_by_cluster,
-    penalty_names: List[str],
-    K: int,
-    device: torch.device,
-    allow_empty_clusters: bool = False,
-) -> Optional[torch.Tensor]:
-    if allowed_by_cluster is None:
-        return None
-    name_to_idx = {str(name): i for i, name in enumerate(penalty_names)}
-    mask = torch.zeros((int(K), len(penalty_names)), device=device, dtype=torch.float32)
-    if isinstance(allowed_by_cluster, dict):
-        iterator = allowed_by_cluster.items()
-    else:
-        iterator = enumerate(allowed_by_cluster)
-    for raw_k, raw_names in iterator:
-        k = int(raw_k)
-        if k < 0 or k >= int(K):
-            raise ValueError(f"cluster_penalty_prior.allowed_by_cluster has invalid cluster id {k}.")
-        if isinstance(raw_names, str):
-            names = [raw_names]
-        else:
-            names = list(raw_names or [])
-        for raw_name in names:
-            name = str(raw_name)
-            if name not in name_to_idx:
-                raise ValueError(
-                    "cluster_penalty_prior.allowed_by_cluster contains unknown penalty "
-                    f"{name!r}; available={penalty_names}"
-                )
-            mask[k, name_to_idx[name]] = 1.0
-    if not bool(allow_empty_clusters):
-        empty = mask.sum(dim=-1, keepdim=True) <= 0.0
-        if bool(empty.any().item()):
-            mask = torch.where(empty, torch.ones_like(mask), mask)
-    return mask
-
-
-def normalize_cluster_penalty_prior_apply_stage(apply_stage: object) -> str:
-    value = str(apply_stage or "train_and_eval").strip().lower().replace("-", "_")
-    if value in {"train", "train_eval", "train_and_eval", "train+eval", "always"}:
-        return "train_and_eval"
-    if value in {"eval", "eval_only", "late", "late_eval", "final", "final_eval"}:
-        return "eval_only"
-    raise ValueError(
-        "cluster_penalty_prior.apply_stage must be 'train_and_eval' or 'eval_only' "
-        f"(got {value!r})."
-    )
-
-
-def split_cluster_penalty_prior_allowed_mask_by_stage(
-    allowed_mask_kp: Optional[torch.Tensor],
-    apply_stage: object,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], str]:
-    stage = normalize_cluster_penalty_prior_apply_stage(apply_stage)
-    if allowed_mask_kp is None or int(allowed_mask_kp.numel()) == 0:
-        return None, None, stage
-    if stage == "eval_only":
-        return None, allowed_mask_kp, stage
-    return allowed_mask_kp, None, stage
-
-
-@torch.no_grad()
-def compute_cluster_penalty_portrait(
-    loader: DataLoader,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    cluster_id_c: torch.Tensor,
-    K: int,
-    pred_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if len(penalty_names) == 0 or len(loader) == 0:
-        return torch.zeros((K, len(penalty_names)), device=device)
-    sum_kp = torch.zeros(K, len(penalty_names), device=device)
-    cnt = 0
-    for x, y, _ in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        # Use a last-value baseline to estimate penalty magnitudes per cluster.
-        last = x[..., -1:]
-        yhat = last.expand(-1, -1, pred_len)
-        pen_bcp = []
-        for name in penalty_names:
-            pen_bc = penalty_fns[name](yhat, y)
-            pen_bcp.append(pen_bc)
-        pen_bcp = torch.stack(pen_bcp, dim=-1)
-        pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)
-        sum_kp += pen_bkp.sum(dim=0)
-        cnt += pen_bkp.shape[0]
-    if cnt == 0:
-        return torch.zeros((K, len(penalty_names)), device=device)
-    return sum_kp / float(cnt)
-
-
-@torch.no_grad()
-def compute_channel_penalty_portrait(
-    loader: DataLoader,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    num_channels: int,
-    pred_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if len(penalty_names) == 0 or len(loader) == 0:
-        return torch.zeros((num_channels, len(penalty_names)), device=device)
-    sum_cp = torch.zeros(num_channels, len(penalty_names), device=device)
-    cnt = 0
-    for x, y, _ in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        last = x[..., -1:]
-        yhat = last.expand(-1, -1, pred_len)
-        pen_bcp = []
-        for name in penalty_names:
-            pen_bc = penalty_fns[name](yhat, y)
-            pen_bcp.append(pen_bc)
-        pen_bcp = torch.stack(pen_bcp, dim=-1)
-        sum_cp += pen_bcp.sum(dim=0)
-        cnt += int(pen_bcp.shape[0])
-    if cnt == 0:
-        return torch.zeros((num_channels, len(penalty_names)), device=device)
-    return sum_cp / float(cnt)
-
-
-def _rowwise_corr(a_kt: torch.Tensor, b_mt: torch.Tensor, align: str = "head", eps: float = 1.0e-6) -> torch.Tensor:
-    use_t = min(int(a_kt.shape[1]), int(b_mt.shape[1]))
-    if use_t <= 1:
-        return torch.zeros((a_kt.shape[0], b_mt.shape[0]), device=a_kt.device, dtype=a_kt.dtype)
-    align = str(align).lower()
-    if align == "tail":
-        a = a_kt[:, -use_t:]
-        b = b_mt[:, -use_t:]
-    else:
-        a = a_kt[:, :use_t]
-        b = b_mt[:, :use_t]
-    a = a - a.mean(dim=1, keepdim=True)
-    b = b - b.mean(dim=1, keepdim=True)
-    a = a / a.std(dim=1, keepdim=True).clamp_min(eps)
-    b = b / b.std(dim=1, keepdim=True).clamp_min(eps)
-    return (a @ b.t()) / max(use_t - 1, 1)
-
-
-def _expand_penalty_setting_for_names(raw_value, penalty_names: List[str], default_value, caster):
-    if isinstance(raw_value, dict):
-        base_default = raw_value.get("default", default_value)
-        return [caster(raw_value.get(name, base_default)) for name in penalty_names]
-    if isinstance(raw_value, (list, tuple)):
-        if len(raw_value) != len(penalty_names):
-            raise ValueError(f"Expected {len(penalty_names)} values, got {len(raw_value)}")
-        return [caster(v) for v in raw_value]
-    value = default_value if raw_value is None else raw_value
-    return [caster(value) for _ in penalty_names]
-
-def _select_rank_mask(probs_bkp: torch.Tensor, select_ranks: List[int], straight_through: bool = True) -> torch.Tensor:
-    """
-    select_ranks: list of 1-based ranks, e.g., [1,3,4].
-    Returns mask [B,K,P] with straight-through option.
-    """
-    B, K, P = probs_bkp.shape
-    ranks = []
-    if select_ranks is not None:
-        for r in select_ranks:
-            try:
-                r = int(r)
-            except Exception:
-                continue
-            if 1 <= r <= P:
-                ranks.append(r - 1)
-    if len(ranks) == 0:
-        k = min(P, 2)
-        top_idx = probs_bkp.topk(k=k, dim=-1).indices
-    else:
-        order = torch.argsort(probs_bkp, dim=-1, descending=True)
-        top_idx = torch.stack([order[..., r] for r in ranks], dim=-1)
-    hard = torch.zeros_like(probs_bkp)
-    hard.scatter_(-1, top_idx, 1.0)
-    hard = hard * (probs_bkp > 0).to(dtype=hard.dtype)
-    if straight_through:
-        return hard - probs_bkp.detach() + probs_bkp
-    return hard
-
-
-def _compute_lambda_bkp(
-    base_lambda_kp: torch.Tensor,
-    feat_bkf: torch.Tensor,
-    series_bkl: Optional[torch.Tensor] = None,
-    dynamic_lambda: ClusterwiseDynamicLambda = None,
-    dynamic_lambda_params: Optional[Dict[str, torch.Tensor]] = None,
-    lambda_min_kp: torch.Tensor = None,
-) -> torch.Tensor:
-    lam = base_lambda_kp.unsqueeze(0).expand(feat_bkf.shape[0], -1, -1)
-    if dynamic_lambda is not None:
-        lam = lam * _module_call(dynamic_lambda, dynamic_lambda_params, feat_bkf, series_bkl=series_bkl)
-    if lambda_min_kp is not None:
-        lam = torch.maximum(lam, lambda_min_kp.unsqueeze(0))
-    return lam
-
-
-def _routed_penalty_loss(
-    mask_bkp: torch.Tensor,
-    lam_bkp: torch.Tensor,
-    pen_bkp: torch.Tensor,
-    gate_route_on_penalty_only: bool = True,
-) -> torch.Tensor:
-    if not gate_route_on_penalty_only:
-        return (mask_bkp * lam_bkp * pen_bkp).sum(dim=-1)
-    # Forward value = mask * lam * pen（数值上不变），但梯度拆分：
-    # gate 参数只从 surrogate 项（mask * pen，无 lambda 缩放）获得梯度，
-    # 使 gate 的路由决策基于惩罚量级本身，而非 lambda 放大后的值。
-    weighted_penalty_bk = (mask_bkp.detach() * lam_bkp * pen_bkp).sum(dim=-1)
-    gate_surrogate_bk = (mask_bkp * pen_bkp.detach()).sum(dim=-1)
-    return weighted_penalty_bk + gate_surrogate_bk - gate_surrogate_bk.detach()
-
-
-def _apply_skip_to_penalty_loss(
-    penalty_loss_bk: torch.Tensor,
-    skip_bk: Optional[torch.Tensor] = None,
-    skip_cost: float = 0.0,
-) -> torch.Tensor:
-    if skip_bk is None:
-        return penalty_loss_bk
-    return (1.0 - skip_bk) * penalty_loss_bk + float(skip_cost) * skip_bk
-
-
-def _pred_residual_loss_terms(
-    pred_out: Optional[Dict[str, torch.Tensor]],
-    y_base: torch.Tensor,
-    y_final: torch.Tensor,
-    y: torch.Tensor,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    cluster_id_c: torch.Tensor,
-    K: int,
-    penalty_scale: Optional[torch.Tensor] = None,
-    specialization_weight: float = 0.0,
-    norm_weight: float = 0.0,
-    intervention_weight: float = 0.0,
-) -> Dict[str, torch.Tensor]:
-    zero_bk = y_final.new_zeros((y_final.shape[0], K))
-    out = {
-        "total_bk": zero_bk,
-        "specialization_bk": zero_bk,
-        "norm_bk": zero_bk,
-        "intervention_bk": zero_bk,
-    }
-    if pred_out is None or (specialization_weight == 0.0 and norm_weight == 0.0 and intervention_weight == 0.0):
-        return out
-    residuals = pred_out.get("residuals")
-    route_bcp = pred_out.get("route_bcp")
-    effective_route_bcp = pred_out.get("effective_route_bcp", route_bcp)
-    intervention_bcp = pred_out.get("intervention_bcp")
-    alpha_cp = pred_out.get("alpha_cp")
-    if residuals is None or route_bcp is None or effective_route_bcp is None or alpha_cp is None or residuals.numel() == 0:
-        return out
-
-    spec_bk = zero_bk
-    if specialization_weight != 0.0 and len(penalty_names) > 0:
-        y_final_sg = y_final.detach()
-        for p, name in enumerate(penalty_names):
-            visible_scale = (effective_route_bcp[..., p] * alpha_cp[:, p].unsqueeze(0)).detach()
-            visible = visible_scale.unsqueeze(-1) * residuals[:, :, p, :]
-            y_view = y_final_sg + visible - visible.detach()
-            pen_bc = penalty_fns[name](y_view, y)
-            if penalty_scale is not None and penalty_scale.numel() > p:
-                scale_p = penalty_scale[p].to(device=pen_bc.device, dtype=pen_bc.dtype).clamp_min(1.0e-6)
-                pen_bc = pen_bc / scale_p
-            # Do not let unselected branches affect the scalar objective.
-            pen_bc = pen_bc * effective_route_bcp[..., p].detach()
-            spec_bk = spec_bk + scatter_mean_bc_to_bk(pen_bc, cluster_id_c, K)
-
-    norm_bk = zero_bk
-    if norm_weight != 0.0:
-        branch_mse_bc = (y_final - y_base.detach()).pow(2).mean(dim=-1)
-        norm_bk = scatter_mean_bc_to_bk(branch_mse_bc, cluster_id_c, K)
-
-    intervention_bk = zero_bk
-    if intervention_weight != 0.0 and intervention_bcp is not None:
-        intervention_bc = (route_bcp.detach() * intervention_bcp).sum(dim=-1)
-        intervention_bk = scatter_mean_bc_to_bk(intervention_bc, cluster_id_c, K)
-
-    total_bk = (
-        (float(specialization_weight) * spec_bk)
-        + (float(norm_weight) * norm_bk)
-        + (float(intervention_weight) * intervention_bk)
-    )
-    out["total_bk"] = total_bk
-    out["specialization_bk"] = spec_bk
-    out["norm_bk"] = norm_bk
-    out["intervention_bk"] = intervention_bk
-    return out
-
-
-def _mae_objective_bc_from_abs(
-    abs_err_bch: torch.Tensor,
-    kind: str = "l1",
-    beta: float = 1.0,
-) -> torch.Tensor:
-    kind = str(kind).lower()
-    if kind in {"l1", "mae"}:
-        return abs_err_bch.mean(dim=-1)
-    if kind in {"smooth_l1", "huber"}:
-        beta_t = max(float(beta), 1.0e-8)
-        loss_bch = torch.where(
-            abs_err_bch < beta_t,
-            0.5 * abs_err_bch.pow(2) / beta_t,
-            abs_err_bch - 0.5 * beta_t,
-        )
-        return loss_bch.mean(dim=-1)
-    raise ValueError(f"Unsupported train.mae_objective.kind='{kind}'. Expected l1 or smooth_l1.")
-
-
-def _mae_objective_weight_is_nonzero(weight) -> bool:
-    if torch.is_tensor(weight):
-        if weight.numel() == 0:
-            return False
-        return bool(weight.detach().abs().max().item() != 0.0)
-    return bool(float(weight) != 0.0)
-
-
-def _apply_mae_objective_weight(mae_objective_bk: torch.Tensor, weight) -> torch.Tensor:
-    if torch.is_tensor(weight):
-        weight_k = weight.detach().to(device=mae_objective_bk.device, dtype=mae_objective_bk.dtype)
-        if weight_k.dim() != 1 or int(weight_k.numel()) != int(mae_objective_bk.shape[1]):
-            raise ValueError(
-                "Per-cluster mae_objective weight must be a [K] tensor matching loss_bk clusters."
-            )
-        return mae_objective_bk * weight_k.view(1, -1)
-    return float(weight) * mae_objective_bk
-
-
-def _scale_mae_objective_weight(base_weight: float, multiplier_k: Optional[torch.Tensor]):
-    if multiplier_k is None:
-        return float(base_weight)
-    return multiplier_k.detach().to(dtype=torch.float32) * float(base_weight)
-
-
-def _cluster_target_stats_from_targets(
-    targets_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-) -> List[Dict[str, float]]:
-    targets_bch = targets_bch.detach().cpu().to(dtype=torch.float32)
-    cluster_id_c = cluster_id_c.detach().cpu().to(dtype=torch.long)
-    rows: List[Dict[str, float]] = []
-    for k in range(int(K)):
-        idx = (cluster_id_c == k).nonzero(as_tuple=False).view(-1)
-        if int(idx.numel()) == 0:
-            rows.append(
-                {
-                    "cluster_id": int(k),
-                    "channels": 0,
-                    "mean": 0.0,
-                    "median": 0.0,
-                    "std": 0.0,
-                    "gap": 0.0,
-                }
-            )
-            continue
-        values = targets_bch.index_select(1, idx).reshape(-1)
-        mean = values.mean()
-        median = values.median()
-        std = values.std(unbiased=False).clamp_min(1.0e-6)
-        gap = (mean - median).abs() / std
-        rows.append(
-            {
-                "cluster_id": int(k),
-                "channels": int(idx.numel()),
-                "mean": float(mean.item()),
-                "median": float(median.item()),
-                "std": float(std.item()),
-                "gap": float(gap.item()),
-            }
-        )
-    return rows
-
-
-def _gap_multiplier_from_rows(
-    rows: List[Dict[str, float]],
-    cfg: Dict[str, object],
-) -> torch.Tensor:
-    gaps = torch.tensor([float(row["gap"]) for row in rows], dtype=torch.float32)
-    min_multiplier = float(cfg.get("min_multiplier", 1.0))
-    max_multiplier = float(cfg.get("max_multiplier", 1.25))
-    if max_multiplier < min_multiplier:
-        raise ValueError("train.mae_objective.per_cluster.max_multiplier must be >= min_multiplier.")
-    pivot_cfg = cfg.get("pivot", "median")
-    if isinstance(pivot_cfg, str):
-        pivot_mode = pivot_cfg.lower()
-        if pivot_mode == "median":
-            pivot = gaps.median()
-        elif pivot_mode in {"mean", "avg"}:
-            pivot = gaps.mean()
-        elif pivot_mode in {"zero", "none"}:
-            pivot = torch.tensor(0.0, dtype=gaps.dtype)
-        else:
-            raise ValueError("train.mae_objective.per_cluster.pivot must be median, mean, zero, or a number.")
-    else:
-        pivot = torch.tensor(float(pivot_cfg), dtype=gaps.dtype)
-    excess = (gaps - pivot).clamp_min(0.0)
-    denom = excess.max().clamp_min(1.0e-12)
-    normalized = torch.where(denom > 0.0, excess / denom, torch.zeros_like(excess))
-    multiplier = 1.0 + (max_multiplier - 1.0) * normalized
-    multiplier = multiplier.clamp(min=min_multiplier, max=max_multiplier)
-    multiplier = torch.where(excess > 0.0, multiplier, torch.ones_like(multiplier).clamp(min=min_multiplier))
-    return multiplier.detach()
-
-
-def _build_mae_per_cluster_diagnostics_from_targets(
-    targets_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    base_weight: float,
-    cfg: Dict[str, object],
-) -> Dict[str, object]:
-    if str(cfg.get("diagnostic", "mean_median_gap")).lower() != "mean_median_gap":
-        raise ValueError("train.mae_objective.per_cluster.diagnostic currently supports mean_median_gap only.")
-    if str(cfg.get("source", "train_targets")).lower() != "train_targets":
-        raise ValueError("train.mae_objective.per_cluster.source currently supports train_targets only.")
-    if str(cfg.get("normalize", "std")).lower() != "std":
-        raise ValueError("train.mae_objective.per_cluster.normalize currently supports std only.")
-    rows = _cluster_target_stats_from_targets(targets_bch, cluster_id_c, K)
-    multiplier_k = _gap_multiplier_from_rows(rows, cfg)
-    effective_weight_k = multiplier_k * float(base_weight)
-    for k, row in enumerate(rows):
-        row["multiplier"] = float(multiplier_k[k].item())
-        row["base_weight"] = float(base_weight)
-        row["effective_weight"] = float(effective_weight_k[k].item())
-    return {
-        "rows": rows,
-        "multiplier_k": multiplier_k.detach(),
-        "effective_weight_k": effective_weight_k.detach(),
-    }
-
-
-def _collect_train_targets_bch(loader: DataLoader, max_windows: int = 0) -> torch.Tensor:
-    parts = []
-    seen = 0
-    limit = int(max_windows or 0)
-    for _, y, _ in loader:
-        if limit > 0:
-            remaining = max(0, limit - seen)
-            if remaining <= 0:
-                break
-            y = y[:remaining]
-        parts.append(y.detach().cpu())
-        seen += int(y.shape[0])
-        if limit > 0 and seen >= limit:
-            break
-    if len(parts) == 0:
-        raise ValueError("Cannot build per-cluster MAE diagnostics from an empty train loader.")
-    return torch.cat(parts, dim=0)
-
-
-def _save_mae_per_cluster_diagnostics_csv(rows: List[Dict[str, float]], path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    pd.DataFrame(rows).to_csv(path, index=False)
-
-
-def _cosine_similarity_matrix(x: torch.Tensor) -> torch.Tensor:
-    x = x.detach().cpu().to(dtype=torch.float32)
-    denom = x.norm(dim=1, keepdim=True).clamp_min(1.0e-12)
-    x_norm = x / denom
-    return x_norm @ x_norm.t()
-
-
-def _write_matrix_csv(matrix: torch.Tensor, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    matrix = matrix.detach().cpu()
-    columns = ["cluster_id"] + [f"cluster_{i}" for i in range(int(matrix.shape[1]))]
-    rows = []
-    for i in range(int(matrix.shape[0])):
-        rows.append([i] + [float(v) for v in matrix[i].tolist()])
-    pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
-
-
-def _save_cluster_embedding_artifacts(model: nn.Module, out_dir: str) -> Dict[str, object]:
-    for module in model.modules():
-        diag_fn = getattr(module, "cluster_embedding_diagnostics", None)
-        if diag_fn is None:
-            continue
-        diag = diag_fn()
-        if diag is None:
-            continue
-        embedding = diag["embedding"].detach().cpu().to(dtype=torch.float32)
-        gamma = diag["gamma"].detach().cpu().to(dtype=torch.float32)
-        beta = diag["beta"].detach().cpu().to(dtype=torch.float32)
-
-        embedding_path = os.path.join(out_dir, "cluster_embedding.csv")
-        embedding_sim_path = os.path.join(out_dir, "cluster_embedding_similarity.csv")
-        film_norm_path = os.path.join(out_dir, "cluster_film_norms.csv")
-        gamma_sim_path = os.path.join(out_dir, "cluster_film_gamma_similarity.csv")
-        beta_sim_path = os.path.join(out_dir, "cluster_film_beta_similarity.csv")
-
-        emb_rows = []
-        for k in range(int(embedding.shape[0])):
-            row = {"cluster_id": int(k)}
-            row.update({f"e{i}": float(v) for i, v in enumerate(embedding[k].tolist())})
-            emb_rows.append(row)
-        pd.DataFrame(emb_rows).to_csv(embedding_path, index=False)
-        _write_matrix_csv(_cosine_similarity_matrix(embedding), embedding_sim_path)
-
-        norm_rows = []
-        for k in range(int(gamma.shape[0])):
-            norm_rows.append(
-                {
-                    "cluster_id": int(k),
-                    "gamma_norm": float(gamma[k].norm().item()),
-                    "beta_norm": float(beta[k].norm().item()),
-                    "gamma_mean_abs": float(gamma[k].abs().mean().item()),
-                    "beta_mean_abs": float(beta[k].abs().mean().item()),
-                }
-            )
-        pd.DataFrame(norm_rows).to_csv(film_norm_path, index=False)
-        _write_matrix_csv(_cosine_similarity_matrix(gamma), gamma_sim_path)
-        _write_matrix_csv(_cosine_similarity_matrix(beta), beta_sim_path)
-        return {
-            "enable": True,
-            "cluster_embedding": embedding_path,
-            "cluster_embedding_similarity": embedding_sim_path,
-            "cluster_film_norms": film_norm_path,
-            "cluster_film_gamma_similarity": gamma_sim_path,
-            "cluster_film_beta_similarity": beta_sim_path,
-        }
-    return {"enable": False}
-
-
-def _pred_residual_channel_keep_mask(
-    policy: str,
-    base_mse_c: torch.Tensor,
-    cand_mse_c: torch.Tensor,
-    base_mae_c: torch.Tensor,
-    cand_mae_c: torch.Tensor,
-    *,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    max_abs_mse_regression: float = 0.0,
-    max_rel_mse_regression: float = 0.0,
-) -> torch.Tensor:
-    policy = str(policy).lower()
-    if policy in {"val_mse_channel", "val_mse_scale", "val_mse_scale_holdout"}:
-        required = torch.maximum(
-            torch.full_like(base_mse_c, float(min_abs_improvement)),
-            float(min_rel_improvement) * base_mse_c.abs().clamp_min(1.0e-12),
-        )
-        return (base_mse_c - cand_mse_c) > required
-    raise ValueError(f"Unsupported residual selection policy for channel keep mask: {policy}")
-
-
-def _gate_regularization(
-    probs_bkp: torch.Tensor,
-    gate_entropy_weight: float = 0.0,
-    gate_balance_weight: float = 0.0,
-    gate_entropy_target_frac: float = 0.0,
-    gate_balance_target_kp: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if probs_bkp.numel() == 0 or (gate_entropy_weight == 0.0 and gate_balance_weight == 0.0):
-        return probs_bkp.new_zeros(())
-    p = probs_bkp.clamp_min(1.0e-8)
-    reg = p.new_zeros(())
-    if gate_entropy_weight != 0.0:
-        ent = -(p * p.log()).sum(dim=-1).mean()
-        if gate_entropy_target_frac > 0.0:
-            target = gate_entropy_target_frac * float(np.log(float(p.shape[-1])))
-            reg = reg + gate_entropy_weight * torch.relu(torch.tensor(target, device=ent.device, dtype=ent.dtype) - ent)
-        else:
-            reg = reg + (-gate_entropy_weight * ent)
-    if gate_balance_weight != 0.0:
-        avg = p.mean(dim=0)
-        if gate_balance_target_kp is None:
-            target = torch.full_like(avg, 1.0 / float(p.shape[-1]))
-        else:
-            target = gate_balance_target_kp.to(device=avg.device, dtype=avg.dtype)
-        reg = reg + gate_balance_weight * (avg - target).pow(2).mean()
-    return reg
-
-
-def _apply_router_penalty_context(
-    probs_bkp: torch.Tensor,
-    pen_bkp: torch.Tensor,
-    router_mode: str = "learned",
-    penalty_context_weight: float = 0.0,
-    detach_penalty_context: bool = True,
-) -> torch.Tensor:
-    mode = str(router_mode).lower()
-    if probs_bkp is None or probs_bkp.numel() == 0:
-        return probs_bkp
-    if pen_bkp is None or pen_bkp.numel() == 0 or mode == "learned":
-        return probs_bkp
-    pen = pen_bkp.detach() if detach_penalty_context else pen_bkp
-    pen_logits = pen.clamp_min(1.0e-8).log()
-    if mode == "penalty_only":
-        weight = float(penalty_context_weight) if penalty_context_weight > 0.0 else 1.0
-        return torch.softmax(weight * pen_logits, dim=-1)
-    if mode == "penalty_context":
-        if penalty_context_weight <= 0.0:
-            return probs_bkp
-        route_logits = probs_bkp.clamp_min(1.0e-8).log() + (float(penalty_context_weight) * pen_logits)
-        return torch.softmax(route_logits, dim=-1)
-    raise ValueError(f"Unsupported moe.router_mode='{router_mode}'. Expected learned, penalty_context, or penalty_only.")
-
-
-def _history_proxy_forecast(x_bcl: torch.Tensor, pred_len: int) -> torch.Tensor:
-    """
-    Build a target-free horizon proxy from observed history only.
-
-    Router penalty context must be available at inference time.  For penalties
-    that compare prediction to a reference series, use the latest observed
-    history segment instead of the future label.
-    """
-    pred_len = int(pred_len)
-    if pred_len <= 0:
-        raise ValueError("pred_len must be positive")
-    L = int(x_bcl.shape[-1])
-    if L <= 0:
-        raise ValueError("history length must be positive")
-    if L >= pred_len:
-        return x_bcl[..., -pred_len:]
-    pad = x_bcl[..., -1:].expand(*x_bcl.shape[:-1], pred_len - L)
-    return torch.cat([x_bcl, pad], dim=-1)
-
-
-def _router_penalty_context_from_history(
-    *,
-    x_bcl: torch.Tensor,
-    yhat_base_bch: torch.Tensor,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    penalty_scale: Optional[torch.Tensor],
-    cluster_id_c: torch.Tensor,
-    K: int,
-) -> torch.Tensor:
-    if len(penalty_names) == 0:
-        return torch.zeros((x_bcl.shape[0], K, 0), device=x_bcl.device, dtype=x_bcl.dtype)
-    y_ref = _history_proxy_forecast(x_bcl, int(yhat_base_bch.shape[-1]))
-    y_ref = y_ref.to(device=yhat_base_bch.device, dtype=yhat_base_bch.dtype)
-    route_pen_bcp = torch.stack(
-        [penalty_fns[name](yhat_base_bch, y_ref) for name in penalty_names],
-        dim=-1,
-    )
-    route_pen_bcp = normalize_penalties(route_pen_bcp, scale=penalty_scale)
-    return scatter_mean_bcf_to_bkf(route_pen_bcp, cluster_id_c, K)
-
-
-def _named_param_dict(module: Optional[nn.Module], detach: bool = False) -> Optional[Dict[str, torch.Tensor]]:
-    if module is None:
-        return None
-    params = {}
-    for name, param in module.named_parameters():
-        params[name] = param.detach() if detach else param
-    return params
-
-
-def _parse_positive_ints(raw) -> List[int]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        values = []
-        for part in raw.split(","):
-            part = part.strip()
-            if part:
-                value = int(part)
-                if value > 0:
-                    values.append(value)
-        return values
-    if isinstance(raw, (int, float)):
-        value = int(raw)
-        return [value] if value > 0 else []
-    values = []
-    for item in raw:
-        value = int(item)
-        if value > 0:
-            values.append(value)
-    return values
-
-
-def history_anchor_enabled(cfg: Optional[dict]) -> bool:
-    cfg = cfg or {}
-    alpha_by_channel = cfg.get("alpha_by_channel", None)
-    if alpha_by_channel is not None:
-        alpha_enabled = any(float(v) > 0.0 for v in alpha_by_channel)
-    else:
-        alpha_enabled = float(cfg.get("alpha", 0.0) or 0.0) > 0.0
-    return (
-        bool(cfg.get("enable", False))
-        and len(_parse_positive_ints(cfg.get("lags", ()))) > 0
-        and alpha_enabled
-    )
-
-
-def _normalize_history_anchor_cfg(cfg: Optional[dict]) -> dict:
-    out = dict(cfg or {})
-    if history_anchor_enabled(out) and "history_scope" not in out:
-        out["history_scope"] = "input_window"
-    return out
-
-
-def _validate_strict_history_anchor_scope(cfg: Optional[dict], *, source: str) -> None:
-    cfg = cfg or {}
-    if not history_anchor_enabled(cfg):
-        return
-    if bool(cfg.get("allow_all_observed", False)):
-        return
-    history_scope = str(cfg.get("history_scope", "input_window")).lower()
-    if history_scope != "input_window":
-        raise ValueError(
-            f"{source}.history_scope must be 'input_window' for strict input-window training; "
-            f"got {history_scope!r}. Set {source}.allow_all_observed=true only for oracle diagnostics."
-        )
-
-
-_MOE_OUTPUT_ANCHOR_KEYS = (
-    "history_anchor_expert",
-    "train_stat_anchor_expert",
-    "train_residual_anchor_expert",
-)
-
-
-def _clone_anchor_cfg(value):
-    if isinstance(value, dict):
-        return {key: _clone_anchor_cfg(sub_value) for key, sub_value in value.items()}
-    if isinstance(value, list):
-        return [_clone_anchor_cfg(sub_value) for sub_value in value]
-    return value
-
-
-def _merge_anchor_cfg(default: dict, override: Optional[dict]) -> dict:
-    out = _clone_anchor_cfg(default)
-    if not isinstance(override, dict):
-        return out
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _merge_anchor_cfg(out[key], value)
-        else:
-            out[key] = _clone_anchor_cfg(value)
-    return out
-
-
-def _stat_anchor_default(
-    *,
-    period: int,
-    metric: str = "mse",
-    max_scale: float = 0.2,
-    steps: int = 9,
-    horizon_segments: Optional[int] = None,
-) -> dict:
-    scale_selection = {
-        "enable": True,
-        "metric": str(metric),
-        "max_scale": float(max_scale),
-        "steps": int(steps),
-    }
-    if horizon_segments is not None:
-        scale_selection["horizon_segments"] = int(horizon_segments)
-    return {
-        "enable": True,
-        "period": int(period),
-        "alpha": 0.0,
-        "mode": "phase_mean",
-        "reference": "last",
-        "blend_target": "prediction",
-        "scale_selection": scale_selection,
-    }
-
-
-def _residual_anchor_default(
-    *,
-    period: int,
-    metric: str = "mse",
-    max_scale: float = 1.2,
-    steps: int = 49,
-    horizon_segments: Optional[int] = None,
-) -> dict:
-    scale_selection = {
-        "enable": True,
-        "metric": str(metric),
-        "max_scale": float(max_scale),
-        "steps": int(steps),
-    }
-    if horizon_segments is not None:
-        scale_selection["horizon_segments"] = int(horizon_segments)
-    return {
-        "enable": True,
-        "period": int(period),
-        "alpha": 0.0,
-        "blend_target": "prediction",
-        "scale_selection": scale_selection,
-    }
-
-
-def _moe_output_anchor_default(
-    *,
-    stat: Optional[dict],
-    residual: Optional[dict],
-    history: Optional[dict] = None,
-) -> dict:
-    return {
-        "history_anchor_expert": _clone_anchor_cfg(history or {"enable": False}),
-        "train_stat_anchor_expert": _clone_anchor_cfg(stat or {"enable": False}),
-        "train_residual_anchor_expert": _clone_anchor_cfg(residual or {"enable": False}),
-    }
-
-
-_MAIN_TABLE_MOE_OUTPUT_ANCHOR_DEFAULTS = {
-    ("etth1", 96): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=24),
-        residual=_residual_anchor_default(period=24, horizon_segments=12),
-    ),
-    ("etth1", 192): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=24, metric="mae", horizon_segments=12),
-        residual=_residual_anchor_default(period=24, metric="mae", horizon_segments=12),
-    ),
-    ("etth1", 336): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, max_scale=0.8, steps=33, horizon_segments=4),
-    ),
-    ("etth1", 720): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, max_scale=0.15, steps=7),
-        residual=_residual_anchor_default(period=96, max_scale=0.6, steps=25, horizon_segments=7),
-    ),
-    ("etth2", 96): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, horizon_segments=7),
-    ),
-    ("etth2", 192): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, metric="mae"),
-        residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
-    ),
-    ("etth2", 336): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, metric="mae"),
-        residual=_residual_anchor_default(period=96, metric="mae", max_scale=2.6, steps=105, horizon_segments=7),
-    ),
-    ("etth2", 720): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, max_scale=0.4, steps=17),
-        residual=None,
-    ),
-    ("ettm1", 96): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, max_scale=1.6, steps=65, horizon_segments=7),
-    ),
-    ("ettm1", 192): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, max_scale=2.65, steps=107, horizon_segments=7),
-    ),
-    ("ettm1", 336): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, max_scale=2.4, steps=97, horizon_segments=7),
-    ),
-    ("ettm1", 720): _moe_output_anchor_default(
-        history={
-            "enable": True,
-            "lags": [96, 192, 288],
-            "alpha": 0.2,
-            "blend_target": "prediction",
-            "history_scope": "input_window",
-        },
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, horizon_segments=7),
-    ),
-    ("ettm2", 96): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.18, steps=8),
-        residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
-    ),
-    ("ettm2", 192): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96),
-        residual=_residual_anchor_default(period=96, horizon_segments=4),
-    ),
-    ("ettm2", 336): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, horizon_segments=12),
-        residual=_residual_anchor_default(period=96, horizon_segments=12),
-    ),
-    ("ettm2", 720): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.18, steps=8),
-        residual=_residual_anchor_default(period=96, metric="mae", horizon_segments=7),
-    ),
-    ("weather", 96): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=144, metric="mse", max_scale=0.4, steps=13),
-        residual=_residual_anchor_default(period=144, metric="mse", max_scale=0.8, steps=25, horizon_segments=8),
-    ),
-    ("weather", 192): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=144, metric="mae", max_scale=0.5, steps=13),
-        residual=_residual_anchor_default(period=144, metric="mae", max_scale=1.0, steps=25, horizon_segments=8),
-    ),
-    ("weather", 336): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.2, steps=9),
-        residual=_residual_anchor_default(period=96, metric="mae", max_scale=1.2, steps=49, horizon_segments=7),
-    ),
-    ("weather", 720): _moe_output_anchor_default(
-        stat=_stat_anchor_default(period=96, metric="mae", max_scale=0.2, steps=9),
-        residual=_residual_anchor_default(period=96, metric="mae", max_scale=1.2, steps=49, horizon_segments=7),
-    ),
-}
-
-
-def _normalize_anchor_default_dataset_name(dataset_name: object) -> str:
-    raw = str(dataset_name or "").strip()
-    if not raw:
-        return ""
-    stem = os.path.splitext(os.path.basename(raw))[0]
-    key = stem.lower()
-    if "_h" in key:
-        head, tail = key.rsplit("_h", 1)
-        if tail.isdigit():
-            return head
-    return key
-
-
-def default_moe_output_anchor_cfg(dataset_name: object, pred_len: int) -> dict:
-    dataset_key = _normalize_anchor_default_dataset_name(dataset_name)
-    horizon = int(pred_len)
-    if dataset_key.startswith("pems"):
-        return _moe_output_anchor_default(
-            stat=_stat_anchor_default(period=288),
-            residual=_residual_anchor_default(period=288, horizon_segments=4),
-        )
-    defaults = _MAIN_TABLE_MOE_OUTPUT_ANCHOR_DEFAULTS.get((dataset_key, horizon), {})
-    return _clone_anchor_cfg(defaults)
-
-
-def apply_default_moe_output_anchor_cfg(moe_cfg: Optional[dict], *, dataset_name: object, pred_len: int) -> dict:
-    out = dict(moe_cfg or {})
-    defaults = default_moe_output_anchor_cfg(dataset_name, pred_len)
-    for key in _MOE_OUTPUT_ANCHOR_KEYS:
-        if key not in out and key in defaults:
-            out[key] = _clone_anchor_cfg(defaults[key])
-        elif key in out and key in defaults and isinstance(out.get(key), dict):
-            out[key] = _merge_anchor_cfg(defaults[key], out[key])
-    return out
-
-
-def _history_anchor_values(
-    observed_history_tc: torch.Tensor,
-    query_start_abs_b: torch.Tensor,
-    *,
-    input_len: int,
-    pred_len: int,
-    channel_count: int,
-    lags: List[int],
-    device: torch.device,
-    dtype: torch.dtype,
-    history_scope: str = "input_window",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    observed = observed_history_tc.detach().to(device=device, dtype=dtype)
-    if observed.ndim != 2:
-        raise ValueError("history_anchor observed history must have shape [time, channel].")
-    if int(observed.shape[1]) != int(channel_count):
-        raise ValueError("history_anchor observed history channel count must match predictions.")
-    history_scope = str(history_scope).lower()
-    if history_scope not in {"all_observed", "input_window"}:
-        raise ValueError("history_anchor.history_scope must be 'all_observed' or 'input_window'.")
-
-    starts = query_start_abs_b.detach().to(device=device, dtype=torch.long).reshape(1, -1, 1)
-    steps = torch.arange(int(pred_len), device=device, dtype=torch.long).view(1, 1, -1)
-    lag_t = torch.as_tensor(lags, device=device, dtype=torch.long).view(-1, 1, 1)
-    forecast_start = starts + int(input_len)
-    idx_lbh = forecast_start + steps - lag_t
-    valid_lbh = (
-        (idx_lbh >= 0)
-        & (idx_lbh < forecast_start)
-        & (idx_lbh < int(observed.shape[0]))
-    )
-    if history_scope == "input_window":
-        valid_lbh = valid_lbh & (idx_lbh >= starts)
-    idx_lbh = idx_lbh.clamp(min=0, max=max(int(observed.shape[0]) - 1, 0))
-    values_lbhc = observed.index_select(0, idx_lbh.reshape(-1)).view(
-        int(lag_t.shape[0]),
-        int(query_start_abs_b.numel()),
-        int(pred_len),
-        int(channel_count),
-    )
-    values_bchl = values_lbhc.permute(1, 3, 2, 0)
-    valid_bh1l = valid_lbh.permute(1, 2, 0).unsqueeze(2).to(dtype=dtype)
-    valid_bchl = valid_bh1l.permute(0, 2, 1, 3)
-    count_b1h = valid_bh1l.sum(dim=-1).permute(0, 2, 1).clamp_min(1.0)
-    anchor_bch = (values_bchl * valid_bchl).sum(dim=-1) / count_b1h
-    mask_b1h = valid_bh1l.sum(dim=-1).permute(0, 2, 1) > 0
-    return anchor_bch, mask_b1h
-
-
-def apply_history_anchor_adapter(
-    pred_bch: torch.Tensor,
-    *,
-    base_pred_bch: torch.Tensor,
-    observed_history_tc: Optional[torch.Tensor],
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-    cfg: Optional[dict],
-) -> torch.Tensor:
-    cfg = cfg or {}
-    if not history_anchor_enabled(cfg):
-        return pred_bch
-    if observed_history_tc is None:
-        raise ValueError("model.history_anchor requires observed history.")
-    lags = _parse_positive_ints(cfg.get("lags", ()))
-    blend_target = str(cfg.get("blend_target", "prediction")).lower()
-    if blend_target not in {"prediction", "base"}:
-        raise ValueError("model.history_anchor.blend_target must be 'prediction' or 'base'.")
-
-    anchor_bch, mask_b1h = _history_anchor_values(
-        observed_history_tc,
-        query_start_abs_b,
-        input_len=int(input_len),
-        pred_len=int(pred_bch.shape[-1]),
-        channel_count=int(pred_bch.shape[1]),
-        lags=lags,
-        device=pred_bch.device,
-        dtype=pred_bch.dtype,
-        history_scope=str(cfg.get("history_scope", "input_window")),
-    )
-    alpha_by_channel = cfg.get("alpha_by_channel", None)
-    if alpha_by_channel is not None:
-        alpha_values = [float(v) for v in alpha_by_channel]
-        if len(alpha_values) != int(pred_bch.shape[1]):
-            raise ValueError(
-                "model.history_anchor.alpha_by_channel length must match the channel count "
-                f"({len(alpha_values)} != {int(pred_bch.shape[1])})."
-            )
-        alpha = torch.as_tensor(alpha_values, device=pred_bch.device, dtype=pred_bch.dtype).view(1, -1, 1)
-    else:
-        alpha = float(cfg.get("alpha", 0.0) or 0.0)
-    if blend_target == "prediction":
-        blended = pred_bch + alpha * (anchor_bch - pred_bch)
-    else:
-        blended = pred_bch + alpha * (anchor_bch - base_pred_bch)
-    return torch.where(mask_b1h.to(device=pred_bch.device), blended, pred_bch)
-
-
-def apply_moe_history_anchor_expert(
-    pred_bch: torch.Tensor,
-    *,
-    base_pred_bch: torch.Tensor,
-    observed_history_tc: Optional[torch.Tensor],
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-    cfg: Optional[dict],
-) -> torch.Tensor:
-    cfg = cfg or {}
-    if not bool(cfg.get("enable", False)):
-        return pred_bch
-    expert_cfg = dict(cfg)
-    expert_cfg["enable"] = True
-    expert_cfg = _normalize_history_anchor_cfg(expert_cfg)
-    return apply_history_anchor_adapter(
-        pred_bch,
-        base_pred_bch=base_pred_bch,
-        observed_history_tc=observed_history_tc,
-        query_start_abs_b=query_start_abs_b,
-        input_len=int(input_len),
-        cfg=expert_cfg,
-    )
-
-
-def build_train_phase_anchor_table(
-    data_tc: torch.Tensor,
-    *,
-    train_end: int,
-    period: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if int(period) <= 0:
-        raise ValueError("train_stat_anchor_expert.period must be positive.")
-    train_end = max(0, min(int(train_end), int(data_tc.shape[0])))
-    if train_end <= 0:
-        raise ValueError("train_stat_anchor_expert requires non-empty train data.")
-    train = data_tc[:train_end].detach()
-    period = int(period)
-    table = torch.zeros(period, int(train.shape[1]), dtype=train.dtype, device=train.device)
-    counts = torch.zeros(period, dtype=torch.long, device=train.device)
-    phases = torch.arange(train_end, device=train.device, dtype=torch.long) % period
-    table.index_add_(0, phases, train)
-    counts.index_add_(0, phases, torch.ones(train_end, dtype=torch.long, device=train.device))
-    global_mean = train.mean(dim=0)
-    nonempty = counts > 0
-    if bool(nonempty.any()):
-        table[nonempty] = table[nonempty] / counts[nonempty].to(dtype=train.dtype).unsqueeze(-1)
-    if bool((~nonempty).any()):
-        table[~nonempty] = global_mean
-    return table, counts
-
-
-def build_train_phase_delta_anchor_table(
-    data_tc: torch.Tensor,
-    *,
-    train_end: int,
-    input_len: int,
-    pred_len: int,
-    period: int,
-    reference: str = "last",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if int(period) <= 0:
-        raise ValueError("train_stat_anchor_expert.period must be positive.")
-    reference = str(reference).lower()
-    if reference not in {"last", "repeat"}:
-        raise ValueError("train_stat_anchor_expert.reference must be 'last' or 'repeat'.")
-    train_end = max(0, min(int(train_end), int(data_tc.shape[0])))
-    input_len = int(input_len)
-    pred_len = int(pred_len)
-    period = int(period)
-    n_windows = train_end - input_len - pred_len + 1
-    if n_windows <= 0:
-        raise ValueError("train_stat_anchor_expert phase_delta requires at least one full train window.")
-    data = data_tc.detach()
-    table = torch.zeros(period, pred_len, int(data.shape[1]), dtype=data.dtype, device=data.device)
-    counts = torch.zeros(period, dtype=torch.long, device=data.device)
-    global_sum = torch.zeros(pred_len, int(data.shape[1]), dtype=data.dtype, device=data.device)
-    for start in range(n_windows):
-        forecast_start = start + input_len
-        phase = int(forecast_start % period)
-        target_hc = data[forecast_start : forecast_start + pred_len]
-        if reference == "last":
-            ref_hc = data[forecast_start - 1].view(1, -1).expand(pred_len, -1)
-        else:
-            pos_h = torch.arange(pred_len, device=data.device, dtype=torch.long) % input_len
-            ref_hc = data[start : start + input_len].index_select(0, pos_h)
-        delta_hc = target_hc - ref_hc
-        table[phase] += delta_hc
-        counts[phase] += 1
-        global_sum += delta_hc
-    global_delta = global_sum / float(n_windows)
-    nonempty = counts > 0
-    if bool(nonempty.any()):
-        table[nonempty] = table[nonempty] / counts[nonempty].to(dtype=data.dtype).view(-1, 1, 1)
-    if bool((~nonempty).any()):
-        table[~nonempty] = global_delta
-    return table, counts
-
-
-def build_train_phase_residual_anchor_table(
-    base_pred_nch: torch.Tensor,
-    target_nch: torch.Tensor,
-    *,
-    query_start_abs_n: torch.Tensor,
-    input_len: int,
-    period: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if int(period) <= 0:
-        raise ValueError("train_residual_anchor_expert.period must be positive.")
-    if base_pred_nch.shape != target_nch.shape:
-        raise ValueError("base_pred and target must have the same [window, channel, horizon] shape.")
-    if base_pred_nch.ndim != 3:
-        raise ValueError("base_pred and target must have shape [window, channel, horizon].")
-    starts = query_start_abs_n.detach().to(dtype=torch.long).reshape(-1)
-    if int(starts.numel()) != int(base_pred_nch.shape[0]):
-        raise ValueError("query_start_abs_n length must match the number of windows.")
-    period = int(period)
-    residual_nhc = (target_nch.detach() - base_pred_nch.detach()).permute(0, 2, 1).contiguous()
-    horizon = int(residual_nhc.shape[1])
-    channel_count = int(residual_nhc.shape[2])
-    table = torch.zeros(period, horizon, channel_count, dtype=residual_nhc.dtype, device=residual_nhc.device)
-    counts = torch.zeros(period, dtype=torch.long, device=residual_nhc.device)
-    phases = (starts.to(device=residual_nhc.device) + int(input_len)) % period
-    table.index_add_(0, phases, residual_nhc)
-    counts.index_add_(0, phases, torch.ones_like(phases, dtype=torch.long, device=residual_nhc.device))
-    global_mean = residual_nhc.mean(dim=0)
-    nonempty = counts > 0
-    if bool(nonempty.any()):
-        table[nonempty] = table[nonempty] / counts[nonempty].to(dtype=residual_nhc.dtype).view(-1, 1, 1)
-    if bool((~nonempty).any()):
-        table[~nonempty] = global_mean
-    return table, counts
-
-
-def build_train_stat_anchor_from_config(
-    data_tc: torch.Tensor,
-    *,
-    train_end: int,
-    input_len: int,
-    pred_len: int,
-    cfg: Optional[dict],
-    prefix: str = "moe.train_stat_anchor_expert",
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, object]]:
-    cfg = cfg or {}
-    summary: Dict[str, object] = {"enable": bool(cfg.get("enable", False))}
-    if not bool(cfg.get("enable", False)):
-        return None, None, summary
-
-    period = int(cfg.get("period", 96))
-    mode = str(cfg.get("mode", "phase_mean")).lower()
-    reference = str(cfg.get("reference", "last")).lower()
-    if mode == "phase_delta":
-        table, counts = build_train_phase_delta_anchor_table(
-            data_tc,
-            train_end=int(train_end),
-            input_len=int(input_len),
-            pred_len=int(pred_len),
-            period=period,
-            reference=reference,
-        )
-    elif mode == "phase_mean":
-        table, counts = build_train_phase_anchor_table(
-            data_tc,
-            train_end=int(train_end),
-            period=period,
-        )
-    else:
-        raise ValueError(f"{prefix}.mode must be 'phase_mean' or 'phase_delta'.")
-
-    summary.update(
-        {
-            "period": int(period),
-            "mode": str(mode),
-            "reference": str(reference),
-            "source_split": "train",
-            "train_end": int(train_end),
-            "min_count": int(counts.min().item()),
-            "max_count": int(counts.max().item()),
-            "alpha": float(cfg.get("alpha", 0.0) or 0.0),
-            "blend_target": str(cfg.get("blend_target", "prediction")),
-        }
-    )
-    return table, counts, summary
-
-
-def _anchor_alpha_from_cfg(
-    cfg: dict,
-    *,
-    channel_count: int,
-    horizon: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    prefix: str,
-) -> Tuple[float | torch.Tensor, bool]:
-    alpha_by_channel_horizon = cfg.get("alpha_by_channel_horizon", None)
-    alpha_by_channel = cfg.get("alpha_by_channel", None)
-    if alpha_by_channel_horizon is not None:
-        rows = [[float(v) for v in row] for row in alpha_by_channel_horizon]
-        if len(rows) != int(channel_count):
-            raise ValueError(
-                f"{prefix}.alpha_by_channel_horizon row count must match the channel count "
-                f"({len(rows)} != {int(channel_count)})."
-            )
-        segments = int(cfg.get("alpha_horizon_segments", len(rows[0]) if rows else 0))
-        if segments <= 0:
-            raise ValueError(f"{prefix}.alpha_horizon_segments must be positive.")
-        if any(len(row) != segments for row in rows):
-            raise ValueError("Each alpha_by_channel_horizon row must match alpha_horizon_segments.")
-        scale_cs = torch.as_tensor(rows, device=device, dtype=dtype)
-        seg_idx_h = torch.div(
-            torch.arange(int(horizon), device=device, dtype=torch.long) * segments,
-            max(int(horizon), 1),
-            rounding_mode="floor",
-        ).clamp_max(segments - 1)
-        alpha: float | torch.Tensor = scale_cs.index_select(1, seg_idx_h).view(1, int(channel_count), int(horizon))
-        return alpha, any(v > 0.0 for row in rows for v in row)
-    if alpha_by_channel is not None:
-        alpha_values = [float(v) for v in alpha_by_channel]
-        if len(alpha_values) != int(channel_count):
-            raise ValueError(
-                f"{prefix}.alpha_by_channel length must match the channel count "
-                f"({len(alpha_values)} != {int(channel_count)})."
-            )
-        alpha = torch.as_tensor(alpha_values, device=device, dtype=dtype).view(1, -1, 1)
-        return alpha, any(v > 0.0 for v in alpha_values)
-    alpha = float(cfg.get("alpha", 0.0) or 0.0)
-    return alpha, alpha > 0.0
-
-
-def apply_train_residual_anchor_expert(
-    pred_bch: torch.Tensor,
-    *,
-    base_pred_bch: torch.Tensor,
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-    residual_anchor_phc: Optional[torch.Tensor],
-    cfg: Optional[dict],
-) -> torch.Tensor:
-    cfg = cfg or {}
-    if not bool(cfg.get("enable", False)):
-        return pred_bch
-    if residual_anchor_phc is None:
-        raise ValueError("moe.train_residual_anchor_expert requires a train residual anchor table.")
-    alpha, alpha_active = _anchor_alpha_from_cfg(
-        cfg,
-        channel_count=int(pred_bch.shape[1]),
-        horizon=int(pred_bch.shape[-1]),
-        device=pred_bch.device,
-        dtype=pred_bch.dtype,
-        prefix="moe.train_residual_anchor_expert",
-    )
-    if not alpha_active:
-        return pred_bch
-    table = residual_anchor_phc.detach().to(device=pred_bch.device, dtype=pred_bch.dtype)
-    if table.ndim != 3 or int(table.shape[1]) != int(pred_bch.shape[-1]) or int(table.shape[2]) != int(pred_bch.shape[1]):
-        raise ValueError("train_residual_anchor_expert table must have shape [period, horizon, channel].")
-    blend_target = str(cfg.get("blend_target", "prediction")).lower()
-    if blend_target not in {"prediction", "base"}:
-        raise ValueError("moe.train_residual_anchor_expert.blend_target must be 'prediction' or 'base'.")
-    phases_b = (query_start_abs_b.detach().to(device=pred_bch.device, dtype=torch.long) + int(input_len)) % int(table.shape[0])
-    residual_bhc = table.index_select(0, phases_b).view(
-        int(pred_bch.shape[0]),
-        int(pred_bch.shape[-1]),
-        int(pred_bch.shape[1]),
-    )
-    residual_bch = residual_bhc.permute(0, 2, 1).contiguous()
-    if blend_target == "prediction":
-        return pred_bch + alpha * residual_bch
-    return pred_bch + alpha * (base_pred_bch + residual_bch - base_pred_bch)
-
-
-def apply_moe_output_anchor_experts(
-    pred_bch: torch.Tensor,
-    *,
-    base_pred_bch: torch.Tensor,
-    x_bcl: torch.Tensor,
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-    moe_cfg: Optional[dict],
-    moe_enable: bool,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    moe_cfg = moe_cfg or {}
-    out = pred_bch
-    history_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
-    stat_cfg = moe_cfg.get("train_stat_anchor_expert", {}) or {}
-    residual_cfg = moe_cfg.get("train_residual_anchor_expert", {}) or {}
-    if bool(history_cfg.get("enable", False)):
-        out = apply_moe_history_anchor_expert(
-            out,
-            base_pred_bch=base_pred_bch,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_cfg,
-        )
-    if bool(stat_cfg.get("enable", False)):
-        out = apply_train_stat_anchor_expert(
-            out,
-            base_pred_bch=base_pred_bch,
-            x_bcl=x_bcl,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=train_stat_anchor_pc,
-            cfg=stat_cfg,
-        )
-    if bool(residual_cfg.get("enable", False)) and train_residual_anchor_phc is not None:
-        out = apply_train_residual_anchor_expert(
-            out,
-            base_pred_bch=base_pred_bch,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            residual_anchor_phc=train_residual_anchor_phc,
-            cfg=residual_cfg,
-        )
-    return out
-
-
-def apply_train_stat_input_centering(
-    x_bcl: torch.Tensor,
-    *,
-    query_start_abs_b: torch.Tensor,
-    stat_anchor_pc: Optional[torch.Tensor],
-    cfg: Optional[dict],
-) -> torch.Tensor:
-    cfg = cfg or {}
-    if not (bool(cfg.get("enable", False)) and bool(cfg.get("input_center", False))):
-        return x_bcl
-    if stat_anchor_pc is None:
-        raise ValueError("model.train_stat_adapter input_center requires a train phase anchor table.")
-    mode = str(cfg.get("mode", "phase_mean")).lower()
-    if mode != "phase_mean":
-        raise ValueError("model.train_stat_adapter input_center currently requires mode='phase_mean'.")
-    table = stat_anchor_pc.detach().to(device=x_bcl.device, dtype=x_bcl.dtype)
-    if table.ndim != 2 or int(table.shape[1]) != int(x_bcl.shape[1]):
-        raise ValueError("model.train_stat_adapter phase_mean table must have shape [period, channel].")
-    starts = query_start_abs_b.detach().to(device=x_bcl.device, dtype=torch.long).view(-1, 1)
-    steps = torch.arange(int(x_bcl.shape[-1]), device=x_bcl.device, dtype=torch.long).view(1, -1)
-    phases_bl = (starts + steps) % int(table.shape[0])
-    anchor_blc = table.index_select(0, phases_bl.reshape(-1)).view(
-        int(x_bcl.shape[0]),
-        int(x_bcl.shape[-1]),
-        int(x_bcl.shape[1]),
-    )
-    scale = float(cfg.get("input_center_scale", 1.0) or 0.0)
-    return x_bcl - scale * anchor_blc.permute(0, 2, 1).contiguous()
-
-
-def apply_train_stat_anchor_expert(
-    pred_bch: torch.Tensor,
-    *,
-    base_pred_bch: torch.Tensor,
-    x_bcl: Optional[torch.Tensor] = None,
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-    stat_anchor_pc: Optional[torch.Tensor],
-    cfg: Optional[dict],
-) -> torch.Tensor:
-    cfg = cfg or {}
-    if not bool(cfg.get("enable", False)):
-        return pred_bch
-    if stat_anchor_pc is None:
-        raise ValueError("moe.train_stat_anchor_expert requires a train phase anchor table.")
-    alpha_by_channel_horizon = cfg.get("alpha_by_channel_horizon", None)
-    alpha_by_channel = cfg.get("alpha_by_channel", None)
-    if alpha_by_channel_horizon is not None:
-        rows = [[float(v) for v in row] for row in alpha_by_channel_horizon]
-        if len(rows) != int(pred_bch.shape[1]):
-            raise ValueError(
-                "moe.train_stat_anchor_expert.alpha_by_channel_horizon row count must match the channel count "
-                f"({len(rows)} != {int(pred_bch.shape[1])})."
-            )
-        segments = int(cfg.get("alpha_horizon_segments", len(rows[0]) if rows else 0))
-        if segments <= 0:
-            raise ValueError("moe.train_stat_anchor_expert.alpha_horizon_segments must be positive.")
-        if any(len(row) != segments for row in rows):
-            raise ValueError("Each alpha_by_channel_horizon row must match alpha_horizon_segments.")
-        scale_cs = torch.as_tensor(rows, device=pred_bch.device, dtype=pred_bch.dtype)
-        horizon = int(pred_bch.shape[-1])
-        seg_idx_h = torch.div(
-            torch.arange(horizon, device=pred_bch.device, dtype=torch.long) * segments,
-            max(horizon, 1),
-            rounding_mode="floor",
-        ).clamp_max(segments - 1)
-        alpha: float | torch.Tensor = scale_cs.index_select(1, seg_idx_h).view(1, int(pred_bch.shape[1]), horizon)
-        alpha_active = any(v > 0.0 for row in rows for v in row)
-    elif alpha_by_channel is not None:
-        alpha_values = [float(v) for v in alpha_by_channel]
-        if len(alpha_values) != int(pred_bch.shape[1]):
-            raise ValueError(
-                "moe.train_stat_anchor_expert.alpha_by_channel length must match the channel count "
-                f"({len(alpha_values)} != {int(pred_bch.shape[1])})."
-            )
-        alpha: float | torch.Tensor = torch.as_tensor(
-            alpha_values,
-            device=pred_bch.device,
-            dtype=pred_bch.dtype,
-        ).view(1, -1, 1)
-        alpha_active = any(v > 0.0 for v in alpha_values)
-    else:
-        alpha = float(cfg.get("alpha", 0.0) or 0.0)
-        alpha_active = alpha > 0.0
-    if not alpha_active:
-        return pred_bch
-    blend_target = str(cfg.get("blend_target", "prediction")).lower()
-    if blend_target not in {"prediction", "base"}:
-        raise ValueError("moe.train_stat_anchor_expert.blend_target must be 'prediction' or 'base'.")
-    combine_mode = str(cfg.get("combine_mode", "blend")).lower()
-    if combine_mode not in {"blend", "anchor_plus_prediction"}:
-        raise ValueError("moe.train_stat_anchor_expert.combine_mode must be 'blend' or 'anchor_plus_prediction'.")
-    table = stat_anchor_pc.detach().to(device=pred_bch.device, dtype=pred_bch.dtype)
-    mode = str(cfg.get("mode", "phase_mean")).lower()
-    if mode not in {"phase_mean", "phase_delta"}:
-        raise ValueError("moe.train_stat_anchor_expert.mode must be 'phase_mean' or 'phase_delta'.")
-    period = int(table.shape[0])
-    starts = query_start_abs_b.detach().to(device=pred_bch.device, dtype=torch.long)
-    steps = torch.arange(int(pred_bch.shape[-1]), device=pred_bch.device, dtype=torch.long).view(1, -1)
-    if mode == "phase_delta":
-        if table.ndim != 3 or int(table.shape[1]) != int(pred_bch.shape[-1]) or int(table.shape[2]) != int(pred_bch.shape[1]):
-            raise ValueError("train_stat_anchor_expert phase_delta table must have shape [period, horizon, channel].")
-        if x_bcl is None:
-            raise ValueError("moe.train_stat_anchor_expert phase_delta requires x_bcl.")
-        reference = str(cfg.get("reference", "last")).lower()
-        if reference == "last":
-            ref_bch = x_bcl[..., -1:].to(device=pred_bch.device, dtype=pred_bch.dtype).expand_as(pred_bch)
-        elif reference == "repeat":
-            pos_h = torch.arange(int(pred_bch.shape[-1]), device=pred_bch.device, dtype=torch.long) % int(x_bcl.shape[-1])
-            ref_bch = x_bcl.to(device=pred_bch.device, dtype=pred_bch.dtype).index_select(-1, pos_h)
-        else:
-            raise ValueError("moe.train_stat_anchor_expert.reference must be 'last' or 'repeat'.")
-        phases_b = (starts + int(input_len)) % period
-        delta_bhc = table.index_select(0, phases_b).view(
-            int(pred_bch.shape[0]),
-            int(pred_bch.shape[-1]),
-            int(pred_bch.shape[1]),
-        )
-        anchor_bch = ref_bch + delta_bhc.permute(0, 2, 1).contiguous()
-    else:
-        if table.ndim != 2 or int(table.shape[1]) != int(pred_bch.shape[1]):
-            raise ValueError("train_stat_anchor_expert phase_mean table must have shape [period, channel].")
-        phases_bh = (starts.view(-1, 1) + int(input_len) + steps) % period
-        anchor_bhc = table.index_select(0, phases_bh.reshape(-1)).view(
-            int(pred_bch.shape[0]),
-            int(pred_bch.shape[-1]),
-            int(pred_bch.shape[1]),
-        )
-        anchor_bch = anchor_bhc.permute(0, 2, 1).contiguous()
-    if combine_mode == "anchor_plus_prediction":
-        return anchor_bch + alpha * pred_bch
-    if blend_target == "prediction":
-        return pred_bch + alpha * (anchor_bch - pred_bch)
-    return pred_bch + alpha * (anchor_bch - base_pred_bch)
-
-
-def select_channel_anchor_scales(
-    base_bch: torch.Tensor,
-    anchor_bch: torch.Tensor,
-    target_bch: torch.Tensor,
-    *,
-    metric: str = "mse",
-    max_scale: float = 1.0,
-    steps: int = 21,
-    channel_chunk_size: int = 8,
-    sample_chunk_size: int = 256,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if base_bch.shape != anchor_bch.shape or base_bch.shape != target_bch.shape:
-        raise ValueError("base, anchor, and target tensors must have the same [batch, channel, horizon] shape.")
-    metric = str(metric).lower()
-    if metric not in {"mse", "mae"}:
-        raise ValueError("train_stat_anchor_expert.scale_selection.metric must be mse or mae.")
-    steps = max(2, int(steps))
-    scale_grid = torch.linspace(
-        0.0,
-        float(max_scale),
-        steps,
-        device=base_bch.device,
-        dtype=base_bch.dtype,
-    )
-    channel_count = int(base_bch.shape[1])
-    chunk_size = max(1, min(channel_count, int(channel_chunk_size))) if channel_count > 0 else 1
-    sample_chunk_size = max(1, min(int(base_bch.shape[0]), int(sample_chunk_size))) if int(base_bch.shape[0]) > 0 else 1
-    scales_c = torch.empty(channel_count, device=base_bch.device, dtype=base_bch.dtype)
-    scores_c = torch.empty_like(scales_c)
-    for c0 in range(0, channel_count, chunk_size):
-        c1 = min(channel_count, c0 + chunk_size)
-        score_sum_sc = torch.zeros(
-            int(scale_grid.numel()),
-            c1 - c0,
-            device=base_bch.device,
-            dtype=base_bch.dtype,
-        )
-        total_count = 0
-        for b0 in range(0, int(base_bch.shape[0]), sample_chunk_size):
-            b1 = min(int(base_bch.shape[0]), b0 + sample_chunk_size)
-            base_chunk = base_bch[b0:b1, c0:c1, :]
-            anchor_chunk = anchor_bch[b0:b1, c0:c1, :]
-            target_chunk = target_bch[b0:b1, c0:c1, :]
-            cand_sbch = base_chunk.unsqueeze(0) + scale_grid.view(-1, 1, 1, 1) * (
-                anchor_chunk - base_chunk
-            ).unsqueeze(0)
-            err_sbch = cand_sbch - target_chunk.unsqueeze(0)
-            if metric == "mae":
-                score_sum_sc += err_sbch.abs().sum(dim=(1, 3))
-            else:
-                score_sum_sc += err_sbch.pow(2).sum(dim=(1, 3))
-            total_count += int(b1 - b0) * int(base_bch.shape[-1])
-        score_sc = score_sum_sc / max(float(total_count), 1.0)
-        best_idx_c = score_sc.argmin(dim=0)
-        scales_c[c0:c1] = scale_grid.index_select(0, best_idx_c)
-        scores_c[c0:c1] = score_sc.gather(0, best_idx_c.view(1, -1)).squeeze(0)
-    return scales_c.detach(), scores_c.detach()
-
-
-def select_channel_horizon_anchor_scales(
-    base_bch: torch.Tensor,
-    anchor_bch: torch.Tensor,
-    target_bch: torch.Tensor,
-    *,
-    metric: str = "mse",
-    max_scale: float = 1.0,
-    steps: int = 21,
-    segments: int = 4,
-    channel_chunk_size: int = 8,
-    sample_chunk_size: int = 256,
-    scale_chunk_size: int = 32,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if base_bch.shape != anchor_bch.shape or base_bch.shape != target_bch.shape:
-        raise ValueError("base, anchor, and target tensors must have the same [batch, channel, horizon] shape.")
-    metric = str(metric).lower()
-    if metric not in {"mse", "mae"}:
-        raise ValueError("train_stat_anchor_expert.scale_selection.metric must be mse or mae.")
-    steps = max(2, int(steps))
-    segments = max(1, int(segments))
-    horizon = int(base_bch.shape[-1])
-    scale_grid = torch.linspace(
-        0.0,
-        float(max_scale),
-        steps,
-        device=base_bch.device,
-        dtype=base_bch.dtype,
-    )
-    scales_cs = torch.zeros(int(base_bch.shape[1]), segments, device=base_bch.device, dtype=base_bch.dtype)
-    scores_cs = torch.zeros_like(scales_cs)
-    channel_count = int(base_bch.shape[1])
-    chunk_size = max(1, min(channel_count, int(channel_chunk_size))) if channel_count > 0 else 1
-    sample_chunk = max(1, int(sample_chunk_size))
-    scale_chunk = max(1, int(scale_chunk_size))
-    for segment in range(segments):
-        start = (segment * horizon) // segments
-        end = ((segment + 1) * horizon) // segments
-        if end <= start:
-            end = min(horizon, start + 1)
-        for c0 in range(0, channel_count, chunk_size):
-            c1 = min(channel_count, c0 + chunk_size)
-            width = int(c1 - c0)
-            best_score_c = torch.full((width,), float("inf"), device=base_bch.device, dtype=base_bch.dtype)
-            best_scale_c = torch.zeros((width,), device=base_bch.device, dtype=base_bch.dtype)
-            for s0 in range(0, int(scale_grid.numel()), scale_chunk):
-                s1 = min(int(scale_grid.numel()), s0 + scale_chunk)
-                local_grid = scale_grid[s0:s1]
-                score_sum_sc = torch.zeros((int(local_grid.numel()), width), device=base_bch.device, dtype=base_bch.dtype)
-                total_count = 0
-                for b0 in range(0, int(base_bch.shape[0]), sample_chunk):
-                    b1 = min(int(base_bch.shape[0]), b0 + sample_chunk)
-                    base_seg = base_bch[b0:b1, c0:c1, start:end]
-                    anchor_seg = anchor_bch[b0:b1, c0:c1, start:end]
-                    target_seg = target_bch[b0:b1, c0:c1, start:end]
-                    cand_sbch = base_seg.unsqueeze(0) + local_grid.view(-1, 1, 1, 1) * (
-                        anchor_seg - base_seg
-                    ).unsqueeze(0)
-                    err_sbch = cand_sbch - target_seg.unsqueeze(0)
-                    if metric == "mae":
-                        score_sum_sc += err_sbch.abs().sum(dim=(1, 3))
-                    else:
-                        score_sum_sc += err_sbch.pow(2).sum(dim=(1, 3))
-                    total_count += int(b1 - b0) * int(end - start)
-                score_sc = score_sum_sc / max(float(total_count), 1.0)
-                local_best_idx_c = score_sc.argmin(dim=0)
-                local_score_c = score_sc.gather(0, local_best_idx_c.view(1, -1)).squeeze(0)
-                local_scale_c = local_grid.index_select(0, local_best_idx_c)
-                update_c = local_score_c < best_score_c
-                best_score_c = torch.where(update_c, local_score_c, best_score_c)
-                best_scale_c = torch.where(update_c, local_scale_c, best_scale_c)
-            scales_cs[c0:c1, segment] = best_scale_c
-            scores_cs[c0:c1, segment] = best_score_c
-    return scales_cs.detach(), scores_cs.detach()
-
-
-@torch.no_grad()
-def select_train_stat_anchor_scales_from_loader(
-    *,
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    history_anchor_cfg: Optional[dict],
-    observed_history_tc: Optional[torch.Tensor],
-    input_len: int,
-    eval_start: int,
-    stat_anchor_pc: torch.Tensor,
-    train_stat_anchor_cfg: dict,
-    metric: str,
-    max_scale: float,
-    steps: int,
-    horizon_segments: int = 1,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    if len(loader) == 0:
-        raise ValueError("train_stat_anchor_expert.scale_selection requires a non-empty validation loader.")
-    model.eval()
-    base_parts: List[torch.Tensor] = []
-    anchor_parts: List[torch.Tensor] = []
-    target_parts: List[torch.Tensor] = []
-    unit_cfg = dict(train_stat_anchor_cfg)
-    unit_cfg["enable"] = True
-    unit_cfg["alpha"] = 1.0
-    unit_cfg.pop("alpha_by_channel", None)
-    unit_cfg.pop("alpha_by_channel_horizon", None)
-    unit_cfg.pop("alpha_horizon_segments", None)
-    combine_mode = str(unit_cfg.get("combine_mode", "blend")).lower()
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        query_start_abs_b = int(eval_start) + idx
-        if bool((model_train_stat_adapter_cfg or {}).get("enable", False)) and bool(
-            (model_train_stat_adapter_cfg or {}).get("input_center", False)
-        ):
-            x_model = apply_train_stat_input_centering(
-                x,
-                query_start_abs_b=query_start_abs_b,
-                stat_anchor_pc=model_train_stat_adapter_pc,
-                cfg=model_train_stat_adapter_cfg,
-            )
-        else:
-            x_model = apply_train_stat_input_centering(
-                x,
-                query_start_abs_b=query_start_abs_b,
-                stat_anchor_pc=stat_anchor_pc,
-                cfg=train_stat_anchor_cfg,
-            )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_anchor = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=stat_anchor_pc,
-            cfg=unit_cfg,
-        )
-        if combine_mode == "anchor_plus_prediction":
-            anchor_only = y_anchor - y_base
-            base_parts.append(anchor_only.detach().cpu())
-            anchor_parts.append(y_anchor.detach().cpu())
-        else:
-            base_parts.append(y_base.detach().cpu())
-            anchor_parts.append(y_anchor.detach().cpu())
-        target_parts.append(y.detach().cpu())
-    base_bch = torch.cat(base_parts, dim=0)
-    anchor_bch = torch.cat(anchor_parts, dim=0)
-    target_bch = torch.cat(target_parts, dim=0)
-    if int(horizon_segments) > 1:
-        scales, scores = select_channel_horizon_anchor_scales(
-            base_bch,
-            anchor_bch,
-            target_bch,
-            metric=metric,
-            max_scale=float(max_scale),
-            steps=int(steps),
-            segments=int(horizon_segments),
-        )
-    else:
-        scales, scores = select_channel_anchor_scales(
-            base_bch,
-            anchor_bch,
-            target_bch,
-            metric=metric,
-            max_scale=float(max_scale),
-            steps=int(steps),
-        )
-    return scales, scores, int(base_bch.shape[0])
-
-
-@torch.no_grad()
-def build_train_residual_anchor_table_from_loader(
-    *,
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    history_anchor_cfg: Optional[dict],
-    observed_history_tc: Optional[torch.Tensor],
-    input_len: int,
-    eval_start: int,
-    period: int,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_stat_anchor_cfg: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    if len(loader) == 0:
-        raise ValueError("train_residual_anchor_expert requires a non-empty train loader.")
-    if int(period) <= 0:
-        raise ValueError("train_residual_anchor_expert.period must be positive.")
-    model.eval()
-    period = int(period)
-    table_sum_phc: Optional[torch.Tensor] = None
-    global_sum_hc: Optional[torch.Tensor] = None
-    counts_p: Optional[torch.Tensor] = None
-    n_windows = 0
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=train_stat_anchor_pc,
-            cfg=train_stat_anchor_cfg,
-        )
-        residual_bhc = (y.detach() - y_base.detach()).permute(0, 2, 1).contiguous().cpu()
-        if table_sum_phc is None:
-            horizon = int(residual_bhc.shape[1])
-            channel_count = int(residual_bhc.shape[2])
-            table_sum_phc = torch.zeros(period, horizon, channel_count, dtype=residual_bhc.dtype)
-            global_sum_hc = torch.zeros(horizon, channel_count, dtype=residual_bhc.dtype)
-            counts_p = torch.zeros(period, dtype=torch.long)
-        phases_b = (query_start_abs_b.detach().cpu().to(dtype=torch.long) + int(input_len)) % period
-        table_sum_phc.index_add_(0, phases_b, residual_bhc)
-        counts_p.index_add_(0, phases_b, torch.ones_like(phases_b, dtype=torch.long))
-        global_sum_hc += residual_bhc.sum(dim=0)
-        n_windows += int(residual_bhc.shape[0])
-    if table_sum_phc is None or global_sum_hc is None or counts_p is None or n_windows <= 0:
-        raise ValueError("train_residual_anchor_expert requires at least one train window.")
-    table_phc = table_sum_phc
-    global_mean_hc = global_sum_hc / float(n_windows)
-    nonempty = counts_p > 0
-    if bool(nonempty.any()):
-        table_phc[nonempty] = table_phc[nonempty] / counts_p[nonempty].to(dtype=table_phc.dtype).view(-1, 1, 1)
-    if bool((~nonempty).any()):
-        table_phc[~nonempty] = global_mean_hc
-    return table_phc, counts_p, int(n_windows)
-
-
-@torch.no_grad()
-def select_train_residual_anchor_scales_from_loader(
-    *,
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    history_anchor_cfg: Optional[dict],
-    observed_history_tc: Optional[torch.Tensor],
-    input_len: int,
-    eval_start: int,
-    residual_anchor_phc: torch.Tensor,
-    train_residual_anchor_cfg: dict,
-    metric: str,
-    max_scale: float,
-    steps: int,
-    horizon_segments: int = 1,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_stat_anchor_cfg: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    if len(loader) == 0:
-        raise ValueError("train_residual_anchor_expert.scale_selection requires a non-empty validation loader.")
-    model.eval()
-    unit_cfg = dict(train_residual_anchor_cfg)
-    unit_cfg["enable"] = True
-    unit_cfg["alpha"] = 1.0
-    unit_cfg.pop("alpha_by_channel", None)
-    unit_cfg.pop("alpha_by_channel_horizon", None)
-    metric = str(metric).lower()
-    if metric not in {"mse", "mae"}:
-        raise ValueError("train_residual_anchor_expert.scale_selection.metric must be mse or mae.")
-    steps = max(2, int(steps))
-    segments = max(1, int(horizon_segments))
-    scale_grid: Optional[torch.Tensor] = None
-    score_sum_scs: Optional[torch.Tensor] = None
-    total_count_s: Optional[torch.Tensor] = None
-    n_windows = 0
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=train_stat_anchor_pc,
-            cfg=train_stat_anchor_cfg,
-        )
-        y_anchor = apply_train_residual_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            residual_anchor_phc=residual_anchor_phc,
-            cfg=unit_cfg,
-        )
-        base_cpu = y_base.detach().cpu()
-        anchor_cpu = y_anchor.detach().cpu()
-        target_cpu = y.detach().cpu()
-        batch_size = int(base_cpu.shape[0])
-        horizon = int(base_cpu.shape[-1])
-        channel_count = int(base_cpu.shape[1])
-        if score_sum_scs is None:
-            scale_grid = torch.linspace(0.0, float(max_scale), steps, dtype=base_cpu.dtype)
-            score_sum_scs = torch.zeros(steps, channel_count, segments, dtype=base_cpu.dtype)
-            total_count_s = torch.zeros(segments, dtype=base_cpu.dtype)
-        assert scale_grid is not None and score_sum_scs is not None and total_count_s is not None
-        if int(score_sum_scs.shape[1]) != channel_count:
-            raise ValueError(
-                "train_residual_anchor_expert.scale_selection saw inconsistent channel counts: "
-                f"{int(score_sum_scs.shape[1])} vs {channel_count}"
-            )
-        diff_cpu = anchor_cpu - base_cpu
-        for segment in range(segments):
-            start = (segment * horizon) // segments
-            end = ((segment + 1) * horizon) // segments
-            if end <= start:
-                end = min(horizon, start + 1)
-            base_seg = base_cpu[:, :, start:end]
-            diff_seg = diff_cpu[:, :, start:end]
-            target_seg = target_cpu[:, :, start:end]
-            for s0 in range(0, steps, 32):
-                s1 = min(steps, s0 + 32)
-                local_grid = scale_grid[s0:s1]
-                pred_sbch = base_seg.unsqueeze(0) + local_grid.view(-1, 1, 1, 1) * diff_seg.unsqueeze(0)
-                err_sbch = pred_sbch - target_seg.unsqueeze(0)
-                if metric == "mae":
-                    score_sum_scs[s0:s1, :, segment] += err_sbch.abs().sum(dim=(1, 3))
-                else:
-                    score_sum_scs[s0:s1, :, segment] += err_sbch.pow(2).sum(dim=(1, 3))
-            total_count_s[segment] += float(batch_size * int(end - start))
-        n_windows += batch_size
-    if score_sum_scs is None or total_count_s is None or scale_grid is None or n_windows <= 0:
-        raise ValueError("train_residual_anchor_expert.scale_selection requires at least one validation window.")
-    score_scs = score_sum_scs / total_count_s.view(1, 1, segments).clamp_min(1.0)
-    best_idx_cs = score_scs.argmin(dim=0)
-    scales_cs = scale_grid.index_select(0, best_idx_cs.reshape(-1)).reshape(best_idx_cs.shape)
-    scores_cs = score_scs.gather(0, best_idx_cs.unsqueeze(0)).squeeze(0)
-    if segments <= 1:
-        return scales_cs[:, 0].detach(), scores_cs[:, 0].detach(), int(n_windows)
-    return scales_cs.detach(), scores_cs.detach(), int(n_windows)
-
-
-@torch.no_grad()
-def eval_loop(
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    lambda_kp: torch.Tensor,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    select_ranks: List[int] = None,
-    collect_plot: bool = False,
-    plot_idx: torch.Tensor = None,
-    channel_count: int = None,
-    mse_weight: float = 1.0,
-    gate_entropy_weight: float = 0.0,
-    gate_balance_weight: float = 0.0,
-    gate_soft_weight: float = 0.0,
-    gate_entropy_target_frac: float = 0.0,
-    gate_feature_mode: str = "history",
-    penalty_scale: torch.Tensor = None,
-    dynamic_lambda: ClusterwiseDynamicLambda = None,
-    lambda_min_kp: torch.Tensor = None,
-    mae_objective_weight=0.0,
-    mae_objective_kind: str = "l1",
-    mae_objective_beta: float = 1.0,
-    pred_residual: Optional[ClusterwisePredResidualMoE] = None,
-    pred_residual_selector: Optional[nn.Module] = None,
-    pred_residual_scale_c: Optional[torch.Tensor] = None,
-    eval_start: int = 0,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    calendar_feature_tf: Optional[torch.Tensor] = None,
-    calendar_residual_coef_cf: Optional[torch.Tensor] = None,
-    diagnostic_collector: Optional[Dict[str, object]] = None,
-):
-    model.eval()
-    gate.eval()
-    if dynamic_lambda is not None:
-        dynamic_lambda.eval()
-    if pred_residual is not None:
-        pred_residual.eval()
-
-    moe_enable = bool(moe_cfg.get("enable", True))
-    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
-    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
-    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
-    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
-    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
-    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
-    moe_history_anchor_expert_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
-    train_stat_anchor_expert_cfg = moe_cfg.get("train_stat_anchor_expert", {}) or {}
-    train_residual_anchor_expert_cfg = moe_cfg.get("train_residual_anchor_expert", {}) or {}
-
-    P = len(penalty_names)
-    total_loss_sum = torch.zeros(K, device=device)
-    total_cnt = torch.zeros(K, device=device)
-    mse_loss_sum = torch.zeros(K, device=device)
-    mae_loss_sum = torch.zeros(K, device=device)
-
-    # per-channel metrics
-    se_c = torch.zeros(channel_count, device=device)
-    ae_c = torch.zeros(channel_count, device=device)
-    denom = 0
-
-    plot_cache = {}  # idx -> (x[C,L], y[C,H], yhat[C,H])
-    best_sample = {}   # c -> (x[L], y[H], yhat[H], mse)
-    worst_sample = {}  # c -> (x[L], y[H], yhat[H], mse)
-    best_mse = torch.full((channel_count,), float("inf"), device=device)
-    worst_mse = torch.full((channel_count,), -float("inf"), device=device)
-
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-
-        query_start_abs_b = eval_start + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        yhat_base_raw = model(x_model, cluster_id_c)
-        yhat_base = apply_history_anchor_adapter(
-            yhat_base_raw,
-            base_pred_bch=yhat_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len or x.shape[-1]),
-            cfg=history_anchor_cfg,
-        )
-        yhat_base = apply_train_stat_anchor_expert(
-            yhat_base,
-            base_pred_bch=yhat_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len or x.shape[-1]),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-
-        # Route on the base prediction. This keeps the router's penalty
-        # context independent from the residual expert it is selecting.
-        feat_bcf = extract_gate_features(x)            # [B,C,F]
-        feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F] for dynamic lambda
-        gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
-        series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
-        route_pen_bkp = _router_penalty_context_from_history(
-            x_bcl=x,
-            yhat_base_bch=yhat_base,
-            penalty_names=penalty_names,
-            penalty_fns=penalty_fns,
-            penalty_scale=penalty_scale,
-            cluster_id_c=cluster_id_c,
-            K=K,
-        )
-
-        if moe_enable and P > 0:
-            straight_through = (not moe_cfg["detach_penalty_grad"])
-            mask_bkp, probs_bkp, skip_bk, _ = gate(
-                gate_feat_bkf,
-                straight_through=straight_through,
-                penalty_context_bkp=route_pen_bkp,
-                penalty_context_mode=router_mode,
-                penalty_context_weight=router_penalty_context_weight,
-                penalty_context_detach=router_detach_penalty_context,
-                penalty_context_score=router_penalty_context_score,
-            )
-            rank_mask = None
-            if select_ranks is not None:
-                mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=straight_through)
-                rank_mask = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
-            if gate_soft_weight > 0.0:
-                probs_sel = probs_bkp
-                if rank_mask is not None:
-                    probs_sel = probs_sel * rank_mask
-                    probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
-                probs_sel = probs_sel * target_mass
-                mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
-        else:
-            mask_bkp = torch.zeros_like(route_pen_bkp)
-            probs_bkp = None
-            skip_bk = None
-
-        yhat_residual_raw = yhat_base
-        residual_gate_scale = None
-        output_anchors_applied = False
-        if pred_residual is not None and moe_enable and P > 0:
-            pred_out = pred_residual(
-                x,
-                yhat_base,
-                cluster_id_c,
-                mask_bkp,
-                skip_bk=skip_bk if allow_skip else None,
-                query_start_abs_b=query_start_abs_b,
-            )
-            yhat_residual_raw = pred_out["y_final"]
-            yhat = yhat_residual_raw
-            if pred_residual_selector is not None:
-                pred_residual_selector.eval()
-                selector_base_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
-                    yhat_base,
-                    pred_out,
-                    pred_residual_scale_c=pred_residual_scale_c,
-                    apply_output_anchors=True,
-                    x_bcl=x,
-                    query_start_abs_b=query_start_abs_b,
-                    input_len=int(input_len or x.shape[-1]),
-                    moe_cfg=moe_cfg,
-                    moe_enable=moe_enable,
-                    observed_history_tc=observed_history_tc,
-                    train_stat_anchor_pc=train_stat_anchor_pc,
-                    train_residual_anchor_phc=train_residual_anchor_phc,
-                )
-                if cand_bcpH is not None:
-                    yhat, _ = pred_residual_selector.select_prediction(x, selector_base_bch, cand_bcpH)
-                    yhat_residual_raw = yhat
-                    output_anchors_applied = True
-            elif pred_residual_scale_c is not None:
-                scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
-                residual_gate_scale = scale.expand(yhat.shape[0], -1, -1)
-                yhat = yhat_base + scale * (yhat - yhat_base)
-        else:
-            yhat = yhat_base
-
-        if not output_anchors_applied:
-            yhat = apply_moe_output_anchor_experts(
-                yhat,
-                base_pred_bch=yhat_base,
-                x_bcl=x,
-                query_start_abs_b=query_start_abs_b,
-                input_len=int(input_len or x.shape[-1]),
-                moe_cfg=moe_cfg,
-                moe_enable=moe_enable,
-                observed_history_tc=observed_history_tc,
-                train_stat_anchor_pc=train_stat_anchor_pc,
-                train_residual_anchor_phc=train_residual_anchor_phc,
-            )
-
-        yhat = apply_calendar_residual_correction(
-            yhat,
-            calendar_feature_tf=calendar_feature_tf,
-            calendar_residual_coef_cf=calendar_residual_coef_cf,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len or x.shape[-1]),
-        )
-
-        if diagnostic_collector is not None:
-            limit = int(diagnostic_collector.get("limit", 0))
-            count = int(diagnostic_collector.get("count", 0))
-            selected_idx = diagnostic_collector.get("indices")
-            if selected_idx is not None:
-                selected_idx = selected_idx.to(device=idx.device, dtype=torch.long)
-                take_pos = torch.isin(idx, selected_idx).nonzero(as_tuple=False).view(-1)
-                remaining = max(0, limit - count)
-                if int(take_pos.numel()) > remaining:
-                    take_pos = take_pos[:remaining]
-            else:
-                take = max(0, min(int(x.shape[0]), limit - count))
-                take_pos = torch.arange(take, device=x.device, dtype=torch.long)
-            if int(take_pos.numel()) > 0:
-                parts = diagnostic_collector.setdefault("parts", {})
-                parts.setdefault("idx", []).append((eval_start + idx.index_select(0, take_pos)).detach().cpu())
-                parts.setdefault("x", []).append(x.index_select(0, take_pos).detach().cpu())
-                parts.setdefault("y_true", []).append(y.index_select(0, take_pos).detach().cpu())
-                parts.setdefault("y_base", []).append(yhat_base.index_select(0, take_pos).detach().cpu())
-                parts.setdefault("y_residual_raw", []).append(yhat_residual_raw.index_select(0, take_pos).detach().cpu())
-                parts.setdefault("y_final", []).append(yhat.index_select(0, take_pos).detach().cpu())
-                if probs_bkp is not None:
-                    parts.setdefault("gate_probs", []).append(probs_bkp.index_select(0, take_pos).detach().cpu())
-                if mask_bkp is not None:
-                    parts.setdefault("gate_mask", []).append(mask_bkp.index_select(0, take_pos).detach().cpu())
-                if skip_bk is not None:
-                    parts.setdefault("skip_prob", []).append(skip_bk.index_select(0, take_pos).detach().cpu())
-                if residual_gate_scale is not None:
-                    parts.setdefault("residual_gate_scale", []).append(
-                        residual_gate_scale.index_select(0, take_pos).detach().cpu()
-                    )
-                diagnostic_collector["count"] = count + int(take_pos.numel())
-
-        # base error metrics per channel
-        err_bch = yhat - y
-        abs_err_bch = err_bch.abs()
-        mse_bc = err_bch.pow(2).mean(dim=-1)  # [B,C]
-        mae_bc = abs_err_bch.mean(dim=-1)  # [B,C]
-        mse_bk = scatter_mean_bc_to_bk(mse_bc, cluster_id_c, K)  # [B,K]
-        mae_bk = scatter_mean_bc_to_bk(mae_bc, cluster_id_c, K)  # [B,K]
-        mse_loss_sum += mse_bk.sum(dim=0)
-        mae_loss_sum += mae_bk.sum(dim=0)
-
-        # penalties on the final prediction.
-        if P > 0:
-            pen_bcp = []
-            for name in penalty_names:
-                pen_bc = penalty_fns[name](yhat, y)  # [B,C]
-                pen_bcp.append(pen_bc)
-            pen_bcp = torch.stack(pen_bcp, dim=-1)  # [B,C,P]
-            pen_bcp = normalize_penalties(pen_bcp, scale=penalty_scale)
-            pen_bkp = scatter_mean_bcf_to_bkf(pen_bcp, cluster_id_c, K)  # [B,K,P]
-        else:
-            pen_bkp = route_pen_bkp
-        # loss per cluster
-        lam = _compute_lambda_bkp(
-            base_lambda_kp=lambda_kp,
-            feat_bkf=feat_bkf,
-            series_bkl=series_bkl,
-            dynamic_lambda=dynamic_lambda,
-            lambda_min_kp=lambda_min_kp,
-        )
-        # Validation/test objective excludes gate regularizers; they are training-only priors.
-        penalty_loss_bk = (mask_bkp * lam * pen_bkp).sum(dim=-1)
-        penalty_loss_bk = _apply_skip_to_penalty_loss(
-            penalty_loss_bk,
-            skip_bk=skip_bk if allow_skip else None,
-            skip_cost=0.0,
-        )
-        if _mae_objective_weight_is_nonzero(mae_objective_weight):
-            mae_objective_bc = _mae_objective_bc_from_abs(
-                abs_err_bch,
-                kind=mae_objective_kind,
-                beta=mae_objective_beta,
-            )
-            mae_objective_bk = scatter_mean_bc_to_bk(mae_objective_bc, cluster_id_c, K)
-        else:
-            mae_objective_bk = torch.zeros_like(mse_bk)
-        loss_bk = (mse_weight * mse_bk) + _apply_mae_objective_weight(mae_objective_bk, mae_objective_weight) + penalty_loss_bk  # [B,K]
-        total_loss_sum += loss_bk.sum(dim=0)
-        total_cnt += torch.tensor([x.shape[0]], device=device).expand_as(total_cnt)
-
-        # per-channel metrics
-        accumulate_channel_errors(se_c, ae_c, yhat, y)
-        denom += int(x.shape[0] * y.shape[2])
-
-        # Track best/worst sample per channel by window MSE.
-        win_mse_bc = (yhat - y).pow(2).mean(dim=-1)  # [B,C]
-
-        for b in range(x.shape[0]):
-            cur = win_mse_bc[b]  # [C]
-            better = cur < best_mse
-            worse = cur > worst_mse
-            if better.any():
-                idxs = better.nonzero(as_tuple=False).view(-1).tolist()
-                for c in idxs:
-                    best_mse[c] = cur[c]
-                    best_sample[c] = (x[b, c].detach().cpu(), y[b, c].detach().cpu(), yhat[b, c].detach().cpu(), float(cur[c].item()))
-            if worse.any():
-                idxs = worse.nonzero(as_tuple=False).view(-1).tolist()
-                for c in idxs:
-                    worst_mse[c] = cur[c]
-                    worst_sample[c] = (x[b, c].detach().cpu(), y[b, c].detach().cpu(), yhat[b, c].detach().cpu(), float(cur[c].item()))
-
-        # Cache selected windows for plotting.
-        if collect_plot and plot_idx is not None:
-            # idx: [B]
-            idx = idx.to(device)
-            hit = torch.isin(idx, plot_idx)
-            if hit.any():
-                hit_pos = hit.nonzero(as_tuple=False).view(-1)
-                for p in hit_pos.tolist():
-                    gidx = int(idx[p].item())
-                    if gidx not in plot_cache:
-                        plot_cache[gidx] = (x[p].detach().cpu(), y[p].detach().cpu(), yhat[p].detach().cpu())
-
-    avg_loss_k = total_loss_sum / total_cnt.clamp_min(1.0)
-    avg_mse_k = mse_loss_sum / total_cnt.clamp_min(1.0)
-    avg_mae_k = mae_loss_sum / total_cnt.clamp_min(1.0)
-    mse_c, mae_c = mse_mae_from_sums(se_c, ae_c, denom)
-    return avg_loss_k, avg_mse_k, avg_mae_k, mse_c.detach().cpu(), mae_c.detach().cpu(), plot_cache, best_sample, worst_sample
-
-
-@torch.no_grad()
-
-
-@torch.no_grad()
-
-
-def _calendar_features_from_datetime(
-    dates: pd.Series | pd.DatetimeIndex,
-    cfg: dict,
-) -> Tuple[torch.Tensor, List[str]]:
-    dt = pd.to_datetime(dates, errors="coerce")
-    if isinstance(dt, pd.Series):
-        dt = pd.DatetimeIndex(dt)
-    if dt.isna().any():
-        raise ValueError("calendar_residual requires parseable timestamps in data.date_col.")
-
-    features: List[np.ndarray] = []
-    names: List[str] = []
-    if bool(cfg.get("include_bias", True)):
-        features.append(np.ones(len(dt), dtype=np.float32))
-        names.append("bias")
-
-    harmonics = max(1, int(cfg.get("tod_harmonics", cfg.get("harmonics", 2))))
-    if bool(cfg.get("time_of_day", True)):
-        seconds = (
-            dt.hour.to_numpy(dtype=np.float32) * 3600.0
-            + dt.minute.to_numpy(dtype=np.float32) * 60.0
-            + dt.second.to_numpy(dtype=np.float32)
-        )
-        phase = seconds / float(24 * 3600)
-        for h in range(1, harmonics + 1):
-            angle = (2.0 * math.pi * float(h)) * phase
-            features.append(np.sin(angle).astype(np.float32))
-            names.append(f"tod_sin_{h}")
-            features.append(np.cos(angle).astype(np.float32))
-            names.append(f"tod_cos_{h}")
-
-    if bool(cfg.get("day_of_week", True)):
-        phase = dt.dayofweek.to_numpy(dtype=np.float32) / 7.0
-        angle = 2.0 * math.pi * phase
-        features.append(np.sin(angle).astype(np.float32))
-        names.append("dow_sin")
-        features.append(np.cos(angle).astype(np.float32))
-        names.append("dow_cos")
-
-    if bool(cfg.get("month_of_year", False)):
-        phase = (dt.month.to_numpy(dtype=np.float32) - 1.0) / 12.0
-        angle = 2.0 * math.pi * phase
-        features.append(np.sin(angle).astype(np.float32))
-        names.append("month_sin")
-        features.append(np.cos(angle).astype(np.float32))
-        names.append("month_cos")
-
-    if len(features) == 0:
-        raise ValueError("calendar_residual must enable at least one feature.")
-    return torch.from_numpy(np.stack(features, axis=1).astype(np.float32)), names
-
-
-def build_calendar_feature_tensor(csv_path: str, date_col: int, max_rows: int, cfg: dict) -> Tuple[torch.Tensor, List[str]]:
-    df = pd.read_csv(csv_path, usecols=[int(date_col)])
-    if int(max_rows or 0) > 0:
-        df = df.iloc[: int(max_rows)]
-    return _calendar_features_from_datetime(df.iloc[:, 0], cfg)
-
-
-def calendar_feature_batch(
-    calendar_feature_tf: torch.Tensor,
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-    pred_len: int,
-) -> torch.Tensor:
-    device = query_start_abs_b.device
-    steps_h = torch.arange(int(pred_len), device=device, dtype=torch.long)
-    idx_bh = query_start_abs_b.to(device=device, dtype=torch.long).view(-1, 1) + int(input_len) + steps_h.view(1, -1)
-    if int(idx_bh.min().item()) < 0 or int(idx_bh.max().item()) >= int(calendar_feature_tf.shape[0]):
-        raise ValueError("calendar_residual forecast index is outside timestamp range.")
-    flat = idx_bh.reshape(-1)
-    feat = calendar_feature_tf.to(device=device).index_select(0, flat)
-    return feat.view(idx_bh.shape[0], idx_bh.shape[1], int(calendar_feature_tf.shape[1]))
-
-
-def apply_calendar_residual_correction(
-    yhat_bch: torch.Tensor,
-    calendar_feature_tf: Optional[torch.Tensor],
-    calendar_residual_coef_cf: Optional[torch.Tensor],
-    query_start_abs_b: torch.Tensor,
-    input_len: int,
-) -> torch.Tensor:
-    if calendar_feature_tf is None or calendar_residual_coef_cf is None:
-        return yhat_bch
-    feat_bhf = calendar_feature_batch(
-        calendar_feature_tf=calendar_feature_tf,
-        query_start_abs_b=query_start_abs_b,
-        input_len=int(input_len),
-        pred_len=int(yhat_bch.shape[-1]),
-    ).to(device=yhat_bch.device, dtype=yhat_bch.dtype)
-    coef_cf = calendar_residual_coef_cf.to(device=yhat_bch.device, dtype=yhat_bch.dtype)
-    return yhat_bch + torch.einsum("bhf,cf->bch", feat_bhf, coef_cf)
-
-
-def _solve_calendar_residual_coefficients(
-    xtx: torch.Tensor,
-    xty: Optional[torch.Tensor],
-    n_rows: int,
-    n_windows: int,
-    cfg: dict,
-) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
-    if xty is None or n_rows <= 0:
-        return None, {"enable": False, "reason": "no_fit_rows"}
-    feat_dim = int(xtx.shape[0])
-    ridge = max(0.0, float(cfg.get("ridge", 1.0e-3)))
-    shrink = float(cfg.get("shrink", 1.0))
-    max_abs = float(cfg.get("max_abs", 0.0))
-    eye = torch.eye(feat_dim, dtype=torch.float64, device=xtx.device)
-    if not bool(cfg.get("regularize_bias", False)) and feat_dim > 0:
-        eye[0, 0] = 0.0
-    coef_fc = torch.linalg.solve(xtx + ridge * eye, xty)
-    coef_cf = coef_fc.transpose(0, 1).to(dtype=torch.float32) * float(shrink)
-    if max_abs > 0.0:
-        coef_cf = coef_cf.clamp(min=-max_abs, max=max_abs)
-    return coef_cf.detach(), {
-        "enable": True,
-        "source_split": str(cfg.get("source_split", "train")),
-        "fit_windows": int(n_windows),
-        "fit_rows": int(n_rows),
-        "feature_dim": int(feat_dim),
-        "ridge": float(ridge),
-        "shrink": float(shrink),
-        "max_abs": float(max_abs),
-        "coef_mean_abs": float(coef_cf.abs().mean().item()),
-        "coef_max_abs": float(coef_cf.abs().max().item()),
-    }
-
-
-def _fit_calendar_residual_from_prediction_parts(
-    idx_parts: List[torch.Tensor],
-    y_true_parts: List[torch.Tensor],
-    y_pred_parts: List[torch.Tensor],
-    calendar_feature_tf: torch.Tensor,
-    input_len: int,
-    cfg: dict,
-) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
-    if len(idx_parts) == 0:
-        return None, {"enable": False, "reason": "empty_prediction_parts"}
-    device = calendar_feature_tf.device
-    feat_dim = int(calendar_feature_tf.shape[1])
-    xtx = torch.zeros((feat_dim, feat_dim), dtype=torch.float64, device=device)
-    xty = None
-    n_rows = 0
-    n_windows = 0
-    max_windows = int(cfg.get("max_windows", 0) or 0)
-    for idx_part, y_true_part, y_pred_part in zip(idx_parts, y_true_parts, y_pred_parts):
-        if max_windows > 0 and n_windows >= max_windows:
-            break
-        idx = idx_part.to(device=device, dtype=torch.long)
-        y_true = y_true_part.to(device=device)
-        y_pred = y_pred_part.to(device=device, dtype=y_true.dtype)
-        if max_windows > 0 and n_windows + int(idx.shape[0]) > max_windows:
-            keep = max(0, max_windows - n_windows)
-            idx = idx[:keep]
-            y_true = y_true[:keep]
-            y_pred = y_pred[:keep]
-        feat_bhf = calendar_feature_batch(
-            calendar_feature_tf=calendar_feature_tf,
-            query_start_abs_b=idx,
-            input_len=int(input_len),
-            pred_len=int(y_true.shape[-1]),
-        ).to(device=device, dtype=torch.float64)
-        feat_nf = feat_bhf.reshape(-1, feat_dim)
-        residual_nc = (y_true - y_pred).permute(0, 2, 1).reshape(-1, y_true.shape[1]).to(dtype=torch.float64)
-        xtx += feat_nf.transpose(0, 1).matmul(feat_nf)
-        batch_xty = feat_nf.transpose(0, 1).matmul(residual_nc)
-        xty = batch_xty if xty is None else xty + batch_xty
-        n_rows += int(feat_nf.shape[0])
-        n_windows += int(idx.shape[0])
-    coef_cf, summary = _solve_calendar_residual_coefficients(
-        xtx=xtx,
-        xty=xty,
-        n_rows=n_rows,
-        n_windows=n_windows,
-        cfg=cfg,
-    )
-    summary["fit_target"] = "prediction_parts"
-    return coef_cf, summary
-
-
-@torch.no_grad()
-def fit_calendar_residual_correction(
-    model: nn.Module,
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    device: torch.device,
-    calendar_feature_tf: torch.Tensor,
-    input_len: int,
-    eval_start: int,
-    cfg: dict,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
-    if len(loader) == 0:
-        return None, {"enable": False, "reason": "empty_loader"}
-    max_windows = int(cfg.get("max_windows", 0) or 0)
-
-    model.eval()
-    feat_dim = int(calendar_feature_tf.shape[1])
-    xtx = torch.zeros((feat_dim, feat_dim), dtype=torch.float64, device=device)
-    xty = None
-    n_rows = 0
-    n_windows = 0
-
-    for x, y, idx in loader:
-        if max_windows > 0 and n_windows >= max_windows:
-            break
-        if max_windows > 0 and n_windows + int(x.shape[0]) > max_windows:
-            keep = max(0, max_windows - n_windows)
-            x = x[:keep]
-            y = y[:keep]
-            idx = idx[:keep]
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        yhat = model(x_model, cluster_id_c)
-        yhat = apply_history_anchor_adapter(
-            yhat,
-            base_pred_bch=yhat,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        feat_bhf = calendar_feature_batch(
-            calendar_feature_tf=calendar_feature_tf,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            pred_len=int(y.shape[-1]),
-        ).to(device=device, dtype=torch.float64)
-        feat_nf = feat_bhf.reshape(-1, feat_dim)
-        residual_nc = (y - yhat).permute(0, 2, 1).reshape(-1, y.shape[1]).to(dtype=torch.float64)
-        xtx += feat_nf.transpose(0, 1).matmul(feat_nf)
-        batch_xty = feat_nf.transpose(0, 1).matmul(residual_nc)
-        xty = batch_xty if xty is None else xty + batch_xty
-        n_rows += int(feat_nf.shape[0])
-        n_windows += int(x.shape[0])
-
-    coef_cf, summary = _solve_calendar_residual_coefficients(
-        xtx=xtx,
-        xty=xty,
-        n_rows=n_rows,
-        n_windows=n_windows,
-        cfg=cfg,
-    )
-    summary["fit_target"] = "base_path"
-    return coef_cf, summary
-
-
-@torch.no_grad()
-def fit_calendar_residual_correction_from_eval_path(
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    lambda_kp: torch.Tensor,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    calendar_feature_tf: torch.Tensor,
-    input_len: int,
-    cfg: dict,
-    channel_count: int,
-    select_ranks: Optional[List[int]] = None,
-    mse_weight: float = 1.0,
-    gate_entropy_weight: float = 0.0,
-    gate_balance_weight: float = 0.0,
-    gate_soft_weight: float = 0.0,
-    gate_entropy_target_frac: float = 0.0,
-    penalty_scale: Optional[torch.Tensor] = None,
-    dynamic_lambda: Optional[ClusterwiseDynamicLambda] = None,
-    lambda_min_kp: Optional[torch.Tensor] = None,
-    mae_objective_weight=0.0,
-    mae_objective_kind: str = "l1",
-    mae_objective_beta: float = 1.0,
-    pred_residual: Optional[ClusterwisePredResidualMoE] = None,
-    pred_residual_selector: Optional[nn.Module] = None,
-    pred_residual_scale_c: Optional[torch.Tensor] = None,
-    eval_start: int = 0,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
-    if len(loader) == 0:
-        return None, {"enable": False, "reason": "empty_loader"}
-    max_windows = int(cfg.get("max_windows", 0) or 0)
-    try:
-        loader_windows = int(len(loader.dataset))
-    except Exception:
-        loader_windows = int(len(loader))
-    collect_limit = loader_windows if max_windows <= 0 else min(loader_windows, max_windows)
-    diagnostic_collector: Dict[str, object] = {"limit": int(collect_limit), "count": 0, "parts": {}}
-    eval_loop(
-        model=model,
-        gate=gate,
-        lambda_kp=lambda_kp,
-        penalty_names=penalty_names,
-        penalty_fns=penalty_fns,
-        loader=loader,
-        cluster_id_c=cluster_id_c,
-        K=K,
-        moe_cfg=moe_cfg,
-        device=device,
-        select_ranks=select_ranks,
-        collect_plot=False,
-        channel_count=channel_count,
-        mse_weight=mse_weight,
-        gate_entropy_weight=gate_entropy_weight,
-        gate_balance_weight=gate_balance_weight,
-        gate_soft_weight=gate_soft_weight,
-        gate_entropy_target_frac=gate_entropy_target_frac,
-        penalty_scale=penalty_scale,
-        dynamic_lambda=dynamic_lambda,
-        lambda_min_kp=lambda_min_kp,
-        mae_objective_weight=mae_objective_weight,
-        mae_objective_kind=mae_objective_kind,
-        mae_objective_beta=mae_objective_beta,
-        pred_residual=pred_residual,
-        pred_residual_selector=pred_residual_selector,
-        pred_residual_scale_c=pred_residual_scale_c,
-        eval_start=eval_start,
-        history_anchor_cfg=history_anchor_cfg,
-        observed_history_tc=observed_history_tc,
-        input_len=input_len,
-        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
-        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
-        train_stat_anchor_pc=train_stat_anchor_pc,
-        train_residual_anchor_phc=train_residual_anchor_phc,
-        calendar_feature_tf=None,
-        calendar_residual_coef_cf=None,
-        diagnostic_collector=diagnostic_collector,
-    )
-    parts = diagnostic_collector.get("parts", {}) or {}
-    coef_cf, summary = _fit_calendar_residual_from_prediction_parts(
-        idx_parts=list(parts.get("idx", [])),
-        y_true_parts=list(parts.get("y_true", [])),
-        y_pred_parts=list(parts.get("y_final", [])),
-        calendar_feature_tf=calendar_feature_tf,
-        input_len=input_len,
-        cfg=cfg,
-    )
-    summary["fit_target"] = "final_eval_path"
-    summary["fit_eval_start"] = int(eval_start)
-    return coef_cf, summary
-
-
-CANDIDATE_DELTA_FEATURE_NAMES = [
-    "hist_mean",
-    "log_hist_std",
-    "hist_last",
-    "hist_range",
-    "hist_slope",
-    "delta_abs_mean",
-    "delta_abs_max",
-    "delta_std",
-    "delta_bias",
-    "base_std",
-    "hybrid_std",
-    "base_shift",
-    "hybrid_shift",
-]
-
-
-HISTORY_PROXY_SELECTOR_FEATURE_NAMES = [
-    "proxy_base_mse",
-    "proxy_hybrid_mse",
-    "proxy_mse_delta",
-    "proxy_base_mae",
-    "proxy_hybrid_mae",
-    "proxy_mae_delta",
-    "proxy_hybrid_bias",
-]
-
-
-SHAPE_PROXY_SELECTOR_FEATURE_NAMES = [
-    "hist_diff_rms",
-    "hist_d2_rms",
-    "base_slope",
-    "hybrid_slope",
-    "base_hist_slope_gap",
-    "hybrid_hist_slope_gap",
-    "hybrid_base_slope_delta",
-    "base_diff_rms",
-    "hybrid_diff_rms",
-    "hybrid_base_diff_rms_delta",
-    "base_d2_rms",
-    "hybrid_d2_rms",
-    "hybrid_base_d2_rms_delta",
-    "base_hist_corr",
-    "hybrid_hist_corr",
-    "hybrid_base_corr_delta",
-    "base_hist_std_ratio",
-    "hybrid_hist_std_ratio",
-    "hybrid_base_std_ratio_delta",
-]
-
-
-def _candidate_selector_feature_names(feature_mode: str = "base") -> List[str]:
-    mode = str(feature_mode or "base").lower()
-    if mode in {"base", "default"}:
-        return list(CANDIDATE_DELTA_FEATURE_NAMES)
-    if mode in {"history_proxy", "proxy"}:
-        return list(CANDIDATE_DELTA_FEATURE_NAMES) + list(HISTORY_PROXY_SELECTOR_FEATURE_NAMES)
-    if mode in {"shape_proxy", "shape", "rich_shape"}:
-        return list(CANDIDATE_DELTA_FEATURE_NAMES) + list(HISTORY_PROXY_SELECTOR_FEATURE_NAMES) + list(SHAPE_PROXY_SELECTOR_FEATURE_NAMES)
-    raise ValueError("candidate_selector.feature_mode must be base, history_proxy, or shape_proxy.")
-
-
-def _history_proxy_for_candidate_selector(x_bcl: torch.Tensor, pred_len: int) -> torch.Tensor:
-    H = int(pred_len)
-    if H <= 0:
-        raise ValueError("candidate selector history proxy requires pred_len > 0.")
-    L = int(x_bcl.shape[-1])
-    if L >= H:
-        return x_bcl[..., -H:]
-    return x_bcl[..., -1:].expand(*x_bcl.shape[:-1], H)
-
-
-def _sequence_slope_bch(values_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
-    if values_bch.shape[-1] <= 1:
-        return torch.zeros_like(values_bch[..., 0])
-    t = torch.linspace(-1.0, 1.0, steps=values_bch.shape[-1], device=values_bch.device, dtype=values_bch.dtype)
-    t = t.view(*([1] * (values_bch.dim() - 1)), -1)
-    centered = values_bch - values_bch.mean(dim=-1, keepdim=True)
-    return (centered * t).mean(dim=-1) / t.pow(2).mean().clamp_min(eps)
-
-
-def _sequence_diff_rms_bch(values_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
-    if values_bch.shape[-1] <= 1:
-        return torch.zeros_like(values_bch[..., 0])
-    return values_bch.diff(dim=-1).pow(2).mean(dim=-1).clamp_min(eps).sqrt()
-
-
-def _sequence_d2_rms_bch(values_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
-    if values_bch.shape[-1] <= 2:
-        return torch.zeros_like(values_bch[..., 0])
-    return values_bch.diff(dim=-1).diff(dim=-1).pow(2).mean(dim=-1).clamp_min(eps).sqrt()
-
-
-def _sequence_corr_bch(a_bch: torch.Tensor, b_bch: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
-    if a_bch.shape[-1] <= 1:
-        return torch.zeros_like(a_bch[..., 0])
-    a_center = a_bch - a_bch.mean(dim=-1, keepdim=True)
-    b_center = b_bch - b_bch.mean(dim=-1, keepdim=True)
-    denom = a_center.pow(2).mean(dim=-1).sqrt() * b_center.pow(2).mean(dim=-1).sqrt()
-    return (a_center * b_center).mean(dim=-1) / denom.clamp_min(eps)
-
-
-def _candidate_selector_features(
-    x_bcl: torch.Tensor,
-    base_bch: torch.Tensor,
-    hybrid_bch: torch.Tensor,
-    feature_mode: str = "base",
-) -> torch.Tensor:
-    base_feat = _candidate_delta_features(x_bcl, base_bch, hybrid_bch)
-    mode = str(feature_mode or "base").lower()
-    if mode in {"base", "default"}:
-        return base_feat
-    if mode not in {"history_proxy", "proxy", "shape_proxy", "shape", "rich_shape"}:
-        raise ValueError("candidate_selector.feature_mode must be base, history_proxy, or shape_proxy.")
-    eps = 1.0e-6
-    hist_std = x_bcl.std(dim=-1).clamp_min(eps)
-    hist_proxy = _history_proxy_for_candidate_selector(x_bcl, int(base_bch.shape[-1])).to(
-        device=base_bch.device,
-        dtype=base_bch.dtype,
-    )
-    scale2 = hist_std.pow(2).clamp_min(eps).to(device=base_bch.device, dtype=base_bch.dtype)
-    scale1 = hist_std.to(device=base_bch.device, dtype=base_bch.dtype)
-    base_proxy_mse = (base_bch - hist_proxy).pow(2).mean(dim=-1) / scale2
-    hybrid_proxy_mse = (hybrid_bch - hist_proxy).pow(2).mean(dim=-1) / scale2
-    base_proxy_mae = (base_bch - hist_proxy).abs().mean(dim=-1) / scale1
-    hybrid_proxy_mae = (hybrid_bch - hist_proxy).abs().mean(dim=-1) / scale1
-    proxy_extra = torch.stack(
-        [
-            base_proxy_mse,
-            hybrid_proxy_mse,
-            hybrid_proxy_mse - base_proxy_mse,
-            base_proxy_mae,
-            hybrid_proxy_mae,
-            hybrid_proxy_mae - base_proxy_mae,
-            (hybrid_bch - hist_proxy).mean(dim=-1) / scale1,
-        ],
-        dim=-1,
-    )
-    if mode in {"history_proxy", "proxy"}:
-        return torch.cat([base_feat, proxy_extra], dim=-1)
-
-    hist_proxy = hist_proxy.to(device=base_bch.device, dtype=base_bch.dtype)
-    hist_slope = _sequence_slope_bch(hist_proxy, eps=eps)
-    base_slope = _sequence_slope_bch(base_bch, eps=eps)
-    hybrid_slope = _sequence_slope_bch(hybrid_bch, eps=eps)
-    hist_diff_rms = _sequence_diff_rms_bch(hist_proxy, eps=eps).to(dtype=base_bch.dtype) / scale1
-    base_diff_rms = _sequence_diff_rms_bch(base_bch, eps=eps) / scale1
-    hybrid_diff_rms = _sequence_diff_rms_bch(hybrid_bch, eps=eps) / scale1
-    hist_d2_rms = _sequence_d2_rms_bch(hist_proxy, eps=eps).to(dtype=base_bch.dtype) / scale1
-    base_d2_rms = _sequence_d2_rms_bch(base_bch, eps=eps) / scale1
-    hybrid_d2_rms = _sequence_d2_rms_bch(hybrid_bch, eps=eps) / scale1
-    base_corr = _sequence_corr_bch(base_bch, hist_proxy, eps=eps)
-    hybrid_corr = _sequence_corr_bch(hybrid_bch, hist_proxy, eps=eps)
-    hist_proxy_std = hist_proxy.std(dim=-1).clamp_min(eps)
-    base_std_ratio = base_bch.std(dim=-1) / hist_proxy_std
-    hybrid_std_ratio = hybrid_bch.std(dim=-1) / hist_proxy_std
-    shape_extra = torch.stack(
-        [
-            hist_diff_rms,
-            hist_d2_rms,
-            base_slope,
-            hybrid_slope,
-            (base_slope - hist_slope) / scale1,
-            (hybrid_slope - hist_slope) / scale1,
-            (hybrid_slope - base_slope) / scale1,
-            base_diff_rms,
-            hybrid_diff_rms,
-            hybrid_diff_rms - base_diff_rms,
-            base_d2_rms,
-            hybrid_d2_rms,
-            hybrid_d2_rms - base_d2_rms,
-            base_corr,
-            hybrid_corr,
-            hybrid_corr - base_corr,
-            base_std_ratio,
-            hybrid_std_ratio,
-            hybrid_std_ratio - base_std_ratio,
-        ],
-        dim=-1,
-    )
-    return torch.cat([base_feat, proxy_extra, shape_extra], dim=-1)
-
-
-def _candidate_delta_features(
-    x_bcl: torch.Tensor,
-    base_bch: torch.Tensor,
-    hybrid_bch: torch.Tensor,
-    eps: float = 1.0e-6,
-) -> torch.Tensor:
-    hist_mean = x_bcl.mean(dim=-1)
-    hist_std = x_bcl.std(dim=-1).clamp_min(eps)
-    hist_last = x_bcl[..., -1]
-    hist_range = (x_bcl.max(dim=-1).values - x_bcl.min(dim=-1).values) / hist_std
-    t_l = torch.linspace(-1.0, 1.0, steps=x_bcl.shape[-1], device=x_bcl.device, dtype=x_bcl.dtype).view(1, 1, -1)
-    hist_center = x_bcl - hist_mean.unsqueeze(-1)
-    hist_slope = (hist_center * t_l).mean(dim=-1) / t_l.pow(2).mean().clamp_min(eps)
-
-    delta_bch = hybrid_bch - base_bch
-    delta_abs_mean = delta_bch.abs().mean(dim=-1) / hist_std
-    delta_abs_max = delta_bch.abs().amax(dim=-1) / hist_std
-    delta_std = delta_bch.std(dim=-1) / hist_std
-    base_std = base_bch.std(dim=-1) / hist_std
-    hybrid_std = hybrid_bch.std(dim=-1) / hist_std
-    base_shift = (base_bch.mean(dim=-1) - hist_last) / hist_std
-    hybrid_shift = (hybrid_bch.mean(dim=-1) - hist_last) / hist_std
-    delta_bias = delta_bch.mean(dim=-1) / hist_std
-
-    return torch.stack(
-        [
-            hist_mean,
-            hist_std.log(),
-            hist_last,
-            hist_range,
-            hist_slope,
-            delta_abs_mean,
-            delta_abs_max,
-            delta_std,
-            delta_bias,
-            base_std,
-            hybrid_std,
-            base_shift,
-            hybrid_shift,
-        ],
-        dim=-1,
-    )
-
-
-def _pred_residual_candidate_predictions(
-    y_base_bch: torch.Tensor,
-    pred_out: Dict[str, torch.Tensor],
-    pred_residual_scale_c: Optional[torch.Tensor] = None,
-    include_intervention: bool = True,
-    include_selector: bool = True,
-) -> Optional[torch.Tensor]:
-    residuals = pred_out.get("residuals")
-    alpha_cp = pred_out.get("alpha_cp")
-    intervention_bcp = pred_out.get("intervention_bcp")
-    selector_bcp = pred_out.get("selector_bcp")
-    confidence_active_bcp = pred_out.get("confidence_active_bcp")
-    if residuals is None or alpha_cp is None or intervention_bcp is None:
-        return None
-    if residuals.numel() == 0:
-        return None
-    if selector_bcp is None:
-        selector_bcp = torch.ones_like(intervention_bcp)
-    if confidence_active_bcp is None:
-        confidence_active_bcp = torch.ones_like(intervention_bcp)
-    if not bool(include_intervention):
-        intervention_bcp = torch.ones_like(intervention_bcp)
-        confidence_active_bcp = torch.ones_like(confidence_active_bcp)
-    if not bool(include_selector):
-        selector_bcp = torch.ones_like(selector_bcp)
-    scale_bcp = intervention_bcp * selector_bcp * confidence_active_bcp * alpha_cp.unsqueeze(0)
-    if pred_residual_scale_c is not None:
-        channel_scale = pred_residual_scale_c.to(device=y_base_bch.device, dtype=y_base_bch.dtype).view(1, -1, 1)
-        scale_bcp = scale_bcp * channel_scale
-    return y_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
-
-
-def _pred_residual_candidates_on_eval_path(
-    y_base_bch: torch.Tensor,
-    pred_out: Dict[str, torch.Tensor],
-    *,
-    pred_residual_scale_c: Optional[torch.Tensor] = None,
-    apply_output_anchors: bool = False,
-    x_bcl: Optional[torch.Tensor] = None,
-    query_start_abs_b: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    moe_cfg: Optional[dict] = None,
-    moe_enable: bool = True,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    include_intervention: bool = True,
-    include_selector: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    cand_bcpH = _pred_residual_candidate_predictions(
-        y_base_bch,
-        pred_out,
-        pred_residual_scale_c=pred_residual_scale_c,
-        include_intervention=include_intervention,
-        include_selector=include_selector,
-    )
-    if cand_bcpH is None or not apply_output_anchors:
-        return y_base_bch, cand_bcpH
-    if x_bcl is None or query_start_abs_b is None:
-        raise ValueError("Output-anchor candidate evaluation requires x_bcl and query_start_abs_b.")
-    y_base_final = apply_moe_output_anchor_experts(
-        y_base_bch,
-        base_pred_bch=y_base_bch,
-        x_bcl=x_bcl,
-        query_start_abs_b=query_start_abs_b,
-        input_len=int(input_len),
-        moe_cfg=moe_cfg,
-        moe_enable=moe_enable,
-        observed_history_tc=observed_history_tc,
-        train_stat_anchor_pc=train_stat_anchor_pc,
-        train_residual_anchor_phc=train_residual_anchor_phc,
-    )
-    cand_final_parts = [
-        apply_moe_output_anchor_experts(
-            cand_bcpH[:, :, p, :],
-            base_pred_bch=y_base_bch,
-            x_bcl=x_bcl,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            moe_cfg=moe_cfg,
-            moe_enable=moe_enable,
-            observed_history_tc=observed_history_tc,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
-        for p in range(int(cand_bcpH.shape[2]))
-    ]
-    return y_base_final, torch.stack(cand_final_parts, dim=2)
-
-
-def _candidate_selector_targets(
-    *,
-    base_bch: torch.Tensor,
-    cand_bcpH: torch.Tensor,
-    y_bch: torch.Tensor,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    allowed_mask_cp: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
-    cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
-    allowed = _selector_allowed_mask_cp(
-        allowed_mask_cp,
-        C=int(cand_err_bcp.shape[1]),
-        P=int(cand_err_bcp.shape[2]),
-        device=cand_err_bcp.device,
-        context="candidate selector target",
-    )
-    if allowed is not None:
-        cand_err_bcp = cand_err_bcp.masked_fill(~allowed.unsqueeze(0), float("inf"))
-    best_err_bc, best_p_bc = cand_err_bcp.min(dim=-1)
-    gain_bc = base_err_bc - best_err_bc
-    gain_bc = torch.where(torch.isfinite(gain_bc), gain_bc, torch.full_like(gain_bc, float("-inf")))
-    required_bc = torch.maximum(
-        torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
-        max(0.0, float(min_rel_improvement)) * base_err_bc.abs().clamp_min(1.0e-12),
-    )
-    return torch.where(gain_bc > required_bc, best_p_bc.to(dtype=torch.long) + 1, torch.zeros_like(best_p_bc))
-
-
-def _selector_allowed_mask_cp(
-    allowed_mask_cp: Optional[torch.Tensor],
-    *,
-    C: int,
-    P: int,
-    device: torch.device,
-    context: str,
-) -> Optional[torch.Tensor]:
-    if allowed_mask_cp is None or int(allowed_mask_cp.numel()) == 0:
-        return None
-    allowed = allowed_mask_cp.to(device=device, dtype=torch.bool)
-    if tuple(allowed.shape) != (int(C), int(P)):
-        raise ValueError(
-            f"{context} allowed mask must have shape [C,P], "
-            f"got {tuple(allowed.shape)} vs {(int(C), int(P))}."
-        )
-    return allowed
-
-
-def _candidate_selector_adoption_decision(
-    *,
-    current_mse: float,
-    current_mae: float,
-    selector_mse: float,
-    selector_mae: float,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    max_rel_mae_regression: float = 0.0,
-) -> Dict[str, object]:
-    current_mse_f = float(current_mse)
-    current_mae_f = float(current_mae)
-    selector_mse_f = float(selector_mse)
-    selector_mae_f = float(selector_mae)
-    required = max(
-        max(0.0, float(min_abs_improvement)),
-        max(0.0, float(min_rel_improvement)) * max(abs(current_mse_f), 1.0e-12),
-    )
-    mse_improvement = current_mse_f - selector_mse_f
-    mae_regression = selector_mae_f - current_mae_f
-    allowed_mae_regression = max(0.0, float(max_rel_mae_regression)) * max(abs(current_mae_f), 1.0e-12)
-    finite = all(math.isfinite(v) for v in (current_mse_f, current_mae_f, selector_mse_f, selector_mae_f))
-    adopt = bool(finite and mse_improvement > required and mae_regression <= allowed_mae_regression)
-    return {
-        "adopt": adopt,
-        "current_mse": current_mse_f,
-        "current_mae": current_mae_f,
-        "selector_mse": selector_mse_f,
-        "selector_mae": selector_mae_f,
-        "mse_improvement": float(mse_improvement),
-        "mse_improvement_pct": float(100.0 * mse_improvement / max(abs(current_mse_f), 1.0e-12)),
-        "required_mse_improvement": float(required),
-        "min_abs_improvement": float(max(0.0, float(min_abs_improvement))),
-        "min_rel_improvement": float(max(0.0, float(min_rel_improvement))),
-        "mae_regression": float(mae_regression),
-        "mae_regression_pct": float(100.0 * mae_regression / max(abs(current_mae_f), 1.0e-12)),
-        "allowed_mae_regression": float(allowed_mae_regression),
-        "max_rel_mae_regression": float(max(0.0, float(max_rel_mae_regression))),
-        "finite": bool(finite),
-    }
-
-
-def _candidate_selector_candidate_scale(
-    *,
-    pred_residual_scale_c: Optional[torch.Tensor],
-    selector_cfg: Dict[str, object],
-) -> Tuple[Optional[torch.Tensor], str]:
-    use_channel_scale = bool(selector_cfg.get("use_channel_scale_for_candidates", True))
-    if use_channel_scale:
-        return pred_residual_scale_c, "channel_scale"
-    return None, "unscaled"
-
-
-def _cluster_utility_threshold_stats(
-    *,
-    gain_bcp: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    allowed_mask_kp: Optional[torch.Tensor],
-    thresholds: List[float],
-) -> Dict[str, torch.Tensor]:
-    if gain_bcp.numel() == 0:
-        return {
-            "valid_count_kt": torch.zeros(int(K), len(thresholds), dtype=torch.float64),
-            "total_count_k": torch.zeros(int(K), dtype=torch.float64),
-            "best_gain_sum_k": torch.zeros(int(K), dtype=torch.float64),
-            "best_gain_positive_count_k": torch.zeros(int(K), dtype=torch.float64),
-        }
-    gain_bkp = scatter_mean_bcf_to_bkf(gain_bcp, cluster_id_c, int(K)).to(dtype=torch.float64)
-    B, _, P = gain_bkp.shape
-    if allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
-        allowed = allowed_mask_kp.to(device=gain_bkp.device, dtype=torch.bool)
-        if tuple(allowed.shape) != (int(K), int(P)):
-            raise ValueError(
-                "utility threshold allowed mask must have shape [K,P], "
-                f"got {tuple(allowed.shape)} vs {(int(K), int(P))}."
-            )
-    else:
-        allowed = torch.ones((int(K), int(P)), device=gain_bkp.device, dtype=torch.bool)
-    allowed_bkp = allowed.unsqueeze(0).expand_as(gain_bkp)
-    masked_gain_bkp = gain_bkp.masked_fill(~allowed_bkp, -float("inf"))
-    best_gain_bk = masked_gain_bkp.max(dim=-1).values
-    best_gain_bk = torch.nan_to_num(best_gain_bk, nan=0.0, posinf=0.0, neginf=0.0)
-    valid_counts = []
-    allowed_float = allowed_bkp.to(dtype=gain_bkp.dtype)
-    for threshold in thresholds:
-        utility_bkp = (gain_bkp - float(threshold)).clamp_min(0.0) * allowed_float
-        valid_counts.append((utility_bkp.sum(dim=-1) > 0.0).sum(dim=0).to(dtype=torch.float64))
-    if valid_counts:
-        valid_count_kt = torch.stack(valid_counts, dim=-1)
-    else:
-        valid_count_kt = torch.zeros(int(K), 0, device=gain_bkp.device, dtype=torch.float64)
-    return {
-        "valid_count_kt": valid_count_kt.detach().cpu(),
-        "total_count_k": torch.full((int(K),), int(B), dtype=torch.float64),
-        "best_gain_sum_k": best_gain_bk.sum(dim=0).detach().cpu().to(dtype=torch.float64),
-        "best_gain_positive_count_k": (best_gain_bk > 0.0).sum(dim=0).detach().cpu().to(dtype=torch.float64),
-    }
-
-
-def _mse_utility_gate_supervision_loss(
-    *,
-    probs_bkp: Optional[torch.Tensor],
-    skip_prob_bk: Optional[torch.Tensor] = None,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    y_base_bch: torch.Tensor,
-    pred_out: Optional[Dict[str, torch.Tensor]],
-    y_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    y_base_eval_bch: Optional[torch.Tensor] = None,
-    cand_eval_bcpH: Optional[torch.Tensor] = None,
-    temperature: float = 1.0,
-    min_gain: float = 0.0,
-    target_power: float = 1.0,
-    include_skip: bool = False,
-    probs_include_skip_mass: bool = False,
-    target_mode: str = "soft_utility",
-    return_diagnostics: bool = False,
-    eps: float = 1.0e-8,
-) -> Optional[torch.Tensor]:
-    if probs_bkp is None or pred_out is None or probs_bkp.numel() == 0:
-        return (None, None) if return_diagnostics else None
-    target_mode_l = str(target_mode or "soft_utility").lower()
-    hard_target = target_mode_l in {"hard", "hard_oracle", "argmax", "one_hot"}
-    if target_mode_l not in {"soft", "soft_utility", "utility", "hard", "hard_oracle", "argmax", "one_hot"}:
-        raise ValueError(
-            "mse utility gate supervision target_mode must be one of "
-            "soft_utility or hard_oracle aliases, "
-            f"got {target_mode!r}."
-        )
-    base_bch = y_base_eval_bch if y_base_eval_bch is not None else y_base_bch
-    cand_bcpH = cand_eval_bcpH if cand_eval_bcpH is not None else _pred_residual_candidate_predictions(y_base_bch, pred_out)
-    if cand_bcpH is None or cand_bcpH.numel() == 0:
-        return (None, None) if return_diagnostics else None
-    with torch.no_grad():
-        base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
-        cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
-        gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
-        gain_bkp = scatter_mean_bcf_to_bkf(gain_bcp, cluster_id_c, K)
-        if allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
-            allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
-            allowed_bkp = allowed.unsqueeze(0).expand_as(probs_bkp).to(dtype=gain_bkp.dtype)
-        else:
-            allowed_bkp = (probs_bkp.detach() > 0.0).to(dtype=gain_bkp.dtype)
-        utility_bkp = (gain_bkp - float(min_gain)).clamp_min(0.0) * allowed_bkp
-        if float(target_power) != 1.0:
-            utility_bkp = utility_bkp.clamp_min(0.0).pow(float(target_power))
-        valid_bk = utility_bkp.sum(dim=-1) > 0.0
-        masked_gain_bkp = gain_bkp.masked_fill(allowed_bkp <= 0.0, float("-inf"))
-        best_gain_bk, best_idx_bk = masked_gain_bkp.max(dim=-1)
-        best_gain_bk = torch.where(torch.isfinite(best_gain_bk), best_gain_bk, torch.zeros_like(best_gain_bk))
-        target_skip_bk = (~valid_bk).to(dtype=utility_bkp.dtype) if bool(include_skip) else torch.zeros_like(utility_bkp[..., 0])
-        diagnostics = {
-            "valid_bk": valid_bk.to(dtype=utility_bkp.dtype).detach(),
-            "target_skip_bk": target_skip_bk.detach(),
-            "best_gain_bk": best_gain_bk.detach(),
-            "utility_sum_bk": utility_bkp.sum(dim=-1).detach(),
-            "probs_include_skip_mass": torch.full_like(valid_bk, float(bool(probs_include_skip_mass)), dtype=utility_bkp.dtype).detach(),
-        }
-        if skip_prob_bk is not None:
-            diagnostics["skip_prob_bk"] = skip_prob_bk.detach()
-        if bool(include_skip):
-            if skip_prob_bk is None:
-                return (None, diagnostics) if return_diagnostics else None
-            if tuple(skip_prob_bk.shape) != tuple(probs_bkp.shape[:2]):
-                raise ValueError(
-                    "skip-aware mse utility gate supervision requires skip_prob_bk shape [B,K], "
-                    f"got {tuple(skip_prob_bk.shape)} vs {tuple(probs_bkp.shape[:2])}."
-                )
-            target_bkp = torch.zeros_like(utility_bkp)
-            if bool(valid_bk.any().item()):
-                if hard_target:
-                    target_bkp.scatter_(-1, best_idx_bk.unsqueeze(-1), 1.0)
-                    target_bkp = target_bkp * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
-                    target_bkp = target_bkp * allowed_bkp
-                else:
-                    temp = max(float(temperature), 1.0e-6)
-                    pos_logits = utility_bkp.clamp_min(eps).log() / temp
-                    pos_logits = pos_logits.masked_fill(~valid_bk.unsqueeze(-1), 0.0)
-                    target_bkp = torch.softmax(pos_logits, dim=-1) * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
-                    target_bkp = target_bkp * allowed_bkp
-                    target_bkp = target_bkp / target_bkp.sum(dim=-1, keepdim=True).clamp_min(eps)
-        else:
-            if not bool(valid_bk.any().item()):
-                return (None, diagnostics) if return_diagnostics else None
-            if hard_target:
-                target_bkp = torch.zeros_like(utility_bkp)
-                target_bkp.scatter_(-1, best_idx_bk.unsqueeze(-1), 1.0)
-                target_bkp = target_bkp * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
-                target_bkp = target_bkp * allowed_bkp
-            else:
-                temp = max(float(temperature), 1.0e-6)
-                target_bkp = utility_bkp.clamp_min(eps).log() / temp
-                target_bkp = target_bkp.masked_fill(~valid_bk.unsqueeze(-1), 0.0)
-                target_bkp = torch.softmax(target_bkp, dim=-1) * valid_bk.unsqueeze(-1).to(dtype=utility_bkp.dtype)
-                target_bkp = target_bkp * allowed_bkp
-                target_bkp = target_bkp / target_bkp.sum(dim=-1, keepdim=True).clamp_min(eps)
-    if bool(include_skip):
-        if bool(probs_include_skip_mass):
-            penalty_mass_bkp = probs_bkp.clamp_min(eps)
-        else:
-            penalty_mass_bkp = (1.0 - skip_prob_bk).clamp_min(eps).unsqueeze(-1) * probs_bkp.clamp_min(eps)
-        loss_penalty_bk = -(target_bkp * penalty_mass_bkp.log()).sum(dim=-1)
-        loss_skip_bk = -(target_skip_bk * skip_prob_bk.clamp_min(eps).log())
-        loss_bk = loss_penalty_bk + loss_skip_bk
-        return (loss_bk, diagnostics) if return_diagnostics else loss_bk
-    log_probs = probs_bkp.clamp_min(eps).log()
-    loss_bk = -(target_bkp * log_probs).sum(dim=-1)
-    loss_bk = torch.where(valid_bk, loss_bk, torch.zeros_like(loss_bk))
-    return (loss_bk, diagnostics) if return_diagnostics else loss_bk
-
-
-def _pred_residual_candidate_supervision_loss(
-    *,
-    y_base_bch: torch.Tensor,
-    pred_out: Optional[Dict[str, torch.Tensor]],
-    y_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    penalty_names: Optional[List[str]] = None,
-    penalty_fns: Optional[Dict[str, callable]] = None,
-    penalty_scale: Optional[torch.Tensor] = None,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    only_allowed: bool = True,
-    loss_kind: str = "mse",
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    include_intervention: bool = True,
-    include_selector: bool = True,
-    apply_output_anchors: bool = False,
-    x_bcl: Optional[torch.Tensor] = None,
-    query_start_abs_b: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    moe_cfg: Optional[dict] = None,
-    moe_enable: bool = True,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    if pred_out is None:
-        return None
-    base_eval_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
-        y_base_bch,
-        pred_out,
-        apply_output_anchors=apply_output_anchors,
-        x_bcl=x_bcl,
-        query_start_abs_b=query_start_abs_b,
-        input_len=int(input_len),
-        moe_cfg=moe_cfg,
-        moe_enable=moe_enable,
-        observed_history_tc=observed_history_tc,
-        train_stat_anchor_pc=train_stat_anchor_pc,
-        train_residual_anchor_phc=train_residual_anchor_phc,
-        include_intervention=include_intervention,
-        include_selector=include_selector,
-    )
-    if cand_bcpH is None or cand_bcpH.numel() == 0:
-        return None
-    loss_mode = str(loss_kind).lower()
-    if loss_mode in {"own_penalty", "penalty", "attribute", "shape"}:
-        if penalty_names is None or penalty_fns is None or len(penalty_names) != int(cand_bcpH.shape[2]):
-            raise ValueError("own_penalty candidate supervision requires one penalty name/function per branch.")
-        per_penalty = []
-        for p, name in enumerate(penalty_names):
-            pen_bc = penalty_fns[name](cand_bcpH[:, :, p, :], y_bch)
-            if penalty_scale is not None and penalty_scale.numel() > p:
-                scale_p = penalty_scale[p].to(device=pen_bc.device, dtype=pen_bc.dtype).clamp_min(1.0e-6)
-                pen_bc = pen_bc / scale_p
-            per_penalty.append(pen_bc)
-        err_bcp = torch.stack(per_penalty, dim=-1)
-    elif loss_mode in {"mse", "l2"}:
-        err_bcpH = cand_bcpH - y_bch.unsqueeze(2)
-        err_bcp = err_bcpH.pow(2).mean(dim=-1)
-    elif loss_mode in {"mae", "l1"}:
-        err_bcpH = cand_bcpH - y_bch.unsqueeze(2)
-        err_bcp = err_bcpH.abs().mean(dim=-1)
-    elif loss_mode in {"gain_hinge", "gain_hinge_mse", "mse_gain_hinge", "residual_gain_hinge"}:
-        cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
-        base_err_bc = (base_eval_bch - y_bch).pow(2).mean(dim=-1)
-        required_bc = torch.maximum(
-            torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
-            max(0.0, float(min_rel_improvement)) * base_err_bc.detach().abs().clamp_min(1.0e-12),
-        )
-        err_bcp = (cand_err_bcp - base_err_bc.detach().unsqueeze(-1) + required_bc.unsqueeze(-1)).clamp_min(0.0)
-    elif loss_mode in {"gain_hinge_mae", "mae_gain_hinge", "l1_gain_hinge"}:
-        cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).abs().mean(dim=-1)
-        base_err_bc = (base_eval_bch - y_bch).abs().mean(dim=-1)
-        required_bc = torch.maximum(
-            torch.full_like(base_err_bc, max(0.0, float(min_abs_improvement))),
-            max(0.0, float(min_rel_improvement)) * base_err_bc.detach().abs().clamp_min(1.0e-12),
-        )
-        err_bcp = (cand_err_bcp - base_err_bc.detach().unsqueeze(-1) + required_bc.unsqueeze(-1)).clamp_min(0.0)
-    else:
-        raise ValueError(
-            "moe.pred_side_residual.candidate_supervision.loss must be mse, mae, own_penalty, "
-            "gain_hinge_mse, or gain_hinge_mae "
-            f"(got {loss_kind!r})."
-        )
-    err_bkp = scatter_mean_bcf_to_bkf(err_bcp, cluster_id_c, K)
-    if bool(only_allowed) and allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
-        allowed = allowed_mask_kp.to(device=err_bkp.device, dtype=err_bkp.dtype)
-        if allowed.shape != err_bkp.shape[1:]:
-            raise ValueError(
-                "candidate_supervision allowed mask must have shape [K,P], "
-                f"got {tuple(allowed.shape)} vs {tuple(err_bkp.shape[1:])}."
-            )
-        empty = allowed.sum(dim=-1, keepdim=True) <= 0.0
-        allowed = torch.where(empty, torch.ones_like(allowed), allowed)
-        return (err_bkp * allowed.unsqueeze(0)).sum(dim=-1) / allowed.sum(dim=-1).clamp_min(1.0).view(1, -1)
-    return err_bkp.mean(dim=-1)
-
-
-def _pred_residual_intervention_supervision_loss(
-    *,
-    y_base_bch: torch.Tensor,
-    pred_out: Optional[Dict[str, torch.Tensor]],
-    y_bch: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    only_allowed: bool = True,
-    min_gain: float = 0.0,
-    pos_weight: float = 1.0,
-    apply_output_anchors: bool = False,
-    x_bcl: Optional[torch.Tensor] = None,
-    query_start_abs_b: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    moe_cfg: Optional[dict] = None,
-    moe_enable: bool = True,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    if pred_out is None:
-        return None
-    intervention_bcp = pred_out.get("intervention_bcp")
-    if intervention_bcp is None or intervention_bcp.numel() == 0:
-        return None
-    base_eval_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
-        y_base_bch,
-        pred_out,
-        apply_output_anchors=apply_output_anchors,
-        x_bcl=x_bcl,
-        query_start_abs_b=query_start_abs_b,
-        input_len=int(input_len),
-        moe_cfg=moe_cfg,
-        moe_enable=moe_enable,
-        observed_history_tc=observed_history_tc,
-        train_stat_anchor_pc=train_stat_anchor_pc,
-        train_residual_anchor_phc=train_residual_anchor_phc,
-        include_intervention=False,
-        include_selector=False,
-    )
-    if cand_bcpH is None or cand_bcpH.numel() == 0:
-        return None
-    base_err_bc = (base_eval_bch.detach() - y_bch.detach()).pow(2).mean(dim=-1)
-    cand_err_bcp = (cand_bcpH.detach() - y_bch.detach().unsqueeze(2)).pow(2).mean(dim=-1)
-    target_bcp = ((base_err_bc.unsqueeze(-1) - cand_err_bcp) > float(min_gain)).to(dtype=intervention_bcp.dtype)
-    prob_bcp = intervention_bcp.clamp(1.0e-6, 1.0 - 1.0e-6)
-    loss_bcp = -(
-        float(max(pos_weight, 0.0)) * target_bcp * prob_bcp.log()
-        + (1.0 - target_bcp) * (1.0 - prob_bcp).log()
-    )
-    if bool(only_allowed) and allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
-        allowed_cp = allowed_mask_kp.to(device=loss_bcp.device, dtype=torch.bool).index_select(
-            0,
-            cluster_id_c.to(device=loss_bcp.device, dtype=torch.long),
-        )
-        if allowed_cp.shape != loss_bcp.shape[1:]:
-            raise ValueError(
-                "intervention supervision allowed mask must broadcast to [C,P], "
-                f"got {tuple(allowed_cp.shape)} vs {tuple(loss_bcp.shape[1:])}."
-            )
-        loss_bcp = loss_bcp * allowed_cp.to(dtype=loss_bcp.dtype).unsqueeze(0)
-        denom_bc = allowed_cp.to(dtype=loss_bcp.dtype).sum(dim=-1).clamp_min(1.0).view(1, -1)
-        loss_bc = loss_bcp.sum(dim=-1) / denom_bc
-    else:
-        loss_bc = loss_bcp.mean(dim=-1)
-    return scatter_mean_bc_to_bk(loss_bc, cluster_id_c, K)
-
-
-class PredResidualCandidateSelector(nn.Module):
-    def __init__(
-        self,
-        feat_dim: int,
-        num_channels: int,
-        num_penalties: int,
-        hidden_dim: int = 64,
-        dropout: float = 0.0,
-        init_skip_bias: float = 0.0,
-        init_penalty_bias: float = 0.0,
-        use_penalty_identity: bool = False,
-        feature_mode: str = "base",
-    ):
-        super().__init__()
-        self.base_F = int(feat_dim)
-        self.C = int(num_channels)
-        self.P = int(num_penalties)
-        self.use_penalty_identity = bool(use_penalty_identity)
-        self.feature_mode = str(feature_mode or "base").lower()
-        self.F = self.base_F + (self.P if self.use_penalty_identity else 0)
-        hidden = int(hidden_dim)
-        self.register_buffer("feature_mean", torch.zeros(1, 1, self.F), persistent=True)
-        self.register_buffer("feature_std", torch.ones(1, 1, self.F), persistent=True)
-        self.register_buffer("feature_standardize_enabled", torch.tensor(0.0), persistent=True)
-        self.register_buffer("feature_standardize_clip", torch.tensor(0.0), persistent=True)
-        self.register_buffer("allowed_penalty_mask_cp", torch.empty(0, 0, dtype=torch.bool), persistent=False)
-        self.net = nn.Sequential(
-            nn.Linear(self.F, hidden),
-            nn.GELU(),
-            nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
-            nn.Linear(hidden, 1),
-        )
-        self.skip_net = nn.Sequential(
-            nn.Linear(self.F, hidden),
-            nn.GELU(),
-            nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
-            nn.Linear(hidden, 1),
-        )
-        self.skip_bias = nn.Parameter(torch.full((self.C,), float(init_skip_bias)))
-        self.penalty_bias = nn.Parameter(torch.full((self.P,), float(init_penalty_bias)))
-        self.penalty_channel_bias = nn.Parameter(torch.zeros(self.C, self.P))
-        self.decision_margin = 0.0
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        for module in list(self.net) + list(self.skip_net):
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-        for seq in (self.net, self.skip_net):
-            last = seq[-1]
-            if isinstance(last, nn.Linear):
-                nn.init.zeros_(last.weight)
-                nn.init.zeros_(last.bias)
-
-    def set_feature_standardization(self, mean_f: torch.Tensor, std_f: torch.Tensor) -> None:
-        mean = mean_f.detach().view(1, 1, self.F).to(device=self.feature_mean.device, dtype=self.feature_mean.dtype)
-        std = std_f.detach().view(1, 1, self.F).to(device=self.feature_std.device, dtype=self.feature_std.dtype)
-        self.feature_mean.copy_(mean)
-        self.feature_std.copy_(std.clamp_min(1.0e-6))
-        self.feature_standardize_enabled.fill_(1.0)
-
-    def set_feature_standardize_clip(self, clip_value: float) -> None:
-        self.feature_standardize_clip.fill_(max(0.0, float(clip_value)))
-
-    def set_allowed_penalty_mask(self, allowed_mask_cp: Optional[torch.Tensor]) -> None:
-        if allowed_mask_cp is None or int(allowed_mask_cp.numel()) == 0:
-            self.allowed_penalty_mask_cp = torch.empty(0, 0, device=self.skip_bias.device, dtype=torch.bool)
-            return
-        allowed = _selector_allowed_mask_cp(
-            allowed_mask_cp,
-            C=self.C,
-            P=self.P,
-            device=self.skip_bias.device,
-            context="candidate selector",
-        )
-        self.allowed_penalty_mask_cp = allowed.detach().clone()
-
-    def _resolved_allowed_penalty_mask(self, allowed_mask_cp: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
-        mask = allowed_mask_cp
-        if mask is None or int(mask.numel()) == 0:
-            mask = self.allowed_penalty_mask_cp
-        return _selector_allowed_mask_cp(mask, C=self.C, P=self.P, device=device, context="candidate selector")
-
-    def _mask_disallowed_logits(
-        self,
-        logits_bcq: torch.Tensor,
-        allowed_mask_cp: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        allowed = self._resolved_allowed_penalty_mask(allowed_mask_cp, logits_bcq.device)
-        if allowed is None:
-            return logits_bcq
-        penalty_logits = logits_bcq[..., 1:].masked_fill(~allowed.unsqueeze(0), torch.finfo(logits_bcq.dtype).min)
-        return torch.cat([logits_bcq[..., :1], penalty_logits], dim=-1)
-
-    def _standardize_feat(self, feat: torch.Tensor) -> torch.Tensor:
-        if bool(self.feature_standardize_enabled.item() > 0.5):
-            feat = (feat - self.feature_mean.to(device=feat.device, dtype=feat.dtype)) / self.feature_std.to(
-                device=feat.device,
-                dtype=feat.dtype,
-            )
-            clip_value = float(self.feature_standardize_clip.item())
-            if clip_value > 0.0:
-                feat = feat.clamp(min=-clip_value, max=clip_value)
-        return feat
-
-    def _append_penalty_identity(
-        self,
-        skip_feat_bcf: torch.Tensor,
-        cand_feat_bcpf: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.use_penalty_identity:
-            return skip_feat_bcf, cand_feat_bcpf
-        if int(skip_feat_bcf.shape[-1]) != self.base_F or int(cand_feat_bcpf.shape[-1]) != self.base_F:
-            raise ValueError(
-                f"Candidate selector expected base feature dim {self.base_F}, "
-                f"got skip={int(skip_feat_bcf.shape[-1])}, cand={int(cand_feat_bcpf.shape[-1])}."
-            )
-        P = int(cand_feat_bcpf.shape[2])
-        if P != self.P:
-            raise ValueError(f"Candidate selector expected {self.P} penalties, got {P}.")
-        skip_eye = torch.zeros(
-            *skip_feat_bcf.shape[:-1],
-            self.P,
-            device=skip_feat_bcf.device,
-            dtype=skip_feat_bcf.dtype,
-        )
-        eye = torch.eye(self.P, device=cand_feat_bcpf.device, dtype=cand_feat_bcpf.dtype).view(1, 1, self.P, self.P)
-        eye = eye.expand(*cand_feat_bcpf.shape[:2], self.P, self.P)
-        return torch.cat([skip_feat_bcf, skip_eye], dim=-1), torch.cat([cand_feat_bcpf, eye], dim=-1)
-
-    def logits_from_features(
-        self,
-        skip_feat_bcf: torch.Tensor,
-        cand_feat_bcpf: torch.Tensor,
-        apply_decision_margin: bool = False,
-        allowed_mask_cp: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        skip_feat_bcf, cand_feat_bcpf = self._append_penalty_identity(skip_feat_bcf, cand_feat_bcpf)
-        skip_feat_bcf = self._standardize_feat(skip_feat_bcf)
-        cand_feat_bcpf = self._standardize_feat(cand_feat_bcpf)
-        skip_score_bc = self.skip_net(skip_feat_bcf).squeeze(-1) + self.skip_bias.view(1, -1)
-        cand_score_bcp = self.net(cand_feat_bcpf).squeeze(-1)
-        cand_score_bcp = cand_score_bcp + self.penalty_bias.view(1, 1, -1)
-        cand_score_bcp = cand_score_bcp + self.penalty_channel_bias.view(1, self.C, self.P)
-        if apply_decision_margin:
-            margin = torch.as_tensor(
-                float(getattr(self, "decision_margin", 0.0)),
-                device=cand_score_bcp.device,
-                dtype=cand_score_bcp.dtype,
-            )
-            cand_score_bcp = cand_score_bcp - margin
-        logits_bcq = torch.cat([skip_score_bc.unsqueeze(-1), cand_score_bcp], dim=-1)
-        return self._mask_disallowed_logits(logits_bcq, allowed_mask_cp=allowed_mask_cp)
-
-    def logits(
-        self,
-        x_bcl: torch.Tensor,
-        base_bch: torch.Tensor,
-        cand_bcpH: torch.Tensor,
-        allowed_mask_cp: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        skip_feat = _candidate_selector_features(x_bcl, base_bch, base_bch, feature_mode=self.feature_mode)
-        cand_feat = torch.stack(
-            [
-                _candidate_selector_features(x_bcl, base_bch, cand_bcpH[:, :, p, :], feature_mode=self.feature_mode)
-                for p in range(int(cand_bcpH.shape[2]))
-            ],
-            dim=2,
-        )
-        return self.logits_from_features(skip_feat, cand_feat, allowed_mask_cp=allowed_mask_cp)
-
-    def select_from_features(
-        self,
-        skip_feat_bcf: torch.Tensor,
-        cand_feat_bcpf: torch.Tensor,
-        base_bch: torch.Tensor,
-        cand_bcpH: torch.Tensor,
-        allowed_mask_cp: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits_bcq = self.logits_from_features(
-            skip_feat_bcf,
-            cand_feat_bcpf,
-            apply_decision_margin=True,
-            allowed_mask_cp=allowed_mask_cp,
-        )
-        selected_class_bc = logits_bcq.argmax(dim=-1)
-        all_pred_bcqh = torch.cat([base_bch.unsqueeze(2), cand_bcpH], dim=2)
-        gather_idx = selected_class_bc.view(*selected_class_bc.shape, 1, 1).expand(-1, -1, 1, int(base_bch.shape[-1]))
-        selected_bch = all_pred_bcqh.gather(2, gather_idx).squeeze(2)
-        return selected_bch, selected_class_bc
-
-    def select_prediction(
-        self,
-        x_bcl: torch.Tensor,
-        base_bch: torch.Tensor,
-        cand_bcpH: torch.Tensor,
-        allowed_mask_cp: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        skip_feat = _candidate_selector_features(x_bcl, base_bch, base_bch, feature_mode=self.feature_mode)
-        cand_feat = torch.stack(
-            [
-                _candidate_selector_features(x_bcl, base_bch, cand_bcpH[:, :, p, :], feature_mode=self.feature_mode)
-                for p in range(int(cand_bcpH.shape[2]))
-            ],
-            dim=2,
-        )
-        return self.select_from_features(skip_feat, cand_feat, base_bch, cand_bcpH, allowed_mask_cp=allowed_mask_cp)
-
-
-class StaticPredResidualCandidateSelector(nn.Module):
-    def __init__(self, selected_class_c: torch.Tensor):
-        super().__init__()
-        selected = selected_class_c.detach().to(dtype=torch.long).view(-1)
-        self.register_buffer("selected_class_c", selected, persistent=True)
-
-    def select_prediction(
-        self,
-        x_bcl: torch.Tensor,
-        base_bch: torch.Tensor,
-        cand_bcpH: torch.Tensor,
-        allowed_mask_cp: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, C, H = base_bch.shape
-        if int(self.selected_class_c.numel()) != int(C):
-            raise ValueError(
-                f"Static candidate selector expected {int(self.selected_class_c.numel())} channels, got {int(C)}."
-            )
-        selected_class_c = self.selected_class_c.to(device=base_bch.device)
-        if allowed_mask_cp is not None and int(allowed_mask_cp.numel()) > 0:
-            allowed = _selector_allowed_mask_cp(
-                allowed_mask_cp,
-                C=int(C),
-                P=int(cand_bcpH.shape[2]),
-                device=base_bch.device,
-                context="static candidate selector",
-            )
-            penalty_idx_c = (selected_class_c - 1).clamp_min(0)
-            candidate_selected_c = selected_class_c > 0
-            allowed_selected_c = allowed.gather(1, penalty_idx_c.view(-1, 1)).squeeze(1)
-            selected_class_c = torch.where(
-                candidate_selected_c & allowed_selected_c,
-                selected_class_c,
-                torch.zeros_like(selected_class_c),
-            )
-        selected_class_bc = selected_class_c.view(1, C).expand(B, C)
-        all_pred_bcqh = torch.cat([base_bch.unsqueeze(2), cand_bcpH], dim=2)
-        gather_idx = selected_class_bc.view(B, C, 1, 1).expand(B, C, 1, H)
-        selected_bch = all_pred_bcqh.gather(2, gather_idx).squeeze(2)
-        return selected_bch, selected_class_bc
-
-
-def _activation_feature_mask_for_mode(mode: str, feat_dim: int) -> torch.Tensor:
-    mode_l = str(mode).lower()
-    mask = torch.zeros(int(feat_dim), dtype=torch.float32)
-    if mode_l in {"full", "all"}:
-        mask.fill_(1.0)
-    elif mode_l in {"input", "history", "history_only", "input_only"}:
-        mask[: min(5, int(feat_dim))] = 1.0
-    elif mode_l in {"input_base", "history_base", "input_and_base"}:
-        keep = [0, 1, 2, 3, 4, 9, 11]
-        for idx in keep:
-            if idx < int(feat_dim):
-                mask[idx] = 1.0
-    elif mode_l in {"no_delta", "no_residual_delta"}:
-        keep = [0, 1, 2, 3, 4, 9, 10, 11, 12]
-        for idx in keep:
-            if idx < int(feat_dim):
-                mask[idx] = 1.0
-    else:
-        raise ValueError(
-            "activation_feature_mode must be full, input_only, input_base, or no_delta "
-            f"(got {mode!r})."
-        )
-    if float(mask.sum().item()) <= 0.0:
-        mask.fill_(1.0)
-    return mask
-
-
-
-
-@torch.no_grad()
-
-
-
-
-@torch.no_grad()
-
-
-@torch.no_grad()
-
-
-@torch.no_grad()
-
-
-@torch.no_grad()
-def evaluate_gate_penalty_hit_metrics(
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    penalty_scale: Optional[torch.Tensor],
-    select_ranks: Optional[List[int]],
-    gate_soft_weight: float,
-    label_min_improvement: float = 0.0,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    gate_feature_mode: str = "history",
-) -> Optional[Dict[str, object]]:
-    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
-        return None
-    moe_enable = bool(moe_cfg.get("enable", True))
-    if not moe_enable:
-        return None
-
-    model.eval()
-    gate.eval()
-    pred_residual.eval()
-    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
-    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
-    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
-    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
-    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
-
-    P = len(penalty_names)
-    cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
-    allowed_mask_device = None
-    if allowed_mask_kp is not None:
-        allowed_mask_device = allowed_mask_kp.detach().to(device=device, dtype=torch.bool)
-        if tuple(allowed_mask_device.shape) != (int(K), int(P)):
-            raise ValueError("allowed_mask_kp must have shape [K,P] for gate penalty hit diagnostics.")
-    total = positive_total = hit_total = positive_hit_total = 0
-    selected_positive = 0
-    base_se = oracle_se = selected_se = 0.0
-    denom = 0
-    oracle_count_p = torch.zeros(P, dtype=torch.long)
-    selected_count_p = torch.zeros(P, dtype=torch.long)
-    positive_oracle_count_p = torch.zeros(P, dtype=torch.long)
-    min_improvement = max(0.0, float(label_min_improvement))
-
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
-        route_pen_bkp = _router_penalty_context_from_history(
-            x_bcl=x,
-            yhat_base_bch=y_base,
-            penalty_names=penalty_names,
-            penalty_fns=penalty_fns,
-            penalty_scale=penalty_scale,
-            cluster_id_c=cluster_id_c,
-            K=K,
-        )
-        mask_bkp, probs_bkp, skip_bk, _ = gate(
-            feat_bkf,
-            straight_through=False,
-            penalty_context_bkp=route_pen_bkp,
-            penalty_context_mode=router_mode,
-            penalty_context_weight=router_penalty_context_weight,
-            penalty_context_detach=router_detach_penalty_context,
-            penalty_context_score=router_penalty_context_score,
-        )
-        rank_mask = None
-        if select_ranks is not None:
-            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
-            rank_mask = mask_bkp
-        if gate_soft_weight > 0.0:
-            probs_sel = probs_bkp
-            if rank_mask is not None:
-                probs_sel = probs_sel * rank_mask
-                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
-            probs_sel = probs_sel * target_mass
-            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
-
-        pred_out = pred_residual(
-            x,
-            y_base,
-            cluster_id_c,
-            mask_bkp,
-            skip_bk=skip_bk if allow_skip else None,
-            query_start_abs_b=query_start_abs_b,
-        )
-        residuals = pred_out.get("residuals")
-        intervention_bcp = pred_out.get("intervention_bcp")
-        selector_bcp = pred_out.get("selector_bcp")
-        alpha_cp = pred_out.get("alpha_cp")
-        if residuals is None or intervention_bcp is None or alpha_cp is None or residuals.numel() == 0:
-            continue
-        if selector_bcp is None:
-            selector_bcp = torch.ones_like(intervention_bcp)
-
-        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
-            y_base,
-            pred_out,
-            apply_output_anchors=True,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            moe_cfg=moe_cfg,
-            moe_enable=moe_enable,
-            observed_history_tc=observed_history_tc,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
-        if cand_bcpH is None:
-            continue
-        err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
-        base_err_bc = (y_base_final - y).pow(2).mean(dim=-1)
-        if allowed_mask_device is not None:
-            allowed_bcp = allowed_mask_device.index_select(0, cid_c).unsqueeze(0)
-            err_for_oracle_bcp = err_bcp.masked_fill(~allowed_bcp, float("inf"))
-        else:
-            err_for_oracle_bcp = err_bcp
-        oracle_penalty_err_bc, oracle_p_bc = err_for_oracle_bcp.min(dim=-1)
-        oracle_err_bc = torch.where(torch.isfinite(oracle_penalty_err_bc), oracle_penalty_err_bc, base_err_bc)
-        route_bcp = mask_bkp[:, cid_c, :]
-        probs_bcp = probs_bkp[:, cid_c, :]
-        selected_score_bcp = route_bcp * probs_bcp
-        selected_p_bc = selected_score_bcp.argmax(dim=-1)
-        selected_err_bc = err_bcp.gather(-1, selected_p_bc.unsqueeze(-1)).squeeze(-1)
-
-        positive_bc = (base_err_bc - oracle_err_bc) > min_improvement
-        hit_bc = selected_p_bc == oracle_p_bc
-        selected_positive_bc = (base_err_bc - selected_err_bc) > min_improvement
-
-        total += int(hit_bc.numel())
-        positive_total += int(positive_bc.sum().item())
-        hit_total += int(hit_bc.sum().item())
-        positive_hit_total += int((hit_bc & positive_bc).sum().item())
-        selected_positive += int(selected_positive_bc.sum().item())
-        base_se += float((y_base_final - y).pow(2).sum().item())
-        oracle_se += float(oracle_err_bc.sum().item() * y.shape[-1])
-        selected_se += float(selected_err_bc.sum().item() * y.shape[-1])
-        denom += int(y.numel())
-        oracle_count_p += torch.bincount(oracle_p_bc.reshape(-1).detach().cpu(), minlength=P)[:P]
-        selected_count_p += torch.bincount(selected_p_bc.reshape(-1).detach().cpu(), minlength=P)[:P]
-        positive_oracle_count_p += torch.bincount(
-            oracle_p_bc[positive_bc].reshape(-1).detach().cpu(),
-            minlength=P,
-        )[:P]
-
-    if total <= 0:
-        return None
-    base_mse = base_se / max(denom, 1)
-    oracle_mse = oracle_se / max(denom, 1)
-    selected_mse = selected_se / max(denom, 1)
-    return {
-        "enable": True,
-        "samples": int(total),
-        "label_min_improvement": float(min_improvement),
-        "top1_hit_rate_all": float(hit_total / max(total, 1)),
-        "top1_hit_rate_on_positive_oracle": float(positive_hit_total / max(positive_total, 1)),
-        "oracle_positive_rate": float(positive_total / max(total, 1)),
-        "selected_positive_rate": float(selected_positive / max(total, 1)),
-        "base_mse": float(base_mse),
-        "oracle_mse": float(oracle_mse),
-        "selected_top1_mse": float(selected_mse),
-        "oracle_gain_pct_vs_base": float(100.0 * (base_mse - oracle_mse) / max(abs(base_mse), 1.0e-12)),
-        "selected_top1_gain_pct_vs_base": float(
-            100.0 * (base_mse - selected_mse) / max(abs(base_mse), 1.0e-12)
-        ),
-        "oracle_count": {name: int(oracle_count_p[i].item()) for i, name in enumerate(penalty_names)},
-        "positive_oracle_count": {
-            name: int(positive_oracle_count_p[i].item()) for i, name in enumerate(penalty_names)
-        },
-        "selected_count": {name: int(selected_count_p[i].item()) for i, name in enumerate(penalty_names)},
-    }
-
-
-def _pearson_list(xs: List[float], ys: List[float]) -> Optional[float]:
-    if len(xs) != len(ys) or len(xs) < 2:
-        return None
-    x = np.asarray(xs, dtype=np.float64)
-    y = np.asarray(ys, dtype=np.float64)
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = float(np.sqrt((x * x).sum()) * np.sqrt((y * y).sum()))
-    if denom <= 1.0e-12:
-        return None
-    return float((x * y).sum() / denom)
-
-
-def _explainability_train_subsplit_ranges(
-    num_windows: int,
-    holdout_fraction: float = 0.30,
-) -> Dict[str, Tuple[int, int]]:
-    n = int(num_windows)
-    if n <= 0:
-        return {}
-    if n == 1:
-        return {"train_fit": (0, 1)}
-    frac = max(0.0, min(float(holdout_fraction), 0.95))
-    holdout = int(math.ceil(float(n) * frac))
-    holdout = max(1, min(holdout, n - 1))
-    cut = n - holdout
-    return {
-        "train_fit": (0, cut),
-        "train_holdout": (cut, n),
-    }
-
-
-def _cluster_route_label_feature_diagnostics(
-    feat_bkf: torch.Tensor,
-    route_label_bk: torch.Tensor,
-    penalty_names: List[str],
-    feature_names: Optional[List[str]] = None,
-) -> Dict[str, object]:
-    label_names = ["skip"] + [str(name) for name in penalty_names]
-    if feature_names is None:
-        feature_names = [f"feature_{i}" for i in range(int(feat_bkf.shape[-1]))]
-    else:
-        feature_names = [str(name) for name in feature_names]
-
-    def _label_name(label: int) -> Optional[str]:
-        if 0 <= int(label) < len(label_names):
-            return label_names[int(label)]
-        return None
-
-    def _majority_label(labels_n: torch.Tensor, label_count: int) -> Tuple[int, float]:
-        if labels_n.numel() <= 0:
-            return -1, 0.0
-        counts = torch.bincount(labels_n.to(dtype=torch.long), minlength=label_count)[:label_count]
-        label = int(counts.argmax().item())
-        acc = float(counts[label].item() / max(int(labels_n.numel()), 1))
-        return label, acc
-
-    feat = feat_bkf.detach().cpu().to(dtype=torch.float32)
-    labels = route_label_bk.detach().cpu().to(dtype=torch.long)
-    if feat.dim() != 3 or labels.dim() != 2:
-        raise ValueError("feat_bkf must be [B,K,F] and route_label_bk must be [B,K].")
-    if int(feat.shape[0]) != int(labels.shape[0]) or int(feat.shape[1]) != int(labels.shape[1]):
-        raise ValueError("feat_bkf and route_label_bk must share [B,K].")
-
-    B, K, F = int(feat.shape[0]), int(feat.shape[1]), int(feat.shape[2])
-    per_cluster = []
-    label_count = len(label_names)
-    for k in range(K):
-        valid = (labels[:, k] >= 0) & (labels[:, k] < label_count)
-        labels_k = labels[valid, k]
-        feat_kf = feat[valid, k, :]
-        samples = int(labels_k.numel())
-        counts = torch.bincount(labels_k, minlength=label_count)[:label_count] if samples > 0 else torch.zeros(label_count, dtype=torch.long)
-        rates = counts.to(dtype=torch.float64) / max(samples, 1)
-        majority_label, majority_acc = _majority_label(labels_k, label_count)
-        entropy_bits = 0.0
-        for rate in rates.tolist():
-            if float(rate) > 0.0:
-                entropy_bits -= float(rate) * math.log(float(rate), 2)
-
-        best_stump = None
-        if samples >= 2 and F > 0 and int((counts > 0).sum().item()) >= 2:
-            best_acc = -1.0
-            best_payload = None
-            for f in range(F):
-                values = feat_kf[:, f]
-                finite = torch.isfinite(values)
-                if int(finite.sum().item()) < 2:
-                    continue
-                values_f = values[finite]
-                labels_f = labels_k[finite]
-                unique = torch.unique(values_f).sort().values
-                if int(unique.numel()) < 2:
-                    continue
-                if int(unique.numel()) <= 16:
-                    thresholds = (unique[:-1] + unique[1:]) * 0.5
-                else:
-                    quantiles = torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90], dtype=values_f.dtype)
-                    thresholds = torch.unique(torch.quantile(values_f, quantiles)).sort().values
-                for threshold in thresholds:
-                    left = values_f <= threshold
-                    right = ~left
-                    if int(left.sum().item()) <= 0 or int(right.sum().item()) <= 0:
-                        continue
-                    left_label, _ = _majority_label(labels_f[left], label_count)
-                    right_label, _ = _majority_label(labels_f[right], label_count)
-                    pred = torch.where(
-                        left,
-                        torch.full_like(labels_f, int(left_label)),
-                        torch.full_like(labels_f, int(right_label)),
-                    )
-                    acc = float((pred == labels_f).to(dtype=torch.float32).mean().item())
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_payload = {
-                            "feature": feature_names[f] if f < len(feature_names) else f"feature_{f}",
-                            "feature_index": int(f),
-                            "threshold": float(threshold.item()),
-                            "op": "<=",
-                            "left_label": _label_name(left_label),
-                            "right_label": _label_name(right_label),
-                            "accuracy": acc,
-                            "lift_vs_majority": float(acc - majority_acc),
-                        }
-            best_stump = best_payload
-
-        label_counts = {label_names[i]: int(counts[i].item()) for i in range(label_count)}
-        label_rates = {label_names[i]: float(rates[i].item()) for i in range(label_count)}
-        per_cluster.append(
-            {
-                "cluster_id": int(k),
-                "samples": samples,
-                "label_counts": label_counts,
-                "label_rates": label_rates,
-                "majority_label": _label_name(majority_label),
-                "majority_acc": float(majority_acc),
-                "entropy_bits": float(entropy_bits),
-                "best_stump": best_stump,
-            }
-        )
-
-    return {
-        "samples": int(B * K),
-        "label_names": label_names,
-        "feature_names": feature_names,
-        "per_cluster": per_cluster,
-    }
-
-
-def _cluster_route_label_phase_diagnostics(
-    query_start_abs_b: torch.Tensor,
-    route_label_bk: torch.Tensor,
-    penalty_names: List[str],
-    periods: List[int],
-    num_bins: int = 8,
-    phase_offset: int = 0,
-) -> Dict[str, object]:
-    label_names = ["skip"] + [str(name) for name in penalty_names]
-    label_count = len(label_names)
-
-    def _label_name(label: int) -> Optional[str]:
-        if 0 <= int(label) < label_count:
-            return label_names[int(label)]
-        return None
-
-    def _counts_payload(labels_n: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int], Dict[str, float], Optional[str], float]:
-        if labels_n.numel() <= 0:
-            counts = torch.zeros(label_count, dtype=torch.long)
-            return counts, {name: 0 for name in label_names}, {name: 0.0 for name in label_names}, None, 0.0
-        counts = torch.bincount(labels_n.to(dtype=torch.long), minlength=label_count)[:label_count]
-        total = int(labels_n.numel())
-        majority = int(counts.argmax().item())
-        label_counts = {label_names[i]: int(counts[i].item()) for i in range(label_count)}
-        label_rates = {label_names[i]: float(counts[i].item() / max(total, 1)) for i in range(label_count)}
-        majority_acc = float(counts[majority].item() / max(total, 1))
-        return counts, label_counts, label_rates, _label_name(majority), majority_acc
-
-    starts = query_start_abs_b.detach().cpu().to(dtype=torch.long).reshape(-1)
-    labels = route_label_bk.detach().cpu().to(dtype=torch.long)
-    if labels.dim() != 2:
-        raise ValueError("route_label_bk must have shape [B,K].")
-    if int(labels.shape[0]) != int(starts.numel()):
-        raise ValueError("query_start_abs_b length must match route_label_bk batch dimension.")
-
-    clean_periods = []
-    for period in periods:
-        period_i = int(period)
-        if period_i > 0 and period_i not in clean_periods:
-            clean_periods.append(period_i)
-    bins_requested = int(num_bins)
-    if bins_requested <= 0:
-        bins_requested = 8
-
-    K = int(labels.shape[1])
-    per_period = []
-    for period in clean_periods:
-        bins = max(1, min(int(bins_requested), int(period)))
-        phase_b = (starts + int(phase_offset)).remainder(int(period))
-        bin_b = torch.div(phase_b * bins, int(period), rounding_mode="floor").clamp(min=0, max=bins - 1)
-        period_clusters = []
-        for k in range(K):
-            valid = (labels[:, k] >= 0) & (labels[:, k] < label_count)
-            labels_k = labels[valid, k]
-            bin_k = bin_b[valid]
-            samples = int(labels_k.numel())
-            _, label_counts, label_rates, global_majority_label, global_majority_acc = _counts_payload(labels_k)
-            bin_payloads = []
-            phase_correct = 0
-            for b in range(bins):
-                bin_mask = bin_k == int(b)
-                labels_bin = labels_k[bin_mask]
-                bin_samples = int(labels_bin.numel())
-                counts, bin_counts, bin_rates, majority_label, majority_acc = _counts_payload(labels_bin)
-                if bin_samples > 0:
-                    phase_correct += int(counts.max().item())
-                start_phase = int(math.floor(float(b) * float(period) / float(bins)))
-                end_phase = int(math.floor(float(b + 1) * float(period) / float(bins)))
-                bin_payloads.append(
-                    {
-                        "bin": int(b),
-                        "phase_start": start_phase,
-                        "phase_end": end_phase,
-                        "samples": bin_samples,
-                        "label_counts": bin_counts,
-                        "label_rates": bin_rates,
-                        "majority_label": majority_label,
-                        "majority_acc": float(majority_acc),
-                    }
-                )
-            phase_majority_acc = float(phase_correct / max(samples, 1))
-            period_clusters.append(
-                {
-                    "cluster_id": int(k),
-                    "samples": samples,
-                    "label_counts": label_counts,
-                    "label_rates": label_rates,
-                    "global_majority_label": global_majority_label,
-                    "global_majority_acc": float(global_majority_acc),
-                    "phase_majority_acc": phase_majority_acc,
-                    "lift_vs_global": float(phase_majority_acc - global_majority_acc),
-                    "bins": bin_payloads,
-                }
-            )
-        per_period.append(
-            {
-                "period": int(period),
-                "num_bins": int(bins),
-                "per_cluster": period_clusters,
-            }
-        )
-
-    return {
-        "samples": int(labels.numel()),
-        "window_count": int(labels.shape[0]),
-        "label_names": label_names,
-        "periods": clean_periods,
-        "num_bins_requested": int(bins_requested),
-        "phase_offset": int(phase_offset),
-        "per_period": per_period,
-    }
-
-
-def _cluster_top1_confidence_gain_diagnostics(
-    *,
-    top1_conf_bc: torch.Tensor,
-    top1_gain_bc: torch.Tensor,
-    top1_p_bc: torch.Tensor,
-    top1_active_bc: torch.Tensor,
-    skip_bc: torch.Tensor,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    penalty_names: List[str],
-    bins: List[float],
-) -> Dict[str, object]:
-    conf = top1_conf_bc.detach().cpu().to(dtype=torch.float32)
-    gain = top1_gain_bc.detach().cpu().to(dtype=torch.float32)
-    top1_p = top1_p_bc.detach().cpu().to(dtype=torch.long)
-    active = top1_active_bc.detach().cpu().to(dtype=torch.bool)
-    skipped = skip_bc.detach().cpu().to(dtype=torch.bool)
-    cid = cluster_id_c.detach().cpu().to(dtype=torch.long)
-    if conf.shape != gain.shape or conf.shape != top1_p.shape or conf.shape != active.shape or conf.shape != skipped.shape:
-        raise ValueError("top1 confidence diagnostics inputs must share shape [B,C].")
-    if conf.dim() != 2:
-        raise ValueError("top1 confidence diagnostics inputs must have shape [B,C].")
-    if int(cid.numel()) != int(conf.shape[1]):
-        raise ValueError("cluster_id_c length must match confidence channel dimension.")
-
-    clean_bins = sorted({float(v) for v in bins if math.isfinite(float(v))})
-    if len(clean_bins) < 2:
-        clean_bins = [0.0, 0.5, 1.0]
-    if clean_bins[0] > 0.0:
-        clean_bins = [0.0] + clean_bins
-    if clean_bins[-1] < 1.0:
-        clean_bins = clean_bins + [1.0]
-    label_names = [str(name) for name in penalty_names]
-
-    def _bin_payload(mask_bc: torch.Tensor, lower: float, upper: float, is_last: bool) -> Dict[str, object]:
-        if is_last:
-            bin_mask = mask_bc & (conf >= float(lower)) & (conf <= float(upper))
-        else:
-            bin_mask = mask_bc & (conf >= float(lower)) & (conf < float(upper))
-        samples = int(bin_mask.sum().item())
-        active_mask = bin_mask & active
-        skipped_mask = bin_mask & skipped
-        active_count = int(active_mask.sum().item())
-        skipped_count = int(skipped_mask.sum().item())
-        if samples > 0:
-            mean_gain = float(gain[bin_mask].mean().item())
-            positive_rate = float((gain[bin_mask] > 0.0).to(dtype=torch.float32).mean().item())
-        else:
-            mean_gain = 0.0
-            positive_rate = 0.0
-        if active_count > 0:
-            active_mean_gain = float(gain[active_mask].mean().item())
-            active_positive_rate = float((gain[active_mask] > 0.0).to(dtype=torch.float32).mean().item())
-            harmful_not_skipped_rate = float((gain[active_mask] <= 0.0).to(dtype=torch.float32).mean().item())
-        else:
-            active_mean_gain = 0.0
-            active_positive_rate = 0.0
-            harmful_not_skipped_rate = 0.0
-        if skipped_count > 0:
-            skipped_positive_rate = float((gain[skipped_mask] > 0.0).to(dtype=torch.float32).mean().item())
-        else:
-            skipped_positive_rate = 0.0
-        return {
-            "low": float(lower),
-            "high": float(upper),
-            "samples": samples,
-            "active_count": active_count,
-            "skipped_count": skipped_count,
-            "mean_gain_mse": mean_gain,
-            "positive_rate": positive_rate,
-            "active_mean_gain_mse": active_mean_gain,
-            "active_positive_rate": active_positive_rate,
-            "harmful_not_skipped_rate": harmful_not_skipped_rate,
-            "skipped_positive_rate": skipped_positive_rate,
-        }
-
-    def _group_payload(mask_bc: torch.Tensor) -> Dict[str, object]:
-        payload_bins = []
-        for i in range(len(clean_bins) - 1):
-            payload_bins.append(
-                _bin_payload(
-                    mask_bc,
-                    lower=clean_bins[i],
-                    upper=clean_bins[i + 1],
-                    is_last=i == len(clean_bins) - 2,
-                )
-            )
-        samples = int(mask_bc.sum().item())
-        if samples > 0:
-            mean_gain = float(gain[mask_bc].mean().item())
-            positive_rate = float((gain[mask_bc] > 0.0).to(dtype=torch.float32).mean().item())
-        else:
-            mean_gain = 0.0
-            positive_rate = 0.0
-        return {
-            "samples": samples,
-            "mean_gain_mse": mean_gain,
-            "positive_rate": positive_rate,
-            "bins": payload_bins,
-        }
-
-    per_cluster = []
-    for k in range(int(K)):
-        cluster_mask = (cid == int(k)).view(1, -1).expand_as(conf)
-        per_penalty = []
-        for p, name in enumerate(label_names):
-            per_penalty.append(
-                {
-                    "penalty": name,
-                    **_group_payload(cluster_mask & (top1_p == int(p))),
-                }
-            )
-        per_cluster.append(
-            {
-                "cluster_id": int(k),
-                "all": _group_payload(cluster_mask),
-                "per_penalty": per_penalty,
-            }
-        )
-
-    return {
-        "bins": [float(v) for v in clean_bins],
-        "penalty_names": label_names,
-        "per_cluster": per_cluster,
-    }
-
-
-def _build_penalty_route_learnability_class_features(
-    *,
-    gate_feat_bkf: torch.Tensor,
-    skip_feat_bkf: torch.Tensor,
-    cand_feat_bkpf: torch.Tensor,
-    gate_prob_bkp: torch.Tensor,
-    route_bkp: torch.Tensor,
-    intervention_bkp: torch.Tensor,
-    selector_bkp: torch.Tensor,
-    alpha_bkp: torch.Tensor,
-    skip_prob_bk: Optional[torch.Tensor],
-    cluster_count: int,
-    penalty_names: List[str],
-) -> Tuple[torch.Tensor, List[str]]:
-    if gate_feat_bkf.dim() != 3:
-        raise ValueError("gate_feat_bkf must have shape [B,K,F].")
-    if skip_feat_bkf.dim() != 3:
-        raise ValueError("skip_feat_bkf must have shape [B,K,F].")
-    if cand_feat_bkpf.dim() != 4:
-        raise ValueError("cand_feat_bkpf must have shape [B,K,P,F].")
-    B, K, gate_dim = [int(v) for v in gate_feat_bkf.shape]
-    if tuple(skip_feat_bkf.shape[:2]) != (B, K):
-        raise ValueError("skip_feat_bkf must share [B,K] with gate_feat_bkf.")
-    if tuple(cand_feat_bkpf.shape[:3]) != (B, K, len(penalty_names)):
-        raise ValueError("cand_feat_bkpf must share [B,K,P] with penalty_names.")
-    P = int(cand_feat_bkpf.shape[2])
-    Q = P + 1
-    stat_shape = (B, K, P)
-    for name, value in [
-        ("gate_prob_bkp", gate_prob_bkp),
-        ("route_bkp", route_bkp),
-        ("intervention_bkp", intervention_bkp),
-        ("selector_bkp", selector_bkp),
-    ]:
-        if tuple(value.shape) != stat_shape:
-            raise ValueError(f"{name} must have shape [B,K,P].")
-    if alpha_bkp.dim() == 2:
-        if tuple(alpha_bkp.shape) != (K, P):
-            raise ValueError("alpha_bkp must have shape [K,P] or [B,K,P].")
-        alpha_bkp = alpha_bkp.unsqueeze(0).expand(B, K, P)
-    elif tuple(alpha_bkp.shape) != stat_shape:
-        raise ValueError("alpha_bkp must have shape [K,P] or [B,K,P].")
-    if skip_prob_bk is None:
-        skip_prob_bk = torch.zeros(B, K, device=gate_feat_bkf.device, dtype=gate_feat_bkf.dtype)
-    if tuple(skip_prob_bk.shape) != (B, K):
-        raise ValueError("skip_prob_bk must have shape [B,K].")
-
-    dtype = gate_feat_bkf.dtype
-    device = gate_feat_bkf.device
-    zero_bk1 = torch.zeros(B, K, 1, device=device, dtype=dtype)
-    class_gate_prob = torch.cat([zero_bk1, gate_prob_bkp.to(device=device, dtype=dtype)], dim=-1)
-    class_route = torch.cat([zero_bk1, route_bkp.to(device=device, dtype=dtype)], dim=-1)
-    class_intervention = torch.cat([zero_bk1, intervention_bkp.to(device=device, dtype=dtype)], dim=-1)
-    class_selector = torch.cat([zero_bk1, selector_bkp.to(device=device, dtype=dtype)], dim=-1)
-    class_alpha = torch.cat([zero_bk1, alpha_bkp.to(device=device, dtype=dtype)], dim=-1)
-    class_skip_prob = skip_prob_bk.to(device=device, dtype=dtype).unsqueeze(-1).expand(B, K, Q)
-    stat_features = torch.stack(
-        [
-            class_gate_prob,
-            class_route,
-            class_intervention,
-            class_selector,
-            class_alpha,
-            class_skip_prob,
-        ],
-        dim=-1,
-    )
-
-    candidate_features = torch.cat(
-        [
-            skip_feat_bkf.to(device=device, dtype=dtype).unsqueeze(2),
-            cand_feat_bkpf.to(device=device, dtype=dtype),
-        ],
-        dim=2,
-    )
-    gate_features = gate_feat_bkf.to(device=device, dtype=dtype).unsqueeze(2).expand(B, K, Q, gate_dim)
-    class_eye = torch.eye(Q, device=device, dtype=dtype).view(1, 1, Q, Q).expand(B, K, Q, Q)
-    cluster_total = int(cluster_count) if int(cluster_count) > 0 else K
-    if cluster_total < K:
-        raise ValueError("cluster_count cannot be smaller than gate_feat_bkf.shape[1].")
-    cluster_eye = torch.eye(cluster_total, device=device, dtype=dtype)[:K].view(1, K, 1, cluster_total)
-    cluster_features = cluster_eye.expand(B, K, Q, cluster_total)
-    features = torch.cat(
-        [
-            gate_features,
-            candidate_features,
-            stat_features,
-            class_eye,
-            cluster_features,
-        ],
-        dim=-1,
-    ).contiguous()
-
-    feature_names = (
-        [f"gate_feature_{i}" for i in range(gate_dim)]
-        + [f"candidate_feature_{i}" for i in range(int(candidate_features.shape[-1]))]
-        + ["gate_prob", "route_weight", "intervention", "selector", "alpha", "skip_prob"]
-        + ["class_skip"]
-        + [f"class_{name}" for name in penalty_names]
-        + [f"cluster_{k}" for k in range(cluster_total)]
-    )
-    return features, feature_names
-
-
-def _scatter_mean_bcpf_to_bkpf(values_bcpf: torch.Tensor, cluster_id_c: torch.Tensor, K: int) -> torch.Tensor:
-    if values_bcpf.dim() != 4:
-        raise ValueError("values_bcpf must have shape [B,C,P,F].")
-    B, C, P, F_dim = [int(v) for v in values_bcpf.shape]
-    flat_bcf = values_bcpf.reshape(B, C, P * F_dim)
-    pooled = scatter_mean_bcf_to_bkf(flat_bcf, cluster_id_c, int(K))
-    return pooled.reshape(B, int(K), P, F_dim)
-
-
-@torch.no_grad()
-def _collect_penalty_route_learnability_tensors(
-    *,
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    penalty_scale: Optional[torch.Tensor],
-    select_ranks: Optional[List[int]],
-    gate_soft_weight: float,
-    split_name: str,
-    feature_mode: str = "base",
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    min_candidate_delta_rms: float = 0.0,
-    max_batches: int = 0,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    gate_feature_mode: str = "history",
-) -> Optional[Dict[str, object]]:
-    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
-        return None
-    moe_enable = bool(moe_cfg.get("enable", True))
-    if not moe_enable:
-        return None
-
-    model.eval()
-    gate.eval()
-    pred_residual.eval()
-    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
-    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
-    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
-    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
-    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
-    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
-    P = len(penalty_names)
-    cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
-    allowed_mask_device = None
-    if allowed_mask_kp is not None:
-        allowed_mask_device = allowed_mask_kp.detach().to(device=device, dtype=torch.bool)
-        if tuple(allowed_mask_device.shape) != (int(K), int(P)):
-            raise ValueError("allowed_mask_kp must have shape [K,P] for route learnability diagnostics.")
-
-    feature_chunks: List[torch.Tensor] = []
-    label_chunks: List[torch.Tensor] = []
-    current_chunks: List[torch.Tensor] = []
-    query_start_chunks: List[torch.Tensor] = []
-    gain_chunks: List[torch.Tensor] = []
-    feature_names: Optional[List[str]] = None
-    batch_count = 0
-
-    for x, y, idx in loader:
-        batch_count += 1
-        if max_batches > 0 and batch_count > int(max_batches):
-            break
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
-        route_pen_bkp = _router_penalty_context_from_history(
-            x_bcl=x,
-            yhat_base_bch=y_base,
-            penalty_names=penalty_names,
-            penalty_fns=penalty_fns,
-            penalty_scale=penalty_scale,
-            cluster_id_c=cluster_id_c,
-            K=K,
-        )
-        mask_bkp, probs_bkp, skip_bk, skip_prob_bk = gate(
-            feat_bkf,
-            straight_through=False,
-            penalty_context_bkp=route_pen_bkp,
-            penalty_context_mode=router_mode,
-            penalty_context_weight=router_penalty_context_weight,
-            penalty_context_detach=router_detach_penalty_context,
-            penalty_context_score=router_penalty_context_score,
-        )
-        rank_mask = None
-        if select_ranks is not None:
-            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
-            rank_mask = mask_bkp
-        if gate_soft_weight > 0.0:
-            probs_sel = probs_bkp
-            if rank_mask is not None:
-                probs_sel = probs_sel * rank_mask
-                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
-            probs_sel = probs_sel * target_mass
-            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
-
-        pred_out = pred_residual(
-            x,
-            y_base,
-            cluster_id_c,
-            mask_bkp,
-            skip_bk=skip_bk if allow_skip else None,
-            query_start_abs_b=query_start_abs_b,
-        )
-        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
-            y_base,
-            pred_out,
-            apply_output_anchors=True,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            moe_cfg=moe_cfg,
-            moe_enable=moe_enable,
-            observed_history_tc=observed_history_tc,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
-        if cand_bcpH is None:
-            continue
-        labels_bk, raw_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
-            base_bch=y_base_final,
-            cand_bcpH=cand_bcpH,
-            y_bch=y,
-            cluster_id_c=cid_c,
-            K=int(K),
-            allowed_mask_kp=allowed_mask_device,
-            min_abs_improvement=float(min_abs_improvement),
-            min_rel_improvement=float(min_rel_improvement),
-            min_candidate_delta_rms=float(min_candidate_delta_rms),
-        )
-        gain_bk = raw_gain_bk.clamp_min(0.0)
-
-        route_bcp = pred_out.get("route_bcp", mask_bkp[:, cid_c, :])
-        intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp))
-        selector_bcp = pred_out.get("selector_bcp", torch.ones_like(route_bcp))
-        alpha_cp = pred_out.get("alpha_cp")
-        if alpha_cp is None:
-            alpha_cp = torch.ones(int(cid_c.numel()), P, device=device, dtype=x.dtype)
-        skip_feat_bcf = _candidate_selector_features(x, y_base_final, y_base_final, feature_mode=feature_mode)
-        cand_feat_parts = [
-            _candidate_selector_features(x, y_base_final, cand_bcpH[:, :, p, :], feature_mode=feature_mode)
-            for p in range(P)
-        ]
-        cand_feat_bcpf = torch.stack(cand_feat_parts, dim=2)
-        skip_feat_bkf = scatter_mean_bcf_to_bkf(skip_feat_bcf, cluster_id_c, int(K))
-        cand_feat_bkpf = _scatter_mean_bcpf_to_bkpf(cand_feat_bcpf, cluster_id_c, int(K))
-        route_bkp = scatter_mean_bcf_to_bkf(route_bcp, cluster_id_c, int(K))
-        intervention_bkp = scatter_mean_bcf_to_bkf(intervention_bcp, cluster_id_c, int(K))
-        selector_bkp = scatter_mean_bcf_to_bkf(selector_bcp, cluster_id_c, int(K))
-        alpha_bkp = scatter_mean_bcf_to_bkf(alpha_cp.unsqueeze(0).expand(x.shape[0], -1, -1), cluster_id_c, int(K))
-        class_features_bkqf, names = _build_penalty_route_learnability_class_features(
-            gate_feat_bkf=feat_bkf,
-            skip_feat_bkf=skip_feat_bkf,
-            cand_feat_bkpf=cand_feat_bkpf,
-            gate_prob_bkp=probs_bkp,
-            route_bkp=route_bkp,
-            intervention_bkp=intervention_bkp,
-            selector_bkp=selector_bkp,
-            alpha_bkp=alpha_bkp,
-            skip_prob_bk=skip_prob_bk if allow_skip else None,
-            cluster_count=int(K),
-            penalty_names=penalty_names,
-        )
-        feature_names = names
-        current_penalty_bk = (mask_bkp * probs_bkp).argmax(dim=-1).to(dtype=torch.long) + 1
-        if allow_skip:
-            current_penalty_bk = torch.where(
-                skip_bk > 0.5,
-                torch.zeros_like(current_penalty_bk),
-                current_penalty_bk,
-            )
-        feature_chunks.append(class_features_bkqf.detach().cpu().reshape(-1, P + 1, class_features_bkqf.shape[-1]))
-        label_chunks.append(labels_bk.detach().cpu().reshape(-1))
-        current_chunks.append(current_penalty_bk.detach().cpu().reshape(-1))
-        query_start_chunks.append(query_start_abs_b.detach().cpu().view(-1, 1).expand(-1, int(K)).reshape(-1))
-        gain_chunks.append(gain_bk.detach().cpu().reshape(-1))
-
-    if not feature_chunks:
-        return None
-    return {
-        "split": str(split_name),
-        "features": torch.cat(feature_chunks, dim=0),
-        "labels": torch.cat(label_chunks, dim=0),
-        "current_pred": torch.cat(current_chunks, dim=0),
-        "query_start_abs": torch.cat(query_start_chunks, dim=0),
-        "oracle_gain_mse": torch.cat(gain_chunks, dim=0),
-        "label_names": ["skip"] + [str(name) for name in penalty_names],
-        "feature_names": list(feature_names or []),
-    }
-
-
-def _penalty_route_learnability_metrics_from_scores(
-    *,
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-    current_pred: torch.Tensor,
-    label_names: List[str],
-) -> Dict[str, object]:
-    if scores.dim() != 2:
-        raise ValueError("scores must have shape [N,num_classes].")
-    label_count = int(scores.shape[1])
-    if len(label_names) != label_count:
-        raise ValueError("label_names length must match scores.shape[1].")
-    labels = labels.detach().cpu().to(dtype=torch.long).view(-1)
-    current_pred = current_pred.detach().cpu().to(dtype=torch.long).view(-1)
-    if int(labels.numel()) != int(scores.shape[0]) or int(current_pred.numel()) != int(scores.shape[0]):
-        raise ValueError("scores, labels, and current_pred must share N.")
-    valid = (labels >= 0) & (labels < label_count)
-    if int(valid.sum().item()) <= 0:
-        return {
-            "samples": 0,
-            "accuracy_all": 0.0,
-            "current_accuracy_all": 0.0,
-            "majority_accuracy_all": 0.0,
-            "accuracy_on_positive_oracle": 0.0,
-            "current_accuracy_on_positive_oracle": 0.0,
-            "prediction_counts": {name: 0 for name in label_names},
-            "current_prediction_counts": {name: 0 for name in label_names},
-            "label_counts": {name: 0 for name in label_names},
-        }
-    labels_v = labels[valid]
-    current_v = current_pred[valid].clamp(0, label_count - 1)
-    pred_v = scores.detach().cpu()[valid].argmax(dim=-1).to(dtype=torch.long)
-    label_counts_t = torch.bincount(labels_v, minlength=label_count)[:label_count]
-    pred_counts_t = torch.bincount(pred_v, minlength=label_count)[:label_count]
-    current_counts_t = torch.bincount(current_v, minlength=label_count)[:label_count]
-    samples = int(labels_v.numel())
-    positive = labels_v > 0
-    positive_count = int(positive.sum().item())
-    majority_acc = float(label_counts_t.max().item() / max(samples, 1))
-    accuracy = float((pred_v == labels_v).to(dtype=torch.float32).mean().item())
-    current_accuracy = float((current_v == labels_v).to(dtype=torch.float32).mean().item())
-    if positive_count > 0:
-        positive_accuracy = float((pred_v[positive] == labels_v[positive]).to(dtype=torch.float32).mean().item())
-        current_positive_accuracy = float(
-            (current_v[positive] == labels_v[positive]).to(dtype=torch.float32).mean().item()
-        )
-    else:
-        positive_accuracy = 0.0
-        current_positive_accuracy = 0.0
-    return {
-        "samples": samples,
-        "positive_oracle_samples": positive_count,
-        "accuracy_all": accuracy,
-        "current_accuracy_all": current_accuracy,
-        "majority_accuracy_all": majority_acc,
-        "lift_vs_current": float(accuracy - current_accuracy),
-        "lift_vs_majority": float(accuracy - majority_acc),
-        "accuracy_on_positive_oracle": positive_accuracy,
-        "current_accuracy_on_positive_oracle": current_positive_accuracy,
-        "prediction_counts": {name: int(pred_counts_t[i].item()) for i, name in enumerate(label_names)},
-        "current_prediction_counts": {name: int(current_counts_t[i].item()) for i, name in enumerate(label_names)},
-        "label_counts": {name: int(label_counts_t[i].item()) for i, name in enumerate(label_names)},
-        "label_rates": {
-            name: float(label_counts_t[i].item() / max(samples, 1)) for i, name in enumerate(label_names)
-        },
-    }
-
-
-class _PenaltyRouteLearnabilityHead(nn.Module):
-    def __init__(
-        self,
-        feat_dim: int,
-        num_classes: int,
-        hidden_dim: int = 0,
-        dropout: float = 0.0,
-        head_mode: str = "classwise",
-    ):
-        super().__init__()
-        self.head_mode = str(head_mode or "classwise").lower()
-        if self.head_mode in {"flat", "multiclass"}:
-            in_dim = int(feat_dim) * int(num_classes)
-            if int(hidden_dim) > 0:
-                self.net = nn.Sequential(
-                    nn.Linear(in_dim, int(hidden_dim)),
-                    nn.ReLU(),
-                    nn.Dropout(float(dropout)),
-                    nn.Linear(int(hidden_dim), int(num_classes)),
-                )
-            else:
-                self.net = nn.Linear(in_dim, int(num_classes))
-            return
-        if self.head_mode not in {"classwise", "candidate", "shared"}:
-            raise ValueError("route learnability head_mode must be classwise or flat.")
-        if int(hidden_dim) > 0:
-            self.net = nn.Sequential(
-                nn.Linear(int(feat_dim), int(hidden_dim)),
-                nn.ReLU(),
-                nn.Dropout(float(dropout)),
-                nn.Linear(int(hidden_dim), 1),
-            )
-        else:
-            self.net = nn.Linear(int(feat_dim), 1)
-
-    def forward(self, features_nqf: torch.Tensor) -> torch.Tensor:
-        if features_nqf.dim() != 3:
-            raise ValueError("features_nqf must have shape [N,num_classes,F].")
-        if self.head_mode in {"flat", "multiclass"}:
-            return self.net(features_nqf.flatten(start_dim=1))
-        return self.net(features_nqf).squeeze(-1)
-
-
-def _fit_penalty_route_learnability_head_from_tensors(
-    *,
-    train_tensors: Dict[str, torch.Tensor],
-    eval_tensors_by_split: Dict[str, Dict[str, torch.Tensor]],
-    label_names: List[str],
-    feature_names: List[str],
-    cfg: Dict[str, object],
-    device: torch.device,
-) -> Tuple[Dict[str, object], Dict[str, object]]:
-    train_features = train_tensors["features"].detach().to(dtype=torch.float32)
-    train_labels = train_tensors["labels"].detach().to(dtype=torch.long).view(-1)
-    train_current = train_tensors["current_pred"].detach().to(dtype=torch.long).view(-1)
-    if train_features.dim() != 3:
-        raise ValueError("train features must have shape [N,num_classes,F].")
-    if int(train_features.shape[0]) != int(train_labels.numel()):
-        raise ValueError("train labels length must match train features N.")
-    label_count = int(train_features.shape[1])
-    if len(label_names) != label_count:
-        raise ValueError("label_names length must match train feature class count.")
-    valid = (train_labels >= 0) & (train_labels < label_count)
-    if int(valid.sum().item()) <= 0:
-        raise ValueError("penalty route learnability probe has no valid train labels.")
-    train_features = train_features[valid]
-    train_labels = train_labels[valid]
-    train_current = train_current[valid]
-    flat = train_features.reshape(-1, int(train_features.shape[-1]))
-    feat_mean = flat.mean(dim=0)
-    feat_std = flat.std(dim=0).clamp_min(1.0e-6)
-
-    seed = int(cfg.get("seed", 0))
-    torch.manual_seed(seed)
-    model = _PenaltyRouteLearnabilityHead(
-        feat_dim=int(train_features.shape[-1]),
-        num_classes=label_count,
-        hidden_dim=int(cfg.get("hidden_dim", 32)),
-        dropout=float(cfg.get("dropout", 0.0)),
-        head_mode=str(cfg.get("head_mode", "classwise")),
-    ).to(device)
-    init_bias_mode = str(cfg.get("init_bias", "none")).lower()
-    if init_bias_mode in {"train_prior", "label_prior", "prior"}:
-        counts = torch.bincount(train_labels, minlength=label_count).to(dtype=torch.float32)
-        counts = counts + float(cfg.get("prior_smoothing", 1.0e-6))
-        prior_logits = torch.log(counts / counts.sum().clamp_min(1.0e-12)).to(device=device)
-        with torch.no_grad():
-            final_layer = model.net if isinstance(model.net, nn.Linear) else model.net[-1]
-            if isinstance(final_layer, nn.Linear) and int(final_layer.out_features) == label_count:
-                if bool(cfg.get("zero_init_output", True)):
-                    final_layer.weight.zero_()
-                final_layer.bias.copy_(prior_logits)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg.get("lr", 1.0e-3)),
-        weight_decay=float(cfg.get("weight_decay", 1.0e-4)),
-    )
-    batch_size = max(1, int(cfg.get("batch_size", 256)))
-    epochs = max(1, int(cfg.get("epochs", 60)))
-    class_weight_mode = str(cfg.get("class_weight", "none")).lower()
-    class_weight = None
-    class_weight_summary = None
-    if class_weight_mode in {"balanced", "auto"}:
-        counts = torch.bincount(train_labels, minlength=label_count).to(dtype=torch.float32).clamp_min(1.0)
-        weight = float(train_labels.numel()) / (float(label_count) * counts)
-        if "class_weight_min" in cfg or "class_weight_max" in cfg:
-            weight = weight.clamp(
-                min=float(cfg.get("class_weight_min", 0.0)),
-                max=float(cfg.get("class_weight_max", float("inf"))),
-            )
-        class_weight = weight.to(device=device)
-        class_weight_summary = [float(v) for v in weight.detach().cpu().tolist()]
-    elif isinstance(cfg.get("class_weight"), (list, tuple)):
-        weight = torch.as_tensor(cfg.get("class_weight"), dtype=torch.float32)
-        if int(weight.numel()) != label_count:
-            raise ValueError(f"route learnability class_weight must have {label_count} entries.")
-        class_weight = weight.to(device=device)
-        class_weight_summary = [float(v) for v in weight.detach().cpu().tolist()]
-
-    def _standardize(features: torch.Tensor) -> torch.Tensor:
-        return (features.to(device=device, dtype=torch.float32) - feat_mean.to(device=device).view(1, 1, -1)) / feat_std.to(
-            device=device
-        ).view(1, 1, -1)
-
-    train_features_device = train_features.to(device=device)
-    train_labels_device = train_labels.to(device=device)
-    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    best_loss = float("inf")
-    best_train_loss = float("inf")
-    best_epoch = 0
-    selection_split_requested = str(cfg.get("early_stop_split", cfg.get("selection_split", "train"))).lower()
-    if selection_split_requested in {"", "none", "off", "false", "0"}:
-        selection_split_requested = "train"
-    selection_split = selection_split_requested
-    selection_fallback_reason = None
-    if selection_split != "train" and selection_split not in eval_tensors_by_split:
-        selection_fallback_reason = f"selection split {selection_split!r} not available; fell back to train loss"
-        selection_split = "train"
-    selection_metric = str(cfg.get("selection_metric", cfg.get("early_stop_metric", "loss"))).lower()
-    metric_alias = {
-        "ce": "loss",
-        "cross_entropy": "loss",
-        "val_loss": "loss",
-        "acc": "accuracy",
-        "accuracy_all": "accuracy",
-        "val_accuracy": "accuracy",
-        "lift": "lift_vs_majority",
-        "majority_lift": "lift_vs_majority",
-    }
-    selection_metric = metric_alias.get(selection_metric, selection_metric)
-    if selection_metric not in {"loss", "accuracy", "lift_vs_majority"}:
-        raise ValueError("route learnability selection_metric must be loss, accuracy, or lift_vs_majority.")
-    minimize_selection = selection_metric == "loss"
-    best_selection_value = float("inf") if minimize_selection else -float("inf")
-    best_selection_loss = float("inf")
-    best_selection_metrics: Dict[str, object] = {}
-    early_stop_patience = int(cfg.get("early_stop_patience", cfg.get("patience", 0)))
-    early_stop_min_delta = float(cfg.get("early_stop_min_delta", cfg.get("min_delta", 0.0)))
-    include_initial_eval = bool(cfg.get("include_initial_eval", False))
-    epochs_without_improvement = 0
-    stopped_epoch = 0
-    selection_history: List[Dict[str, object]] = []
-
-    def _filtered_eval_tensors(tensors: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = tensors["features"].detach().to(dtype=torch.float32)
-        labels = tensors["labels"].detach().to(dtype=torch.long).view(-1)
-        current = tensors["current_pred"].detach().to(dtype=torch.long).view(-1)
-        valid_eval = (labels >= 0) & (labels < label_count)
-        return features[valid_eval], labels[valid_eval], current[valid_eval]
-
-    def _loss_and_metrics_for_features(
-        features: torch.Tensor,
-        labels: torch.Tensor,
-        current: torch.Tensor,
-    ) -> Tuple[float, Dict[str, object]]:
-        if int(labels.numel()) <= 0:
-            metrics = _penalty_route_learnability_metrics_from_scores(
-                scores=torch.zeros(0, label_count),
-                labels=labels,
-                current_pred=current,
-                label_names=label_names,
-            )
-            return float("inf"), metrics
-        with torch.no_grad():
-            scores_device = model(_standardize(features))
-            loss = nn.functional.cross_entropy(scores_device, labels.to(device=device), weight=None)
-            scores = scores_device.detach().cpu()
-        metrics = _penalty_route_learnability_metrics_from_scores(
-            scores=scores,
-            labels=labels,
-            current_pred=current,
-            label_names=label_names,
-        )
-        return float(loss.detach().item()), metrics
-
-    train_selection_tensors = {
-        "features": train_features.detach().cpu(),
-        "labels": train_labels.detach().cpu(),
-        "current_pred": train_current.detach().cpu(),
-    }
-
-    def _selection_value_for_epoch(epoch_train_loss: float) -> Tuple[float, float, Dict[str, object]]:
-        if selection_split == "train":
-            if selection_metric == "loss":
-                return float(epoch_train_loss), float(epoch_train_loss), {}
-            features, labels, current = _filtered_eval_tensors(train_selection_tensors)
-        else:
-            features, labels, current = _filtered_eval_tensors(eval_tensors_by_split[selection_split])
-        eval_loss, metrics = _loss_and_metrics_for_features(features, labels, current)
-        if selection_metric == "loss":
-            value = eval_loss
-        elif selection_metric == "accuracy":
-            value = float(metrics.get("accuracy_all", 0.0))
-        else:
-            value = float(metrics.get("lift_vs_majority", 0.0))
-        return float(value), float(eval_loss), metrics
-
-    def _selection_improved(value: float) -> bool:
-        if minimize_selection:
-            return value < (best_selection_value - early_stop_min_delta)
-        return value > (best_selection_value + early_stop_min_delta)
-
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    if include_initial_eval:
-        model.eval()
-        selection_value, selection_loss, selection_metrics = _selection_value_for_epoch(float("inf"))
-        selection_history.append(
-            {
-                "epoch": 0,
-                "train_loss": None,
-                "selection_split": selection_split,
-                "selection_metric": selection_metric,
-                "selection_value": float(selection_value),
-                "selection_loss": float(selection_loss),
-            }
-        )
-        if _selection_improved(selection_value):
-            best_epoch = 0
-            best_selection_value = float(selection_value)
-            best_selection_loss = float(selection_loss)
-            best_selection_metrics = dict(selection_metrics)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    for epoch in range(1, epochs + 1):
-        order = torch.randperm(int(train_features.shape[0]), generator=generator)
-        model.train()
-        total_loss = 0.0
-        total_seen = 0
-        for start in range(0, int(order.numel()), batch_size):
-            idx = order[start : start + batch_size].to(device=device)
-            features = _standardize(train_features_device.index_select(0, idx))
-            target = train_labels_device.index_select(0, idx)
-            logits = model(features)
-            loss = nn.functional.cross_entropy(logits, target, weight=class_weight)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            batch_n = int(target.numel())
-            total_loss += float(loss.detach().item()) * batch_n
-            total_seen += batch_n
-        epoch_loss = total_loss / max(total_seen, 1)
-        best_train_loss = min(best_train_loss, float(epoch_loss))
-        model.eval()
-        selection_value, selection_loss, selection_metrics = _selection_value_for_epoch(epoch_loss)
-        selection_history.append(
-            {
-                "epoch": int(epoch),
-                "train_loss": float(epoch_loss),
-                "selection_split": selection_split,
-                "selection_metric": selection_metric,
-                "selection_value": float(selection_value),
-                "selection_loss": float(selection_loss),
-            }
-        )
-        if _selection_improved(selection_value):
-            best_loss = float(epoch_loss)
-            best_epoch = int(epoch)
-            best_selection_value = float(selection_value)
-            best_selection_loss = float(selection_loss)
-            best_selection_metrics = dict(selection_metrics)
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
-                stopped_epoch = int(epoch)
-                break
-    if best_epoch <= 0:
-        best_epoch = 1
-    model.load_state_dict(best_state, strict=True)
-    model.eval()
-
-    def _metrics_for(tensors: Dict[str, torch.Tensor]) -> Dict[str, object]:
-        features, labels, current = _filtered_eval_tensors(tensors)
-        if int(labels.numel()) <= 0:
-            return _penalty_route_learnability_metrics_from_scores(
-                scores=torch.zeros(0, label_count),
-                labels=labels,
-                current_pred=current,
-                label_names=label_names,
-            )
-        with torch.no_grad():
-            scores = model(_standardize(features)).detach().cpu()
-        return _penalty_route_learnability_metrics_from_scores(
-            scores=scores,
-            labels=labels,
-            current_pred=current,
-            label_names=label_names,
-        )
-
-    split_metrics = {
-        "train": _metrics_for(
-            {
-                "features": train_features.detach().cpu(),
-                "labels": train_labels.detach().cpu(),
-                "current_pred": train_current.detach().cpu(),
-            }
-        )
-    }
-    for split_name, tensors in eval_tensors_by_split.items():
-        split_metrics[str(split_name)] = _metrics_for(tensors)
-
-    summary = {
-        "enable": True,
-        "samples_train": int(train_labels.numel()),
-        "label_names": list(label_names),
-        "feature_names": list(feature_names),
-        "config": {
-            "epochs": int(epochs),
-            "batch_size": int(batch_size),
-            "lr": float(cfg.get("lr", 1.0e-3)),
-            "head_mode": str(cfg.get("head_mode", "classwise")).lower(),
-            "hidden_dim": int(cfg.get("hidden_dim", 32)),
-            "dropout": float(cfg.get("dropout", 0.0)),
-            "weight_decay": float(cfg.get("weight_decay", 1.0e-4)),
-            "class_weight": class_weight_mode,
-            "class_weight_values": class_weight_summary,
-            "class_weight_min": None if "class_weight_min" not in cfg else float(cfg.get("class_weight_min", 0.0)),
-            "class_weight_max": None if "class_weight_max" not in cfg else float(cfg.get("class_weight_max", 0.0)),
-            "selection_split": selection_split_requested,
-            "selection_metric": selection_metric,
-            "early_stop_patience": int(early_stop_patience),
-            "early_stop_min_delta": float(early_stop_min_delta),
-            "init_bias": init_bias_mode,
-            "include_initial_eval": bool(include_initial_eval),
-            "seed": int(seed),
-        },
-        "best_train_loss": float(best_train_loss),
-        "selection": {
-            "split": selection_split,
-            "requested_split": selection_split_requested,
-            "fallback_reason": selection_fallback_reason,
-            "metric": selection_metric,
-            "best_epoch": int(best_epoch),
-            "best_value": float(best_selection_value),
-            "best_loss": float(best_selection_loss),
-            "best_train_epoch_loss": float(best_loss),
-            "minimize": bool(minimize_selection),
-            "patience": int(early_stop_patience),
-            "min_delta": float(early_stop_min_delta),
-            "stopped_epoch": int(stopped_epoch),
-            "best_metrics": best_selection_metrics,
-        },
-        "selection_history": selection_history,
-        "splits": split_metrics,
-    }
-    artifact = {
-        "state_dict": best_state,
-        "feature_mean": feat_mean.detach().cpu(),
-        "feature_std": feat_std.detach().cpu(),
-        "class_weight": None if class_weight is None else class_weight.detach().cpu(),
-        "label_names": list(label_names),
-        "feature_names": list(feature_names),
-        "config": dict(summary["config"]),
-        "selection": dict(summary["selection"]),
-    }
-    return summary, artifact
-
-
-@torch.no_grad()
-def evaluate_penalty_explainability(
-    model: nn.Module,
-    gate: ClusterwiseMoEGate,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_names: List[str],
-    penalty_fns: Dict[str, callable],
-    penalty_scale: Optional[torch.Tensor],
-    select_ranks: Optional[List[int]],
-    gate_soft_weight: float,
-    split_name: str,
-    penalty_portrait_kp: Optional[torch.Tensor] = None,
-    prior_prob_kp: Optional[torch.Tensor] = None,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    max_batches: int = 0,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    gate_feature_mode: str = "history",
-) -> Optional[Dict[str, object]]:
-    if len(loader) == 0 or pred_residual is None or len(penalty_names) == 0:
-        return None
-    moe_enable = bool(moe_cfg.get("enable", True))
-    if not moe_enable:
-        return None
-
-    model.eval()
-    gate.eval()
-    pred_residual.eval()
-    allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
-    router_mode = str(moe_cfg.get("router_mode", "learned")).lower()
-    router_penalty_context_weight = float(moe_cfg.get("router_penalty_context_weight", 0.0))
-    router_detach_penalty_context = bool(moe_cfg.get("router_detach_penalty_context", True))
-    router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
-    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
-    explain_cfg = moe_cfg.get("explainability", {}) or {}
-    utility_thresholds = [float(v) for v in (explain_cfg.get("utility_thresholds", []) or [])]
-    route_label_phase_periods = [
-        int(v) for v in (explain_cfg.get("route_label_phase_periods", []) or []) if int(v) > 0
-    ]
-    route_label_phase_bins = int(explain_cfg.get("route_label_phase_bins", 8))
-    top1_confidence_bins = [float(v) for v in (explain_cfg.get("top1_confidence_bins", []) or [])]
-
-    P = len(penalty_names)
-    cid_c = cluster_id_c.detach().to(device=device, dtype=torch.long)
-    cid_cpu = cluster_id_c.detach().cpu().to(dtype=torch.long)
-    cluster_channel_count = torch.bincount(cid_cpu, minlength=K).clamp_min(1).to(dtype=torch.float32)
-    allowed_mask_device = None
-    if allowed_mask_kp is not None:
-        allowed_mask_device = allowed_mask_kp.detach().to(device=device, dtype=torch.bool)
-        if tuple(allowed_mask_device.shape) != (int(K), int(P)):
-            raise ValueError("allowed_mask_kp must have shape [K,P] for explainability diagnostics.")
-
-    total_bc_k = torch.zeros(K, dtype=torch.float64)
-    base_err_sum_k = torch.zeros(K, dtype=torch.float64)
-    final_err_sum_k = torch.zeros(K, dtype=torch.float64)
-    oracle_err_sum_k = torch.zeros(K, dtype=torch.float64)
-    cluster_penalty_oracle_err_sum_k = torch.zeros(K, dtype=torch.float64)
-    cluster_route_oracle_err_sum_k = torch.zeros(K, dtype=torch.float64)
-    cluster_route_oracle_skip_count_k = torch.zeros(K, dtype=torch.float64)
-    cluster_route_oracle_decision_count_k = torch.zeros(K, dtype=torch.float64)
-    fusion_sum_k = torch.zeros(K, dtype=torch.float64)
-    skip_count_k = torch.zeros(K, dtype=torch.float64)
-    skip_on_oracle_positive_count_k = torch.zeros(K, dtype=torch.float64)
-    selected_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    top1_intended_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    top1_selected_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    top1_selected_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    top1_selected_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    skipped_top1_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    skipped_on_oracle_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    harmful_top1_not_skipped_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    oracle_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    positive_oracle_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    selected_positive_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    gate_prob_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    route_weight_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    selector_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    intervention_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    single_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    selected_gain_sum_kp = torch.zeros(K, P, dtype=torch.float64)
-    selected_gain_count_kp = torch.zeros(K, P, dtype=torch.float64)
-    utility_valid_count_kt = torch.zeros(K, len(utility_thresholds), dtype=torch.float64)
-    utility_total_count_k = torch.zeros(K, dtype=torch.float64)
-    utility_best_gain_sum_k = torch.zeros(K, dtype=torch.float64)
-    utility_best_gain_positive_count_k = torch.zeros(K, dtype=torch.float64)
-
-    total_decisions = 0
-    total_selected = 0
-    total_oracle_positive = 0
-    total_selected_positive = 0
-    batch_count = 0
-    route_label_feature_chunks: List[torch.Tensor] = []
-    route_label_chunks: List[torch.Tensor] = []
-    route_label_query_start_chunks: List[torch.Tensor] = []
-    top1_conf_chunks: List[torch.Tensor] = []
-    top1_gain_chunks: List[torch.Tensor] = []
-    top1_penalty_chunks: List[torch.Tensor] = []
-    top1_active_chunks: List[torch.Tensor] = []
-    top1_skip_chunks: List[torch.Tensor] = []
-
-    for x, y, idx in loader:
-        batch_count += 1
-        if max_batches > 0 and batch_count > int(max_batches):
-            break
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
-        route_pen_bkp = _router_penalty_context_from_history(
-            x_bcl=x,
-            yhat_base_bch=y_base,
-            penalty_names=penalty_names,
-            penalty_fns=penalty_fns,
-            penalty_scale=penalty_scale,
-            cluster_id_c=cluster_id_c,
-            K=K,
-        )
-        mask_bkp, probs_bkp, skip_bk, _ = gate(
-            feat_bkf,
-            straight_through=False,
-            penalty_context_bkp=route_pen_bkp,
-            penalty_context_mode=router_mode,
-            penalty_context_weight=router_penalty_context_weight,
-            penalty_context_detach=router_detach_penalty_context,
-            penalty_context_score=router_penalty_context_score,
-        )
-        rank_mask = None
-        if select_ranks is not None:
-            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
-            rank_mask = mask_bkp
-        if gate_soft_weight > 0.0:
-            probs_sel = probs_bkp
-            if rank_mask is not None:
-                probs_sel = probs_sel * rank_mask
-                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
-            probs_sel = probs_sel * target_mass
-            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
-
-        pred_out = pred_residual(
-            x,
-            y_base,
-            cluster_id_c,
-            mask_bkp,
-            skip_bk=skip_bk if allow_skip else None,
-            query_start_abs_b=query_start_abs_b,
-        )
-        residuals = pred_out.get("residuals")
-        alpha_cp = pred_out.get("alpha_cp")
-        if residuals is None or alpha_cp is None or residuals.numel() == 0:
-            continue
-
-        route_bcp = pred_out.get("route_bcp", mask_bkp[:, cid_c, :])
-        effective_route_bcp = pred_out.get("effective_route_bcp", route_bcp)
-        selector_bcp = pred_out.get("selector_bcp", torch.ones_like(route_bcp))
-        intervention_bcp = pred_out.get("intervention_bcp", torch.ones_like(route_bcp))
-        fusion_bc = pred_out.get("fusion_bc", torch.ones_like(route_bcp[..., 0]))
-        y_final_raw = pred_out["y_final"]
-        y_final = apply_moe_output_anchor_experts(
-            y_final_raw,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            moe_cfg=moe_cfg,
-            moe_enable=moe_enable,
-            observed_history_tc=observed_history_tc,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
-
-        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
-            y_base,
-            pred_out,
-            apply_output_anchors=True,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            moe_cfg=moe_cfg,
-            moe_enable=moe_enable,
-            observed_history_tc=observed_history_tc,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
-        if cand_bcpH is None:
-            continue
-        base_err_bc = (y_base_final - y).pow(2).mean(dim=-1)
-        final_err_bc = (y_final - y).pow(2).mean(dim=-1)
-        cand_err_bcp = (cand_bcpH - y.unsqueeze(2)).pow(2).mean(dim=-1)
-        gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
-        if utility_thresholds:
-            utility_stats = _cluster_utility_threshold_stats(
-                gain_bcp=gain_bcp.detach(),
-                cluster_id_c=cluster_id_c,
-                K=K,
-                allowed_mask_kp=allowed_mask_kp,
-                thresholds=utility_thresholds,
-            )
-            utility_valid_count_kt += utility_stats["valid_count_kt"]
-            utility_total_count_k += utility_stats["total_count_k"]
-            utility_best_gain_sum_k += utility_stats["best_gain_sum_k"]
-            utility_best_gain_positive_count_k += utility_stats["best_gain_positive_count_k"]
-        if allowed_mask_device is not None:
-            allowed_bcp = allowed_mask_device.index_select(0, cid_c).unsqueeze(0)
-            cand_err_for_oracle_bcp = cand_err_bcp.masked_fill(~allowed_bcp, float("inf"))
-        else:
-            cand_err_for_oracle_bcp = cand_err_bcp
-        oracle_penalty_err_bc, oracle_p_bc = cand_err_for_oracle_bcp.min(dim=-1)
-        oracle_err_bc = torch.where(torch.isfinite(oracle_penalty_err_bc), oracle_penalty_err_bc, base_err_bc)
-        oracle_gain_bc = base_err_bc - oracle_err_bc
-        selected_bool_bcp = route_bcp > 0
-        selected_positive_bcp = selected_bool_bcp & (gain_bcp > 0)
-        positive_oracle_bc = oracle_gain_bc > 0
-        raw_route_bcp = mask_bkp[:, cid_c, :]
-        raw_score_bcp = raw_route_bcp * probs_bkp[:, cid_c, :]
-        top1_p_bc = raw_score_bcp.argmax(dim=-1)
-        top1_conf_bc = probs_bkp[:, cid_c, :].gather(-1, top1_p_bc.unsqueeze(-1)).squeeze(-1)
-        top1_weight_bc = raw_route_bcp.gather(-1, top1_p_bc.unsqueeze(-1)).squeeze(-1)
-        skip_bc = (skip_bk[:, cid_c] > 0.5) if allow_skip else torch.zeros_like(base_err_bc, dtype=torch.bool)
-        top1_active_bc = (top1_weight_bc > 0) & (~skip_bc)
-        top1_gain_bc = gain_bcp.gather(-1, top1_p_bc.unsqueeze(-1)).squeeze(-1)
-        top1_positive_bc = top1_active_bc & (top1_gain_bc > 0)
-        top1_harmful_bc = top1_active_bc & (top1_gain_bc <= 0)
-
-        total_decisions += int(base_err_bc.numel())
-        total_selected += int(selected_bool_bcp.sum().item())
-        total_oracle_positive += int(positive_oracle_bc.sum().item())
-        total_selected_positive += int(selected_positive_bcp.sum().item())
-
-        route_label_bk = torch.full((base_err_bc.shape[0], K), -1, device=device, dtype=torch.long)
-        for k in range(K):
-            ch_mask = cid_c == int(k)
-            if not bool(ch_mask.any().item()):
-                continue
-            base_k = base_err_bc[:, ch_mask]
-            final_k = final_err_bc[:, ch_mask]
-            cand_err_k = cand_err_bcp[:, ch_mask, :]
-            total_k = int(base_k.numel())
-            channels_k = int(ch_mask.sum().item())
-            total_bc_k[k] += total_k
-            base_err_sum_k[k] += float(base_k.sum().item())
-            final_err_sum_k[k] += float(final_k.sum().item())
-            oracle_err_sum_k[k] += float(oracle_err_bc[:, ch_mask].sum().item())
-            cluster_base_err_b = base_k.mean(dim=1)
-            cluster_penalty_err_bp = cand_err_k.mean(dim=1)
-            if allowed_mask_device is not None:
-                allowed_p = allowed_mask_device[int(k)].view(1, P)
-                cluster_penalty_err_bp = cluster_penalty_err_bp.masked_fill(~allowed_p, float("inf"))
-            best_cluster_penalty_err_b, best_cluster_penalty_p_b = cluster_penalty_err_bp.min(dim=-1)
-            has_allowed_penalty_b = torch.isfinite(best_cluster_penalty_err_b)
-            best_cluster_penalty_err_for_sum_b = torch.where(
-                has_allowed_penalty_b,
-                best_cluster_penalty_err_b,
-                cluster_base_err_b,
-            )
-            best_cluster_route_err_b = torch.minimum(cluster_base_err_b, best_cluster_penalty_err_for_sum_b)
-            cluster_route_label_b = torch.where(
-                cluster_base_err_b <= best_cluster_penalty_err_for_sum_b,
-                torch.zeros_like(best_cluster_penalty_p_b),
-                best_cluster_penalty_p_b + 1,
-            )
-            cluster_route_label_b = torch.where(
-                has_allowed_penalty_b,
-                cluster_route_label_b,
-                torch.zeros_like(cluster_route_label_b),
-            )
-            route_label_bk[:, int(k)] = cluster_route_label_b
-            cluster_penalty_oracle_err_sum_k[k] += float(best_cluster_penalty_err_for_sum_b.sum().item() * channels_k)
-            cluster_route_oracle_err_sum_k[k] += float(best_cluster_route_err_b.sum().item() * channels_k)
-            cluster_route_oracle_skip_count_k[k] += float((cluster_route_label_b == 0).sum().item())
-            cluster_route_oracle_decision_count_k[k] += int(cluster_base_err_b.numel())
-            fusion_sum_k[k] += float(fusion_bc[:, ch_mask].sum().item())
-            skip_count_k[k] += float(skip_bc[:, ch_mask].sum().item())
-            skip_on_oracle_positive_count_k[k] += float((skip_bc[:, ch_mask] & positive_oracle_bc[:, ch_mask]).sum().item())
-
-            selected_count_kp[k] += selected_bool_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            selected_positive_count_kp[k] += selected_positive_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            gate_prob_sum_kp[k] += probs_bkp[:, k, :].sum(dim=0).detach().cpu().to(dtype=torch.float64) * int(ch_mask.sum().item())
-            route_weight_sum_kp[k] += effective_route_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            selector_sum_kp[k] += selector_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            intervention_sum_kp[k] += intervention_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            single_gain_sum_kp[k] += gain_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            selected_gain_sum_kp[k] += (gain_bcp[:, ch_mask, :] * selected_bool_bcp[:, ch_mask, :].to(gain_bcp.dtype)).sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-            selected_gain_count_kp[k] += selected_bool_bcp[:, ch_mask, :].sum(dim=(0, 1)).detach().cpu().to(dtype=torch.float64)
-
-            oracle_k = oracle_p_bc[:, ch_mask].detach().cpu().reshape(-1)
-            oracle_pos_k = oracle_p_bc[:, ch_mask][positive_oracle_bc[:, ch_mask]].detach().cpu().reshape(-1)
-            top1_k = top1_p_bc[:, ch_mask].detach().cpu().reshape(-1)
-            top1_active_k = top1_p_bc[:, ch_mask][top1_active_bc[:, ch_mask]].detach().cpu().reshape(-1)
-            top1_positive_k = top1_p_bc[:, ch_mask][top1_positive_bc[:, ch_mask]].detach().cpu().reshape(-1)
-            top1_harmful_k = top1_p_bc[:, ch_mask][top1_harmful_bc[:, ch_mask]].detach().cpu().reshape(-1)
-            skipped_top1_k = top1_p_bc[:, ch_mask][skip_bc[:, ch_mask]].detach().cpu().reshape(-1)
-            skipped_positive_k = top1_p_bc[:, ch_mask][skip_bc[:, ch_mask] & positive_oracle_bc[:, ch_mask]].detach().cpu().reshape(-1)
-            oracle_count_kp[k] += torch.bincount(oracle_k, minlength=P)[:P].to(dtype=torch.float64)
-            if oracle_pos_k.numel() > 0:
-                positive_oracle_count_kp[k] += torch.bincount(oracle_pos_k, minlength=P)[:P].to(dtype=torch.float64)
-            top1_intended_count_kp[k] += torch.bincount(top1_k, minlength=P)[:P].to(dtype=torch.float64)
-            if top1_active_k.numel() > 0:
-                top1_selected_count_kp[k] += torch.bincount(top1_active_k, minlength=P)[:P].to(dtype=torch.float64)
-            if top1_positive_k.numel() > 0:
-                top1_selected_positive_count_kp[k] += torch.bincount(top1_positive_k, minlength=P)[:P].to(dtype=torch.float64)
-            if top1_harmful_k.numel() > 0:
-                harmful_top1_not_skipped_count_kp[k] += torch.bincount(top1_harmful_k, minlength=P)[:P].to(dtype=torch.float64)
-            if skipped_top1_k.numel() > 0:
-                skipped_top1_count_kp[k] += torch.bincount(skipped_top1_k, minlength=P)[:P].to(dtype=torch.float64)
-            if skipped_positive_k.numel() > 0:
-                skipped_on_oracle_positive_count_kp[k] += torch.bincount(skipped_positive_k, minlength=P)[:P].to(dtype=torch.float64)
-            active_gain_k = top1_gain_bc[:, ch_mask] * top1_active_bc[:, ch_mask].to(dtype=top1_gain_bc.dtype)
-            for p in range(P):
-                top1_selected_gain_sum_kp[k, p] += float(
-                    active_gain_k[top1_p_bc[:, ch_mask] == int(p)].sum().item()
-                )
-        route_label_feature_chunks.append(feat_bkf.detach().cpu())
-        route_label_chunks.append(route_label_bk.detach().cpu())
-        route_label_query_start_chunks.append(query_start_abs_b.detach().cpu())
-        if top1_confidence_bins:
-            top1_conf_chunks.append(top1_conf_bc.detach().cpu())
-            top1_gain_chunks.append(top1_gain_bc.detach().cpu())
-            top1_penalty_chunks.append(top1_p_bc.detach().cpu())
-            top1_active_chunks.append(top1_active_bc.detach().cpu())
-            top1_skip_chunks.append(skip_bc.detach().cpu())
-
-    if total_decisions <= 0:
-        return None
-
-    if penalty_portrait_kp is not None:
-        portrait = penalty_portrait_kp.detach().cpu().to(dtype=torch.float64)
-    else:
-        portrait = torch.full((K, P), float("nan"), dtype=torch.float64)
-    if prior_prob_kp is not None:
-        prior = prior_prob_kp.detach().cpu().to(dtype=torch.float64)
-    else:
-        prior = torch.full((K, P), float("nan"), dtype=torch.float64)
-    if allowed_mask_kp is not None:
-        allowed = allowed_mask_kp.detach().cpu().to(dtype=torch.float64)
-    else:
-        allowed = torch.ones(K, P, dtype=torch.float64)
-
-    penalty_corr = {}
-    denom_kp = (total_bc_k.view(K, 1)).clamp_min(1.0)
-    mean_gain_kp = single_gain_sum_kp / denom_kp
-    for p, name in enumerate(penalty_names):
-        xs = [float(portrait[k, p].item()) for k in range(K) if math.isfinite(float(portrait[k, p].item()))]
-        ys = [float(mean_gain_kp[k, p].item()) for k in range(K) if math.isfinite(float(portrait[k, p].item()))]
-        penalty_corr[name] = _pearson_list(xs, ys)
-
-    rows = []
-    per_cluster = []
-    for k in range(K):
-        cluster_total = float(total_bc_k[k].item())
-        base_mse_k = float(base_err_sum_k[k].item() / max(cluster_total, 1.0))
-        final_mse_k = float(final_err_sum_k[k].item() / max(cluster_total, 1.0))
-        oracle_mse_k = float(oracle_err_sum_k[k].item() / max(cluster_total, 1.0))
-        cluster_penalty_oracle_mse_k = float(cluster_penalty_oracle_err_sum_k[k].item() / max(cluster_total, 1.0))
-        cluster_route_oracle_mse_k = float(cluster_route_oracle_err_sum_k[k].item() / max(cluster_total, 1.0))
-        cluster_gain = float(100.0 * (base_mse_k - final_mse_k) / max(abs(base_mse_k), 1.0e-12))
-        oracle_gain_pct = float(100.0 * (base_mse_k - oracle_mse_k) / max(abs(base_mse_k), 1.0e-12))
-        cluster_penalty_oracle_gain_pct = float(
-            100.0 * (base_mse_k - cluster_penalty_oracle_mse_k) / max(abs(base_mse_k), 1.0e-12)
-        )
-        cluster_route_oracle_gain_pct = float(
-            100.0 * (base_mse_k - cluster_route_oracle_mse_k) / max(abs(base_mse_k), 1.0e-12)
-        )
-        cluster_route_oracle_skip_rate = float(
-            cluster_route_oracle_skip_count_k[k].item() / max(cluster_route_oracle_decision_count_k[k].item(), 1.0)
-        )
-        skip_rate = float(skip_count_k[k].item() / max(cluster_total, 1.0))
-        skip_on_positive_rate = float(skip_on_oracle_positive_count_k[k].item() / max(total_bc_k[k].item(), 1.0))
-        cluster_rows = []
-        for p, name in enumerate(penalty_names):
-            selected_count = float(selected_count_kp[k, p].item())
-            selected_gain_count = float(selected_gain_count_kp[k, p].item())
-            top1_selected_count = float(top1_selected_count_kp[k, p].item())
-            mean_gain = float(mean_gain_kp[k, p].item())
-            selected_mean_gain = float(selected_gain_sum_kp[k, p].item() / max(selected_gain_count, 1.0))
-            top1_selected_mean_gain = float(top1_selected_gain_sum_kp[k, p].item() / max(top1_selected_count, 1.0))
-            prior_value = float(prior[k, p].item()) if math.isfinite(float(prior[k, p].item())) else None
-            portrait_value = float(portrait[k, p].item()) if math.isfinite(float(portrait[k, p].item())) else None
-            allowed_value = bool(allowed[k, p].item() > 0.5)
-            if allowed_value and mean_gain > 0.0:
-                reason = "train_prior_allowed_and_positive_split_gain"
-            elif allowed_value:
-                reason = "train_prior_allowed_but_nonpositive_split_gain"
-            elif mean_gain > 0.0:
-                reason = "blocked_by_train_prior_but_positive_split_gain"
-            else:
-                reason = "low_prior_or_nonpositive_split_gain"
-            row = {
-                "split": split_name,
-                "cluster_id": int(k),
-                "cluster_channels": int(cluster_channel_count[k].item()),
-                "penalty": name,
-                "train_diagnostic_score": portrait_value,
-                "train_prior_prob": prior_value,
-                "allowed_by_train_prior": allowed_value,
-                "prior_actual_gain_corr_for_penalty": penalty_corr.get(name),
-                "selected_count": int(selected_count),
-                "selected_rate": float(selected_count / max(cluster_total, 1.0)),
-                "top1_intended_count": int(top1_intended_count_kp[k, p].item()),
-                "top1_intended_rate": float(top1_intended_count_kp[k, p].item() / max(cluster_total, 1.0)),
-                "top1_selected_count": int(top1_selected_count),
-                "top1_selected_rate": float(top1_selected_count / max(cluster_total, 1.0)),
-                "top1_selected_positive_count": int(top1_selected_positive_count_kp[k, p].item()),
-                "top1_selected_positive_rate": float(
-                    top1_selected_positive_count_kp[k, p].item() / max(top1_selected_count, 1.0)
-                ),
-                "top1_selected_mean_gain_mse": top1_selected_mean_gain,
-                "harmful_top1_not_skipped_count": int(harmful_top1_not_skipped_count_kp[k, p].item()),
-                "harmful_top1_not_skipped_rate": float(
-                    harmful_top1_not_skipped_count_kp[k, p].item() / max(top1_selected_count, 1.0)
-                ),
-                "skipped_top1_count": int(skipped_top1_count_kp[k, p].item()),
-                "skipped_top1_rate": float(skipped_top1_count_kp[k, p].item() / max(cluster_total, 1.0)),
-                "skipped_on_oracle_positive_count": int(skipped_on_oracle_positive_count_kp[k, p].item()),
-                "skipped_on_oracle_positive_rate": float(
-                    skipped_on_oracle_positive_count_kp[k, p].item() / max(cluster_total, 1.0)
-                ),
-                "oracle_count": int(oracle_count_kp[k, p].item()),
-                "oracle_rate": float(oracle_count_kp[k, p].item() / max(cluster_total, 1.0)),
-                "positive_oracle_count": int(positive_oracle_count_kp[k, p].item()),
-                "positive_oracle_rate": float(positive_oracle_count_kp[k, p].item() / max(cluster_total, 1.0)),
-                "selected_positive_count": int(selected_positive_count_kp[k, p].item()),
-                "selected_positive_rate": float(selected_positive_count_kp[k, p].item() / max(selected_count, 1.0)),
-                "mean_gate_prob": float(gate_prob_sum_kp[k, p].item() / max(cluster_total, 1.0)),
-                "mean_effective_route_weight": float(route_weight_sum_kp[k, p].item() / max(cluster_total, 1.0)),
-                "mean_selector": float(selector_sum_kp[k, p].item() / max(cluster_total, 1.0)),
-                "mean_intervention": float(intervention_sum_kp[k, p].item() / max(cluster_total, 1.0)),
-                "mean_single_penalty_gain_mse": mean_gain,
-                "selected_mean_gain_mse": selected_mean_gain,
-                "cluster_base_mse": base_mse_k,
-                "cluster_final_mse": final_mse_k,
-                "cluster_oracle_mse": oracle_mse_k,
-                "cluster_penalty_oracle_mse": cluster_penalty_oracle_mse_k,
-                "cluster_penalty_oracle_gain_pct_vs_base": cluster_penalty_oracle_gain_pct,
-                "cluster_route_oracle_mse": cluster_route_oracle_mse_k,
-                "cluster_route_oracle_gain_pct_vs_base": cluster_route_oracle_gain_pct,
-                "cluster_route_oracle_skip_rate": cluster_route_oracle_skip_rate,
-                "cluster_final_gain_pct": cluster_gain,
-                "cluster_oracle_gain_pct_vs_base": oracle_gain_pct,
-                "cluster_skip_rate": skip_rate,
-                "cluster_skip_on_oracle_positive_rate": skip_on_positive_rate,
-                "mean_fusion_gate": float(fusion_sum_k[k].item() / max(cluster_total, 1.0)),
-                "reason": reason,
-            }
-            rows.append(row)
-            cluster_rows.append(row)
-        cluster_rows_sorted = sorted(
-            cluster_rows,
-            key=lambda item: (
-                bool(item["allowed_by_train_prior"]),
-                float(item["mean_single_penalty_gain_mse"]),
-                float(item["selected_rate"]),
-            ),
-            reverse=True,
-        )
-        per_cluster.append(
-            {
-                "cluster_id": int(k),
-                "channels": int(cluster_channel_count[k].item()),
-                "base_mse": base_mse_k,
-                "final_mse": final_mse_k,
-                "oracle_mse": oracle_mse_k,
-                "cluster_penalty_oracle_mse": cluster_penalty_oracle_mse_k,
-                "cluster_penalty_oracle_gain_pct_vs_base": cluster_penalty_oracle_gain_pct,
-                "cluster_route_oracle_mse": cluster_route_oracle_mse_k,
-                "cluster_route_oracle_gain_pct_vs_base": cluster_route_oracle_gain_pct,
-                "cluster_route_oracle_skip_rate": cluster_route_oracle_skip_rate,
-                "final_gain_pct": cluster_gain,
-                "oracle_gain_pct_vs_base": oracle_gain_pct,
-                "skip_count": int(skip_count_k[k].item()),
-                "skip_rate": skip_rate,
-                "skip_on_oracle_positive_count": int(skip_on_oracle_positive_count_k[k].item()),
-                "skip_on_oracle_positive_rate": skip_on_positive_rate,
-                "top_penalties": [
-                    {
-                        "penalty": item["penalty"],
-                        "allowed_by_train_prior": item["allowed_by_train_prior"],
-                        "train_prior_prob": item["train_prior_prob"],
-                        "mean_single_penalty_gain_mse": item["mean_single_penalty_gain_mse"],
-                        "selected_rate": item["selected_rate"],
-                        "top1_selected_positive_rate": item["top1_selected_positive_rate"],
-                        "harmful_top1_not_skipped_rate": item["harmful_top1_not_skipped_rate"],
-                        "skipped_top1_rate": item["skipped_top1_rate"],
-                        "reason": item["reason"],
-                    }
-                    for item in cluster_rows_sorted[: min(3, len(cluster_rows_sorted))]
-                ],
-            }
-        )
-
-    base_mse = float(base_err_sum_k.sum().item() / max(total_decisions, 1))
-    final_mse = float(final_err_sum_k.sum().item() / max(total_decisions, 1))
-    oracle_mse = float(oracle_err_sum_k.sum().item() / max(total_decisions, 1))
-    cluster_penalty_oracle_mse = float(cluster_penalty_oracle_err_sum_k.sum().item() / max(total_decisions, 1))
-    cluster_route_oracle_mse = float(cluster_route_oracle_err_sum_k.sum().item() / max(total_decisions, 1))
-    cluster_route_oracle_decisions = float(cluster_route_oracle_decision_count_k.sum().item())
-    cluster_route_oracle_skip_rate = float(
-        cluster_route_oracle_skip_count_k.sum().item() / max(cluster_route_oracle_decisions, 1.0)
-    )
-    utility_threshold_summary = []
-    if utility_thresholds:
-        for k in range(K):
-            total_k = float(utility_total_count_k[k].item())
-            utility_threshold_summary.append(
-                {
-                    "cluster_id": int(k),
-                    "windows": int(total_k),
-                    "mean_best_allowed_gain_mse": float(utility_best_gain_sum_k[k].item() / max(total_k, 1.0)),
-                    "positive_best_allowed_gain_rate": float(
-                        utility_best_gain_positive_count_k[k].item() / max(total_k, 1.0)
-                    ),
-                    "thresholds": [
-                        {
-                            "min_gain": float(threshold),
-                            "valid_count": int(utility_valid_count_kt[k, t].item()),
-                            "valid_rate": float(utility_valid_count_kt[k, t].item() / max(total_k, 1.0)),
-                        }
-                        for t, threshold in enumerate(utility_thresholds)
-                    ],
-                }
-            )
-    route_label_feature_diagnostics = None
-    if route_label_feature_chunks and route_label_chunks:
-        route_label_feature_diagnostics = _cluster_route_label_feature_diagnostics(
-            feat_bkf=torch.cat(route_label_feature_chunks, dim=0),
-            route_label_bk=torch.cat(route_label_chunks, dim=0),
-            penalty_names=penalty_names,
-            feature_names=_gate_feature_names_for_mode(gate_feature_mode),
-        )
-    route_label_phase_diagnostics = None
-    if route_label_phase_periods and route_label_chunks and route_label_query_start_chunks:
-        route_label_phase_diagnostics = _cluster_route_label_phase_diagnostics(
-            query_start_abs_b=torch.cat(route_label_query_start_chunks, dim=0),
-            route_label_bk=torch.cat(route_label_chunks, dim=0),
-            penalty_names=penalty_names,
-            periods=route_label_phase_periods,
-            num_bins=route_label_phase_bins,
-            phase_offset=int(input_len),
-        )
-    top1_confidence_gain_diagnostics = None
-    if top1_confidence_bins and top1_conf_chunks:
-        top1_confidence_gain_diagnostics = _cluster_top1_confidence_gain_diagnostics(
-            top1_conf_bc=torch.cat(top1_conf_chunks, dim=0),
-            top1_gain_bc=torch.cat(top1_gain_chunks, dim=0),
-            top1_p_bc=torch.cat(top1_penalty_chunks, dim=0),
-            top1_active_bc=torch.cat(top1_active_chunks, dim=0),
-            skip_bc=torch.cat(top1_skip_chunks, dim=0),
-            cluster_id_c=cluster_id_c.detach().cpu(),
-            K=K,
-            penalty_names=penalty_names,
-            bins=top1_confidence_bins,
-        )
-    return {
-        "split": split_name,
-        "samples": int(total_decisions),
-        "selected_penalty_events": int(total_selected),
-        "oracle_positive_events": int(total_oracle_positive),
-        "selected_positive_events": int(total_selected_positive),
-        "base_mse": base_mse,
-        "final_mse": final_mse,
-        "final_gain_pct_vs_base": float(100.0 * (base_mse - final_mse) / max(abs(base_mse), 1.0e-12)),
-        "oracle_mse": oracle_mse,
-        "oracle_gain_pct_vs_base": float(100.0 * (base_mse - oracle_mse) / max(abs(base_mse), 1.0e-12)),
-        "cluster_penalty_oracle_mse": cluster_penalty_oracle_mse,
-        "cluster_penalty_oracle_gain_pct_vs_base": float(
-            100.0 * (base_mse - cluster_penalty_oracle_mse) / max(abs(base_mse), 1.0e-12)
-        ),
-        "cluster_route_oracle_mse": cluster_route_oracle_mse,
-        "cluster_route_oracle_gain_pct_vs_base": float(
-            100.0 * (base_mse - cluster_route_oracle_mse) / max(abs(base_mse), 1.0e-12)
-        ),
-        "cluster_route_oracle_skip_rate": cluster_route_oracle_skip_rate,
-        "prior_actual_gain_corr": penalty_corr,
-        "utility_target_thresholds": utility_threshold_summary,
-        "route_label_feature_diagnostics": route_label_feature_diagnostics,
-        "route_label_phase_diagnostics": route_label_phase_diagnostics,
-        "top1_confidence_gain_diagnostics": top1_confidence_gain_diagnostics,
-        "per_cluster": per_cluster,
-        "rows": rows,
-    }
-
-
-def save_penalty_explainability_artifacts(
-    out_dir: str,
-    explainability: Dict[str, object],
-) -> Dict[str, str]:
-    paths = {}
-    json_path = os.path.join(out_dir, "penalty_explainability.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(explainability, f, ensure_ascii=False, indent=2)
-    paths["json"] = json_path
-    rows = []
-    for split_payload in explainability.get("splits", {}).values():
-        if isinstance(split_payload, dict):
-            rows.extend(split_payload.get("rows", []))
-    if len(rows) > 0:
-        csv_path = os.path.join(out_dir, "penalty_explainability.csv")
-        pd.DataFrame(rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
-        paths["csv"] = csv_path
-    return paths
-
-
-
-
-@torch.no_grad()
-def _collect_pred_residual_selector_tensors(
-    model: nn.Module,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_count: int,
-    pred_residual_scale_c: Optional[torch.Tensor] = None,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    candidate_feature_mode: str = "base",
-) -> Optional[Dict[str, torch.Tensor]]:
-    if len(loader) == 0 or pred_residual is None or int(penalty_count) <= 0:
-        return None
-    if not bool(moe_cfg.get("enable", True)):
-        return None
-
-    model.eval()
-    pred_residual.eval()
-    skip_feat_parts = []
-    cand_feat_parts = []
-    base_parts = []
-    cand_parts = []
-    confidence_parts = []
-    y_parts = []
-    P = int(penalty_count)
-    for x, y, idx in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        idx = idx.to(device=device, dtype=torch.long)
-        query_start_abs_b = int(eval_start) + idx
-        x_model = apply_train_stat_input_centering(
-            x,
-            query_start_abs_b=query_start_abs_b,
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        y_base_raw = model(x_model, cluster_id_c)
-        y_base = apply_history_anchor_adapter(
-            y_base_raw,
-            base_pred_bch=y_base_raw,
-            observed_history_tc=observed_history_tc,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            cfg=history_anchor_cfg,
-        )
-        y_base = apply_train_stat_anchor_expert(
-            y_base,
-            base_pred_bch=y_base,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            stat_anchor_pc=model_train_stat_adapter_pc,
-            cfg=model_train_stat_adapter_cfg,
-        )
-        mask_all_bkp = torch.ones(x.shape[0], int(K), P, device=device, dtype=y_base.dtype)
-        pred_out = pred_residual(
-            x,
-            y_base,
-            cluster_id_c,
-            mask_all_bkp,
-            skip_bk=None,
-            query_start_abs_b=query_start_abs_b,
-        )
-        y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
-            y_base,
-            pred_out,
-            pred_residual_scale_c=pred_residual_scale_c,
-            apply_output_anchors=True,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            input_len=int(input_len),
-            moe_cfg=moe_cfg,
-            moe_enable=True,
-            observed_history_tc=observed_history_tc,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
-        if cand_bcpH is None:
-            continue
-        skip_feat = _candidate_selector_features(x, y_base_final, y_base_final, feature_mode=candidate_feature_mode)
-        cand_feat = torch.stack(
-            [
-                _candidate_selector_features(
-                    x,
-                    y_base_final,
-                    cand_bcpH[:, :, p, :],
-                    feature_mode=candidate_feature_mode,
-                )
-                for p in range(P)
-            ],
-            dim=2,
-        )
-        skip_feat_parts.append(skip_feat.detach().cpu())
-        cand_feat_parts.append(cand_feat.detach().cpu())
-        base_parts.append(y_base_final.detach().cpu())
-        cand_parts.append(cand_bcpH.detach().cpu())
-        confidence_parts.append(
-            pred_out.get("intervention_bcp", torch.ones_like(cand_bcpH[..., 0])).detach().cpu()
-        )
-        y_parts.append(y.detach().cpu())
-
-    if len(skip_feat_parts) == 0:
-        return None
-    return {
-        "skip_feat": torch.cat(skip_feat_parts, dim=0),
-        "cand_feat": torch.cat(cand_feat_parts, dim=0),
-        "base": torch.cat(base_parts, dim=0),
-        "cand": torch.cat(cand_parts, dim=0),
-        "confidence": torch.cat(confidence_parts, dim=0),
-        "y": torch.cat(y_parts, dim=0),
-    }
-
-
-@torch.no_grad()
-def _select_pred_residual_confidence_thresholds_from_tensors(
-    *,
-    tensors: Optional[Dict[str, torch.Tensor]],
-    cluster_id_c: torch.Tensor,
-    K: int,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    penalty_names: Optional[List[str]] = None,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    max_candidates: int = 101,
-    selection_metric: str = "mse",
-    min_precision: float = 0.0,
-    max_pred_positive_rate: Optional[float] = None,
-) -> Tuple[torch.Tensor, Dict[str, object]]:
-    if tensors is None:
-        raise ValueError("confidence threshold selection requires collected train tensors.")
-    base = tensors.get("base")
-    cand = tensors.get("cand")
-    y = tensors.get("y")
-    confidence = tensors.get("confidence")
-    if base is None or cand is None or y is None or confidence is None:
-        raise ValueError("confidence threshold selection requires base, cand, y, and confidence tensors.")
-    if cand.ndim != 4:
-        raise ValueError(f"candidate tensor must have shape [B,C,P,H], got {tuple(cand.shape)}")
-    B, C, P, _ = cand.shape
-    if base.shape[:2] != (B, C) or y.shape[:2] != (B, C) or confidence.shape != (B, C, P):
-        raise ValueError(
-            "confidence threshold tensors have inconsistent shapes: "
-            f"base={tuple(base.shape)}, cand={tuple(cand.shape)}, "
-            f"y={tuple(y.shape)}, confidence={tuple(confidence.shape)}"
-        )
-    cluster_id = cluster_id_c.detach().cpu().to(dtype=torch.long).view(-1)
-    if int(cluster_id.numel()) != int(C):
-        raise ValueError(f"cluster_id_c must have one entry per channel, got {int(cluster_id.numel())} vs {int(C)}")
-    K = int(K)
-    if K <= 0:
-        raise ValueError("K must be positive for confidence threshold selection.")
-    metric_mode = str(selection_metric).lower()
-    if metric_mode not in {"mse", "precision_guarded_mse"}:
-        raise ValueError(
-            "confidence threshold selection currently supports selection_metric='mse' "
-            "or 'precision_guarded_mse'."
-        )
-
-    if allowed_mask_kp is None:
-        allowed = torch.ones(K, P, dtype=torch.bool)
-    else:
-        if allowed_mask_kp.shape != (K, P):
-            raise ValueError(f"allowed_mask_kp must have shape [{K},{P}], got {tuple(allowed_mask_kp.shape)}")
-        allowed = allowed_mask_kp.detach().cpu().to(dtype=torch.float32) > 0.0
-
-    names = list(penalty_names or [f"p{p}" for p in range(P)])
-    if len(names) != P:
-        names = [f"p{p}" for p in range(P)]
-
-    min_abs = max(0.0, float(min_abs_improvement))
-    min_rel = max(0.0, float(min_rel_improvement))
-    min_precision = max(0.0, float(min_precision))
-    max_rate = None
-    if max_pred_positive_rate is not None:
-        max_rate = min(1.0, max(0.0, float(max_pred_positive_rate)))
-    max_candidates = max(2, int(max_candidates))
-    base_err_bc = (base - y).pow(2).mean(dim=-1).detach().cpu()
-    cand_err_bcp = (cand - y.unsqueeze(2)).pow(2).mean(dim=-1).detach().cpu()
-    confidence_bcp = confidence.detach().cpu().to(dtype=torch.float32)
-    thresholds = torch.full((K, P), 1.000001, dtype=torch.float32)
-    per_cluster_penalty: Dict[str, Dict[str, object]] = {}
-
-    for k in range(K):
-        channel_mask_c = cluster_id == int(k)
-        per_penalty: Dict[str, object] = {}
-        for p in range(P):
-            name = str(names[p])
-            if not bool(allowed[k, p].item()):
-                per_penalty[name] = {
-                    "allowed": False,
-                    "threshold": float(thresholds[k, p].item()),
-                    "samples": 0,
-                    "reason": "disallowed",
-                }
-                continue
-            if not bool(channel_mask_c.any().item()):
-                per_penalty[name] = {
-                    "allowed": True,
-                    "threshold": float(thresholds[k, p].item()),
-                    "samples": 0,
-                    "reason": "empty_cluster",
-                }
-                continue
-
-            score_v = confidence_bcp[:, channel_mask_c, p].reshape(-1)
-            base_err_v = base_err_bc[:, channel_mask_c].reshape(-1)
-            cand_err_v = cand_err_bcp[:, channel_mask_c, p].reshape(-1)
-            finite = torch.isfinite(score_v) & torch.isfinite(base_err_v) & torch.isfinite(cand_err_v)
-            score_v = score_v[finite]
-            base_err_v = base_err_v[finite]
-            cand_err_v = cand_err_v[finite]
-            if int(score_v.numel()) == 0:
-                per_penalty[name] = {
-                    "allowed": True,
-                    "threshold": float(thresholds[k, p].item()),
-                    "samples": 0,
-                    "reason": "empty_scores",
-                }
-                continue
-
-            gain_v = base_err_v - cand_err_v
-            required_v = torch.maximum(
-                torch.full_like(gain_v, min_abs),
-                min_rel * base_err_v.abs().clamp_min(1.0e-12),
-            )
-            positive_v = gain_v > required_v
-            if int(positive_v.sum().item()) == 0:
-                threshold = float(score_v.max().item()) + 1.0e-6
-                thresholds[k, p] = float(threshold)
-                per_penalty[name] = {
-                    "allowed": True,
-                    "threshold": threshold,
-                    "samples": int(score_v.numel()),
-                    "reason": "no_positive_gain_labels",
-                    "positive_rate": 0.0,
-                    "base_mse": float(base_err_v.mean().item()),
-                    "selected_mse": float(base_err_v.mean().item()),
-                    "selected_gain_pct_vs_base": 0.0,
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "pred_positive_rate": 0.0,
-                }
-                continue
-
-            uniq = torch.unique(score_v)
-            if int(uniq.numel()) > max_candidates:
-                quantiles = torch.linspace(0.0, 1.0, steps=max_candidates, dtype=score_v.dtype)
-                candidates_v = torch.unique(torch.quantile(score_v, quantiles))
-            else:
-                candidates_v = uniq
-            candidates_v = torch.unique(
-                torch.cat(
-                    [
-                        torch.tensor([0.0], dtype=score_v.dtype),
-                        candidates_v,
-                        torch.tensor([float(score_v.max().item()) + 1.0e-6], dtype=score_v.dtype),
-                    ],
-                    dim=0,
-                )
-            )
-            base_mse = float(base_err_v.mean().item())
-            skip_threshold = float(score_v.max().item()) + 1.0e-6
-            best = {
-                "threshold": skip_threshold,
-                "mse": base_mse,
-                "precision": 0.0,
-                "recall": 0.0,
-                "pred_positive_rate": 0.0,
-                "reason": "no_improving_threshold",
-                "skip_selected": True,
-            }
-            feasible_count = 0
-            for candidate_threshold in candidates_v.tolist():
-                pred_active = score_v >= float(candidate_threshold)
-                selected_err = torch.where(pred_active, cand_err_v, base_err_v)
-                selected_mse = float(selected_err.mean().item())
-                tp = int((pred_active & positive_v).sum().item())
-                fp = int((pred_active & (~positive_v)).sum().item())
-                fn = int(((~pred_active) & positive_v).sum().item())
-                precision = tp / max(tp + fp, 1)
-                recall = tp / max(tp + fn, 1)
-                pred_rate = float(pred_active.to(dtype=torch.float32).mean().item())
-                if metric_mode == "precision_guarded_mse":
-                    if precision + 1.0e-12 < min_precision:
-                        continue
-                    if max_rate is not None and pred_rate > float(max_rate) + 1.0e-12:
-                        continue
-                feasible_count += 1
-                better = selected_mse < float(best["mse"]) - 1.0e-12
-                if not better and abs(selected_mse - float(best["mse"])) <= 1.0e-12:
-                    better = precision > float(best["precision"]) + 1.0e-12
-                if not better and abs(selected_mse - float(best["mse"])) <= 1.0e-12 and abs(precision - float(best["precision"])) <= 1.0e-12:
-                    better = float(candidate_threshold) > float(best["threshold"])
-                if better:
-                    best = {
-                        "threshold": float(candidate_threshold),
-                        "mse": selected_mse,
-                        "precision": float(precision),
-                        "recall": float(recall),
-                        "pred_positive_rate": pred_rate,
-                        "reason": "selected",
-                        "skip_selected": False,
-                    }
-            if metric_mode == "precision_guarded_mse" and feasible_count == 0:
-                best["reason"] = "no_threshold_meets_confidence_guard"
-            thresholds[k, p] = float(best["threshold"])
-            per_penalty[name] = {
-                "allowed": True,
-                "threshold": float(best["threshold"]),
-                "samples": int(score_v.numel()),
-                "feasible_threshold_count": int(feasible_count),
-                "reason": str(best["reason"]),
-                "skip_selected": bool(best["skip_selected"]),
-                "positive_rate": float(positive_v.to(dtype=torch.float32).mean().item()),
-                "base_mse": base_mse,
-                "selected_mse": float(best["mse"]),
-                "selected_gain_pct_vs_base": float(
-                    100.0 * (base_mse - float(best["mse"])) / max(abs(base_mse), 1.0e-12)
-                ),
-                "precision": float(best["precision"]),
-                "recall": float(best["recall"]),
-                "pred_positive_rate": float(best["pred_positive_rate"]),
-            }
-        per_cluster_penalty[str(k)] = per_penalty
-
-    summary = {
-        "enable": True,
-        "source_requirement": "train_only",
-        "selection_metric": metric_mode,
-        "min_abs_improvement": float(min_abs),
-        "min_rel_improvement": float(min_rel),
-        "min_precision": float(min_precision),
-        "max_pred_positive_rate": None if max_rate is None else float(max_rate),
-        "threshold_kp": [[float(v) for v in row] for row in thresholds.tolist()],
-        "penalty_names": names,
-        "per_cluster_penalty": per_cluster_penalty,
-    }
-    return thresholds, summary
-
-
-@torch.no_grad()
-def _candidate_selector_feature_gain_diagnostics(
-    *,
-    tensors: Optional[Dict[str, torch.Tensor]],
-    feature_names: Optional[List[str]] = None,
-    penalty_names: Optional[List[str]] = None,
-    allowed_mask_cp: Optional[torch.Tensor] = None,
-    indices: Optional[torch.Tensor] = None,
-    cluster_id_c: Optional[torch.Tensor] = None,
-    K: Optional[int] = None,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-    topk: int = 5,
-) -> Optional[Dict[str, object]]:
-    if tensors is None:
-        return None
-    cand_feat = tensors.get("cand_feat")
-    base = tensors.get("base")
-    cand = tensors.get("cand")
-    y = tensors.get("y")
-    if cand_feat is None or base is None or cand is None or y is None:
-        return None
-    n = int(base.shape[0])
-    if n <= 0:
-        return None
-    if indices is None:
-        indices = torch.arange(0, n, dtype=torch.long)
-    else:
-        indices = indices.detach().cpu().to(dtype=torch.long)
-    if int(indices.numel()) == 0:
-        return None
-
-    cand_feat = cand_feat.index_select(0, indices)
-    base = base.index_select(0, indices)
-    cand = cand.index_select(0, indices)
-    y = y.index_select(0, indices)
-    B, C, P, F = cand_feat.shape
-    names = list(feature_names or [f"f{i}" for i in range(F)])
-    if len(names) != F:
-        names = [f"f{i}" for i in range(F)]
-    penalties = list(penalty_names or [f"p{i}" for i in range(P)])
-    if len(penalties) != P:
-        penalties = [f"p{i}" for i in range(P)]
-
-    allowed = _selector_allowed_mask_cp(
-        allowed_mask_cp,
-        C=int(C),
-        P=int(P),
-        device=cand_feat.device,
-        context="candidate selector feature diagnostics",
-    )
-    valid_bcp = torch.ones((B, C, P), dtype=torch.bool, device=cand_feat.device)
-    if allowed is not None:
-        valid_bcp = valid_bcp & allowed.unsqueeze(0)
-
-    base_err_bc = (base - y).pow(2).mean(dim=-1)
-    cand_err_bcp = (cand - y.unsqueeze(2)).pow(2).mean(dim=-1)
-    gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
-    required_bcp = torch.maximum(
-        torch.full_like(gain_bcp, max(0.0, float(min_abs_improvement))),
-        max(0.0, float(min_rel_improvement)) * base_err_bc.abs().unsqueeze(-1).clamp_min(1.0e-12),
-    )
-    positive_bcp = gain_bcp > required_bcp
-
-    finite_bcpf = torch.isfinite(cand_feat).all(dim=-1)
-    finite_bcp = finite_bcpf & torch.isfinite(gain_bcp)
-    valid_bcp = valid_bcp & finite_bcp
-
-    def _corr_table(feat_nf: torch.Tensor, target_n: torch.Tensor, limit: int) -> List[Dict[str, object]]:
-        if int(feat_nf.shape[0]) <= 1:
-            return [
-                {"feature": names[i], "corr": 0.0, "abs_corr": 0.0, "std": 0.0}
-                for i in range(min(int(limit), int(feat_nf.shape[1])))
-            ]
-        x = feat_nf.to(dtype=torch.float64)
-        target = target_n.to(dtype=torch.float64)
-        y_center = target - target.mean()
-        y_ss = y_center.pow(2).sum()
-        x_center = x - x.mean(dim=0, keepdim=True)
-        x_ss = x_center.pow(2).sum(dim=0)
-        denom = (x_ss * y_ss).clamp_min(0.0).sqrt()
-        corr_f = torch.where(denom > 1.0e-12, (x_center * y_center.unsqueeze(-1)).sum(dim=0) / denom, torch.zeros_like(denom))
-        std_f = x.std(dim=0, unbiased=False)
-        order = sorted(range(int(x.shape[1])), key=lambda i: (-abs(float(corr_f[i].item())), i))
-        rows = []
-        for i in order[: max(0, int(limit))]:
-            corr = float(corr_f[i].item())
-            rows.append(
-                {
-                    "feature": names[i],
-                    "corr": corr,
-                    "abs_corr": abs(corr),
-                    "std": float(std_f[i].item()),
-                }
-            )
-        return rows
-
-    def _summarize(mask_bcp: torch.Tensor) -> Dict[str, object]:
-        flat_mask = mask_bcp.reshape(-1)
-        samples = int(flat_mask.sum().item())
-        if samples <= 0:
-            return {
-                "samples": 0,
-                "positive_rate": 0.0,
-                "mean_gain": 0.0,
-                "top_abs_gain_corr": [],
-                "top_abs_positive_corr": [],
-            }
-        feat_nf = cand_feat.reshape(-1, F)[flat_mask]
-        gain_n = gain_bcp.reshape(-1)[flat_mask]
-        positive_n = positive_bcp.reshape(-1)[flat_mask].to(dtype=torch.float32)
-        return {
-            "samples": samples,
-            "positive_rate": float(positive_n.mean().item()),
-            "mean_gain": float(gain_n.mean().item()),
-            "top_abs_gain_corr": _corr_table(feat_nf, gain_n, int(topk)),
-            "top_abs_positive_corr": _corr_table(feat_nf, positive_n, int(topk)),
-        }
-
-    summary = _summarize(valid_bcp)
-    summary["feature_names"] = names
-    summary["penalty_names"] = penalties
-    summary["min_abs_improvement"] = float(max(0.0, float(min_abs_improvement)))
-    summary["min_rel_improvement"] = float(max(0.0, float(min_rel_improvement)))
-    summary["allowed_candidates"] = int(valid_bcp.sum().item())
-    by_penalty = {}
-    for p_idx, name in enumerate(penalties):
-        penalty_mask = torch.zeros_like(valid_bcp)
-        penalty_mask[:, :, p_idx] = valid_bcp[:, :, p_idx]
-        by_penalty[str(name)] = _summarize(penalty_mask)
-    summary["by_penalty"] = by_penalty
-
-    if cluster_id_c is not None:
-        cluster_idx = cluster_id_c.detach().cpu().to(dtype=torch.long)
-        if int(cluster_idx.numel()) == int(C):
-            k_count = int(K) if K is not None else int(cluster_idx.max().item() + 1)
-            by_cluster = {}
-            for k in range(k_count):
-                channel_mask_c = (cluster_idx == int(k)).to(device=valid_bcp.device)
-                cluster_mask = valid_bcp & channel_mask_c.view(1, C, 1)
-                by_cluster[str(k)] = _summarize(cluster_mask)
-            summary["by_cluster"] = by_cluster
-    return summary
-
-
-@torch.no_grad()
-def _pred_residual_selector_metrics_from_tensors(
-    tensors: Optional[Dict[str, torch.Tensor]],
-    selector: Optional[PredResidualCandidateSelector],
-    device: torch.device,
-    batch_size: int,
-    min_abs_improvement: float,
-    min_rel_improvement: float,
-    indices: Optional[torch.Tensor] = None,
-    penalty_names: Optional[List[str]] = None,
-    allowed_mask_cp: Optional[torch.Tensor] = None,
-) -> Optional[Dict[str, object]]:
-    if tensors is None or selector is None:
-        return None
-    skip_feat = tensors["skip_feat"]
-    cand_feat = tensors["cand_feat"]
-    base = tensors["base"]
-    cand = tensors["cand"]
-    y = tensors["y"]
-    n = int(base.shape[0])
-    if n == 0:
-        return None
-    if indices is None:
-        indices = torch.arange(0, n, dtype=torch.long)
-    else:
-        indices = indices.detach().cpu().to(dtype=torch.long)
-    if int(indices.numel()) == 0:
-        return None
-
-    selector.eval()
-    P = int(cand.shape[2])
-    q = P + 1
-    allowed_mask_device = _selector_allowed_mask_cp(
-        allowed_mask_cp,
-        C=int(base.shape[1]),
-        P=P,
-        device=device,
-        context="candidate selector metrics",
-    )
-    batch_size = max(1, int(batch_size))
-    base_se = selected_se = target_se = oracle_se = 0.0
-    denom = 0
-    correct = 0
-    total_bc = 0
-    selected_count_q = torch.zeros(q, dtype=torch.long)
-    target_count_q = torch.zeros(q, dtype=torch.long)
-    oracle_count_q = torch.zeros(q, dtype=torch.long)
-    for b0 in range(0, int(indices.numel()), batch_size):
-        batch_idx = indices[b0:b0 + batch_size]
-        skip_feat_b = skip_feat.index_select(0, batch_idx).to(device)
-        cand_feat_b = cand_feat.index_select(0, batch_idx).to(device)
-        base_b = base.index_select(0, batch_idx).to(device)
-        cand_b = cand.index_select(0, batch_idx).to(device)
-        y_b = y.index_select(0, batch_idx).to(device)
-        selected_b, selected_class_b = selector.select_from_features(
-            skip_feat_b,
-            cand_feat_b,
-            base_b,
-            cand_b,
-            allowed_mask_cp=allowed_mask_device,
-        )
-        target_b = _candidate_selector_targets(
-            base_bch=base_b,
-            cand_bcpH=cand_b,
-            y_bch=y_b,
-            min_abs_improvement=min_abs_improvement,
-            min_rel_improvement=min_rel_improvement,
-            allowed_mask_cp=allowed_mask_device,
-        )
-        all_pred_bq = torch.cat([base_b.unsqueeze(2), cand_b], dim=2)
-        target_pred_b = all_pred_bq.gather(
-            2,
-            target_b.view(*target_b.shape, 1, 1).expand(-1, -1, 1, int(base_b.shape[-1])),
-        ).squeeze(2)
-        base_err_bc = (base_b - y_b).pow(2).mean(dim=-1)
-        cand_err_bcp = (cand_b - y_b.unsqueeze(2)).pow(2).mean(dim=-1)
-        if allowed_mask_device is not None:
-            cand_err_bcp = cand_err_bcp.masked_fill(~allowed_mask_device.unsqueeze(0), float("inf"))
-        best_cand_err_bc, oracle_p_bc = cand_err_bcp.min(dim=-1)
-        oracle_use_bc = torch.isfinite(best_cand_err_bc) & (best_cand_err_bc < base_err_bc)
-        oracle_err_bc = torch.where(oracle_use_bc, best_cand_err_bc, base_err_bc)
-        oracle_class_bc = torch.where(
-            oracle_use_bc,
-            oracle_p_bc.to(dtype=torch.long) + 1,
-            torch.zeros_like(oracle_p_bc, dtype=torch.long),
-        )
-        selected_se += float((selected_b - y_b).pow(2).sum().item())
-        target_se += float((target_pred_b - y_b).pow(2).sum().item())
-        oracle_se += float(oracle_err_bc.sum().item() * y_b.shape[-1])
-        base_se += float((base_b - y_b).pow(2).sum().item())
-        denom += int(y_b.numel())
-        total_bc += int(target_b.numel())
-        correct += int((selected_class_b == target_b).sum().item())
-        selected_count_q += torch.bincount(selected_class_b.detach().cpu().reshape(-1), minlength=q)[:q]
-        target_count_q += torch.bincount(target_b.detach().cpu().reshape(-1), minlength=q)[:q]
-        oracle_count_q += torch.bincount(oracle_class_bc.detach().cpu().reshape(-1), minlength=q)[:q]
-
-    if denom <= 0:
-        return None
-    base_mse = base_se / max(denom, 1)
-    selected_mse = selected_se / max(denom, 1)
-    target_mse = target_se / max(denom, 1)
-    oracle_mse = oracle_se / max(denom, 1)
-    names = ["skip"] + [str(name) for name in (penalty_names or [f"p{p}" for p in range(P)])]
-    return {
-        "samples": int(total_bc),
-        "accuracy": float(correct / max(total_bc, 1)),
-        "base_mse": float(base_mse),
-        "selected_mse": float(selected_mse),
-        "target_mse": float(target_mse),
-        "oracle_mse": float(oracle_mse),
-        "selected_gain_pct_vs_base": float(100.0 * (base_mse - selected_mse) / max(abs(base_mse), 1.0e-12)),
-        "target_gain_pct_vs_base": float(100.0 * (base_mse - target_mse) / max(abs(base_mse), 1.0e-12)),
-        "oracle_gain_pct_vs_base": float(100.0 * (base_mse - oracle_mse) / max(abs(base_mse), 1.0e-12)),
-        "selected_class_rate": {
-            names[i]: float(selected_count_q[i].item() / max(total_bc, 1)) for i in range(q)
-        },
-        "target_class_rate": {
-            names[i]: float(target_count_q[i].item() / max(total_bc, 1)) for i in range(q)
-        },
-        "oracle_class_rate": {
-            names[i]: float(oracle_count_q[i].item() / max(total_bc, 1)) for i in range(q)
-        },
-    }
-
-
-def _candidate_selector_feature_standardization_stats(
-    *,
-    skip_feat: torch.Tensor,
-    cand_feat: torch.Tensor,
-    selector: PredResidualCandidateSelector,
-    train_idx: torch.Tensor,
-    mode: str = "mean_std",
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
-    skip_train_raw = skip_feat.index_select(0, train_idx)
-    cand_train_raw = cand_feat.index_select(0, train_idx)
-    skip_train_aug, cand_train_aug = selector._append_penalty_identity(skip_train_raw, cand_train_raw)
-    skip_train = skip_train_aug.reshape(-1, int(skip_train_aug.shape[-1]))
-    cand_train = cand_train_aug.reshape(-1, int(cand_train_aug.shape[-1]))
-    feat_train = torch.cat([skip_train, cand_train], dim=0).to(dtype=torch.float32)
-    mode_norm = str(mode or "mean_std").lower()
-    if mode_norm in {"robust", "median_iqr", "iqr"}:
-        feat_mean = feat_train.median(dim=0).values
-        q = torch.quantile(feat_train, torch.tensor([0.25, 0.75], device=feat_train.device), dim=0)
-        iqr_scale = (q[1] - q[0]) / 1.349
-        std_fallback = feat_train.std(dim=0, unbiased=False)
-        feat_std = torch.where(iqr_scale > 1.0e-6, iqr_scale, std_fallback).clamp_min(1.0e-6)
-        mode_summary = "robust"
-    elif mode_norm in {"mean_std", "standard", "std"}:
-        feat_mean = feat_train.mean(dim=0)
-        feat_std = feat_train.std(dim=0, unbiased=False).clamp_min(1.0e-6)
-        mode_summary = "mean_std"
-    else:
-        raise ValueError("candidate_selector.standardization_mode must be mean_std or robust.")
-    summary = {
-        "mode": mode_summary,
-        "min_std": float(feat_std.min().item()),
-        "max_std": float(feat_std.max().item()),
-    }
-    return feat_mean, feat_std, summary
-
-
-@torch.no_grad()
-def _fit_static_candidate_channel_selector_from_tensors(
-    *,
-    tensors: Dict[str, torch.Tensor],
-    allowed_mask_cp: Optional[torch.Tensor] = None,
-    penalty_names: Optional[List[str]] = None,
-    channel_names: Optional[List[str]] = None,
-    select_indices: Optional[torch.Tensor] = None,
-    eval_indices: Optional[torch.Tensor] = None,
-    min_abs_improvement: float = 0.0,
-    min_rel_improvement: float = 0.0,
-) -> Tuple[StaticPredResidualCandidateSelector, Dict[str, object]]:
-    base = tensors["base"]
-    cand = tensors["cand"]
-    y = tensors["y"]
-    n, C, _ = base.shape
-    P = int(cand.shape[2])
-    if select_indices is None:
-        select_indices = torch.arange(0, n, dtype=torch.long)
-    else:
-        select_indices = select_indices.detach().cpu().to(dtype=torch.long)
-    if eval_indices is None:
-        eval_indices = select_indices
-    else:
-        eval_indices = eval_indices.detach().cpu().to(dtype=torch.long)
-    allowed = _selector_allowed_mask_cp(
-        allowed_mask_cp,
-        C=int(C),
-        P=P,
-        device=base.device,
-        context="static candidate channel selector",
-    )
-
-    def _mse_mae_for_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        base_i = base.index_select(0, indices)
-        cand_i = cand.index_select(0, indices)
-        y_i = y.index_select(0, indices)
-        base_mse_c = (base_i - y_i).pow(2).mean(dim=(0, 2))
-        base_mae_c = (base_i - y_i).abs().mean(dim=(0, 2))
-        cand_mse_cp = (cand_i - y_i.unsqueeze(2)).pow(2).mean(dim=(0, 3))
-        cand_mae_cp = (cand_i - y_i.unsqueeze(2)).abs().mean(dim=(0, 3))
-        if allowed is not None:
-            cand_mse_cp = cand_mse_cp.masked_fill(~allowed, float("inf"))
-            cand_mae_cp = cand_mae_cp.masked_fill(~allowed, float("inf"))
-        return base_mse_c, base_mae_c, cand_mse_cp, cand_mae_cp
-
-    select_base_mse_c, select_base_mae_c, select_cand_mse_cp, select_cand_mae_cp = _mse_mae_for_indices(select_indices)
-    best_cand_mse_c, best_p_c = select_cand_mse_cp.min(dim=-1)
-    best_cand_mae_c = select_cand_mae_cp.gather(1, best_p_c.view(-1, 1)).squeeze(1)
-    required_c = torch.maximum(
-        torch.full_like(select_base_mse_c, max(0.0, float(min_abs_improvement))),
-        max(0.0, float(min_rel_improvement)) * select_base_mse_c.abs().clamp_min(1.0e-12),
-    )
-    use_candidate_c = torch.isfinite(best_cand_mse_c) & ((select_base_mse_c - best_cand_mse_c) > required_c)
-    selected_class_c = torch.where(
-        use_candidate_c,
-        best_p_c.to(dtype=torch.long) + 1,
-        torch.zeros_like(best_p_c, dtype=torch.long),
-    )
-    selector = StaticPredResidualCandidateSelector(selected_class_c)
-
-    eval_base_mse_c, eval_base_mae_c, eval_cand_mse_cp, eval_cand_mae_cp = _mse_mae_for_indices(eval_indices)
-    safe_p_c = (selected_class_c - 1).clamp_min(0)
-    chosen_cand_mse_c = eval_cand_mse_cp.gather(1, safe_p_c.view(-1, 1)).squeeze(1)
-    chosen_cand_mae_c = eval_cand_mae_cp.gather(1, safe_p_c.view(-1, 1)).squeeze(1)
-    selected_mse_c = torch.where(selected_class_c > 0, chosen_cand_mse_c, eval_base_mse_c)
-    selected_mae_c = torch.where(selected_class_c > 0, chosen_cand_mae_c, eval_base_mae_c)
-
-    penalties = list(penalty_names or [f"p{i}" for i in range(P)])
-    if len(penalties) != P:
-        penalties = [f"p{i}" for i in range(P)]
-    channels = list(channel_names or [f"ch_{i}" for i in range(C)])
-    if len(channels) != C:
-        channels = [f"ch_{i}" for i in range(C)]
-    selected_classes = [int(v) for v in selected_class_c.detach().cpu().tolist()]
-    selected_names = [penalties[cls - 1] if cls > 0 else "skip" for cls in selected_classes]
-    base_avg_mse = float(eval_base_mse_c.mean().item())
-    base_avg_mae = float(eval_base_mae_c.mean().item())
-    selected_avg_mse = float(selected_mse_c.mean().item())
-    selected_avg_mae = float(selected_mae_c.mean().item())
-    summary = {
-        "mode": "static_candidate_channel",
-        "selection_windows": int(select_indices.numel()),
-        "eval_windows": int(eval_indices.numel()),
-        "min_abs_improvement": float(max(0.0, float(min_abs_improvement))),
-        "min_rel_improvement": float(max(0.0, float(min_rel_improvement))),
-        "selected_class": selected_classes,
-        "selected_penalty_by_channel": selected_names,
-        "selected_channels": [channels[i] for i, cls in enumerate(selected_classes) if cls > 0],
-        "num_candidate_channels": int((selected_class_c > 0).sum().item()),
-        "select_base_mse_per_channel": [float(v) for v in select_base_mse_c.detach().cpu().tolist()],
-        "select_best_candidate_mse_per_channel": [float(v) for v in best_cand_mse_c.detach().cpu().tolist()],
-        "select_best_candidate_mae_per_channel": [float(v) for v in best_cand_mae_c.detach().cpu().tolist()],
-        "eval_base_avg_mse": base_avg_mse,
-        "eval_base_avg_mae": base_avg_mae,
-        "eval_selected_avg_mse": selected_avg_mse,
-        "eval_selected_avg_mae": selected_avg_mae,
-        "eval_gain_pct_vs_base": float(100.0 * (base_avg_mse - selected_avg_mse) / max(abs(base_avg_mse), 1.0e-12)),
-        "eval_mae_gain_pct_vs_base": float(100.0 * (base_avg_mae - selected_avg_mae) / max(abs(base_avg_mae), 1.0e-12)),
-        "eval_base_mse_per_channel": [float(v) for v in eval_base_mse_c.detach().cpu().tolist()],
-        "eval_selected_mse_per_channel": [float(v) for v in selected_mse_c.detach().cpu().tolist()],
-        "eval_base_mae_per_channel": [float(v) for v in eval_base_mae_c.detach().cpu().tolist()],
-        "eval_selected_mae_per_channel": [float(v) for v in selected_mae_c.detach().cpu().tolist()],
-    }
-    return selector, summary
-
-
-def train_pred_residual_candidate_selector(
-    model: nn.Module,
-    pred_residual: Optional[ClusterwisePredResidualMoE],
-    loader: DataLoader,
-    cluster_id_c: torch.Tensor,
-    K: int,
-    moe_cfg: dict,
-    device: torch.device,
-    penalty_names: List[str],
-    channel_names: List[str],
-    cfg: Dict[str, object],
-    pred_residual_scale_c: Optional[torch.Tensor] = None,
-    history_anchor_cfg: Optional[dict] = None,
-    observed_history_tc: Optional[torch.Tensor] = None,
-    input_len: int = 0,
-    eval_start: int = 0,
-    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
-    model_train_stat_adapter_cfg: Optional[dict] = None,
-    train_stat_anchor_pc: Optional[torch.Tensor] = None,
-    train_residual_anchor_phc: Optional[torch.Tensor] = None,
-    allowed_mask_kp: Optional[torch.Tensor] = None,
-    gate_feature_mode: str = "history",
-) -> Tuple[Optional[PredResidualCandidateSelector], Dict[str, object]]:
-    candidate_feature_mode = str(cfg.get("feature_mode", "base")).lower()
-    candidate_feature_names = _candidate_selector_feature_names(candidate_feature_mode)
-    tensors = _collect_pred_residual_selector_tensors(
-        model=model,
-        pred_residual=pred_residual,
-        loader=loader,
-        cluster_id_c=cluster_id_c,
-        K=K,
-        moe_cfg=moe_cfg,
-        device=device,
-        penalty_count=len(penalty_names),
-        pred_residual_scale_c=pred_residual_scale_c,
-        history_anchor_cfg=history_anchor_cfg,
-        observed_history_tc=observed_history_tc,
-        input_len=input_len,
-        eval_start=eval_start,
-        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
-        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
-        train_stat_anchor_pc=train_stat_anchor_pc,
-        train_residual_anchor_phc=train_residual_anchor_phc,
-        candidate_feature_mode=candidate_feature_mode,
-    )
-    if tensors is None:
-        return None, {"enable": False, "reason": "empty_loader_or_residual_disabled"}
-
-    skip_feat = tensors["skip_feat"]
-    cand_feat = tensors["cand_feat"]
-    base = tensors["base"]
-    cand = tensors["cand"]
-    y = tensors["y"]
-    n = int(base.shape[0])
-    c = int(base.shape[1])
-    p = int(cand.shape[2])
-    allowed_mask_cp = None
-    if allowed_mask_kp is not None and int(allowed_mask_kp.numel()) > 0:
-        allowed_kp = allowed_mask_kp.detach().to(dtype=torch.bool)
-        if tuple(allowed_kp.shape) != (int(K), p):
-            raise ValueError(
-                "candidate_selector allowed_mask_kp must have shape [K,P], "
-                f"got {tuple(allowed_kp.shape)} vs {(int(K), p)}."
-            )
-        cluster_idx = cluster_id_c.detach().cpu().to(dtype=torch.long)
-        allowed_mask_cp = allowed_kp.detach().cpu().index_select(0, cluster_idx)
-    train_fraction = float(cfg.get("train_fraction", 0.75))
-    split = int(max(1, min(n - 1, round(n * train_fraction)))) if n > 1 else n
-    train_idx = torch.arange(0, split, dtype=torch.long)
-    hold_idx = torch.arange(split, n, dtype=torch.long)
-    if hold_idx.numel() == 0:
-        hold_idx = train_idx
-
-    selector = PredResidualCandidateSelector(
-        feat_dim=int(skip_feat.shape[-1]),
-        num_channels=c,
-        num_penalties=p,
-        hidden_dim=int(cfg.get("hidden_dim", 64)),
-        dropout=float(cfg.get("dropout", 0.0)),
-        init_skip_bias=float(cfg.get("init_skip_bias", 0.0)),
-        init_penalty_bias=float(cfg.get("init_penalty_bias", 0.0)),
-        use_penalty_identity=bool(cfg.get("use_penalty_identity", False)),
-        feature_mode=candidate_feature_mode,
-    ).to(device)
-    selector.set_allowed_penalty_mask(allowed_mask_cp)
-    standardize_features = bool(cfg.get("standardize_features", True))
-    feature_std_summary: Dict[str, object] = {
-        "standardize_features": bool(standardize_features),
-        "fit_windows": int(train_idx.numel()) if standardize_features else 0,
-        "mode": None,
-        "min_std": None,
-        "max_std": None,
-        "clip": 0.0,
-    }
-    if standardize_features:
-        feat_mean, feat_std, std_stats = _candidate_selector_feature_standardization_stats(
-            skip_feat=skip_feat,
-            cand_feat=cand_feat,
-            selector=selector,
-            train_idx=train_idx,
-            mode=str(cfg.get("standardization_mode", "mean_std")),
-        )
-        selector.set_feature_standardization(feat_mean.to(device), feat_std.to(device))
-        feature_clip = float(cfg.get("standardize_clip", cfg.get("feature_clip", 0.0)))
-        selector.set_feature_standardize_clip(feature_clip)
-        feature_std_summary.update(std_stats)
-        feature_std_summary["clip"] = float(max(0.0, feature_clip))
-
-    min_abs_improvement = float(cfg.get("label_min_abs_improvement", cfg.get("min_abs_improvement", 0.0)))
-    min_rel_improvement = float(cfg.get("label_min_rel_improvement", cfg.get("min_rel_improvement", 0.0)))
-    lr = float(cfg.get("lr", 1.0e-3))
-    weight_decay = float(cfg.get("weight_decay", 1.0e-4))
-    batch_size = max(1, int(cfg.get("batch_size", 256)))
-    epochs = max(1, int(cfg.get("epochs", 40)))
-    grad_clip = float(cfg.get("grad_clip", 1.0))
-    positive_sample_weight = float(cfg.get("positive_sample_weight", 1.0))
-    negative_sample_weight = float(cfg.get("negative_sample_weight", 1.0))
-    class_weight_cfg = cfg.get("class_weight", "auto")
-    class_weight = None
-    class_weight_summary: object = None
-    train_target = _candidate_selector_targets(
-        base_bch=base.index_select(0, train_idx),
-        cand_bcpH=cand.index_select(0, train_idx),
-        y_bch=y.index_select(0, train_idx),
-        min_abs_improvement=min_abs_improvement,
-        min_rel_improvement=min_rel_improvement,
-        allowed_mask_cp=allowed_mask_cp,
-    ).reshape(-1)
-    if isinstance(class_weight_cfg, str) and class_weight_cfg.lower() == "auto":
-        counts = torch.bincount(train_target, minlength=p + 1).to(dtype=torch.float32)
-        total = counts.sum().clamp_min(1.0)
-        weight = total / (float(p + 1) * counts.clamp_min(1.0))
-        weight = weight.clamp(
-            min=float(cfg.get("class_weight_min", 0.25)),
-            max=float(cfg.get("class_weight_max", 8.0)),
-        )
-        class_weight = weight.to(device)
-        class_weight_summary = [float(v) for v in weight.tolist()]
-    elif isinstance(class_weight_cfg, (list, tuple)):
-        weight = torch.as_tensor(class_weight_cfg, dtype=torch.float32)
-        if int(weight.numel()) != p + 1:
-            raise ValueError(f"candidate_selector.class_weight must have {p + 1} entries.")
-        class_weight = weight.to(device)
-        class_weight_summary = [float(v) for v in weight.tolist()]
-    elif isinstance(class_weight_cfg, str) and class_weight_cfg.lower() in {"none", "false", "off", "0"}:
-        class_weight = None
-        class_weight_summary = None
-    elif bool(class_weight_cfg):
-        scalar = float(class_weight_cfg)
-        class_weight = torch.ones(p + 1, dtype=torch.float32, device=device)
-        class_weight[1:] = scalar
-        class_weight_summary = [float(v) for v in class_weight.detach().cpu().tolist()]
-
-    opt = torch.optim.AdamW(selector.parameters(), lr=lr, weight_decay=weight_decay)
-    best_state = None
-    best_hold = float("inf")
-    best_epoch = 0
-
-    def _loss_for(batch_idx: torch.Tensor) -> torch.Tensor:
-        skip_feat_b = skip_feat.index_select(0, batch_idx).to(device)
-        cand_feat_b = cand_feat.index_select(0, batch_idx).to(device)
-        base_b = base.index_select(0, batch_idx).to(device)
-        cand_b = cand.index_select(0, batch_idx).to(device)
-        y_b = y.index_select(0, batch_idx).to(device)
-        target_b = _candidate_selector_targets(
-            base_bch=base_b,
-            cand_bcpH=cand_b,
-            y_bch=y_b,
-            min_abs_improvement=min_abs_improvement,
-            min_rel_improvement=min_rel_improvement,
-            allowed_mask_cp=allowed_mask_cp,
-        )
-        logits_bcq = selector.logits_from_features(skip_feat_b, cand_feat_b, allowed_mask_cp=allowed_mask_cp)
-        loss_bc = torch.nn.functional.cross_entropy(
-            logits_bcq.reshape(-1, p + 1),
-            target_b.reshape(-1),
-            weight=class_weight,
-            reduction="none",
-        ).view_as(target_b).to(dtype=logits_bcq.dtype)
-        if positive_sample_weight != 1.0 or negative_sample_weight != 1.0:
-            sample_weight = torch.where(
-                target_b > 0,
-                torch.full_like(loss_bc, positive_sample_weight),
-                torch.full_like(loss_bc, negative_sample_weight),
-            )
-            loss_bc = loss_bc * sample_weight
-        return loss_bc.mean()
-
-    for ep in range(1, epochs + 1):
-        selector.train()
-        perm = train_idx[torch.randperm(train_idx.numel())]
-        for b0 in range(0, int(perm.numel()), batch_size):
-            batch_idx = perm[b0:b0 + batch_size]
-            loss = _loss_for(batch_idx)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(selector.parameters(), grad_clip)
-            opt.step()
-        hold_metrics = _pred_residual_selector_metrics_from_tensors(
-            tensors=tensors,
-            selector=selector,
-            device=device,
-            batch_size=batch_size,
-            min_abs_improvement=min_abs_improvement,
-            min_rel_improvement=min_rel_improvement,
-            indices=hold_idx,
-            penalty_names=penalty_names,
-            allowed_mask_cp=allowed_mask_cp,
-        )
-        hold_mse = float((hold_metrics or {}).get("selected_mse", float("inf")))
-        if hold_mse < best_hold:
-            best_hold = hold_mse
-            best_epoch = ep
-            best_state = {k: v.detach().cpu().clone() for k, v in selector.state_dict().items()}
-
-    if best_state is not None:
-        selector.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-    margin_raw = cfg.get("decision_margin", "auto")
-    margin_selection: Dict[str, object] = {"mode": "fixed", "margin": 0.0}
-    if isinstance(margin_raw, str) and margin_raw.lower() == "auto":
-        max_margin = max(0.0, float(cfg.get("decision_margin_max", 6.0)))
-        num_margin = max(2, int(cfg.get("decision_margin_candidates", 61)))
-        best_margin = 0.0
-        best_margin_mse = float("inf")
-        best_margin_gain = float("-inf")
-        margins = torch.linspace(0.0, max_margin, steps=num_margin).tolist()
-        for margin in margins:
-            selector.decision_margin = float(margin)
-            metrics = _pred_residual_selector_metrics_from_tensors(
-                tensors=tensors,
-                selector=selector,
-                device=device,
-                batch_size=batch_size,
-                min_abs_improvement=min_abs_improvement,
-                min_rel_improvement=min_rel_improvement,
-                indices=hold_idx,
-                penalty_names=penalty_names,
-                allowed_mask_cp=allowed_mask_cp,
-            )
-            if metrics is None:
-                continue
-            mse = float(metrics.get("selected_mse", float("inf")))
-            gain = float(metrics.get("selected_gain_pct_vs_base", float("-inf")))
-            if mse < best_margin_mse:
-                best_margin_mse = mse
-                best_margin_gain = gain
-                best_margin = float(margin)
-        selector.decision_margin = float(best_margin)
-        margin_selection = {
-            "mode": "auto",
-            "margin": float(best_margin),
-            "holdout_selected_mse": float(best_margin_mse),
-            "holdout_gain_pct_vs_base": float(best_margin_gain),
-            "max_margin": float(max_margin),
-            "candidates": int(num_margin),
-        }
-    else:
-        selector.decision_margin = float(margin_raw)
-        margin_selection = {"mode": "fixed", "margin": float(selector.decision_margin)}
-    train_metrics = _pred_residual_selector_metrics_from_tensors(
-        tensors=tensors,
-        selector=selector,
-        device=device,
-        batch_size=batch_size,
-        min_abs_improvement=min_abs_improvement,
-        min_rel_improvement=min_rel_improvement,
-        indices=train_idx,
-        penalty_names=penalty_names,
-        allowed_mask_cp=allowed_mask_cp,
-    )
-    hold_metrics = _pred_residual_selector_metrics_from_tensors(
-        tensors=tensors,
-        selector=selector,
-        device=device,
-        batch_size=batch_size,
-        min_abs_improvement=min_abs_improvement,
-        min_rel_improvement=min_rel_improvement,
-        indices=hold_idx,
-        penalty_names=penalty_names,
-        allowed_mask_cp=allowed_mask_cp,
-    )
-    feature_gain_diagnostics = {
-        "train": _candidate_selector_feature_gain_diagnostics(
-            tensors=tensors,
-            feature_names=candidate_feature_names,
-            penalty_names=penalty_names,
-            allowed_mask_cp=allowed_mask_cp,
-            indices=train_idx,
-            cluster_id_c=cluster_id_c,
-            K=K,
-            min_abs_improvement=min_abs_improvement,
-            min_rel_improvement=min_rel_improvement,
-            topk=int(cfg.get("feature_gain_diagnostic_topk", 5)),
-        ),
-        "holdout": _candidate_selector_feature_gain_diagnostics(
-            tensors=tensors,
-            feature_names=candidate_feature_names,
-            penalty_names=penalty_names,
-            allowed_mask_cp=allowed_mask_cp,
-            indices=hold_idx,
-            cluster_id_c=cluster_id_c,
-            K=K,
-            min_abs_improvement=min_abs_improvement,
-            min_rel_improvement=min_rel_improvement,
-            topk=int(cfg.get("feature_gain_diagnostic_topk", 5)),
-        ),
-    }
-    summary = {
-        "enable": True,
-        "train_windows": int(train_idx.numel()),
-        "holdout_windows": int(hold_idx.numel()),
-        "best_epoch": int(best_epoch),
-        "label_min_abs_improvement": float(min_abs_improvement),
-        "label_min_rel_improvement": float(min_rel_improvement),
-        "positive_sample_weight": float(positive_sample_weight),
-        "negative_sample_weight": float(negative_sample_weight),
-        "class_weight": class_weight_summary,
-        "use_penalty_identity": bool(selector.use_penalty_identity),
-        "feature_mode": candidate_feature_mode,
-        "decision_margin": float(selector.decision_margin),
-        "decision_margin_selection": margin_selection,
-        "feature_standardization": feature_std_summary,
-        "channel_names": list(channel_names),
-        "penalty_names": list(penalty_names),
-        "allowed_mask_cp": allowed_mask_cp.to(dtype=torch.long).tolist() if allowed_mask_cp is not None else None,
-        "gate_feature_mode": _normalize_gate_feature_mode(gate_feature_mode),
-        "feature_gain_diagnostics": feature_gain_diagnostics,
-        "train": train_metrics,
-        "holdout": hold_metrics,
-    }
-    selector.eval()
-    return selector, summary
-
+# Preserve the historical ``src.train`` helper API for experiment scripts.
+from .train_support import *  # noqa: F401,F403
 
 def main():
     ap = argparse.ArgumentParser()
@@ -8528,8 +229,29 @@ def main():
     diagnostics_cfg = cfg.get("diagnostics", {}) or {}
     stage2_loss_audit_cfg = diagnostics_cfg.get("stage2_loss_audit", {}) or {}
     stage2_loss_audit_enable = bool(stage2_loss_audit_cfg.get("enable", False))
+    stage2_objective_overlap_cfg = stage2_loss_audit_cfg.get(
+        "objective_overlap",
+        {},
+    ) or {}
+    if not isinstance(stage2_objective_overlap_cfg, dict):
+        stage2_objective_overlap_cfg = {
+            "enable": bool(stage2_objective_overlap_cfg)
+        }
+    stage2_objective_overlap_enable = bool(
+        stage2_loss_audit_enable
+        and stage2_objective_overlap_cfg.get("enable", False)
+    )
+    stage2_objective_overlap_max_batches = max(
+        1,
+        int(stage2_objective_overlap_cfg.get("max_batches", 4)),
+    )
     if stage2_loss_audit_enable:
         print("Stage-2 loss audit diagnostics enabled.")
+    if stage2_objective_overlap_enable:
+        print(
+            "Stage-2 gate objective-overlap diagnostics enabled: "
+            f"max_batches={stage2_objective_overlap_max_batches}"
+        )
     stage2_route_audit_cfg = diagnostics_cfg.get("stage2_route_audit", {}) or {}
     if not isinstance(stage2_route_audit_cfg, dict):
         stage2_route_audit_cfg = {"enable": bool(stage2_route_audit_cfg)}
@@ -8638,6 +360,18 @@ def main():
             dtype=data_tc.dtype,
     )
 
+    overfit_diagnostic_cfg = cfg["train"].get("overfit_diagnostic", {}) or {}
+    if isinstance(overfit_diagnostic_cfg, bool):
+        overfit_diagnostic_cfg = {"enable": bool(overfit_diagnostic_cfg)}
+    overfit_diagnostic_range = _resolve_overfit_diagnostic_range(
+        len(dtr),
+        overfit_diagnostic_cfg,
+    )
+    optimization_dataset = dtr
+    if overfit_diagnostic_range is not None:
+        overfit_start, overfit_end = overfit_diagnostic_range
+        optimization_dataset = Subset(dtr, range(overfit_start, overfit_end))
+
     bs = int(cfg["train"]["batch_size"])
     pin_mem = (device.type == "cuda") and (data_window_tc.device.type == "cpu")
     shuffle_seed = cfg["train"].get("shuffle_seed", None)
@@ -8645,15 +379,32 @@ def main():
         shuffle_seed = int(cfg["exp"]["seed"])
     train_generator = _make_torch_generator(None if shuffle_seed is None else int(shuffle_seed))
     dl_tr = DataLoader(
-        dtr,
+        optimization_dataset,
         batch_size=bs,
         shuffle=True,
         num_workers=0,
         pin_memory=pin_mem,
         generator=train_generator,
     )
+    dl_overfit_eval = (
+        DataLoader(
+            optimization_dataset,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_mem,
+        )
+        if overfit_diagnostic_range is not None
+        else None
+    )
     dl_va = DataLoader(dva, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin_mem)
     dl_te = DataLoader(dte, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin_mem)
+    if overfit_diagnostic_range is not None:
+        print(
+            "Gate overfit diagnostic: "
+            f"train_windows=[{overfit_start}:{overfit_end}], "
+            f"count={len(optimization_dataset)}, epoch_eval=train_subset"
+        )
     # penalties
     penalty_names = list(cfg["penalties"]["enabled"])
     penalty_fns = build_penalty_bank(penalty_names, jump_thr=float(cfg["penalties"]["jump_threshold"]))
@@ -8878,6 +629,7 @@ def main():
         kwargs.setdefault("model_train_stat_adapter_cfg", model_train_stat_adapter_cfg)
         kwargs.setdefault("train_stat_anchor_pc", train_stat_anchor_pc)
         kwargs.setdefault("train_residual_anchor_phc", train_residual_anchor_phc)
+        kwargs.setdefault("learnable_output_anchor", learnable_output_anchor)
         kwargs.setdefault("gate_feature_mode", gate_feature_mode)
         kwargs.setdefault("calendar_feature_tf", calendar_feature_tf)
         kwargs.setdefault("calendar_residual_coef_cf", calendar_residual_coef_cf)
@@ -8961,6 +713,9 @@ def main():
     # 7) Configure MoE routing and lambda weighting.
     moe_cfg = cfg["moe"]
     moe_enable = bool(moe_cfg.get("enable", True))
+    shared_moe_across_clusters = bool(
+        moe_cfg.get("shared_across_clusters", moe_cfg.get("share_across_clusters", False))
+    ) and moe_enable and P > 0
     gate_entropy_weight = float(moe_cfg.get("gate_entropy_weight", 0.0))
     gate_balance_weight = float(moe_cfg.get("gate_balance_weight", 0.0))
     gate_soft_weight = float(moe_cfg.get("gate_soft_weight", 0.0))
@@ -8973,6 +728,350 @@ def main():
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
     pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
     pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
+    patch_router_cfg = pred_residual_cfg.get("patch_router", {}) or {}
+    if not isinstance(patch_router_cfg, dict):
+        patch_router_cfg = {"enable": bool(patch_router_cfg)}
+    patch_router_expected_mse_weight = (
+        max(0.0, float(patch_router_cfg.get("expected_mse_weight", 0.0)))
+        if bool(patch_router_cfg.get("enable", False))
+        else 0.0
+    )
+    patch_router_temporal_group_dro_cfg = patch_router_cfg.get(
+        "temporal_group_dro",
+        {},
+    ) or {}
+    if not isinstance(patch_router_temporal_group_dro_cfg, dict):
+        patch_router_temporal_group_dro_cfg = {
+            "enable": bool(patch_router_temporal_group_dro_cfg)
+        }
+    patch_router_temporal_group_dro_enable = bool(
+        patch_router_cfg.get("enable", False)
+        and patch_router_temporal_group_dro_cfg.get("enable", False)
+    )
+    patch_router_temporal_group_dro_weight = max(
+        0.0,
+        float(patch_router_temporal_group_dro_cfg.get("weight", 1.0)),
+    )
+    patch_router_temporal_group_dro_domains = max(
+        2,
+        int(patch_router_temporal_group_dro_cfg.get("num_domains", 6)),
+    )
+    patch_router_temporal_group_dro_temperature = max(
+        0.0,
+        float(patch_router_temporal_group_dro_cfg.get("temperature", 0.01)),
+    )
+    if (
+        patch_router_temporal_group_dro_enable
+        and patch_router_expected_mse_weight <= 0.0
+    ):
+        raise ValueError(
+            "patch_router.temporal_group_dro requires expected_mse_weight > 0."
+        )
+    patch_router_oracle_ce_weight = (
+        max(0.0, float(patch_router_cfg.get("oracle_ce_weight", 0.0)))
+        if bool(patch_router_cfg.get("enable", False))
+        else 0.0
+    )
+    patch_router_oracle_ce_warmup_epochs = max(
+        0,
+        int(patch_router_cfg.get("oracle_ce_warmup_epochs", 0)),
+    )
+    patch_router_freeze_experts_after_warmup = bool(
+        patch_router_cfg.get("freeze_experts_after_warmup", False)
+    )
+    patch_router_supervision_only = bool(
+        patch_router_cfg.get("supervision_only", False)
+    )
+    patch_router_diagnostics_cfg = patch_router_cfg.get(
+        "diagnostics",
+        pred_residual_cfg.get("diagnostics", {}),
+    ) or {}
+    if not isinstance(patch_router_diagnostics_cfg, dict):
+        patch_router_diagnostics_cfg = {"enable": bool(patch_router_diagnostics_cfg)}
+    patch_router_train_oracle_diagnostic = bool(
+        patch_router_diagnostics_cfg.get("train_oracle", False)
+    )
+    patch_router_score_threshold_curve = bool(
+        patch_router_diagnostics_cfg.get("score_threshold_curve", False)
+    )
+    patch_router_score_threshold_max_windows = max(
+        0,
+        int(patch_router_diagnostics_cfg.get("score_threshold_curve_max_windows", 0)),
+    )
+    raw_score_threshold_heads = patch_router_diagnostics_cfg.get(
+        "score_threshold_curve_heads",
+        None,
+    )
+    if isinstance(raw_score_threshold_heads, str):
+        patch_router_score_threshold_heads = {raw_score_threshold_heads}
+    elif raw_score_threshold_heads is None:
+        patch_router_score_threshold_heads = None
+    else:
+        patch_router_score_threshold_heads = {
+            str(value) for value in raw_score_threshold_heads
+        }
+    patch_router_train_temporal_blocks = max(
+        0,
+        int(patch_router_diagnostics_cfg.get("train_temporal_blocks", 0)),
+    )
+    patch_router_walk_forward_cfg = patch_router_diagnostics_cfg.get(
+        "walk_forward_reliability",
+        {},
+    ) or {}
+    if not isinstance(patch_router_walk_forward_cfg, dict):
+        patch_router_walk_forward_cfg = {
+            "enable": bool(patch_router_walk_forward_cfg)
+        }
+    patch_router_walk_forward_enable = bool(
+        patch_router_walk_forward_cfg.get("enable", False)
+    )
+    patch_router_walk_forward_label_delay = int(
+        patch_router_walk_forward_cfg.get("label_delay", H)
+    )
+    patch_router_walk_forward_label_delay_mode = str(
+        patch_router_walk_forward_cfg.get("label_delay_mode", "full_horizon")
+    ).strip().lower()
+    if patch_router_walk_forward_label_delay_mode not in {
+        "full_horizon",
+        "patch_end",
+    }:
+        raise ValueError(
+            "walk_forward_reliability.label_delay_mode must be full_horizon or patch_end."
+        )
+    patch_router_walk_forward_lookback = int(
+        patch_router_walk_forward_cfg.get("lookback_windows", 2 * H)
+    )
+    patch_router_walk_forward_min_history = int(
+        patch_router_walk_forward_cfg.get("min_history_windows", H)
+    )
+    patch_router_walk_forward_history_stride = int(
+        patch_router_walk_forward_cfg.get("history_stride", 1)
+    )
+    patch_router_walk_forward_min_mean_gain = float(
+        patch_router_walk_forward_cfg.get("min_mean_gain", 0.0)
+    )
+    patch_router_walk_forward_max_abs_regime_z_raw = (
+        patch_router_walk_forward_cfg.get("max_abs_regime_z", None)
+    )
+    patch_router_walk_forward_max_abs_regime_z = (
+        None
+        if patch_router_walk_forward_max_abs_regime_z_raw is None
+        else float(patch_router_walk_forward_max_abs_regime_z_raw)
+    )
+    patch_router_walk_forward_scale_mode = str(
+        patch_router_walk_forward_cfg.get("scale_mode", "binary")
+    ).strip().lower()
+    patch_router_walk_forward_max_scale = float(
+        patch_router_walk_forward_cfg.get("max_scale", 1.0)
+    )
+    patch_router_walk_forward_scale_consensus_blocks = int(
+        patch_router_walk_forward_cfg.get("scale_consensus_blocks", 1)
+    )
+    patch_router_walk_forward_feature_ridge = float(
+        patch_router_walk_forward_cfg.get("feature_ridge", 0.1)
+    )
+    patch_router_walk_forward_feature_update_blocks = int(
+        patch_router_walk_forward_cfg.get("feature_update_blocks", 6)
+    )
+    patch_router_walk_forward_temporal_blocks = max(
+        0,
+        int(patch_router_walk_forward_cfg.get("temporal_blocks", 6)),
+    )
+    patch_router_walk_forward_train_audit_fraction = float(
+        patch_router_walk_forward_cfg.get("train_audit_fraction", 0.4)
+    )
+    if patch_router_walk_forward_enable and not (
+        0.0 < patch_router_walk_forward_train_audit_fraction < 1.0
+    ):
+        raise ValueError(
+            "walk_forward_reliability.train_audit_fraction must be in (0,1)."
+        )
+    patch_router_validation_temporal_blocks = max(
+        0,
+        int(patch_router_diagnostics_cfg.get("validation_temporal_blocks", 0)),
+    )
+    patch_router_frozen_expert_params = 0
+    patch_router_expert_freeze_applied = False
+    patch_router_oracle_min_abs_improvement = float(
+        patch_router_cfg.get("oracle_min_abs_improvement", 0.0)
+    )
+    patch_router_hierarchical_cfg = patch_router_cfg.get("hierarchical_recall", {}) or {}
+    if not isinstance(patch_router_hierarchical_cfg, dict):
+        patch_router_hierarchical_cfg = {"enable": bool(patch_router_hierarchical_cfg)}
+    patch_router_mask_inactive_fixed_channels = bool(
+        patch_router_hierarchical_cfg.get(
+            "mask_inactive_fixed_channels",
+            False,
+        )
+    )
+    patch_router_hierarchical_enable = bool(
+        patch_router_cfg.get("enable", False)
+        and patch_router_hierarchical_cfg.get("enable", False)
+    )
+    patch_router_hierarchical_weight = (
+        max(0.0, float(patch_router_hierarchical_cfg.get("supervision_weight", 0.0)))
+        if patch_router_hierarchical_enable
+        else 0.0
+    )
+    patch_router_hierarchical_warmup_epochs = max(
+        0,
+        int(patch_router_hierarchical_cfg.get("warmup_epochs", 0)),
+    )
+    patch_router_hierarchical_min_abs_improvement = float(
+        patch_router_hierarchical_cfg.get(
+            "min_abs_improvement",
+            patch_router_oracle_min_abs_improvement,
+        )
+    )
+    patch_router_expert_risk_cfg = patch_router_hierarchical_cfg.get(
+        "expert_conditional_risk",
+        {},
+    ) or {}
+    if not isinstance(patch_router_expert_risk_cfg, dict):
+        patch_router_expert_risk_cfg = {"enable": bool(patch_router_expert_risk_cfg)}
+    patch_router_lower_quantile_cfg = patch_router_expert_risk_cfg.get(
+        "lower_quantile",
+        {},
+    ) or {}
+    if not isinstance(patch_router_lower_quantile_cfg, dict):
+        patch_router_lower_quantile_cfg = {
+            "enable": bool(patch_router_lower_quantile_cfg)
+        }
+    patch_router_pairwise_rank_cfg = patch_router_expert_risk_cfg.get(
+        "pairwise_rank",
+        {},
+    ) or {}
+    if not isinstance(patch_router_pairwise_rank_cfg, dict):
+        patch_router_pairwise_rank_cfg = {
+            "enable": bool(patch_router_pairwise_rank_cfg)
+        }
+    patch_router_pairwise_freeze_other_parameters = bool(
+        patch_router_pairwise_rank_cfg.get("freeze_other_parameters", False)
+    )
+    patch_router_temporal_calibration_cfg = patch_router_expert_risk_cfg.get(
+        "temporal_calibration",
+        {},
+    ) or {}
+    if not isinstance(patch_router_temporal_calibration_cfg, dict):
+        patch_router_temporal_calibration_cfg = {
+            "enable": bool(patch_router_temporal_calibration_cfg)
+        }
+    patch_router_temporal_calibration_enable = bool(
+        patch_router_hierarchical_enable
+        and patch_router_expert_risk_cfg.get("enable", False)
+        and patch_router_temporal_calibration_cfg.get("enable", False)
+    )
+    patch_router_calibration_tail_fraction = float(
+        patch_router_temporal_calibration_cfg.get("tail_fraction", 0.2)
+    )
+    patch_router_calibration_blocks = max(
+        1,
+        int(patch_router_temporal_calibration_cfg.get("temporal_blocks", 4)),
+    )
+    patch_router_calibration_purge_windows = max(
+        0,
+        int(patch_router_temporal_calibration_cfg.get("purge_windows", L + H - 1)),
+    )
+    patch_router_calibration_min_gain_cost_ratio = max(
+        0.0,
+        float(patch_router_temporal_calibration_cfg.get("min_gain_cost_ratio", 1.0)),
+    )
+    patch_router_calibration_min_block_net_gain = float(
+        patch_router_temporal_calibration_cfg.get("min_block_net_gain", 0.0)
+    )
+    patch_router_calibration_per_penalty = bool(
+        patch_router_temporal_calibration_cfg.get("per_penalty", False)
+    )
+    if patch_router_temporal_calibration_enable and not (
+        0.0 < patch_router_calibration_tail_fraction < 0.5
+    ):
+        raise ValueError("patch router calibration tail_fraction must be in (0,0.5).")
+    patch_router_calibration_start_idx = int(
+        len(dtr) * (1.0 - patch_router_calibration_tail_fraction)
+    )
+    patch_router_supervision_end_idx = max(
+        0,
+        patch_router_calibration_start_idx - patch_router_calibration_purge_windows,
+    )
+    if patch_router_temporal_calibration_enable and not patch_router_supervision_only:
+        raise ValueError(
+            "patch router temporal calibration requires patch_router.supervision_only=true."
+        )
+    if (
+        patch_router_temporal_calibration_enable
+        and patch_router_supervision_end_idx <= 0
+    ):
+        raise ValueError("patch router temporal calibration leaves no supervision windows.")
+    patch_router_temporal_calibration_summary = None
+    patch_router_hierarchical_loss_cfg = {
+        "adoption_bce_weight": float(patch_router_hierarchical_cfg.get("adoption_bce_weight", 1.0)),
+        "proposal_bce_weight": float(patch_router_hierarchical_cfg.get("proposal_bce_weight", 1.0)),
+        "proposal_gain_listwise_weight": float(
+            patch_router_hierarchical_cfg.get("proposal_gain_listwise_weight", 0.0)
+        ),
+        "proposal_rescue_ce_weight": float(
+            patch_router_hierarchical_cfg.get("proposal_rescue_ce_weight", 0.0)
+        ),
+        "ranking_ce_weight": float(patch_router_hierarchical_cfg.get("ranking_ce_weight", 1.0)),
+        "utility_regression_weight": float(
+            patch_router_hierarchical_cfg.get("utility_regression_weight", 0.0)
+        ),
+        "risk_calibration_weight": float(
+            patch_router_hierarchical_cfg.get("risk_calibration_weight", 0.0)
+        ),
+        "risk_sign_bce_weight": float(
+            patch_router_hierarchical_cfg.get("risk_sign_bce_weight", 0.0)
+        ),
+        "risk_magnitude_weight": float(
+            patch_router_hierarchical_cfg.get("risk_magnitude_weight", 0.0)
+        ),
+        "risk_lower_quantile_weight": float(
+            patch_router_lower_quantile_cfg.get("loss_weight", 0.0)
+        ),
+        "risk_lower_quantile": float(
+            patch_router_lower_quantile_cfg.get("quantile", 0.2)
+        ),
+        "selected_utility_policy_weight": float(
+            patch_router_hierarchical_cfg.get("selected_utility_policy_weight", 0.0)
+        ),
+        "selected_adoption_bce_weight": float(
+            patch_router_hierarchical_cfg.get("selected_adoption_bce_weight", 0.0)
+        ),
+        "selected_adoption_recall_weight": float(
+            patch_router_hierarchical_cfg.get(
+                "selected_adoption_recall_weight",
+                0.0,
+            )
+        ),
+        "selected_false_adopt_weight": float(
+            patch_router_hierarchical_cfg.get("selected_false_adopt_weight", 0.0)
+        ),
+        "pairwise_rank_weight": float(
+            patch_router_pairwise_rank_cfg.get("loss_weight", 0.0)
+        ),
+        "adoption_recall_weight": float(patch_router_hierarchical_cfg.get("adoption_recall_weight", 1.0)),
+        "false_adopt_weight": float(patch_router_hierarchical_cfg.get("false_adopt_weight", 1.0)),
+        "penalty_recall_weight": float(patch_router_hierarchical_cfg.get("penalty_recall_weight", 1.0)),
+        "false_penalty_weight": float(patch_router_hierarchical_cfg.get("false_penalty_weight", 1.0)),
+        "target_adopt_probability": float(
+            patch_router_hierarchical_cfg.get("target_adopt_probability", 0.8)
+        ),
+        "false_adopt_max_probability": float(
+            patch_router_hierarchical_cfg.get("false_adopt_max_probability", 0.2)
+        ),
+        "target_penalty_probability": float(
+            patch_router_hierarchical_cfg.get("target_penalty_probability", 0.7)
+        ),
+        "false_penalty_max_probability": float(
+            patch_router_hierarchical_cfg.get("false_penalty_max_probability", 0.3)
+        ),
+    }
+    patch_router_expert_warmup_epochs = max(
+        int(patch_router_oracle_ce_warmup_epochs),
+        int(patch_router_hierarchical_warmup_epochs),
+    )
+    if shared_moe_across_clusters and bool((pred_residual_cfg.get("channel_expert_adapters", {}) or {}).get("enable", False)):
+        raise ValueError("moe.shared_across_clusters does not support pred_side_residual.channel_expert_adapters.")
     phase_residual_candidate_cfg = pred_residual_cfg.get("phase_residual_candidate", {}) or {}
     if not isinstance(phase_residual_candidate_cfg, dict):
         phase_residual_candidate_cfg = {"enable": bool(phase_residual_candidate_cfg)}
@@ -9390,7 +1489,10 @@ def main():
         skip_init_bias=skip_init_bias,
         skip_competes=skip_competes,
         skip_argmax_noop=skip_argmax_noop,
+        shared_across_clusters=shared_moe_across_clusters,
     ).to(device)
+    if shared_moe_across_clusters:
+        print("Shared MoE across clusters enabled: gate and prediction residual expert parameters are shared.")
     gate.temperature = float(moe_cfg.get("gate_temperature", 1.0))
     gate.noise_std = float(moe_cfg.get("gate_noise_std", 0.0))
     gate.logit_clip = float(moe_cfg.get("gate_logit_clip", 0.0))
@@ -9408,8 +1510,8 @@ def main():
             dtype=torch.float32,
         )
         with torch.no_grad():
-            for k in range(K):
-                gate.b2[k].add_(bias_p)
+            for b2 in gate.b2:
+                b2.add_(bias_p)
         print(f"Gate init bias applied: {dict(zip(penalty_names, [float(v) for v in bias_p.detach().cpu().tolist()]))}")
     channel_expert_mask_c = None
     channel_expert_cfg = pred_residual_cfg.get("channel_expert_adapters", {}) or {}
@@ -9481,7 +1583,14 @@ def main():
             seasonal_anchor_scale=float(pred_residual_cfg.get("seasonal_anchor_scale", 1.0)),
             phase_residual_candidate_names=phase_residual_candidate_names,
             phase_residual_candidate_scale=phase_residual_candidate_scale,
+            shared_across_clusters=shared_moe_across_clusters,
+            patch_router_cfg=patch_router_cfg,
         ).to(device)
+        if (
+            pred_residual.patch_router is not None
+            and pred_residual.patch_router.regime_context_enable
+        ):
+            pred_residual.set_patch_router_observed_history(data_window_tc)
         print(
             "Prediction residual MoE enabled: "
             f"hidden={pred_residual.hidden_dim}, feature_mode={pred_residual.feature_mode}, "
@@ -9493,6 +1602,10 @@ def main():
             f"phase_residual_candidate={phase_residual_candidate_names}, "
             f"phase_residual_period={int(phase_residual_candidate_period)}, "
             f"phase_residual_scale={float(phase_residual_candidate_scale):.3f}, "
+            f"patch_router={bool(pred_residual.patch_router is not None)}, "
+            f"patch_len={int(pred_residual.patch_router.patch_len) if pred_residual.patch_router is not None else 0}, "
+            f"history_projection={pred_residual.patch_router.history_patch_projection if pred_residual.patch_router is not None else 'none'}, "
+            f"regime_context={pred_residual.patch_router.regime_context_lengths if pred_residual.patch_router is not None else []}, "
             f"specialization_weight={pred_residual_specialization_weight:.6f}, "
             f"norm_weight={pred_residual_norm_weight:.6f}, "
             f"intervention_weight={pred_residual_intervention_weight:.6f}, "
@@ -9509,6 +1622,87 @@ def main():
             f"detach_routed_penalty_pred={pred_residual_detach_routed_penalty_pred}, "
             f"penalty_selector={pred_residual.penalty_selector_enable}, "
             f"fusion_gate={pred_residual.fusion_gate_enable}"
+        )
+    learnable_output_anchor_cfg = _normalize_learnable_output_anchor_cfg(
+        moe_cfg.get("learnable_output_anchor", {})
+    )
+    moe_cfg["learnable_output_anchor"] = learnable_output_anchor_cfg
+    learnable_output_anchor_enable = bool(learnable_output_anchor_cfg.get("enable", False))
+    learnable_output_anchor_train_mode = str(learnable_output_anchor_cfg.get("train_mode", "joint")).lower()
+    if learnable_output_anchor_train_mode in {"anchor-only", "anchor_only", "posthoc", "post_hoc"}:
+        learnable_output_anchor_train_mode = "anchor_only"
+    if learnable_output_anchor_train_mode not in {"joint", "anchor_only"}:
+        raise ValueError("moe.learnable_output_anchor.train_mode must be joint or anchor_only.")
+    learnable_output_anchor = None
+    learnable_output_anchor_summary: Dict[str, object] = {
+        "enable": bool(learnable_output_anchor_enable),
+        "source": "static_output_anchor_refiner" if learnable_output_anchor_enable else None,
+        "num_clusters": int(K),
+        "num_channels": int(C),
+        "pred_len": int(H),
+        "train_mode": str(learnable_output_anchor_train_mode) if learnable_output_anchor_enable else None,
+        "train_with_eval_anchors": bool(learnable_output_anchor_enable),
+        "final_eval_enable": bool(learnable_output_anchor_enable),
+        "adoption_guard_applied": False,
+        "loaded_from_checkpoint": False,
+    }
+    if learnable_output_anchor_enable:
+        learnable_output_anchor = ClusterwiseLearnableOutputAnchor(
+            num_clusters=K,
+            num_channels=C,
+            pred_len=H,
+            cfg=learnable_output_anchor_cfg,
+        ).to(device)
+        learnable_output_anchor_summary.update(
+            {
+                "max_scale_delta": float(learnable_output_anchor.max_scale_delta),
+                "learn_stat_scale": bool(learnable_output_anchor.learn_stat_scale),
+                "learn_residual_scale": bool(learnable_output_anchor.learn_residual_scale),
+                "learn_bias": bool(learnable_output_anchor.learn_bias),
+                "max_bias": float(learnable_output_anchor.max_bias),
+                "learn_history_trend": bool(learnable_output_anchor.learn_history_trend),
+                "max_history_trend_delta": float(learnable_output_anchor.max_history_trend_delta),
+                "history_trend_window": int(learnable_output_anchor.history_trend_window),
+                "history_trend_feature": str(learnable_output_anchor.history_trend_feature),
+                "history_trend_projection": str(learnable_output_anchor.history_trend_projection),
+                "scale_parameterization": str(learnable_output_anchor.scale_parameterization),
+                "bias_parameterization": str(learnable_output_anchor.bias_parameterization),
+                "history_trend_parameterization": str(learnable_output_anchor.history_trend_parameterization),
+                "scale_temporal_basis_rank": int(learnable_output_anchor.scale_temporal_basis_rank),
+                "trainable_params": int(
+                    sum(param.numel() for param in learnable_output_anchor.parameters() if param.requires_grad)
+                ),
+                "parameter_shape_per_cluster": {
+                    "scale": [int(v) for v in learnable_output_anchor.scale_shape],
+                    "bias": [int(v) for v in learnable_output_anchor.bias_shape],
+                    "history_trend": [int(v) for v in learnable_output_anchor.history_trend_shape],
+                    "history_trend_basis": [
+                        int(learnable_output_anchor.history_trend_basis_h.shape[0]),
+                    ],
+                    "scale_temporal_coef": [
+                        int(learnable_output_anchor.scale_shape[0]),
+                        int(learnable_output_anchor.scale_temporal_basis_rank),
+                    ],
+                    "scale_temporal_basis": [
+                        int(learnable_output_anchor.scale_temporal_basis_rh.shape[0]),
+                        int(learnable_output_anchor.scale_temporal_basis_rh.shape[1]),
+                    ],
+                },
+                "zero_init_static_equivalent": True,
+            }
+        )
+        print(
+            "Learnable output anchor enabled: "
+            f"max_scale_delta={learnable_output_anchor.max_scale_delta:.3f}, "
+            f"learn_stat_scale={bool(learnable_output_anchor.learn_stat_scale)}, "
+            f"learn_residual_scale={bool(learnable_output_anchor.learn_residual_scale)}, "
+            f"learn_bias={bool(learnable_output_anchor.learn_bias)}, "
+            f"max_bias={learnable_output_anchor.max_bias:.3f}, "
+            f"learn_history_trend={bool(learnable_output_anchor.learn_history_trend)}, "
+            f"max_history_trend_delta={learnable_output_anchor.max_history_trend_delta:.3f}, "
+            f"scale_parameterization={learnable_output_anchor.scale_parameterization}, "
+            f"scale_temporal_basis_rank={learnable_output_anchor.scale_temporal_basis_rank}, "
+            "zero_init_static_equivalent=True"
         )
     gate_balance_target_kp = None
     gate_prior_prob_kp = None
@@ -9913,12 +2107,18 @@ def main():
                 topk=int(src_moe_cfg.get("topk", 1)),
                 allow_skip=source_gate_allow_skip,
                 skip_init_bias=float(src_moe_cfg.get("skip_init_bias", -2.0)),
+                shared_across_clusters=bool(
+                    src_moe_cfg.get("shared_across_clusters", src_moe_cfg.get("share_across_clusters", False))
+                ),
             ).to(device)
             source_gate.load_state_dict(source_gate_state, strict=True)
             source_gate.eval()
-            for k in range(K):
-                src_k = int(target_to_source_k[k].item())
-                gate.load_cluster_state(k, source_gate.get_cluster_state(src_k))
+            if shared_moe_across_clusters:
+                gate.load_cluster_state(0, source_gate.get_cluster_state(0))
+            else:
+                for k in range(K):
+                    src_k = int(target_to_source_k[k].item())
+                    gate.load_cluster_state(k, source_gate.get_cluster_state(src_k))
 
         if bool(ft_cfg.get("load_pred_residual", False)) and pred_residual is not None:
             loaded_pred_residual_state = _load_finetune_pred_residual_state(
@@ -9973,6 +2173,62 @@ def main():
                 src_k = int(target_to_source_k[k].item())
                 learnable_lambda.load_cluster_state(k, source_learnable_lambda.get_cluster_state(src_k))
 
+        if (
+            bool(ft_cfg.get("load_learnable_output_anchor", True))
+            and learnable_output_anchor is not None
+            and "learnable_output_anchor_state" in ckpt
+        ):
+            source_refiner_summary = meta.get("learnable_output_anchor_refiner", {})
+            source_refiner_rejected = (
+                isinstance(source_refiner_summary, dict)
+                and source_refiner_summary.get("final_eval_uses_learnable") is False
+            )
+            if source_refiner_rejected and not bool(
+                ft_cfg.get("load_rejected_learnable_output_anchor", False)
+            ):
+                learnable_output_anchor_summary["loaded_from_checkpoint"] = False
+                learnable_output_anchor_summary["skipped_checkpoint_reason"] = (
+                    "source_refiner_rejected_by_val_guard"
+                )
+                print("Fine-tune skipped learnable_output_anchor_state: source refiner was rejected by val guard.")
+            else:
+                src_moe_cfg = dict(meta.get("moe_cfg", {}))
+                src_anchor_cfg = _normalize_learnable_output_anchor_cfg(
+                    src_moe_cfg.get("learnable_output_anchor", learnable_output_anchor_cfg)
+                )
+                source_learnable_output_anchor = ClusterwiseLearnableOutputAnchor(
+                    num_clusters=src_k_count,
+                    num_channels=int(meta.get("num_channels", C)),
+                    pred_len=int(meta.get("pred_len", H)),
+                    cfg=src_anchor_cfg,
+                ).to(device)
+                source_learnable_output_anchor.load_state_dict(
+                    ckpt["learnable_output_anchor_state"],
+                    strict=bool(ft_cfg.get("strict_learnable_output_anchor", False)),
+                )
+                source_learnable_output_anchor.eval()
+                src_num_channels = int(meta.get("num_channels", C))
+                src_pred_len = int(meta.get("pred_len", H))
+                if src_num_channels != C or src_pred_len != H:
+                    if bool(ft_cfg.get("strict_learnable_output_anchor", False)):
+                        raise ValueError(
+                            "Fine-tune learnable_output_anchor loading requires identical channel/horizon shapes: "
+                            f"source=({src_num_channels}, {src_pred_len}), target=({C}, {H})."
+                        )
+                    learnable_output_anchor_summary["loaded_from_checkpoint"] = False
+                    learnable_output_anchor_summary["skipped_checkpoint_reason"] = "shape_mismatch"
+                else:
+                    for k in range(K):
+                        src_k = int(target_to_source_k[k].item())
+                        learnable_output_anchor.load_cluster_state(
+                            k,
+                            source_learnable_output_anchor.get_cluster_state(src_k),
+                        )
+                    learnable_output_anchor_summary["loaded_from_checkpoint"] = True
+                    learnable_output_anchor_summary["loaded_with_cluster_map"] = [
+                        int(v) for v in target_to_source_k.detach().cpu().tolist()
+                    ]
+
         finetune_summary = {
             "checkpoint_path": ckpt_path,
             "memory_path": str(ft_cfg.get("memory_path", "")),
@@ -9993,13 +2249,89 @@ def main():
     if freeze_backbone:
         frozen_backbone_params = _freeze_module_params(model)
         print(f"Backbone frozen for MoE training: params={frozen_backbone_params}")
+    patch_router_replaces_cluster_gate = bool(
+        pred_residual is not None and getattr(pred_residual, "patch_router", None) is not None
+    )
+    frozen_cluster_gate_for_patch_router = 0
+    if patch_router_replaces_cluster_gate:
+        frozen_cluster_gate_for_patch_router = _freeze_module_params(gate)
+        print(
+            "Input patch router replaces cluster gate for prediction residual routing: "
+            f"frozen_gate_params={frozen_cluster_gate_for_patch_router}"
+        )
+    patch_router_pairwise_frozen_other_params = 0
+    patch_router_pairwise_frozen_reference: Dict[str, torch.Tensor] = {}
+    if patch_router_pairwise_freeze_other_parameters:
+        if (
+            pred_residual is None
+            or pred_residual.patch_router is None
+            or not pred_residual.patch_router.expert_risk_pairwise_rank_enable
+        ):
+            raise ValueError(
+                "pairwise_rank.freeze_other_parameters requires an enabled pairwise rank head."
+            )
+        patch_router_pairwise_frozen_other_params = _freeze_module_params_except_prefixes(
+            pred_residual,
+            (
+                "patch_router.W_pairwise_rank",
+                "patch_router.b_pairwise_rank",
+            ),
+        )
+        print(
+            "Pairwise-only patch gate training: "
+            f"frozen_other_pred_residual_params={patch_router_pairwise_frozen_other_params}"
+        )
+        patch_router_pairwise_frozen_reference = {
+            name: param.detach().clone()
+            for name, param in pred_residual.named_parameters()
+            if not (
+                name.startswith("patch_router.W_pairwise_rank")
+                or name.startswith("patch_router.b_pairwise_rank")
+            )
+        }
+
+    def assert_pairwise_frozen_parameters_unchanged(stage: str) -> None:
+        if not patch_router_pairwise_frozen_reference or pred_residual is None:
+            return
+        current = dict(pred_residual.named_parameters())
+        for name, expected in patch_router_pairwise_frozen_reference.items():
+            actual = current[name].detach()
+            if not torch.equal(actual, expected):
+                max_abs = float((actual - expected).abs().max().item())
+                raise RuntimeError(
+                    "pairwise-only frozen parameter changed: "
+                    f"stage={stage}, name={name}, max_abs={max_abs:.6g}"
+                )
+    learnable_output_anchor_anchor_only = bool(
+        learnable_output_anchor is not None and learnable_output_anchor_train_mode == "anchor_only"
+    )
+    if learnable_output_anchor_anchor_only:
+        frozen_for_anchor_only = {
+            "gate": int(_freeze_module_params(gate)),
+            "pred_residual": 0,
+            "dynamic_lambda": 0,
+            "learnable_lambda": 0,
+        }
+        if pred_residual is not None:
+            frozen_for_anchor_only["pred_residual"] = int(_freeze_module_params(pred_residual))
+        if dynamic_lambda is not None:
+            frozen_for_anchor_only["dynamic_lambda"] = int(_freeze_module_params(dynamic_lambda))
+        if learnable_lambda is not None:
+            frozen_for_anchor_only["learnable_lambda"] = int(_freeze_module_params(learnable_lambda))
+        learnable_output_anchor_summary["anchor_only_freeze"] = frozen_for_anchor_only
+        print(
+            "Learnable output anchor train_mode=anchor_only: "
+            "gate/pred-residual/lambda modules are frozen; only anchor parameters are optimized."
+        )
     pred_residual_train_with_eval_anchors = (
         pred_residual is not None
         and bool(pred_residual_cfg.get("train_with_eval_anchors", bool(freeze_backbone)))
     )
-    if pred_residual_train_with_eval_anchors:
+    output_anchor_train_with_eval = bool(pred_residual_train_with_eval_anchors or learnable_output_anchor is not None)
+    learnable_output_anchor_summary["train_with_eval_anchors"] = bool(output_anchor_train_with_eval)
+    if output_anchor_train_with_eval:
         print(
-            "Prediction residual training uses the same MoE anchor post-processing modules as eval "
+            "Training uses the same MoE output-anchor post-processing modules as eval "
             "(train-side anchor scales are selected on train only)."
         )
     raw_moe_weight_decay = moe_cfg.get("weight_decay", None)
@@ -10009,6 +2341,29 @@ def main():
         moe_weight_decay = float(raw_moe_weight_decay)
     else:
         moe_weight_decay = None
+    backbone_lr = None
+    if (not freeze_backbone) and (not learnable_output_anchor_anchor_only):
+        if moe_cfg.get("backbone_lr", None) is not None:
+            backbone_lr = float(moe_cfg["backbone_lr"])
+        elif moe_cfg.get("backbone_lr_scale", None) is not None:
+            backbone_lr = float(cfg["train"]["lr"]) * float(moe_cfg["backbone_lr_scale"])
+    learnable_anchor_weight_decay = None
+    learnable_anchor_lr = None
+    if learnable_output_anchor is not None:
+        if learnable_output_anchor_cfg.get("weight_decay", None) is not None:
+            learnable_anchor_weight_decay = float(learnable_output_anchor_cfg["weight_decay"])
+        if learnable_output_anchor_cfg.get("optimizer_weight_decay", None) is not None:
+            learnable_anchor_weight_decay = float(learnable_output_anchor_cfg["optimizer_weight_decay"])
+        if learnable_output_anchor_cfg.get("lr", None) is not None:
+            learnable_anchor_lr = float(learnable_output_anchor_cfg["lr"])
+        elif learnable_output_anchor_cfg.get("lr_scale", None) is not None:
+            learnable_anchor_lr = float(cfg["train"]["lr"]) * float(learnable_output_anchor_cfg["lr_scale"])
+        learnable_output_anchor_summary["optimizer"] = {
+            "lr": None if learnable_anchor_lr is None else float(learnable_anchor_lr),
+            "weight_decay": (
+                None if learnable_anchor_weight_decay is None else float(learnable_anchor_weight_decay)
+            ),
+        }
 
     cluster_params = []
     cluster_param_groups = []
@@ -10019,62 +2374,79 @@ def main():
         pred_residual_params_k = []
         dynamic_lambda_params_k = []
         learnable_lambda_params_k = []
-        if not freeze_backbone:
+        learnable_anchor_params_k = []
+        if (not freeze_backbone) and (not learnable_output_anchor_anchor_only):
             base_params_k.extend(model.get_cluster_params(k))
-        if not (bilevel_enable and bilevel_optimize_gate):
+        if (
+            (not learnable_output_anchor_anchor_only)
+            and (not patch_router_replaces_cluster_gate)
+            and not (bilevel_enable and bilevel_optimize_gate)
+        ):
             gate_params_k.extend(_gate_cluster_params(gate, k))
-        if pred_residual is not None:
+        if pred_residual is not None and (not learnable_output_anchor_anchor_only):
             pred_residual_params_k.extend(pred_residual.get_cluster_params(k))
-        if dynamic_lambda is not None and (not bilevel_enable):
+        if dynamic_lambda is not None and (not bilevel_enable) and (not learnable_output_anchor_anchor_only):
             dynamic_lambda_params_k.extend(dynamic_lambda.get_cluster_params(k))
-        if learnable_lambda is not None and (not bilevel_enable):
+        if learnable_lambda is not None and (not bilevel_enable) and (not learnable_output_anchor_anchor_only):
             learnable_lambda_params_k.append(learnable_lambda.raw[k])
-        if stage2_loss_audit_enable:
-            stage2_trainable_param_counts.append(
-                {
-                    "cluster_id": int(k),
-                    "backbone": int(sum(param.numel() for param in base_params_k)),
-                    "gate": int(sum(param.numel() for param in gate_params_k)),
-                    "pred_residual": int(sum(param.numel() for param in pred_residual_params_k)),
-                    "dynamic_lambda": int(sum(param.numel() for param in dynamic_lambda_params_k)),
-                    "learnable_lambda": int(sum(param.numel() for param in learnable_lambda_params_k)),
-                }
-            )
+        if learnable_output_anchor is not None:
+            learnable_anchor_params_k.extend(learnable_output_anchor.get_cluster_params(k))
+        stage2_trainable_param_counts.append(
+            {
+                "cluster_id": int(k),
+                "backbone": int(sum(param.numel() for param in base_params_k)),
+                "gate": int(sum(param.numel() for param in gate_params_k)),
+                "pred_residual": int(sum(param.numel() for param in pred_residual_params_k)),
+                "dynamic_lambda": int(sum(param.numel() for param in dynamic_lambda_params_k)),
+                "learnable_lambda": int(sum(param.numel() for param in learnable_lambda_params_k)),
+                "learnable_output_anchor": int(sum(param.numel() for param in learnable_anchor_params_k)),
+            }
+        )
         param_groups_k = _make_cluster_optimizer_param_groups(
             base_params=base_params_k,
             gate_params=gate_params_k,
             pred_residual_params=pred_residual_params_k,
             dynamic_lambda_params=dynamic_lambda_params_k,
             learnable_lambda_params=learnable_lambda_params_k,
+            learnable_anchor_params=learnable_anchor_params_k,
             base_weight_decay=float(cfg["train"]["weight_decay"]),
             moe_weight_decay=moe_weight_decay,
             pred_residual_weight_decay=pred_residual_weight_decay,
+            learnable_anchor_weight_decay=learnable_anchor_weight_decay,
+            learnable_anchor_lr=learnable_anchor_lr,
+            base_lr=backbone_lr,
         )
         params_k = [param for group in param_groups_k for param in group["params"]]
         cluster_params.append(params_k)
         cluster_param_groups.append(param_groups_k)
-    stage2_trainable_parameter_groups = None
-    if stage2_loss_audit_enable:
-        totals = {
-            "backbone": int(sum(row["backbone"] for row in stage2_trainable_param_counts)),
-            "gate": int(sum(row["gate"] for row in stage2_trainable_param_counts)),
-            "pred_residual": int(sum(row["pred_residual"] for row in stage2_trainable_param_counts)),
-            "dynamic_lambda": int(sum(row["dynamic_lambda"] for row in stage2_trainable_param_counts)),
-            "learnable_lambda": int(sum(row["learnable_lambda"] for row in stage2_trainable_param_counts)),
-        }
-        stage2_trainable_parameter_groups = {
-            "total": totals,
-            "per_cluster": stage2_trainable_param_counts,
-        }
+    totals = {
+        "backbone": int(sum(row["backbone"] for row in stage2_trainable_param_counts)),
+        "gate": int(sum(row["gate"] for row in stage2_trainable_param_counts)),
+        "pred_residual": int(sum(row["pred_residual"] for row in stage2_trainable_param_counts)),
+        "dynamic_lambda": int(sum(row["dynamic_lambda"] for row in stage2_trainable_param_counts)),
+        "learnable_lambda": int(sum(row["learnable_lambda"] for row in stage2_trainable_param_counts)),
+        "learnable_output_anchor": int(sum(row["learnable_output_anchor"] for row in stage2_trainable_param_counts)),
+    }
+    stage2_trainable_parameter_groups = {
+        "total": totals,
+        "per_cluster": stage2_trainable_param_counts,
+        "shared_moe_across_clusters": bool(shared_moe_across_clusters),
+    }
 
-    optimizers = [
-        torch.optim.Adam(
-            param_groups_k,
-            lr=float(cfg["train"]["lr"]),
+    optimizers: List[Optional[torch.optim.Optimizer]] = [
+        (
+            torch.optim.Adam(
+                param_groups_k,
+                lr=float(cfg["train"]["lr"]),
+            )
+            if len(param_groups_k) > 0
+            else None
         )
         for param_groups_k in cluster_param_groups
     ]
     for opt_k in optimizers:
+        if opt_k is None:
+            continue
         for group in opt_k.param_groups:
             group.setdefault("initial_lr", float(group["lr"]))
     sched_cfg = cfg["train"].get("lr_scheduler", {"name": "none"})
@@ -10085,30 +2457,42 @@ def main():
     sched_name = str(sched_cfg.get("name", "none")).lower()
     if sched_name in {"plateau", "reduce", "reduce_on_plateau"}:
         schedulers = [
-            torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt_k,
-                mode="min",
-                factor=float(sched_cfg.get("factor", 0.5)),
-                patience=int(sched_cfg.get("patience", 3)),
-                min_lr=float(sched_cfg.get("min_lr", 1.0e-6)),
+            (
+                torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    opt_k,
+                    mode="min",
+                    factor=float(sched_cfg.get("factor", 0.5)),
+                    patience=int(sched_cfg.get("patience", 3)),
+                    min_lr=float(sched_cfg.get("min_lr", 1.0e-6)),
+                )
+                if opt_k is not None
+                else None
             )
             for opt_k in optimizers
         ]
     elif sched_name in {"cosine", "cosineannealing"}:
         schedulers = [
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt_k,
-                T_max=int(sched_cfg.get("t_max", 50)),
-                eta_min=float(sched_cfg.get("min_lr", 1.0e-6)),
+            (
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt_k,
+                    T_max=int(sched_cfg.get("t_max", 50)),
+                    eta_min=float(sched_cfg.get("min_lr", 1.0e-6)),
+                )
+                if opt_k is not None
+                else None
             )
             for opt_k in optimizers
         ]
     elif sched_name in {"step", "steplr"}:
         schedulers = [
-            torch.optim.lr_scheduler.StepLR(
-                opt_k,
-                step_size=int(sched_cfg.get("step_size", 10)),
-                gamma=float(sched_cfg.get("gamma", 0.5)),
+            (
+                torch.optim.lr_scheduler.StepLR(
+                    opt_k,
+                    step_size=int(sched_cfg.get("step_size", 10)),
+                    gamma=float(sched_cfg.get("gamma", 0.5)),
+                )
+                if opt_k is not None
+                else None
             )
             for opt_k in optimizers
         ]
@@ -10116,7 +2500,7 @@ def main():
         schedulers = None
 
     lambda_optimizer = None
-    if bilevel_enable:
+    if bilevel_enable and (not learnable_output_anchor_anchor_only):
         lambda_params = []
         if bilevel_optimize_gate:
             lambda_params.extend(list(gate.parameters()))
@@ -10165,6 +2549,8 @@ def main():
             swa_averagers["dynamic_lambda"] = torch.optim.swa_utils.AveragedModel(dynamic_lambda)
         if learnable_lambda is not None:
             swa_averagers["learnable_lambda"] = torch.optim.swa_utils.AveragedModel(learnable_lambda)
+        if learnable_output_anchor is not None:
+            swa_averagers["learnable_output_anchor"] = torch.optim.swa_utils.AveragedModel(learnable_output_anchor)
 
     def update_swa_averagers(epoch_idx: int) -> None:
         nonlocal swa_updates
@@ -10178,6 +2564,8 @@ def main():
             swa_averagers["dynamic_lambda"].update_parameters(dynamic_lambda)
         if learnable_lambda is not None and "learnable_lambda" in swa_averagers:
             swa_averagers["learnable_lambda"].update_parameters(learnable_lambda)
+        if learnable_output_anchor is not None and "learnable_output_anchor" in swa_averagers:
+            swa_averagers["learnable_output_anchor"].update_parameters(learnable_output_anchor)
         swa_updates += 1
 
     def load_swa_averagers() -> None:
@@ -10189,6 +2577,8 @@ def main():
             dynamic_lambda.load_state_dict(swa_averagers["dynamic_lambda"].module.state_dict())
         if learnable_lambda is not None and "learnable_lambda" in swa_averagers:
             learnable_lambda.load_state_dict(swa_averagers["learnable_lambda"].module.state_dict())
+        if learnable_output_anchor is not None and "learnable_output_anchor" in swa_averagers:
+            learnable_output_anchor.load_state_dict(swa_averagers["learnable_output_anchor"].module.state_dict())
 
     monitor_metric = selection_metric
     if len(dva) == 0 and monitor_metric.startswith("val_"):
@@ -10249,36 +2639,59 @@ def main():
     stopped = torch.zeros((K,), dtype=torch.bool, device=device)
 
     best_state = [
-        {"model": None, "gate": None, "pred_residual": None, "dynamic_lambda": None, "learnable_lambda": None}
+        {
+            "model": None,
+            "gate": None,
+            "pred_residual": None,
+            "dynamic_lambda": None,
+            "learnable_lambda": None,
+            "learnable_output_anchor": None,
+        }
         for _ in range(K)
     ]
     best_epoch = torch.ones((K,), dtype=torch.long, device=device)
+    shared_moe_best_monitor = float("inf")
+    shared_moe_best_epoch = 1
+    shared_moe_best_state: Dict[str, Optional[Dict[str, torch.Tensor]]] = {
+        "gate": None,
+        "pred_residual": None,
+    }
     train_mse_hist = []
     val_mse_hist = []
     epoch_times = []
 
     def save_best(k: int, epoch_idx: int):
         best_state[k]["model"] = model.get_cluster_state(k)
-        best_state[k]["gate"] = gate.get_cluster_state(k)
-        if pred_residual is not None:
+        if not shared_moe_across_clusters:
+            best_state[k]["gate"] = gate.get_cluster_state(k)
+        if pred_residual is not None and not shared_moe_across_clusters:
             best_state[k]["pred_residual"] = pred_residual.get_cluster_state(k)
         if dynamic_lambda is not None:
             best_state[k]["dynamic_lambda"] = dynamic_lambda.get_cluster_state(k)
         if learnable_lambda is not None:
             best_state[k]["learnable_lambda"] = learnable_lambda.get_cluster_state(k)
+        if learnable_output_anchor is not None:
+            best_state[k]["learnable_output_anchor"] = learnable_output_anchor.get_cluster_state(k)
         best_epoch[k] = epoch_idx
 
     def load_best_all():
         for k in range(K):
             if best_state[k]["model"] is not None:
                 model.load_cluster_state(k, best_state[k]["model"])
-                gate.load_cluster_state(k, best_state[k]["gate"])
-                if pred_residual is not None and best_state[k]["pred_residual"] is not None:
+                if not shared_moe_across_clusters:
+                    gate.load_cluster_state(k, best_state[k]["gate"])
+                if pred_residual is not None and (not shared_moe_across_clusters) and best_state[k]["pred_residual"] is not None:
                     pred_residual.load_cluster_state(k, best_state[k]["pred_residual"])
                 if dynamic_lambda is not None and best_state[k]["dynamic_lambda"] is not None:
                     dynamic_lambda.load_cluster_state(k, best_state[k]["dynamic_lambda"])
                 if learnable_lambda is not None and best_state[k]["learnable_lambda"] is not None:
                     learnable_lambda.load_cluster_state(k, best_state[k]["learnable_lambda"])
+                if learnable_output_anchor is not None and best_state[k]["learnable_output_anchor"] is not None:
+                    learnable_output_anchor.load_cluster_state(k, best_state[k]["learnable_output_anchor"])
+        if shared_moe_across_clusters and shared_moe_best_state["gate"] is not None:
+            gate.load_cluster_state(0, shared_moe_best_state["gate"])
+            if pred_residual is not None and shared_moe_best_state["pred_residual"] is not None:
+                pred_residual.load_cluster_state(0, shared_moe_best_state["pred_residual"])
 
     @torch.no_grad()
     def average_lambda_kp(loader: DataLoader, base_lambda_kp: torch.Tensor) -> torch.Tensor:
@@ -10410,6 +2823,7 @@ def main():
                 penalty_scale=penalty_scale,
                 cluster_id_c=cluster_id_c,
                 K=K,
+                router_mode=router_mode,
             )
             feat_bkf = _build_gate_routing_features(x, yhat, cluster_id_c, K, mode=gate_feature_mode)
             _, probs_bkp, skip_bk, skip_prob_bk = gate(
@@ -10470,6 +2884,36 @@ def main():
             pd.DataFrame(rows).to_csv(csv_path, index=False)
             print(f"Saved cluster penalty probabilities to: {csv_path}")
         return avg_probs.detach()
+
+    @torch.no_grad()
+    def _eval_path_base_prediction(
+        x_bcl: torch.Tensor,
+        query_start_abs_b: torch.Tensor,
+    ) -> torch.Tensor:
+        x_model = apply_train_stat_input_centering(
+            x_bcl,
+            query_start_abs_b=query_start_abs_b,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
+        y_base_raw = model(x_model, cluster_id_c)
+        y_base = apply_history_anchor_adapter(
+            y_base_raw,
+            base_pred_bch=y_base_raw,
+            observed_history_tc=data_window_tc,
+            query_start_abs_b=query_start_abs_b,
+            input_len=L,
+            cfg=history_anchor_cfg,
+        )
+        return apply_train_stat_anchor_expert(
+            y_base,
+            base_pred_bch=y_base,
+            x_bcl=x_bcl,
+            query_start_abs_b=query_start_abs_b,
+            input_len=L,
+            stat_anchor_pc=model_train_stat_adapter_pc,
+            cfg=model_train_stat_adapter_cfg,
+        )
 
     @torch.no_grad()
     def collect_pred_residual_summary(loader: DataLoader, eval_start: int = 0) -> Dict[str, object]:
@@ -10542,6 +2986,257 @@ def main():
             return cfg_summary
         cfg_summary["feature_mode"] = str(getattr(pred_residual, "feature_mode", "legacy"))
         cfg_summary["input_dim"] = int(getattr(pred_residual, "input_dim", 0))
+        patch_router = getattr(pred_residual, "patch_router", None)
+        cfg_summary["routing_granularity"] = "channel_patch" if patch_router is not None else "cluster"
+        cfg_summary["patch_router"] = {
+            "enable": bool(patch_router is not None),
+            "patch_len": int(patch_router.patch_len) if patch_router is not None else 0,
+            "num_patches": int(patch_router.num_patches) if patch_router is not None else 0,
+            "feature_source": str(patch_router.feature_source) if patch_router is not None else None,
+            "history_patch_projection": (
+                str(patch_router.history_patch_projection)
+                if patch_router is not None
+                else None
+            ),
+            "regime_context_enable": bool(
+                patch_router is not None and patch_router.regime_context_enable
+            ),
+            "regime_context_lengths": (
+                [int(v) for v in patch_router.regime_context_lengths]
+                if patch_router is not None
+                else []
+            ),
+            "fixed_penalty_index_by_channel": (
+                [
+                    int(v)
+                    for v in patch_router.fixed_penalty_index_by_channel_c
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+                if (
+                    patch_router is not None
+                    and int(patch_router.fixed_penalty_index_by_channel_c.numel()) > 0
+                )
+                else None
+            ),
+            "candidate_scale_by_channel": (
+                [
+                    float(v)
+                    for v in pred_residual.patch_candidate_scale_c
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+                if (
+                    pred_residual is not None
+                    and int(pred_residual.patch_candidate_scale_c.numel()) > 0
+                )
+                else None
+            ),
+            "hierarchical_gate_enable": bool(
+                patch_router is not None and patch_router.hierarchical_recall_enable
+            ),
+            "utility_verifier_enable": bool(
+                patch_router is not None and patch_router.utility_verifier_enable
+            ),
+            "utility_verifier_temperature": (
+                float(patch_router.utility_verifier_temperature) if patch_router is not None else None
+            ),
+            "expert_conditional_risk_enable": bool(
+                patch_router is not None and patch_router.expert_conditional_risk_enable
+            ),
+            "expert_risk_decoupled_encoder": bool(
+                patch_router is not None and patch_router.expert_risk_decoupled_encoder
+            ),
+            "expert_risk_candidate_aware": bool(
+                patch_router is not None and patch_router.expert_risk_candidate_aware
+            ),
+            "expert_risk_candidate_compatibility": bool(
+                patch_router is not None
+                and patch_router.expert_risk_candidate_compatibility
+            ),
+            "expert_risk_temporal_domain_ensemble": {
+                "enable": bool(
+                    patch_router is not None
+                    and patch_router.expert_risk_temporal_domain_enable
+                ),
+                "num_domains": (
+                    int(patch_router.expert_risk_temporal_domain_count)
+                    if patch_router is not None
+                    else 0
+                ),
+                "train_window_count": (
+                    int(patch_router.expert_risk_temporal_domain_train_windows)
+                    if patch_router is not None
+                    else 0
+                ),
+                "combine": (
+                    str(patch_router.expert_risk_temporal_domain_combine)
+                    if patch_router is not None
+                    else None
+                ),
+            },
+            "expert_risk_proposal_candidate_aware": bool(
+                patch_router is not None
+                and patch_router.expert_risk_proposal_candidate_aware
+            ),
+            "expert_risk_proposal_topk": (
+                int(patch_router.expert_risk_proposal_topk) if patch_router is not None else None
+            ),
+            "expert_risk_proposal_rescue_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_proposal_rescue_enable
+            ),
+            "expert_risk_lower_quantile_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_lower_quantile_enable
+            ),
+            "expert_risk_lower_quantile": (
+                float(patch_router.expert_risk_lower_quantile)
+                if patch_router is not None
+                else None
+            ),
+            "expert_risk_adoption_source": (
+                str(patch_router.expert_risk_adoption_source)
+                if patch_router is not None
+                else None
+            ),
+            "expert_risk_utility_veto_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_utility_veto_enable
+            ),
+            "expert_risk_utility_veto_detach_features": bool(
+                patch_router is not None
+                and patch_router.expert_risk_utility_veto_detach_features
+            ),
+            "expert_risk_adopt_threshold": (
+                float(patch_router.expert_risk_adopt_threshold.item())
+                if (
+                    patch_router is not None
+                    and patch_router.expert_risk_adopt_threshold is not None
+                )
+                else None
+            ),
+            "expert_risk_adopt_threshold_by_penalty": (
+                {
+                    penalty_names[p]: float(value)
+                    for p, value in enumerate(
+                        patch_router.expert_risk_adopt_threshold_by_penalty
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                }
+                if (
+                    patch_router is not None
+                    and patch_router.expert_risk_adopt_threshold_by_penalty is not None
+                )
+                else None
+            ),
+            "expert_risk_pairwise_rank_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_pairwise_rank_enable
+            ),
+            "expert_risk_pairwise_detach_features": bool(
+                patch_router is not None
+                and patch_router.expert_risk_pairwise_detach_features
+            ),
+            "pairwise_frozen_other_params": int(
+                patch_router_pairwise_frozen_other_params
+            ),
+            "expected_mse_weight": float(patch_router_expected_mse_weight),
+            "temporal_group_dro": {
+                "enable": bool(patch_router_temporal_group_dro_enable),
+                "weight": float(patch_router_temporal_group_dro_weight),
+                "num_domains": int(patch_router_temporal_group_dro_domains),
+                "temperature": float(
+                    patch_router_temporal_group_dro_temperature
+                ),
+                "target": "expected_patch_mse_minus_frozen_backbone_patch_mse",
+            },
+            "oracle_ce_weight": float(patch_router_oracle_ce_weight),
+            "oracle_ce_warmup_epochs": int(patch_router_oracle_ce_warmup_epochs),
+            "freeze_experts_after_warmup": bool(patch_router_freeze_experts_after_warmup),
+            "supervision_only": bool(patch_router_supervision_only),
+            "train_oracle_diagnostic_enable": bool(patch_router_train_oracle_diagnostic),
+            "score_threshold_curve_enable": bool(
+                patch_router_score_threshold_curve
+            ),
+            "score_threshold_curve_max_windows": int(
+                patch_router_score_threshold_max_windows
+            ),
+            "score_threshold_curve_heads": (
+                sorted(patch_router_score_threshold_heads)
+                if patch_router_score_threshold_heads is not None
+                else None
+            ),
+            "train_temporal_blocks": int(patch_router_train_temporal_blocks),
+            "validation_temporal_blocks": int(
+                patch_router_validation_temporal_blocks
+            ),
+            "walk_forward_reliability": {
+                "enable": bool(patch_router_walk_forward_enable),
+                "label_delay": int(patch_router_walk_forward_label_delay),
+                "label_delay_mode": str(
+                    patch_router_walk_forward_label_delay_mode
+                ),
+                "lookback_windows": int(patch_router_walk_forward_lookback),
+                "min_history_windows": int(
+                    patch_router_walk_forward_min_history
+                ),
+                "history_stride": int(
+                    patch_router_walk_forward_history_stride
+                ),
+                "min_mean_gain": float(
+                    patch_router_walk_forward_min_mean_gain
+                ),
+                "max_abs_regime_z": patch_router_walk_forward_max_abs_regime_z,
+                "scale_mode": str(patch_router_walk_forward_scale_mode),
+                "max_scale": float(patch_router_walk_forward_max_scale),
+                "scale_consensus_blocks": int(
+                    patch_router_walk_forward_scale_consensus_blocks
+                ),
+                "feature_ridge": float(patch_router_walk_forward_feature_ridge),
+                "feature_update_blocks": int(
+                    patch_router_walk_forward_feature_update_blocks
+                ),
+                "temporal_blocks": int(
+                    patch_router_walk_forward_temporal_blocks
+                ),
+                "train_audit_fraction": float(
+                    patch_router_walk_forward_train_audit_fraction
+                ),
+            },
+            "temporal_calibration": {
+                "enable": bool(patch_router_temporal_calibration_enable),
+                "supervision_end_idx": int(patch_router_supervision_end_idx),
+                "calibration_start_idx": int(patch_router_calibration_start_idx),
+                "calibration_end_idx": int(len(dtr)),
+                "purge_windows": int(patch_router_calibration_purge_windows),
+                "temporal_blocks": int(patch_router_calibration_blocks),
+                "min_gain_cost_ratio": float(
+                    patch_router_calibration_min_gain_cost_ratio
+                ),
+                "min_block_net_gain": float(
+                    patch_router_calibration_min_block_net_gain
+                ),
+                "per_penalty": bool(patch_router_calibration_per_penalty),
+                "selection": patch_router_temporal_calibration_summary,
+            },
+            "frozen_expert_params": int(patch_router_frozen_expert_params),
+            "oracle_min_abs_improvement": float(patch_router_oracle_min_abs_improvement),
+            "hierarchical_recall": {
+                "enable": bool(patch_router_hierarchical_enable),
+                "mask_inactive_fixed_channels": bool(
+                    patch_router_mask_inactive_fixed_channels
+                ),
+                "supervision_weight": float(patch_router_hierarchical_weight),
+                "warmup_epochs": int(patch_router_hierarchical_warmup_epochs),
+                "min_abs_improvement": float(patch_router_hierarchical_min_abs_improvement),
+                **{key: float(value) for key, value in patch_router_hierarchical_loss_cfg.items()},
+            },
+        }
 
         model.eval()
         gate.eval()
@@ -10559,6 +3254,55 @@ def main():
         route_sum_p = torch.zeros(P, device=device)
         effective_route_sum_p = torch.zeros(P, device=device)
         route_numel = 0
+        patch_route_sum_p = torch.zeros(P, device=device)
+        patch_route_numel = 0
+        patch_skip_sum = 0.0
+        patch_skip_numel = 0
+        patch_oracle_count = torch.tensor(0.0, device=device)
+        patch_oracle_base_error_sum = torch.tensor(0.0, device=device)
+        patch_oracle_error_sum = torch.tensor(0.0, device=device)
+        patch_selected_error_sum = torch.tensor(0.0, device=device)
+        patch_correct_count = torch.tensor(0.0, device=device)
+        patch_oracle_penalty_count = torch.tensor(0.0, device=device)
+        patch_selected_penalty_count = torch.tensor(0.0, device=device)
+        patch_adoption_true_positive_count = torch.tensor(0.0, device=device)
+        patch_selected_beneficial_count = torch.tensor(0.0, device=device)
+        patch_selected_harmful_count = torch.tensor(0.0, device=device)
+        patch_selected_positive_gain_sum = torch.tensor(0.0, device=device)
+        patch_selected_negative_cost_sum = torch.tensor(0.0, device=device)
+        patch_risk_sign_positive_count = torch.tensor(0.0, device=device)
+        patch_risk_sign_predicted_positive_count = torch.tensor(0.0, device=device)
+        patch_risk_sign_true_positive_count = torch.tensor(0.0, device=device)
+        patch_risk_sign_correct_count = torch.tensor(0.0, device=device)
+        patch_risk_sign_count = torch.tensor(0.0, device=device)
+        patch_selected_beneficial_count_by_penalty = torch.zeros(P, device=device)
+        patch_selected_count_by_penalty = torch.zeros(P, device=device)
+        patch_selected_gain_sum_by_penalty = torch.zeros(P, device=device)
+        patch_oracle_penalty_hit_count = torch.tensor(0.0, device=device)
+        patch_beneficial_penalty_count = torch.zeros(P, device=device)
+        patch_proposed_penalty_count = torch.zeros(P, device=device)
+        patch_proposal_true_positive_count = torch.zeros(P, device=device)
+        patch_proposal_oracle_hit_count = torch.tensor(0.0, device=device)
+        patch_shortlist_pairwise_count = torch.tensor(0.0, device=device)
+        patch_shortlist_pairwise_correct_count = torch.tensor(0.0, device=device)
+        patch_proposal_oracle_hit_count_by_penalty = torch.zeros(P, device=device)
+        patch_beneficial_cardinality_sum = torch.tensor(0.0, device=device)
+        patch_beneficial_cardinality_histogram = torch.zeros(P + 1, device=device)
+        patch_oracle_class_count = torch.zeros(P + 1, device=device)
+        patch_selected_class_count = torch.zeros(P + 1, device=device)
+        patch_confusion_matrix = torch.zeros(P + 1, P + 1, device=device)
+        patch_base_error_sum_by_patch = (
+            torch.zeros(patch_router.num_patches, device=device) if patch_router is not None else None
+        )
+        patch_oracle_error_sum_by_patch = (
+            torch.zeros(patch_router.num_patches, device=device) if patch_router is not None else None
+        )
+        patch_selected_error_sum_by_patch = (
+            torch.zeros(patch_router.num_patches, device=device) if patch_router is not None else None
+        )
+        patch_count_by_patch = (
+            torch.zeros(patch_router.num_patches, device=device) if patch_router is not None else None
+        )
         cnt = 0
 
         for x, y, idx in loader:
@@ -10566,7 +3310,7 @@ def main():
             y = y.to(device, non_blocking=True)
             idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
             query_start_abs_b = int(eval_start) + idx
-            y_base = model(x, cluster_id_c)
+            y_base = _eval_path_base_prediction(x, query_start_abs_b)
             route_pen_bkp = _router_penalty_context_from_history(
                 x_bcl=x,
                 yhat_base_bch=y_base,
@@ -10575,6 +3319,7 @@ def main():
                 penalty_scale=penalty_scale,
                 cluster_id_c=cluster_id_c,
                 K=K,
+                router_mode=router_mode,
             )
             feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
             mask_bkp, probs_bkp, skip_bk, _ = gate(
@@ -10629,6 +3374,126 @@ def main():
             selected_intervention_sum_p += (route_bcp * intervention_bcp).sum(dim=(0, 1))
             effective_route_sum_p += effective_route_bcp.sum(dim=(0, 1))
             route_numel += int(route_bcp.shape[0] * route_bcp.shape[1])
+            patch_route_bcph = pred_out.get("patch_route_bcph")
+            if patch_route_bcph is not None:
+                patch_route_bcph = patch_route_bcph.detach()
+                patch_route_sum_p += patch_route_bcph.sum(dim=(0, 1, 3))
+                patch_route_numel += int(
+                    patch_route_bcph.shape[0] * patch_route_bcph.shape[1] * patch_route_bcph.shape[3]
+                )
+                patch_skip_bcq = pred_out.get("patch_skip_bcq")
+                if patch_skip_bcq is not None:
+                    patch_skip_sum += float(patch_skip_bcq.detach().sum().item())
+                    patch_skip_numel += int(patch_skip_bcq.numel())
+                    oracle_base_bch, candidate_bcpH = _pred_residual_candidates_on_eval_path(
+                        y_base,
+                        pred_out,
+                        apply_output_anchors=output_anchor_train_with_eval,
+                        x_bcl=x,
+                        query_start_abs_b=query_start_abs_b,
+                        input_len=L,
+                        moe_cfg=moe_cfg,
+                        moe_enable=moe_enable,
+                        observed_history_tc=data_window_tc,
+                        train_stat_anchor_pc=train_stat_anchor_pc,
+                        train_residual_anchor_phc=train_residual_anchor_phc,
+                        learnable_output_anchor=learnable_output_anchor,
+                        cluster_id_c=cluster_id_c,
+                        include_patch_route=False,
+                    )
+                    if candidate_bcpH is not None:
+                        oracle_stats = _patch_router_oracle_batch_stats(
+                            base_bch=oracle_base_bch,
+                            candidate_bcpH=candidate_bcpH,
+                            y_bch=y,
+                            patch_route_bcph=patch_route_bcph,
+                            patch_skip_bcq=patch_skip_bcq,
+                            patch_penalty_benefit_probs_bcqp=pred_out.get(
+                                "patch_penalty_benefit_probs_bcqp"
+                            ),
+                            patch_penalty_risk_benefit_probs_bcqp=pred_out.get(
+                                "patch_penalty_risk_benefit_probs_bcqp"
+                            ),
+                            patch_penalty_proposal_mask_bcqp=pred_out.get(
+                                "patch_penalty_proposal_mask_bcqp"
+                            ),
+                            patch_selected_penalty_index_bcq=pred_out.get(
+                                "patch_selected_penalty_index_bcq"
+                            ),
+                        )
+                        patch_oracle_count += oracle_stats["count"]
+                        patch_oracle_base_error_sum += oracle_stats["base_error_sum"]
+                        patch_oracle_error_sum += oracle_stats["oracle_error_sum"]
+                        patch_selected_error_sum += oracle_stats["selected_error_sum"]
+                        patch_correct_count += oracle_stats["correct_count"]
+                        patch_oracle_penalty_count += oracle_stats["oracle_penalty_count"]
+                        patch_selected_penalty_count += oracle_stats["selected_penalty_count"]
+                        patch_adoption_true_positive_count += oracle_stats[
+                            "adoption_true_positive_count"
+                        ]
+                        patch_selected_beneficial_count += oracle_stats[
+                            "selected_beneficial_count"
+                        ]
+                        patch_selected_harmful_count += oracle_stats["selected_harmful_count"]
+                        patch_selected_positive_gain_sum += oracle_stats[
+                            "selected_positive_gain_sum"
+                        ]
+                        patch_selected_negative_cost_sum += oracle_stats[
+                            "selected_negative_cost_sum"
+                        ]
+                        patch_risk_sign_positive_count += oracle_stats[
+                            "risk_sign_positive_count"
+                        ]
+                        patch_risk_sign_predicted_positive_count += oracle_stats[
+                            "risk_sign_predicted_positive_count"
+                        ]
+                        patch_risk_sign_true_positive_count += oracle_stats[
+                            "risk_sign_true_positive_count"
+                        ]
+                        patch_risk_sign_correct_count += oracle_stats[
+                            "risk_sign_correct_count"
+                        ]
+                        patch_risk_sign_count += oracle_stats["risk_sign_count"]
+                        patch_selected_beneficial_count_by_penalty += oracle_stats[
+                            "selected_beneficial_count_by_penalty"
+                        ]
+                        patch_selected_count_by_penalty += oracle_stats[
+                            "selected_count_by_penalty"
+                        ]
+                        patch_selected_gain_sum_by_penalty += oracle_stats[
+                            "selected_gain_sum_by_penalty"
+                        ]
+                        patch_oracle_penalty_hit_count += oracle_stats["oracle_penalty_hit_count"]
+                        patch_beneficial_penalty_count += oracle_stats["beneficial_penalty_count"]
+                        patch_proposed_penalty_count += oracle_stats["proposed_penalty_count"]
+                        patch_proposal_true_positive_count += oracle_stats[
+                            "proposal_true_positive_count"
+                        ]
+                        patch_proposal_oracle_hit_count += oracle_stats[
+                            "proposal_oracle_hit_count"
+                        ]
+                        patch_shortlist_pairwise_count += oracle_stats[
+                            "shortlist_pairwise_count"
+                        ]
+                        patch_shortlist_pairwise_correct_count += oracle_stats[
+                            "shortlist_pairwise_correct_count"
+                        ]
+                        patch_proposal_oracle_hit_count_by_penalty += oracle_stats[
+                            "proposal_oracle_hit_count_by_penalty"
+                        ]
+                        patch_beneficial_cardinality_sum += oracle_stats[
+                            "beneficial_cardinality_sum"
+                        ]
+                        patch_beneficial_cardinality_histogram += oracle_stats[
+                            "beneficial_cardinality_histogram"
+                        ]
+                        patch_oracle_class_count += oracle_stats["oracle_class_count"]
+                        patch_selected_class_count += oracle_stats["selected_class_count"]
+                        patch_confusion_matrix += oracle_stats["confusion_matrix"]
+                        patch_base_error_sum_by_patch += oracle_stats["base_error_sum_by_patch"]
+                        patch_oracle_error_sum_by_patch += oracle_stats["oracle_error_sum_by_patch"]
+                        patch_selected_error_sum_by_patch += oracle_stats["selected_error_sum_by_patch"]
+                        patch_count_by_patch += oracle_stats["count_by_patch"]
 
         spec_k = spec_sum_k / max(cnt, 1)
         norm_k = norm_sum_k / max(cnt, 1)
@@ -10660,7 +3525,517 @@ def main():
         )
         if stage2_loss_audit_enable:
             cfg_summary["residual_delta_rms"] = float((delta_sq_sum / max(delta_numel, 1)) ** 0.5)
+        if patch_route_numel > 0:
+            patch_rate_p = patch_route_sum_p / float(patch_route_numel)
+            cfg_summary["patch_router"].update(
+                {
+                    "selection_rate_by_penalty": {
+                        penalty_names[p]: float(patch_rate_p[p].item()) for p in range(P)
+                    },
+                    "skip_rate": float(patch_skip_sum / max(patch_skip_numel, 1)),
+                }
+            )
+        if float(patch_oracle_count.item()) > 0.0:
+            oracle_count = float(patch_oracle_count.item())
+            base_patch_mse = float((patch_oracle_base_error_sum / oracle_count).item())
+            oracle_patch_mse = float((patch_oracle_error_sum / oracle_count).item())
+            selected_patch_mse = float((patch_selected_error_sum / oracle_count).item())
+            headroom = base_patch_mse - oracle_patch_mse
+            class_names = ["skip", *penalty_names]
+            true_positive = patch_confusion_matrix.diag()
+            oracle_count_by_class = patch_confusion_matrix.sum(dim=1)
+            selected_count_by_class = patch_confusion_matrix.sum(dim=0)
+            recall_by_class = true_positive / oracle_count_by_class.clamp_min(1.0)
+            precision_by_class = true_positive / selected_count_by_class.clamp_min(1.0)
+            proposal_recall_p = (
+                patch_proposal_true_positive_count / patch_beneficial_penalty_count.clamp_min(1.0)
+            )
+            proposal_precision_p = (
+                patch_proposal_true_positive_count / patch_proposed_penalty_count.clamp_min(1.0)
+            )
+            proposal_present_p = patch_beneficial_penalty_count > 0.0
+            present_class_mask = oracle_count_by_class > 0.0
+            present_penalty_mask = present_class_mask.clone()
+            present_penalty_mask[0] = False
+            cfg_summary["patch_router"]["oracle_diagnostic"] = {
+                "path": (
+                    "eval_output_anchor"
+                    if output_anchor_train_with_eval
+                    else "raw_residual_no_output_anchor"
+                ),
+                "base_patch_mse": base_patch_mse,
+                "selected_patch_mse": selected_patch_mse,
+                "oracle_patch_mse": oracle_patch_mse,
+                "selected_gain_pct": 100.0 * (base_patch_mse - selected_patch_mse) / max(base_patch_mse, 1.0e-12),
+                "oracle_gain_pct": 100.0 * headroom / max(base_patch_mse, 1.0e-12),
+                "captured_oracle_headroom_pct": (
+                    100.0 * (base_patch_mse - selected_patch_mse) / headroom
+                    if headroom > 1.0e-12
+                    else 0.0
+                ),
+                "top1_accuracy": float((patch_correct_count / patch_oracle_count).item()),
+                "adoption_recall": float(
+                    (patch_adoption_true_positive_count / patch_oracle_penalty_count.clamp_min(1.0)).item()
+                ),
+                "adoption_precision": float(
+                    (patch_adoption_true_positive_count / patch_selected_penalty_count.clamp_min(1.0)).item()
+                ),
+                "selected_utility_recall": float(
+                    (patch_selected_beneficial_count / patch_oracle_penalty_count.clamp_min(1.0)).item()
+                ),
+                "selected_utility_precision": float(
+                    (patch_selected_beneficial_count / patch_selected_penalty_count.clamp_min(1.0)).item()
+                ),
+                "selected_harmful_rate": float(
+                    (patch_selected_harmful_count / patch_selected_penalty_count.clamp_min(1.0)).item()
+                ),
+                "selected_positive_gain_sum": float(patch_selected_positive_gain_sum.item()),
+                "selected_negative_cost_sum": float(patch_selected_negative_cost_sum.item()),
+                "selected_gain_to_cost_ratio": float(
+                    (
+                        patch_selected_positive_gain_sum
+                        / patch_selected_negative_cost_sum.clamp_min(1.0e-12)
+                    ).item()
+                ),
+                "risk_sign_recall": float(
+                    (
+                        patch_risk_sign_true_positive_count
+                        / patch_risk_sign_positive_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "risk_sign_precision": float(
+                    (
+                        patch_risk_sign_true_positive_count
+                        / patch_risk_sign_predicted_positive_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "risk_sign_accuracy": float(
+                    (
+                        patch_risk_sign_correct_count
+                        / patch_risk_sign_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "risk_sign_predicted_positive_rate": float(
+                    (
+                        patch_risk_sign_predicted_positive_count
+                        / patch_risk_sign_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "selected_utility_precision_by_penalty": {
+                    penalty_names[p]: float(
+                        (
+                            patch_selected_beneficial_count_by_penalty[p]
+                            / patch_selected_count_by_penalty[p].clamp_min(1.0)
+                        ).item()
+                    )
+                    for p in range(P)
+                },
+                "selected_mean_gain_by_penalty": {
+                    penalty_names[p]: float(
+                        (
+                            patch_selected_gain_sum_by_penalty[p]
+                            / patch_selected_count_by_penalty[p].clamp_min(1.0)
+                        ).item()
+                    )
+                    for p in range(P)
+                },
+                "oracle_penalty_recall_at_k": float(
+                    (patch_oracle_penalty_hit_count / patch_oracle_penalty_count.clamp_min(1.0)).item()
+                ),
+                "proposal_macro_recall": float(
+                    proposal_recall_p[proposal_present_p].mean().item()
+                    if bool(proposal_present_p.any().item())
+                    else 0.0
+                ),
+                "proposal_oracle_best_recall_at_k": float(
+                    (
+                        patch_proposal_oracle_hit_count
+                        / patch_oracle_penalty_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "shortlist_pairwise_accuracy": float(
+                    (
+                        patch_shortlist_pairwise_correct_count
+                        / patch_shortlist_pairwise_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "proposal_oracle_best_recall_by_penalty": {
+                    penalty_names[p]: float(
+                        (
+                            patch_proposal_oracle_hit_count_by_penalty[p]
+                            / patch_oracle_class_count[p + 1].clamp_min(1.0)
+                        ).item()
+                    )
+                    for p in range(P)
+                },
+                "mean_beneficial_penalties_per_patch": float(
+                    (patch_beneficial_cardinality_sum / patch_oracle_count).item()
+                ),
+                "beneficial_penalty_count_distribution": {
+                    str(count): float(
+                        (patch_beneficial_cardinality_histogram[count] / patch_oracle_count).item()
+                    )
+                    for count in range(P + 1)
+                },
+                "proposal_recall_by_penalty": {
+                    penalty_names[p]: float(proposal_recall_p[p].item()) for p in range(P)
+                },
+                "proposal_precision_by_penalty": {
+                    penalty_names[p]: float(proposal_precision_p[p].item()) for p in range(P)
+                },
+                "macro_recall": float(recall_by_class[present_class_mask].mean().item()),
+                "macro_penalty_recall": float(
+                    recall_by_class[present_penalty_mask].mean().item()
+                    if bool(present_penalty_mask.any().item())
+                    else 0.0
+                ),
+                "skip_recall": float(recall_by_class[0].item()),
+                "recall_by_class": {
+                    class_names[i]: float(recall_by_class[i].item()) for i in range(P + 1)
+                },
+                "precision_by_class": {
+                    class_names[i]: float(precision_by_class[i].item()) for i in range(P + 1)
+                },
+                "confusion_matrix_oracle_rows_selected_columns": [
+                    [int(value) for value in row]
+                    for row in patch_confusion_matrix.to(dtype=torch.long).detach().cpu().tolist()
+                ],
+                "oracle_class_rate": {
+                    class_names[i]: float((patch_oracle_class_count[i] / patch_oracle_count).item())
+                    for i in range(P + 1)
+                },
+                "selected_class_rate": {
+                    class_names[i]: float((patch_selected_class_count[i] / patch_oracle_count).item())
+                    for i in range(P + 1)
+                },
+                "by_patch": [
+                    {
+                        "index": int(q),
+                        "base_mse": float((patch_base_error_sum_by_patch[q] / patch_count_by_patch[q].clamp_min(1.0)).item()),
+                        "selected_mse": float((patch_selected_error_sum_by_patch[q] / patch_count_by_patch[q].clamp_min(1.0)).item()),
+                        "oracle_mse": float((patch_oracle_error_sum_by_patch[q] / patch_count_by_patch[q].clamp_min(1.0)).item()),
+                    }
+                    for q in range(int(patch_router.num_patches))
+                ],
+            }
         return cfg_summary
+
+    @torch.no_grad()
+    def collect_patch_risk_calibration_tensors(
+        loader: DataLoader,
+        *,
+        eval_start: int = 0,
+        include_patch_values: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        if pred_residual is None or getattr(pred_residual, "patch_router", None) is None:
+            raise ValueError("patch risk calibration requires an enabled patch router.")
+        model.eval()
+        gate.eval()
+        pred_residual.eval()
+        score_parts = []
+        gain_parts = []
+        time_parts = []
+        penalty_parts = []
+        base_mse_parts = []
+        candidate_mse_parts = []
+        base_mae_parts = []
+        candidate_mae_parts = []
+        regime_parts = []
+        cross_parts = []
+        delta_sq_parts = []
+        base_residual_patch_parts = []
+        candidate_delta_patch_parts = []
+        scale_feature_parts = []
+        head_score_parts: Dict[str, List[torch.Tensor]] = {
+            "proposal_adopt_probability": [],
+            "proposal_fixed_probability": [],
+            "proposal_fixed_logit": [],
+            "risk_fixed_probability": [],
+            "risk_domain_disagreement": [],
+            "utility_fixed_score": [],
+            "pairwise_fixed_score": [],
+            "lower_quantile_fixed_score": [],
+            "utility_veto_fixed_probability": [],
+        }
+        for x, y, idx in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+            query_start_abs_b = int(eval_start) + idx
+            y_base = _eval_path_base_prediction(x, query_start_abs_b)
+            route_pen_bkp = _router_penalty_context_from_history(
+                x_bcl=x,
+                yhat_base_bch=y_base,
+                penalty_names=penalty_names,
+                penalty_fns=penalty_fns,
+                penalty_scale=penalty_scale,
+                cluster_id_c=cluster_id_c,
+                K=K,
+                router_mode=router_mode,
+            )
+            feat_bkf = _build_gate_routing_features(
+                x,
+                y_base,
+                cluster_id_c,
+                K,
+                mode=gate_feature_mode,
+            )
+            mask_bkp, probs_bkp, skip_bk, _ = gate(
+                feat_bkf,
+                straight_through=False,
+                penalty_context_bkp=route_pen_bkp,
+                penalty_context_mode=router_mode,
+                penalty_context_weight=router_penalty_context_weight,
+                penalty_context_detach=router_detach_penalty_context,
+                penalty_context_score=router_penalty_context_score,
+            )
+            if select_ranks is not None:
+                mask_bkp = _select_rank_mask(
+                    probs_bkp,
+                    select_ranks,
+                    straight_through=False,
+                )
+            pred_out = pred_residual(
+                x,
+                y_base,
+                cluster_id_c,
+                mask_bkp,
+                skip_bk=skip_bk if allow_skip else None,
+                query_start_abs_b=query_start_abs_b,
+            )
+            selected_score_bcq = pred_out.get("patch_selected_risk_score_bcq")
+            selected_penalty_bcq = pred_out.get("patch_selected_penalty_index_bcq")
+            calibration_base_bch, candidate_bcpH = _pred_residual_candidates_on_eval_path(
+                y_base,
+                pred_out,
+                apply_output_anchors=output_anchor_train_with_eval,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
+                include_patch_route=False,
+            )
+            if (
+                selected_score_bcq is None
+                or selected_penalty_bcq is None
+                or candidate_bcpH is None
+            ):
+                raise ValueError("patch risk calibration outputs are incomplete.")
+
+            def gather_selected_head(output_key: str) -> Optional[torch.Tensor]:
+                head_bcqp = pred_out.get(output_key)
+                if head_bcqp is None:
+                    return None
+                if tuple(head_bcqp.shape[:-1]) != tuple(selected_penalty_bcq.shape):
+                    raise ValueError(
+                        f"patch risk head {output_key} shape must match selected penalties."
+                    )
+                return head_bcqp.gather(
+                    dim=-1,
+                    index=selected_penalty_bcq.unsqueeze(-1),
+                ).squeeze(-1)
+
+            batch_head_scores = {
+                "proposal_adopt_probability": pred_out.get(
+                    "patch_proposal_adopt_prob_bcq"
+                ),
+                "proposal_fixed_probability": gather_selected_head(
+                    "patch_penalty_benefit_probs_bcqp"
+                ),
+                "proposal_fixed_logit": gather_selected_head(
+                    "patch_penalty_proposal_logits_bcqp"
+                ),
+                "risk_fixed_probability": gather_selected_head(
+                    "patch_penalty_risk_benefit_probs_bcqp"
+                ),
+                "risk_domain_disagreement": pred_out.get(
+                    "patch_selected_risk_domain_std_bcq"
+                ),
+                "utility_fixed_score": gather_selected_head(
+                    "patch_penalty_utility_scores_bcqp"
+                ),
+                "pairwise_fixed_score": gather_selected_head(
+                    "patch_penalty_pairwise_rank_scores_bcqp"
+                ),
+                "lower_quantile_fixed_score": gather_selected_head(
+                    "patch_penalty_risk_lower_quantile_scores_bcqp"
+                ),
+                "utility_veto_fixed_probability": gather_selected_head(
+                    "patch_penalty_risk_utility_veto_probs_bcqp"
+                ),
+            }
+            for head_name, head_score_bcq in batch_head_scores.items():
+                if head_score_bcq is None:
+                    continue
+                if tuple(head_score_bcq.shape) != tuple(selected_penalty_bcq.shape):
+                    raise ValueError(
+                        f"patch risk head {head_name} shape must match selected penalties."
+                    )
+                head_score_parts[head_name].append(head_score_bcq.detach().cpu())
+            batch, channels, horizon = calibration_base_bch.shape
+            patches = int(selected_score_bcq.shape[2])
+            if horizon % patches != 0:
+                raise ValueError("patch risk calibration patch count must divide horizon.")
+            patch_len = horizon // patches
+            base_error_bcq = (calibration_base_bch - y).square().reshape(
+                batch,
+                channels,
+                patches,
+                patch_len,
+            ).mean(dim=-1)
+            candidate_error_bcqp = (
+                (candidate_bcpH - y.unsqueeze(2))
+                .square()
+                .reshape(batch, channels, P, patches, patch_len)
+                .mean(dim=-1)
+                .permute(0, 1, 3, 2)
+            )
+            selected_error_bcq = candidate_error_bcqp.gather(
+                dim=-1,
+                index=selected_penalty_bcq.unsqueeze(-1),
+            ).squeeze(-1)
+            selected_gain_bcq = base_error_bcq - selected_error_bcq
+            base_abs_error_bcq = (calibration_base_bch - y).abs().reshape(
+                batch,
+                channels,
+                patches,
+                patch_len,
+            ).mean(dim=-1)
+            candidate_abs_error_bcqp = (
+                (candidate_bcpH - y.unsqueeze(2))
+                .abs()
+                .reshape(batch, channels, P, patches, patch_len)
+                .mean(dim=-1)
+                .permute(0, 1, 3, 2)
+            )
+            selected_abs_error_bcq = candidate_abs_error_bcqp.gather(
+                dim=-1,
+                index=selected_penalty_bcq.unsqueeze(-1),
+            ).squeeze(-1)
+            candidate_patch_bcqpr = candidate_bcpH.reshape(
+                batch,
+                channels,
+                P,
+                patches,
+                patch_len,
+            ).permute(0, 1, 3, 2, 4)
+            selected_candidate_bcqr = candidate_patch_bcqpr.gather(
+                dim=3,
+                index=selected_penalty_bcq.unsqueeze(-1).unsqueeze(-1).expand(
+                    -1,
+                    -1,
+                    -1,
+                    1,
+                    patch_len,
+                ),
+            ).squeeze(3)
+            candidate_delta_bcqr = selected_candidate_bcqr - calibration_base_bch.reshape(
+                batch,
+                channels,
+                patches,
+                patch_len,
+            )
+            target_residual_bcqr = (y - calibration_base_bch).reshape(
+                batch,
+                channels,
+                patches,
+                patch_len,
+            )
+            cross_bcq = (candidate_delta_bcqr * target_residual_bcqr).mean(dim=-1)
+            delta_sq_bcq = candidate_delta_bcqr.square().mean(dim=-1)
+            query_bcq = query_start_abs_b.view(-1, 1, 1).expand(
+                -1,
+                channels,
+                patches,
+            )
+            score_parts.append(selected_score_bcq.detach().cpu())
+            gain_parts.append(selected_gain_bcq.detach().cpu())
+            time_parts.append(query_bcq.detach().cpu())
+            penalty_parts.append(selected_penalty_bcq.detach().cpu())
+            base_mse_parts.append(base_error_bcq.detach().cpu())
+            candidate_mse_parts.append(selected_error_bcq.detach().cpu())
+            base_mae_parts.append(base_abs_error_bcq.detach().cpu())
+            candidate_mae_parts.append(selected_abs_error_bcq.detach().cpu())
+            regime_parts.append(_causal_patch_regime_descriptor(x).detach().cpu())
+            cross_parts.append(cross_bcq.detach().cpu())
+            delta_sq_parts.append(delta_sq_bcq.detach().cpu())
+            scale_feature_parts.append(
+                _causal_patch_scale_features(
+                    x,
+                    calibration_base_bch,
+                    candidate_delta_bcqr,
+                ).detach().cpu()
+            )
+            if include_patch_values:
+                base_residual_patch_parts.append(
+                    (calibration_base_bch - y)
+                    .reshape(batch, channels, patches, patch_len)
+                    .detach()
+                    .cpu()
+                )
+                candidate_delta_patch_parts.append(
+                    candidate_delta_bcqr.detach().cpu()
+                )
+        if not score_parts:
+            empty_result = {
+                "score": torch.empty(0),
+                "gain": torch.empty(0),
+                "time": torch.empty(0, dtype=torch.long),
+                "penalty": torch.empty(0, dtype=torch.long),
+                "base_mse": torch.empty(0),
+                "candidate_mse": torch.empty(0),
+                "base_mae": torch.empty(0),
+                "candidate_mae": torch.empty(0),
+                "regime": torch.empty(0),
+                "cross": torch.empty(0),
+                "delta_sq": torch.empty(0),
+                "base_residual_patch": torch.empty(0),
+                "candidate_delta_patch": torch.empty(0),
+                "scale_feature": torch.empty(0),
+            }
+            empty_result.update(
+                {head_name: torch.empty(0) for head_name in head_score_parts}
+            )
+            return empty_result
+        result = {
+            "score": torch.cat(score_parts, dim=0),
+            "gain": torch.cat(gain_parts, dim=0),
+            "time": torch.cat(time_parts, dim=0),
+            "penalty": torch.cat(penalty_parts, dim=0),
+            "base_mse": torch.cat(base_mse_parts, dim=0),
+            "candidate_mse": torch.cat(candidate_mse_parts, dim=0),
+            "base_mae": torch.cat(base_mae_parts, dim=0),
+            "candidate_mae": torch.cat(candidate_mae_parts, dim=0),
+            "regime": torch.cat(regime_parts, dim=0),
+            "cross": torch.cat(cross_parts, dim=0),
+            "delta_sq": torch.cat(delta_sq_parts, dim=0),
+            "base_residual_patch": (
+                torch.cat(base_residual_patch_parts, dim=0)
+                if base_residual_patch_parts
+                else torch.empty(0)
+            ),
+            "candidate_delta_patch": (
+                torch.cat(candidate_delta_patch_parts, dim=0)
+                if candidate_delta_patch_parts
+                else torch.empty(0)
+            ),
+            "scale_feature": torch.cat(scale_feature_parts, dim=0),
+        }
+        result.update(
+            {
+                head_name: (
+                    torch.cat(parts, dim=0) if parts else torch.empty(0)
+                )
+                for head_name, parts in head_score_parts.items()
+            }
+        )
+        return result
 
     def compute_batch_terms(
         x: torch.Tensor,
@@ -10698,10 +4073,16 @@ def main():
             stat_anchor_pc=model_train_stat_adapter_pc,
             cfg=model_train_stat_adapter_cfg,
         )
-        feat_bcf = extract_gate_features(x)
-        lambda_feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
         gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
-        series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)
+        if dynamic_lambda is None:
+            lambda_feat_bkf = gate_feat_bkf
+            series_bkl = None
+        else:
+            lambda_feat_bkf = gate_feat_bkf
+            if gate_feature_mode != "history":
+                feat_bcf = extract_gate_features(x)
+                lambda_feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+            series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)
         probs_bkp = None
         skip_bk = None
         skip_prob_bk = None
@@ -10715,6 +4096,7 @@ def main():
             penalty_scale=penalty_scale,
             cluster_id_c=cluster_id_c,
             K=K,
+            router_mode=router_mode,
         )
 
         if moe_enable and P > 0:
@@ -10757,13 +4139,14 @@ def main():
                     allow_skip=allow_skip,
                     ignore_skip_during_training=pred_residual_ignore_skip_during_training,
                 ),
+                query_start_abs_b=idx,
             )
             yhat_residual_raw = pred_out["y_final"]
             yhat = yhat_residual_raw
         else:
             yhat_residual_raw = yhat_base
             yhat = yhat_base
-        if pred_residual_train_with_eval_anchors:
+        if output_anchor_train_with_eval:
             yhat = apply_moe_output_anchor_experts(
                 yhat,
                 base_pred_bch=yhat_base,
@@ -10775,6 +4158,8 @@ def main():
                 observed_history_tc=data_window_tc,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
             )
 
         err_bch = yhat - y
@@ -10865,7 +4250,7 @@ def main():
                 min_rel_improvement=pred_residual_candidate_supervision_min_rel,
                 include_intervention=pred_residual_candidate_supervision_include_intervention,
                 include_selector=pred_residual_candidate_supervision_include_selector,
-                apply_output_anchors=pred_residual_train_with_eval_anchors,
+                apply_output_anchors=output_anchor_train_with_eval,
                 x_bcl=x,
                 query_start_abs_b=idx,
                 input_len=L,
@@ -10874,6 +4259,7 @@ def main():
                 observed_history_tc=data_window_tc,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
             )
         intervention_supervision_loss_bk = None
         if pred_residual_intervention_supervision_weight > 0.0:
@@ -10887,7 +4273,7 @@ def main():
                 only_allowed=pred_residual_intervention_supervision_only_allowed,
                 min_gain=pred_residual_intervention_supervision_min_gain,
                 pos_weight=pred_residual_intervention_supervision_pos_weight,
-                apply_output_anchors=pred_residual_train_with_eval_anchors,
+                apply_output_anchors=output_anchor_train_with_eval,
                 x_bcl=x,
                 query_start_abs_b=idx,
                 input_len=L,
@@ -10896,6 +4282,7 @@ def main():
                 observed_history_tc=data_window_tc,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
             )
         loss_terms_bk, _ = _normalize_loss_terms(
             {
@@ -10935,7 +4322,7 @@ def main():
             utility_base_bch, utility_cand_bcpH = _pred_residual_candidates_on_eval_path(
                 yhat_base,
                 pred_out,
-                apply_output_anchors=pred_residual_train_with_eval_anchors,
+                apply_output_anchors=output_anchor_train_with_eval,
                 x_bcl=x,
                 query_start_abs_b=idx,
                 input_len=L,
@@ -10944,6 +4331,8 @@ def main():
                 observed_history_tc=data_window_tc,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
             )
         if route_ce_weight > 0.0 and utility_cand_bcpH is not None:
             route_labels_bk, route_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
@@ -11174,7 +4563,7 @@ def main():
 
     def _prepare_train_anchors_for_pred_residual_training() -> None:
         nonlocal train_residual_anchor_phc
-        if not pred_residual_train_with_eval_anchors:
+        if not output_anchor_train_with_eval:
             return
         if len(dtr) <= 0:
             return
@@ -11391,7 +4780,12 @@ def main():
                 gate_entropy_target_frac=gate_entropy_target_frac,
                 gate_balance_target_kp=gate_balance_target_kp,
             )
-        inner_loss = reduce_cluster_metric(inner_loss_bk, cluster_weight_k).mean()
+        train_weight_k = _training_cluster_weight(
+            cluster_weight_k,
+            stopped,
+            shared_moe=shared_moe_across_clusters,
+        )
+        inner_loss = reduce_cluster_metric(inner_loss_bk, train_weight_k).mean()
 
         inner_params = [param for _, _, param in inner_named]
         inner_grads = torch.autograd.grad(
@@ -11480,11 +4874,53 @@ def main():
     early_stopped = False
     mse_gate_train_diag_history: List[Dict[str, object]] = []
     stage2_loss_audit_history: List[Dict[str, object]] = []
+    stage2_objective_overlap_batches: List[Dict[str, object]] = []
     stage2_route_audit_history: List[Dict[str, object]] = []
+    overfit_diagnostic_history: List[Dict[str, object]] = []
+    overfit_diagnostic_metric_epochs: List[int] = []
+    if overfit_diagnostic_range is not None:
+        configured_metric_epochs = overfit_diagnostic_cfg.get(
+            "metric_epochs",
+            [1, 5, 10, 20, int(epochs)],
+        )
+        overfit_diagnostic_metric_epochs = sorted(
+            {
+                int(epoch_idx)
+                for epoch_idx in configured_metric_epochs
+                if 1 <= int(epoch_idx) <= int(epochs)
+            }
+            | {int(epochs)}
+        )
     stage2_route_audit_frequency = max(1, int(stage2_route_audit_cfg.get("frequency_epochs", 1)))
 
     for ep in range(1, epochs + 1):
         t_ep0 = time.perf_counter()
+        if (
+            patch_router_freeze_experts_after_warmup
+            and not patch_router_expert_freeze_applied
+            and ep > patch_router_expert_warmup_epochs
+        ):
+            if pred_residual is None or getattr(pred_residual, "patch_router", None) is None:
+                raise ValueError(
+                    "patch_router.freeze_experts_after_warmup requires an enabled patch router."
+                )
+            patch_router_trainable_prefixes = (
+                (
+                    "patch_router.W_pairwise_rank",
+                    "patch_router.b_pairwise_rank",
+                )
+                if patch_router_pairwise_freeze_other_parameters
+                else ("patch_router.",)
+            )
+            patch_router_frozen_expert_params = _freeze_module_params_except_prefixes(
+                pred_residual,
+                patch_router_trainable_prefixes,
+            )
+            patch_router_expert_freeze_applied = True
+            print(
+                "Patch-router second stage froze shared residual experts: "
+                f"epoch={ep}, params={patch_router_frozen_expert_params}"
+            )
         if lr_warmup_epochs > 0 and ep <= lr_warmup_epochs:
             _set_optimizer_lr_scale(
                 optimizers,
@@ -11494,6 +4930,16 @@ def main():
             warmup_scale = min(1.0, float(ep) / float(penalty_warmup_epochs))
         else:
             warmup_scale = 1.0
+        patch_router_oracle_ce_weight_ep = (
+            patch_router_oracle_ce_weight
+            if ep > patch_router_oracle_ce_warmup_epochs
+            else 0.0
+        )
+        patch_router_hierarchical_weight_ep = (
+            patch_router_hierarchical_weight
+            if ep > patch_router_hierarchical_warmup_epochs
+            else 0.0
+        )
         model.train()
         gate.train()
         if pred_residual is not None:
@@ -11531,6 +4977,7 @@ def main():
                 "pred_residual": 0.0,
                 "dynamic_lambda": 0.0,
                 "learnable_lambda": 0.0,
+                "learnable_output_anchor": 0.0,
             }
             stage2_grad_norm_batches = 0
         mse_gate_loss_sum_k = torch.zeros(K, device=device)
@@ -11578,12 +5025,20 @@ def main():
                 stat_anchor_pc=model_train_stat_adapter_pc,
                 cfg=model_train_stat_adapter_cfg,
             )
-            feat_bcf = extract_gate_features(x)  # [B,C,F]
-            feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)  # [B,K,F] for dynamic lambda
             gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
-            series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
+            if dynamic_lambda is None:
+                feat_bkf = gate_feat_bkf
+                series_bkl = None
+            else:
+                feat_bkf = gate_feat_bkf
+                if gate_feature_mode != "history":
+                    feat_bcf = extract_gate_features(x)
+                    feat_bkf = scatter_mean_bcf_to_bkf(feat_bcf, cluster_id_c, K)
+                series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
             skip_bk = None
             pred_out = None
+            hierarchical_terms = None
+            objective_overlap_reference_bk = None
             route_pen_bkp = _router_penalty_context_from_history(
                 x_bcl=x,
                 yhat_base_bch=yhat_base,
@@ -11592,6 +5047,7 @@ def main():
                 penalty_scale=penalty_scale,
                 cluster_id_c=cluster_id_c,
                 K=K,
+                router_mode=router_mode,
             )
 
             if moe_enable and P > 0:
@@ -11663,7 +5119,7 @@ def main():
             else:
                 yhat_residual_raw = yhat_base
                 yhat = yhat_base
-            if pred_residual_train_with_eval_anchors:
+            if output_anchor_train_with_eval:
                 yhat = apply_moe_output_anchor_experts(
                     yhat,
                     base_pred_bch=yhat_base,
@@ -11675,6 +5131,8 @@ def main():
                     observed_history_tc=data_window_tc,
                     train_stat_anchor_pc=train_stat_anchor_pc,
                     train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
+                    cluster_id_c=cluster_id_c,
                 )
 
             err_bch = yhat - y
@@ -11772,7 +5230,7 @@ def main():
                         min_rel_improvement=pred_residual_candidate_supervision_min_rel,
                         include_intervention=pred_residual_candidate_supervision_include_intervention,
                         include_selector=pred_residual_candidate_supervision_include_selector,
-                        apply_output_anchors=pred_residual_train_with_eval_anchors,
+                        apply_output_anchors=output_anchor_train_with_eval,
                         x_bcl=x,
                         query_start_abs_b=idx,
                         input_len=L,
@@ -11781,6 +5239,7 @@ def main():
                         observed_history_tc=data_window_tc,
                         train_stat_anchor_pc=train_stat_anchor_pc,
                         train_residual_anchor_phc=train_residual_anchor_phc,
+                        learnable_output_anchor=learnable_output_anchor,
                     )
                 intervention_supervision_loss_bk = None
                 if pred_residual_intervention_supervision_weight > 0.0:
@@ -11794,7 +5253,7 @@ def main():
                         only_allowed=pred_residual_intervention_supervision_only_allowed,
                         min_gain=pred_residual_intervention_supervision_min_gain,
                         pos_weight=pred_residual_intervention_supervision_pos_weight,
-                        apply_output_anchors=pred_residual_train_with_eval_anchors,
+                        apply_output_anchors=output_anchor_train_with_eval,
                         x_bcl=x,
                         query_start_abs_b=idx,
                         input_len=L,
@@ -11803,6 +5262,7 @@ def main():
                         observed_history_tc=data_window_tc,
                         train_stat_anchor_pc=train_stat_anchor_pc,
                         train_residual_anchor_phc=train_residual_anchor_phc,
+                        learnable_output_anchor=learnable_output_anchor,
                     )
                 loss_terms_bk, _ = _normalize_loss_terms(
                     {
@@ -11819,6 +5279,10 @@ def main():
                 )
                 penalty_loss_component_bk = loss_terms_bk["penalty"]
                 pred_residual_aux_component_bk = loss_terms_bk["pred_residual"]
+                if patch_router_supervision_only:
+                    forecast_loss_component_bk = forecast_loss_component_bk.detach()
+                    penalty_loss_component_bk = penalty_loss_component_bk.detach()
+                    pred_residual_aux_component_bk = pred_residual_aux_component_bk.detach()
                 candidate_supervision_component_bk = torch.zeros_like(mse_bk)
                 intervention_supervision_component_bk = torch.zeros_like(mse_bk)
                 skip_noop_component_bk = torch.zeros_like(mse_bk)
@@ -11847,11 +5311,14 @@ def main():
                     or route_positive_recall_weight > 0.0
                     or route_precision_recall_weight > 0.0
                     or mse_utility_gate_weight > 0.0
+                    or patch_router_expected_mse_weight > 0.0
+                    or patch_router_oracle_ce_weight_ep > 0.0
+                    or patch_router_hierarchical_weight_ep > 0.0
                 ):
                     utility_base_bch, utility_cand_bcpH = _pred_residual_candidates_on_eval_path(
                         yhat_base,
                         pred_out,
-                        apply_output_anchors=pred_residual_train_with_eval_anchors,
+                        apply_output_anchors=output_anchor_train_with_eval,
                         x_bcl=x,
                         query_start_abs_b=idx,
                         input_len=L,
@@ -11860,7 +5327,205 @@ def main():
                         observed_history_tc=data_window_tc,
                         train_stat_anchor_pc=train_stat_anchor_pc,
                         train_residual_anchor_phc=train_residual_anchor_phc,
+                        learnable_output_anchor=learnable_output_anchor,
+                        cluster_id_c=cluster_id_c,
+                        include_patch_route=not (
+                            patch_router_expected_mse_weight > 0.0
+                            or patch_router_oracle_ce_weight_ep > 0.0
+                            or patch_router_hierarchical_weight_ep > 0.0
+                        ),
                     )
+                if patch_router_expected_mse_weight > 0.0 and utility_cand_bcpH is not None:
+                    patch_probs_bcqp = pred_out.get("patch_probs_bcqp")
+                    patch_skip_prob_bcq = pred_out.get("patch_skip_prob_bcq")
+                    if patch_probs_bcqp is None or patch_skip_prob_bcq is None:
+                        raise ValueError(
+                            "patch_router.expected_mse_weight requires patch router probabilities."
+                        )
+                    patch_utility_loss_bk = _patch_router_expected_mse_loss_bk(
+                        base_bch=utility_base_bch,
+                        candidate_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        patch_probs_bcqp=patch_probs_bcqp,
+                        patch_skip_prob_bcq=patch_skip_prob_bcq,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                    )
+                    patch_utility_component_bk = (
+                        patch_router_expected_mse_weight * patch_utility_loss_bk
+                    )
+                    gate_utility_component_bk = gate_utility_component_bk + patch_utility_component_bk
+                    loss_bk = loss_bk + patch_utility_component_bk
+                    if patch_router_temporal_group_dro_enable:
+                        batch_size_now, channel_count_now, horizon_now = (
+                            utility_base_bch.shape
+                        )
+                        patch_count_now = int(patch_skip_prob_bcq.shape[2])
+                        if horizon_now % patch_count_now != 0:
+                            raise ValueError(
+                                "temporal group DRO patch count must divide horizon."
+                            )
+                        base_error_bcq = (
+                            (utility_base_bch - y)
+                            .square()
+                            .reshape(
+                                batch_size_now,
+                                channel_count_now,
+                                patch_count_now,
+                                horizon_now // patch_count_now,
+                            )
+                            .mean(dim=-1)
+                        )
+                        base_loss_bk = scatter_mean_bc_to_bk(
+                            base_error_bcq.mean(dim=-1),
+                            cluster_id_c,
+                            K,
+                        )
+                        group_dro_loss, _, _ = (
+                            _temporal_group_dro_incremental_loss(
+                                incremental_loss_bk=(
+                                    patch_utility_loss_bk - base_loss_bk.detach()
+                                ),
+                                query_index_b=idx,
+                                train_window_count=len(dtr),
+                                cluster_weight_k=cluster_weight_k,
+                                num_domains=patch_router_temporal_group_dro_domains,
+                                temperature=(
+                                    patch_router_temporal_group_dro_temperature
+                                ),
+                            )
+                        )
+                        group_dro_component_bk = (
+                            patch_router_temporal_group_dro_weight
+                            * group_dro_loss
+                        ).expand_as(patch_utility_loss_bk)
+                        gate_utility_component_bk = (
+                            gate_utility_component_bk
+                            + group_dro_component_bk
+                        )
+                        loss_bk = loss_bk + group_dro_component_bk
+                if patch_router_oracle_ce_weight_ep > 0.0 and utility_cand_bcpH is not None:
+                    patch_probs_bcqp = pred_out.get("patch_probs_bcqp")
+                    patch_skip_prob_bcq = pred_out.get("patch_skip_prob_bcq")
+                    if patch_probs_bcqp is None or patch_skip_prob_bcq is None:
+                        raise ValueError(
+                            "patch_router.oracle_ce_weight requires patch router probabilities."
+                        )
+                    patch_ce_loss_bk = _patch_router_oracle_ce_loss_bk(
+                        base_bch=utility_base_bch,
+                        candidate_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        patch_probs_bcqp=patch_probs_bcqp,
+                        patch_skip_prob_bcq=patch_skip_prob_bcq,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        min_abs_improvement=patch_router_oracle_min_abs_improvement,
+                    )
+                    patch_ce_component_bk = patch_router_oracle_ce_weight_ep * patch_ce_loss_bk
+                    gate_utility_component_bk = gate_utility_component_bk + patch_ce_component_bk
+                    loss_bk = loss_bk + patch_ce_component_bk
+                if patch_router_hierarchical_weight_ep > 0.0 and utility_cand_bcpH is not None:
+                    patch_adopt_prob_bcq = pred_out.get("patch_proposal_adopt_prob_bcq")
+                    patch_final_adopt_prob_bcq = pred_out.get("patch_adopt_prob_bcq")
+                    patch_conditional_probs_bcqp = pred_out.get(
+                        "patch_penalty_conditional_probs_bcqp"
+                    )
+                    patch_benefit_probs_bcqp = pred_out.get("patch_penalty_benefit_probs_bcqp")
+                    patch_utility_scores_bcqp = pred_out.get("patch_penalty_utility_scores_bcqp")
+                    if (
+                        patch_adopt_prob_bcq is None
+                        or patch_conditional_probs_bcqp is None
+                        or patch_benefit_probs_bcqp is None
+                        or patch_utility_scores_bcqp is None
+                    ):
+                        raise ValueError(
+                            "patch_router hierarchical recall supervision requires hierarchical gate outputs."
+                        )
+                    hierarchical_terms = _patch_router_hierarchical_recall_loss_terms(
+                        base_bch=utility_base_bch,
+                        candidate_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        patch_adopt_prob_bcq=patch_adopt_prob_bcq,
+                        patch_penalty_conditional_probs_bcqp=patch_conditional_probs_bcqp,
+                        patch_penalty_benefit_probs_bcqp=patch_benefit_probs_bcqp,
+                        patch_penalty_utility_scores_bcqp=patch_utility_scores_bcqp,
+                        patch_penalty_risk_benefit_probs_bcqp=pred_out.get(
+                            "patch_penalty_risk_benefit_probs_bcqp"
+                        ),
+                        patch_penalty_risk_positive_magnitude_bcqp=pred_out.get(
+                            "patch_penalty_risk_positive_magnitude_bcqp"
+                        ),
+                        patch_penalty_risk_negative_magnitude_bcqp=pred_out.get(
+                            "patch_penalty_risk_negative_magnitude_bcqp"
+                        ),
+                        patch_penalty_proposal_logits_bcqp=pred_out.get(
+                            "patch_penalty_proposal_logits_bcqp"
+                        ),
+                        patch_penalty_proposal_rescue_logits_bcqp=pred_out.get(
+                            "patch_penalty_proposal_rescue_logits_bcqp"
+                        ),
+                        patch_penalty_risk_lower_quantile_scores_bcqp=pred_out.get(
+                            "patch_penalty_risk_lower_quantile_scores_bcqp"
+                        ),
+                        patch_final_adopt_prob_bcq=patch_final_adopt_prob_bcq,
+                        patch_penalty_pairwise_rank_scores_bcqp=pred_out.get(
+                            "patch_penalty_pairwise_rank_scores_bcqp"
+                        ),
+                        patch_penalty_proposal_mask_bcqp=pred_out.get(
+                            "patch_penalty_proposal_mask_bcqp"
+                        ),
+                        patch_active_mask_bcq=(
+                            pred_out.get("patch_fixed_penalty_active_bcq")
+                            if patch_router_mask_inactive_fixed_channels
+                            else None
+                        ),
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        min_abs_improvement=patch_router_hierarchical_min_abs_improvement,
+                        **patch_router_hierarchical_loss_cfg,
+                    )
+                    if (
+                        stage2_objective_overlap_enable
+                        and len(stage2_objective_overlap_batches)
+                        < stage2_objective_overlap_max_batches
+                    ):
+                        patch_probs_bcqp = pred_out.get("patch_probs_bcqp")
+                        patch_skip_prob_bcq = pred_out.get("patch_skip_prob_bcq")
+                        if (
+                            patch_probs_bcqp is None
+                            or patch_skip_prob_bcq is None
+                        ):
+                            raise ValueError(
+                                "objective-overlap diagnostics require soft patch route "
+                                "probabilities."
+                            )
+                        objective_overlap_reference_bk = (
+                            _patch_router_expected_mse_loss_bk(
+                                base_bch=utility_base_bch,
+                                candidate_bcpH=utility_cand_bcpH,
+                                y_bch=y,
+                                patch_probs_bcqp=patch_probs_bcqp,
+                                patch_skip_prob_bcq=patch_skip_prob_bcq,
+                                cluster_id_c=cluster_id_c,
+                                K=K,
+                            )
+                        )
+                    hierarchical_component_bk = (
+                        patch_router_hierarchical_weight_ep * hierarchical_terms["total_bk"]
+                    )
+                    if patch_router_temporal_calibration_enable:
+                        supervision_mask_b = (
+                            idx < int(patch_router_supervision_end_idx)
+                        ).to(
+                            device=hierarchical_component_bk.device,
+                            dtype=hierarchical_component_bk.dtype,
+                        )
+                        hierarchical_component_bk = (
+                            hierarchical_component_bk
+                            * supervision_mask_b.view(-1, 1)
+                        )
+                    gate_utility_component_bk = gate_utility_component_bk + hierarchical_component_bk
+                    loss_bk = loss_bk + hierarchical_component_bk
                 if route_ce_weight > 0.0 and utility_cand_bcpH is not None:
                     route_labels_bk, route_gain_bk = _cluster_route_oracle_labels_and_gain_from_candidates(
                         base_bch=utility_base_bch,
@@ -12151,15 +5816,142 @@ def main():
             if mse_gate_loss_bk is not None:
                 _accumulate_detached_sum_(mse_gate_loss_sum_k, mse_gate_loss_bk)
             train_cnt += int(loss_bk.shape[0])
-            loss = reduce_cluster_metric(loss_bk, cluster_weight_k).mean()
+            train_weight_k = _training_cluster_weight(
+                cluster_weight_k,
+                stopped,
+                shared_moe=shared_moe_across_clusters,
+            )
+            loss = reduce_cluster_metric(loss_bk, train_weight_k).mean()
+
+            if (
+                stage2_objective_overlap_enable
+                and objective_overlap_reference_bk is not None
+                and hierarchical_terms is not None
+                and pred_residual is not None
+                and getattr(pred_residual, "patch_router", None) is not None
+                and len(stage2_objective_overlap_batches)
+                < stage2_objective_overlap_max_batches
+            ):
+                reference_loss = reduce_cluster_metric(
+                    objective_overlap_reference_bk,
+                    train_weight_k,
+                ).mean()
+                overlap_term_losses = {
+                    "total_active_hierarchical": (
+                        float(patch_router_hierarchical_weight_ep)
+                        * reduce_cluster_metric(
+                            hierarchical_terms["total_bk"],
+                            train_weight_k,
+                        ).mean()
+                    )
+                }
+                overlap_term_weights = {
+                    "total_active_hierarchical": float(
+                        patch_router_hierarchical_weight_ep
+                    )
+                }
+                for weight_name, configured_weight in (
+                    patch_router_hierarchical_loss_cfg.items()
+                ):
+                    if not weight_name.endswith("_weight"):
+                        continue
+                    configured_weight = float(configured_weight)
+                    if configured_weight <= 0.0:
+                        continue
+                    term_name = f"{weight_name[:-7]}_bk"
+                    if term_name not in hierarchical_terms:
+                        continue
+                    report_name = term_name[:-3]
+                    effective_weight = (
+                        float(patch_router_hierarchical_weight_ep)
+                        * configured_weight
+                    )
+                    overlap_term_losses[report_name] = (
+                        effective_weight
+                        * reduce_cluster_metric(
+                            hierarchical_terms[term_name],
+                            train_weight_k,
+                        ).mean()
+                    )
+                    overlap_term_weights[report_name] = float(effective_weight)
+
+                risk_encoder_prefixes = (
+                    "W1",
+                    "b1",
+                    "W_candidate",
+                    "b_candidate",
+                    "penalty_embedding",
+                )
+                risk_sign_prefixes = ("W_risk_sign", "b_risk_sign")
+                overlap_summary = _loss_gradient_overlap_summary(
+                    reference_loss=reference_loss,
+                    term_losses=overlap_term_losses,
+                    named_parameters=(
+                        pred_residual.patch_router.named_parameters()
+                    ),
+                    parameter_groups={
+                        "all_patch_router": ("",),
+                        "execution_risk_path": (
+                            *risk_encoder_prefixes,
+                            *risk_sign_prefixes,
+                        ),
+                        "execution_risk_encoder": risk_encoder_prefixes,
+                        "execution_risk_sign_head": risk_sign_prefixes,
+                        "risk_magnitude_heads": (
+                            "W_risk_gain",
+                            "b_risk_gain",
+                            "W_risk_cost",
+                            "b_risk_cost",
+                        ),
+                        "proposal_path": (
+                            "W_proposal1",
+                            "b_proposal1",
+                            "W_proposal_candidate",
+                            "b_proposal_candidate",
+                            "proposal_penalty_embedding",
+                            "W_adopt",
+                            "b_adopt",
+                            "W_benefit",
+                            "b_benefit",
+                            "W_proposal_rescue",
+                            "b_proposal_rescue",
+                        ),
+                        "pairwise_head": (
+                            "W_pairwise_rank",
+                            "b_pairwise_rank",
+                        ),
+                    },
+                )
+                overlap_summary.update(
+                    {
+                        "epoch": int(ep),
+                        "batch": int(n_batches),
+                        "reference": (
+                            "soft expected patch MSE on the exact fixed-candidate "
+                            "eval output-anchor path"
+                        ),
+                        "reference_loss": float(reference_loss.detach().item()),
+                        "effective_term_weights": overlap_term_weights,
+                        "term_losses": {
+                            name: float(value.detach().item())
+                            for name, value in overlap_term_losses.items()
+                        },
+                    }
+                )
+                stage2_objective_overlap_batches.append(overlap_summary)
 
             for opt_k in optimizers:
+                if opt_k is None:
+                    continue
                 opt_k.zero_grad(set_to_none=True)
             loss.backward()
 
             if grad_clip > 0:
                 for k, params_k in enumerate(cluster_params):
-                    if stopped[k]:
+                    if (
+                        len(params_k) == 0
+                        or not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters)
+                    ):
                         continue
                     torch.nn.utils.clip_grad_norm_(params_k, grad_clip)
 
@@ -12178,6 +5970,8 @@ def main():
                 dynamic_lambda.mask_cluster_grads(stopped)
             if learnable_lambda is not None:
                 learnable_lambda.mask_cluster_grads(stopped)
+            if learnable_output_anchor is not None:
+                learnable_output_anchor.mask_cluster_grads(stopped)
             if stage2_loss_audit_enable:
                 stage2_grad_norm_sum["backbone"] += _parameter_grad_l2_norm(model.parameters())
                 stage2_grad_norm_sum["gate"] += _parameter_grad_l2_norm(gate.parameters())
@@ -12187,9 +5981,15 @@ def main():
                     stage2_grad_norm_sum["dynamic_lambda"] += _parameter_grad_l2_norm(dynamic_lambda.parameters())
                 if learnable_lambda is not None:
                     stage2_grad_norm_sum["learnable_lambda"] += _parameter_grad_l2_norm(learnable_lambda.parameters())
+                if learnable_output_anchor is not None:
+                    stage2_grad_norm_sum["learnable_output_anchor"] += _parameter_grad_l2_norm(
+                        learnable_output_anchor.parameters()
+                    )
                 stage2_grad_norm_batches += 1
             for k, opt_k in enumerate(optimizers):
-                if stopped[k]:
+                if opt_k is None:
+                    continue
+                if not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters):
                     continue
                 opt_k.step()
 
@@ -12205,6 +6005,7 @@ def main():
                     ),
                 )
 
+        assert_pairwise_frozen_parameters_unchanged(f"epoch_{ep}_post_optimizer")
         outer_loss_epoch = None
         if bilevel_enable:
             outer_vals = []
@@ -12221,12 +6022,15 @@ def main():
                 suffix=f"epoch={ep}/{epochs} loss={running / max(n_batches, 1):.6f} validating",
                 force=True,
             )
+        epoch_eval_loader = dl_overfit_eval if dl_overfit_eval is not None else dl_va
+        epoch_eval_start = 0 if dl_overfit_eval is not None else val_eval_start
         val_loss_k, val_mse_k, val_mae_k, _, _, _, _, _ = eval_loop_with_history(
             model, gate, lambda_kp_at(ep, detach=True),
             penalty_names, penalty_fns,
-            dl_va, cluster_id_c, K, moe_cfg, device,
+            epoch_eval_loader, cluster_id_c, K, moe_cfg, device,
             select_ranks=select_ranks,
             collect_plot=False, channel_count=C,
+            collect_samples=False,
             mse_weight=mse_weight,
             gate_entropy_weight=gate_entropy_weight,
             gate_balance_weight=gate_balance_weight,
@@ -12239,7 +6043,7 @@ def main():
             mae_objective_kind=mae_objective_kind,
             mae_objective_beta=mae_objective_beta,
             pred_residual=pred_residual,
-            eval_start=val_eval_start,
+            eval_start=epoch_eval_start,
         )
         train_loss_k = train_loss_sum_k / max(train_cnt, 1)
         train_mse_k = train_mse_sum_k / max(train_cnt, 1)
@@ -12273,6 +6077,15 @@ def main():
 
         monitor_k = _select_monitor_k(train_loss_k, train_mse_k, train_mae_k, val_loss_k, val_mse_k, val_mae_k)
         selection_active = ep >= selection_start_epoch
+        if shared_moe_across_clusters and selection_active:
+            shared_monitor = float(reduce_cluster_metric(monitor_k, cluster_weight_k).item())
+            if (shared_moe_best_monitor - shared_monitor) > min_delta:
+                shared_moe_best_monitor = shared_monitor
+                shared_moe_best_epoch = int(ep)
+                shared_moe_best_state["gate"] = gate.get_cluster_state(0)
+                shared_moe_best_state["pred_residual"] = (
+                    pred_residual.get_cluster_state(0) if pred_residual is not None else None
+                )
         improved = (best_monitor - monitor_k) > min_delta if selection_active else torch.zeros_like(stopped)
         for k in range(K):
             if stopped[k]:
@@ -12289,11 +6102,19 @@ def main():
                     stopped[k] = True
 
         if schedulers is not None and ep > lr_warmup_epochs:
+            shared_monitor_value = float(reduce_cluster_metric(monitor_k, cluster_weight_k).item())
             for k, sched in enumerate(schedulers):
-                if stopped[k]:
+                if sched is None:
+                    continue
+                if not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters):
                     continue
                 if sched_name in {"plateau", "reduce", "reduce_on_plateau"}:
-                    sched.step(float(monitor_k[k].item()))
+                    metric_value = (
+                        shared_monitor_value
+                        if shared_moe_across_clusters and int(k) == 0
+                        else float(monitor_k[k].item())
+                    )
+                    sched.step(metric_value)
                 else:
                     sched.step()
         train_loss_agg = float(reduce_cluster_metric(train_loss_k, cluster_weight_k).item())
@@ -12402,6 +6223,7 @@ def main():
                     model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                     train_stat_anchor_pc=train_stat_anchor_pc,
                     train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
                     gate_feature_mode=gate_feature_mode,
                 )
                 if route_tensors is None:
@@ -12433,6 +6255,7 @@ def main():
                     model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                     train_stat_anchor_pc=train_stat_anchor_pc,
                     train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
                     gate_feature_mode=gate_feature_mode,
                 )
                 split_summary = _route_audit_summary_from_tensors(
@@ -12459,6 +6282,79 @@ def main():
                 msg += f" | lambda_loss={outer_loss_epoch:.6f}"
             print(msg)
 
+        if (
+            dl_overfit_eval is not None
+            and ep in overfit_diagnostic_metric_epochs
+            and pred_residual is not None
+            and getattr(pred_residual, "patch_router", None) is not None
+        ):
+            fit_summary = collect_pred_residual_summary(dl_overfit_eval, eval_start=0)
+            fit_oracle = (fit_summary.get("patch_router", {}) or {}).get(
+                "oracle_diagnostic",
+                {},
+            ) or {}
+            fit_selected_rates = fit_oracle.get("selected_class_rate", {}) or {}
+            fit_risk_tensors = collect_patch_risk_calibration_tensors(
+                dl_overfit_eval,
+                eval_start=0,
+            )
+            fixed_penalty_c = (
+                pred_residual.patch_router.fixed_penalty_index_by_channel_c
+            )
+            active_channel_c = torch.ones(C, dtype=torch.bool)
+            if int(fixed_penalty_c.numel()) == C:
+                active_channel_c = fixed_penalty_c.detach().cpu() >= 0
+            fit_score = fit_risk_tensors["score"][:, active_channel_c].reshape(-1)
+            fit_gain = fit_risk_tensors["gain"][:, active_channel_c].reshape(-1)
+            score_ordering = _select_recall_constrained_risk_threshold(
+                score_n=fit_score,
+                gain_n=fit_gain,
+                block_n=torch.zeros_like(fit_gain, dtype=torch.long),
+                min_gain_cost_ratio=1.0,
+                min_block_net_gain=0.0,
+            )
+            fit_metrics = {
+                "epoch": int(ep),
+                "train_loss": float(train_loss_agg),
+                "selection_loss": float(val_loss_agg),
+                "selected_gain_pct": float(fit_oracle.get("selected_gain_pct", 0.0)),
+                "oracle_gain_pct": float(fit_oracle.get("oracle_gain_pct", 0.0)),
+                "proposal_oracle_best_recall_at_k": float(
+                    fit_oracle.get("proposal_oracle_best_recall_at_k", 0.0)
+                ),
+                "shortlist_pairwise_accuracy": float(
+                    fit_oracle.get("shortlist_pairwise_accuracy", 0.0)
+                ),
+                "risk_sign_recall": float(fit_oracle.get("risk_sign_recall", 0.0)),
+                "risk_sign_precision": float(fit_oracle.get("risk_sign_precision", 0.0)),
+                "risk_sign_accuracy": float(fit_oracle.get("risk_sign_accuracy", 0.0)),
+                "risk_sign_predicted_positive_rate": float(
+                    fit_oracle.get("risk_sign_predicted_positive_rate", 0.0)
+                ),
+                "selected_utility_recall": float(
+                    fit_oracle.get("selected_utility_recall", 0.0)
+                ),
+                "selected_utility_precision": float(
+                    fit_oracle.get("selected_utility_precision", 0.0)
+                ),
+                "selected_gain_to_cost_ratio": float(
+                    fit_oracle.get("selected_gain_to_cost_ratio", 0.0)
+                ),
+                "skip_rate": float(fit_selected_rates.get("skip", 0.0)),
+                "score_ordering_nonnegative": score_ordering,
+            }
+            overfit_diagnostic_history.append(fit_metrics)
+            print(
+                "  Gate-overfit fit metrics: "
+                f"proposal_r@k={fit_metrics['proposal_oracle_best_recall_at_k']:.4f}, "
+                f"pair_acc={fit_metrics['shortlist_pairwise_accuracy']:.4f}, "
+                f"risk_recall={fit_metrics['risk_sign_recall']:.4f}, "
+                f"utility_recall={fit_metrics['selected_utility_recall']:.4f}, "
+                f"utility_precision={fit_metrics['selected_utility_precision']:.4f}, "
+                f"ordered_recall={score_ordering['positive_recall']:.4f}, "
+                f"gain={fit_metrics['selected_gain_pct']:.4f}%"
+            )
+
         epoch_times.append(time.perf_counter() - t_ep0)
         if stopped.all():
             early_stopped = True
@@ -12484,6 +6380,7 @@ def main():
         print(f"Saved MSE curves to: {loss_dir}")
 
     load_best_all()
+    assert_pairwise_frozen_parameters_unchanged("post_load_best")
     swa_summary["updates"] = int(swa_updates)
     if swa_enable and swa_updates <= 0:
         swa_summary["reason"] = "no_swa_updates"
@@ -12937,6 +6834,7 @@ def main():
                     model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                     train_stat_anchor_pc=train_stat_anchor_pc,
                     train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
                     candidate_feature_mode="base",
                 )
                 threshold_kp, pred_residual_confidence_summary = (
@@ -13018,6 +6916,93 @@ def main():
                 f"threshold_mode={pred_residual_confidence_summary.get('threshold_mode')}"
             )
 
+    if patch_router_temporal_calibration_enable:
+        assert pred_residual is not None and pred_residual.patch_router is not None
+        calibration_indices = list(
+            range(int(patch_router_calibration_start_idx), int(len(dtr)))
+        )
+        calibration_loader = DataLoader(
+            Subset(dtr, calibration_indices),
+            batch_size=int(cfg["train"]["batch_size"]),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_mem,
+        )
+        calibration_tensors = collect_patch_risk_calibration_tensors(
+            calibration_loader,
+            eval_start=0,
+        )
+        calibration_time = calibration_tensors["time"].to(dtype=torch.long)
+        calibration_span = max(
+            1,
+            int(len(dtr)) - int(patch_router_calibration_start_idx),
+        )
+        calibration_block = (
+            (
+                calibration_time - int(patch_router_calibration_start_idx)
+            ).clamp_min(0)
+            * int(patch_router_calibration_blocks)
+            // calibration_span
+        ).clamp_max(int(patch_router_calibration_blocks) - 1)
+        if patch_router_calibration_per_penalty:
+            probability_adoption = (
+                pred_residual.patch_router.expert_risk_adoption_source
+                in {"benefit_probability", "utility_veto"}
+            )
+            threshold_selection = (
+                _select_recall_constrained_risk_threshold_by_penalty(
+                    score_n=calibration_tensors["score"],
+                    gain_n=calibration_tensors["gain"],
+                    block_n=calibration_block,
+                    penalty_n=calibration_tensors["penalty"],
+                    penalty_names=penalty_names,
+                    min_gain_cost_ratio=patch_router_calibration_min_gain_cost_ratio,
+                    min_block_net_gain=patch_router_calibration_min_block_net_gain,
+                    no_adoption_threshold=(
+                        1.0 if probability_adoption else torch.finfo(torch.float32).max
+                    ),
+                )
+            )
+            threshold_by_penalty = threshold_selection["threshold_by_penalty"]
+            pred_residual.patch_router.set_expert_risk_adopt_threshold_by_penalty(
+                [float(threshold_by_penalty[name]) for name in penalty_names]
+            )
+        else:
+            threshold_selection = _select_recall_constrained_risk_threshold(
+                score_n=calibration_tensors["score"],
+                gain_n=calibration_tensors["gain"],
+                block_n=calibration_block,
+                min_gain_cost_ratio=patch_router_calibration_min_gain_cost_ratio,
+                min_block_net_gain=patch_router_calibration_min_block_net_gain,
+            )
+            pred_residual.patch_router.set_expert_risk_adopt_threshold(
+                float(threshold_selection["threshold"])
+            )
+        patch_router_temporal_calibration_summary = {
+            "source_split": "train_tail",
+            "source_range": [
+                int(patch_router_calibration_start_idx),
+                int(len(dtr)),
+            ],
+            "source_windows": int(len(calibration_indices)),
+            "test_y_base_used": False,
+            **threshold_selection,
+        }
+        if patch_router_calibration_per_penalty:
+            threshold_text = ", ".join(
+                f"{name}={float(threshold_selection['threshold_by_penalty'][name]):.6f}"
+                for name in penalty_names
+            )
+        else:
+            threshold_text = f"threshold={float(threshold_selection['threshold']):.6f}"
+        print(
+            "Patch risk threshold calibrated: "
+            f"source=train[{patch_router_calibration_start_idx}:{len(dtr)}], "
+            f"{threshold_text}, "
+            f"recall={float(threshold_selection['positive_recall']):.4f}, "
+            f"gain_cost={float(threshold_selection['gain_cost_ratio']):.4f}"
+        )
+
     if memory_enable:
         if cluster_memory_bank is not None and cluster_memory_bank.total_updates > 0:
             prototypes_kt = cluster_memory_bank.finalize()
@@ -13042,6 +7027,14 @@ def main():
         save_cluster_memory(memory_path, prototypes_kt, cluster_id_c, channel_names, meta=memory_meta)
         print(f"Saved cluster memory to: {memory_path}")
 
+    best_checkpoint_path = None
+    best_checkpoint_meta = None
+    best_checkpoint_model_state = None
+    best_checkpoint_gate_state = None
+    best_checkpoint_pred_residual_state = None
+    best_checkpoint_dynamic_lambda_state = None
+    best_checkpoint_learnable_lambda_state = None
+    best_checkpoint_learnable_output_anchor_state = None
     if bool(memory_cfg.get("save_checkpoint", False)):
         ckpt_path = str(memory_cfg.get("checkpoint_path", os.path.join(out_dir, "best_checkpoint.pt")))
         meta = {
@@ -13057,18 +7050,28 @@ def main():
             "gate_feature_names": _gate_feature_names_for_mode(gate_feature_mode),
             "penalty_names": list(penalty_names),
             "best_epoch": best_epoch.detach().cpu(),
+            "shared_moe_across_clusters": bool(shared_moe_across_clusters),
+            "shared_moe_best_epoch": int(shared_moe_best_epoch),
         }
-        pred_residual_state = None if pred_residual is None else pred_residual.state_dict()
-        dynamic_lambda_state = None if dynamic_lambda is None else dynamic_lambda.state_dict()
-        learnable_lambda_state = None if learnable_lambda is None else learnable_lambda.state_dict()
+        best_checkpoint_path = ckpt_path
+        best_checkpoint_meta = meta
+        best_checkpoint_model_state = _clone_module_state_dict(model)
+        best_checkpoint_gate_state = _clone_module_state_dict(gate)
+        best_checkpoint_pred_residual_state = _clone_module_state_dict(pred_residual)
+        best_checkpoint_dynamic_lambda_state = _clone_module_state_dict(dynamic_lambda)
+        best_checkpoint_learnable_lambda_state = _clone_module_state_dict(learnable_lambda)
+        best_checkpoint_learnable_output_anchor_state = _clone_module_state_dict(learnable_output_anchor)
+        assert best_checkpoint_model_state is not None
+        assert best_checkpoint_gate_state is not None
         save_cluster_checkpoint(
             ckpt_path,
-            model.state_dict(),
-            gate.state_dict(),
+            best_checkpoint_model_state,
+            best_checkpoint_gate_state,
             meta,
-            pred_residual_state=pred_residual_state,
-            dynamic_lambda_state=dynamic_lambda_state,
-            learnable_lambda_state=learnable_lambda_state,
+            pred_residual_state=best_checkpoint_pred_residual_state,
+            dynamic_lambda_state=best_checkpoint_dynamic_lambda_state,
+            learnable_lambda_state=best_checkpoint_learnable_lambda_state,
+            learnable_output_anchor_state=best_checkpoint_learnable_output_anchor_state,
         )
         print(f"Saved best checkpoint to: {ckpt_path}")
     if cluster_penalty_late_allowed_mask_kp is not None:
@@ -13100,6 +7103,715 @@ def main():
     lambda_stats_csv_path = os.path.join(out_dir, "cluster_lambda_stats.csv")
     print_dynamic_lambda_summary(summary_name, lambda_stats, csv_path=lambda_stats_csv_path)
     moe_residual_summary = collect_pred_residual_summary(summary_loader, eval_start=summary_eval_start)
+    if (
+        patch_router_train_oracle_diagnostic
+        and pred_residual is not None
+        and getattr(pred_residual, "patch_router", None) is not None
+        and len(dtr) > 0
+    ):
+        train_residual_summary = collect_pred_residual_summary(dl_tr, eval_start=0)
+        train_patch_summary = train_residual_summary.get("patch_router", {})
+        train_oracle_diagnostic = train_patch_summary.get("oracle_diagnostic")
+        if train_oracle_diagnostic is not None:
+            moe_residual_summary["patch_router"]["train_oracle_diagnostic"] = (
+                train_oracle_diagnostic
+            )
+    def collect_patch_router_temporal_blocks(
+        dataset: Dataset,
+        *,
+        eval_start: int,
+        num_blocks: int,
+        split_name: str,
+    ) -> Dict[str, object]:
+        block_metrics: List[Dict[str, object]] = []
+        for block_idx in range(num_blocks):
+            block_start = block_idx * len(dataset) // num_blocks
+            block_end = (block_idx + 1) * len(dataset) // num_blocks
+            if block_end <= block_start:
+                continue
+            block_loader = DataLoader(
+                Subset(dataset, range(block_start, block_end)),
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            block_summary = collect_pred_residual_summary(
+                block_loader,
+                eval_start=eval_start,
+            )
+            block_oracle = (block_summary.get("patch_router", {}) or {}).get(
+                "oracle_diagnostic",
+                {},
+            ) or {}
+            block_selected_rate = block_oracle.get("selected_class_rate", {}) or {}
+            block_metrics.append(
+                {
+                    "block": int(block_idx),
+                    "start_window": int(block_start),
+                    "end_window": int(block_end),
+                    "num_windows": int(block_end - block_start),
+                    "selected_gain_pct": float(
+                        block_oracle.get("selected_gain_pct", 0.0)
+                    ),
+                    "proposal_oracle_best_recall_at_k": float(
+                        block_oracle.get("proposal_oracle_best_recall_at_k", 0.0)
+                    ),
+                    "shortlist_pairwise_accuracy": float(
+                        block_oracle.get("shortlist_pairwise_accuracy", 0.0)
+                    ),
+                    "risk_sign_recall": float(
+                        block_oracle.get("risk_sign_recall", 0.0)
+                    ),
+                    "risk_sign_precision": float(
+                        block_oracle.get("risk_sign_precision", 0.0)
+                    ),
+                    "selected_utility_recall": float(
+                        block_oracle.get("selected_utility_recall", 0.0)
+                    ),
+                    "selected_utility_precision": float(
+                        block_oracle.get("selected_utility_precision", 0.0)
+                    ),
+                    "selected_gain_to_cost_ratio": float(
+                        block_oracle.get("selected_gain_to_cost_ratio", 0.0)
+                    ),
+                    "skip_rate": float(block_selected_rate.get("skip", 0.0)),
+                    "selected_class_rate": dict(block_selected_rate),
+                    "selected_utility_precision_by_penalty": dict(
+                        block_oracle.get(
+                            "selected_utility_precision_by_penalty",
+                            {},
+                        )
+                        or {}
+                    ),
+                    "selected_mean_gain_by_penalty": dict(
+                        block_oracle.get("selected_mean_gain_by_penalty", {}) or {}
+                    ),
+                    "proposal_oracle_best_recall_by_penalty": dict(
+                        block_oracle.get(
+                            "proposal_oracle_best_recall_by_penalty",
+                            {},
+                        )
+                        or {}
+                    ),
+                }
+            )
+        return {
+            "split": str(split_name),
+            "num_blocks": int(num_blocks),
+            "test_read": False,
+            "blocks": block_metrics,
+        }
+    if (
+        pred_residual is not None
+        and getattr(pred_residual, "patch_router", None) is not None
+    ):
+        if stage2_objective_overlap_batches:
+            moe_residual_summary["patch_router"][
+                "loss_objective_gradient_overlap"
+            ] = {
+                "test_read": False,
+                "max_batches": int(stage2_objective_overlap_max_batches),
+                "batches": stage2_objective_overlap_batches,
+            }
+        if patch_router_train_temporal_blocks > 1 and len(dtr) > 0:
+            moe_residual_summary["patch_router"]["train_temporal_block_metrics"] = (
+                collect_patch_router_temporal_blocks(
+                    dtr,
+                    eval_start=0,
+                    num_blocks=patch_router_train_temporal_blocks,
+                    split_name="train",
+                )
+            )
+        if patch_router_validation_temporal_blocks > 1 and len(dva) > 0:
+            moe_residual_summary["patch_router"]["validation_temporal_block_metrics"] = (
+                collect_patch_router_temporal_blocks(
+                    dva,
+                    eval_start=val_eval_start,
+                    num_blocks=patch_router_validation_temporal_blocks,
+                    split_name="validation",
+                )
+            )
+        if patch_router_score_threshold_curve and len(dtr) > 0 and len(dva) > 0:
+            fixed_penalty_c = pred_residual.patch_router.fixed_penalty_index_by_channel_c
+            fixed_candidate_mode = int(fixed_penalty_c.numel()) == C
+            def score_curve_dataset(dataset: Dataset) -> Dataset:
+                max_windows = int(patch_router_score_threshold_max_windows)
+                if max_windows <= 0 or len(dataset) <= max_windows:
+                    return dataset
+                indices = (
+                    torch.linspace(0, len(dataset) - 1, steps=max_windows)
+                    .round()
+                    .to(dtype=torch.long)
+                    .unique(sorted=True)
+                    .tolist()
+                )
+                return Subset(dataset, indices)
+
+            score_train_dataset = score_curve_dataset(dtr)
+            score_val_dataset = score_curve_dataset(dva)
+            chronological_train_loader = DataLoader(
+                score_train_dataset,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            train_score_tensors = collect_patch_risk_calibration_tensors(
+                chronological_train_loader,
+                eval_start=0,
+            )
+            score_val_loader = DataLoader(
+                score_val_dataset,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            val_score_tensors = collect_patch_risk_calibration_tensors(
+                score_val_loader,
+                eval_start=val_eval_start,
+            )
+            fixed_penalty_cpu = fixed_penalty_c.detach().cpu()
+            active_channel_c = (
+                fixed_penalty_cpu >= 0
+                if fixed_candidate_mode
+                else torch.ones(C, dtype=torch.bool)
+            )
+            routing_scope = (
+                "fixed_channel_candidate"
+                if fixed_candidate_mode
+                else "dynamic_patch_candidate"
+            )
+            configured_threshold = float(
+                pred_residual.patch_router.expert_risk_adopt_threshold
+            )
+
+            def score_curve_for_split(
+                tensors: Dict[str, torch.Tensor],
+                *,
+                score_key: str = "score",
+                fixed_threshold: float = configured_threshold,
+            ) -> Dict[str, object]:
+                aggregate = _risk_score_threshold_curve_summary(
+                    score_n=tensors[score_key][:, active_channel_c],
+                    gain_n=tensors["gain"][:, active_channel_c],
+                    fixed_threshold=fixed_threshold,
+                )
+                per_channel = []
+                for channel_idx in range(C):
+                    channel_meta: Dict[str, object] = {
+                        "channel_index": int(channel_idx),
+                        "channel": str(channel_names[channel_idx]),
+                        "routing_scope": routing_scope,
+                    }
+                    if fixed_candidate_mode:
+                        penalty_idx = int(fixed_penalty_cpu[channel_idx].item())
+                        if penalty_idx < 0:
+                            continue
+                        channel_meta.update(
+                            {
+                                "penalty_index": penalty_idx,
+                                "penalty": str(penalty_names[penalty_idx]),
+                            }
+                        )
+                    per_channel.append(
+                        {
+                            **channel_meta,
+                            **_risk_score_threshold_curve_summary(
+                                score_n=tensors[score_key][:, channel_idx],
+                                gain_n=tensors["gain"][:, channel_idx],
+                                fixed_threshold=fixed_threshold,
+                            ),
+                        }
+                    )
+                per_penalty = []
+                for penalty_idx, penalty_name in enumerate(penalty_names):
+                    if fixed_candidate_mode:
+                        penalty_channel_c = fixed_penalty_cpu == int(penalty_idx)
+                        if not bool(penalty_channel_c.any().item()):
+                            continue
+                        penalty_score = tensors[score_key][:, penalty_channel_c]
+                        penalty_gain = tensors["gain"][:, penalty_channel_c]
+                        channel_indices = torch.nonzero(
+                            penalty_channel_c,
+                            as_tuple=False,
+                        ).reshape(-1)
+                    else:
+                        penalty_entry_mask = tensors["penalty"] == int(penalty_idx)
+                        if not bool(penalty_entry_mask.any().item()):
+                            continue
+                        penalty_score = tensors[score_key][penalty_entry_mask]
+                        penalty_gain = tensors["gain"][penalty_entry_mask]
+                        channel_indices = torch.nonzero(
+                            penalty_entry_mask.any(dim=(0, 2)),
+                            as_tuple=False,
+                        ).reshape(-1)
+                    per_penalty.append(
+                        {
+                            "penalty_index": int(penalty_idx),
+                            "penalty": str(penalty_name),
+                            "routing_scope": routing_scope,
+                            "channel_indices": [
+                                int(value)
+                                for value in channel_indices.tolist()
+                            ],
+                            **_risk_score_threshold_curve_summary(
+                                score_n=penalty_score,
+                                gain_n=penalty_gain,
+                                fixed_threshold=fixed_threshold,
+                            ),
+                        }
+                    )
+                return {
+                    **aggregate,
+                    "per_channel": per_channel,
+                    "per_penalty": per_penalty,
+                }
+
+            moe_residual_summary["patch_router"]["score_threshold_curve"] = {
+                "test_read": False,
+                "routing_scope": routing_scope,
+                "train_sampled_windows": int(len(score_train_dataset)),
+                "validation_sampled_windows": int(len(score_val_dataset)),
+                "active_channel_mask": [
+                    bool(value) for value in active_channel_c.tolist()
+                ],
+                "train": score_curve_for_split(train_score_tensors),
+                "validation": score_curve_for_split(val_score_tensors),
+            }
+            head_specs = {
+                "executed_risk_score": {
+                    "tensor_key": "score",
+                    "fixed_threshold": configured_threshold,
+                    "native_role": "final executed-candidate adoption decision",
+                },
+                "proposal_adopt_probability": {
+                    "tensor_key": "proposal_adopt_probability",
+                    "fixed_threshold": 0.5,
+                    "native_role": "whether any penalty candidate should be proposed",
+                },
+                "proposal_fixed_probability": {
+                    "tensor_key": "proposal_fixed_probability",
+                    "fixed_threshold": 0.5,
+                    "native_role": "proposal score of the executed candidate",
+                },
+                "proposal_fixed_logit": {
+                    "tensor_key": "proposal_fixed_logit",
+                    "fixed_threshold": 0.0,
+                    "native_role": "proposal logit of the executed candidate",
+                },
+                "risk_fixed_probability": {
+                    "tensor_key": "risk_fixed_probability",
+                    "fixed_threshold": 0.5,
+                    "native_role": "risk-sign probability of the executed candidate",
+                },
+                "risk_domain_disagreement": {
+                    "tensor_key": "risk_domain_disagreement",
+                    "fixed_threshold": 0.0,
+                    "native_role": "temporal-domain risk probability disagreement",
+                },
+                "utility_fixed_score": {
+                    "tensor_key": "utility_fixed_score",
+                    "fixed_threshold": 0.0,
+                    "native_role": "expected utility of the executed candidate",
+                },
+                "pairwise_fixed_score": {
+                    "tensor_key": "pairwise_fixed_score",
+                    "fixed_threshold": 0.0,
+                    "native_role": "pairwise ranking score of the executed candidate",
+                },
+                "lower_quantile_fixed_score": {
+                    "tensor_key": "lower_quantile_fixed_score",
+                    "fixed_threshold": 0.0,
+                    "native_role": "lower-quantile utility of the executed candidate",
+                },
+                "utility_veto_fixed_probability": {
+                    "tensor_key": "utility_veto_fixed_probability",
+                    "fixed_threshold": 0.5,
+                    "native_role": "utility-veto probability of the executed candidate",
+                },
+            }
+            head_target_overlap = {}
+            overlap_temporal_blocks = max(
+                int(patch_router_train_temporal_blocks),
+                int(patch_router_validation_temporal_blocks),
+            )
+
+            def chronological_head_overlap(
+                tensors: Dict[str, torch.Tensor],
+                *,
+                score_key: str,
+                fixed_threshold: float,
+            ) -> List[Dict[str, object]]:
+                num_windows = int(tensors[score_key].shape[0])
+                if overlap_temporal_blocks <= 1 or num_windows == 0:
+                    return []
+                rows = []
+                for block_idx in range(overlap_temporal_blocks):
+                    block_start = block_idx * num_windows // overlap_temporal_blocks
+                    block_end = (
+                        (block_idx + 1) * num_windows // overlap_temporal_blocks
+                    )
+                    if block_end <= block_start:
+                        continue
+                    rows.append(
+                        {
+                            "block": int(block_idx),
+                            "start_window": int(block_start),
+                            "end_window": int(block_end),
+                            "num_windows": int(block_end - block_start),
+                            **_risk_score_threshold_curve_summary(
+                                score_n=tensors[score_key][
+                                    block_start:block_end,
+                                    active_channel_c,
+                                ],
+                                gain_n=tensors["gain"][
+                                    block_start:block_end,
+                                    active_channel_c,
+                                ],
+                                fixed_threshold=fixed_threshold,
+                            ),
+                        }
+                    )
+                return rows
+
+            def score_complementarity_summary(
+                tensors: Dict[str, torch.Tensor],
+                *,
+                score_key: str,
+            ) -> Dict[str, object]:
+                def summarize(
+                    score: torch.Tensor,
+                    gain: torch.Tensor,
+                    base_mse: torch.Tensor,
+                    cross: torch.Tensor,
+                    delta_sq: torch.Tensor,
+                ) -> Dict[str, object]:
+                    score = score.detach().reshape(-1).to(torch.float64)
+                    gain = gain.detach().reshape(-1).to(torch.float64)
+                    base_mse = base_mse.detach().reshape(-1).to(torch.float64)
+                    cross = cross.detach().reshape(-1).to(torch.float64)
+                    delta_sq = delta_sq.detach().reshape(-1).to(torch.float64)
+                    reconstructed_gain = 2.0 * cross - delta_sq
+                    alignment = cross / torch.sqrt(
+                        (base_mse * delta_sq).clamp_min(1.0e-12)
+                    )
+                    optimal_scale = cross / delta_sq.clamp_min(1.0e-12)
+                    normalized_gain = gain / base_mse.clamp_min(1.0e-12)
+                    signals = {
+                        "incremental_gain": gain,
+                        "backbone_mse": base_mse,
+                        "residual_delta_cross": cross,
+                        "delta_energy": delta_sq,
+                        "residual_delta_cosine": alignment.clamp(-1.0, 1.0),
+                        "optimal_delta_scale": optimal_scale.clamp(-5.0, 5.0),
+                        "normalized_incremental_gain": normalized_gain.clamp(
+                            -5.0,
+                            5.0,
+                        ),
+                    }
+                    finite = torch.isfinite(score)
+                    for signal in signals.values():
+                        finite = finite & torch.isfinite(signal)
+                    if not bool(finite.any().item()):
+                        return {"status": "empty", "total_count": 0}
+                    score = score[finite]
+                    signals = {
+                        name: signal[finite] for name, signal in signals.items()
+                    }
+                    gain = signals["incremental_gain"]
+                    positive = gain > 0.0
+                    positive_count = int(positive.sum().item())
+
+                    def pearson(signal: torch.Tensor) -> Optional[float]:
+                        centered_score = score - score.mean()
+                        centered_signal = signal - signal.mean()
+                        denominator = torch.sqrt(
+                            centered_score.square().sum()
+                            * centered_signal.square().sum()
+                        )
+                        if float(denominator.item()) <= 0.0:
+                            return None
+                        return float(
+                            (
+                                (centered_score * centered_signal).sum()
+                                / denominator
+                            ).item()
+                        )
+
+                    top_index = None
+                    if positive_count > 0:
+                        top_index = torch.argsort(
+                            score,
+                            descending=True,
+                            stable=True,
+                        )[:positive_count]
+
+                    def signal_means(signal: torch.Tensor) -> Dict[str, object]:
+                        all_mean = float(signal.mean().item())
+                        beneficial_mean = (
+                            float(signal[positive].mean().item())
+                            if positive_count > 0
+                            else None
+                        )
+                        top_mean = (
+                            float(signal.index_select(0, top_index).mean().item())
+                            if top_index is not None
+                            else None
+                        )
+                        return {
+                            "all": all_mean,
+                            "oracle_beneficial": beneficial_mean,
+                            "top_by_gate": top_mean,
+                            "top_minus_all": (
+                                float(top_mean - all_mean)
+                                if top_mean is not None
+                                else None
+                            ),
+                        }
+
+                    reconstructed = reconstructed_gain[finite]
+                    return {
+                        "status": "ok",
+                        "total_count": int(score.numel()),
+                        "positive_count": positive_count,
+                        "positive_rate": float(
+                            positive.to(torch.float64).mean().item()
+                        ),
+                        "gain_decomposition_max_abs_error": float(
+                            (gain - reconstructed).abs().max().item()
+                        ),
+                        "score_pearson": {
+                            name: pearson(signal)
+                            for name, signal in signals.items()
+                        },
+                        "signal_means": {
+                            name: signal_means(signal)
+                            for name, signal in signals.items()
+                        },
+                    }
+
+                aggregate = summarize(
+                    tensors[score_key][:, active_channel_c],
+                    tensors["gain"][:, active_channel_c],
+                    tensors["base_mse"][:, active_channel_c],
+                    tensors["cross"][:, active_channel_c],
+                    tensors["delta_sq"][:, active_channel_c],
+                )
+                per_channel = []
+                for channel_idx in range(C):
+                    channel_meta: Dict[str, object] = {
+                        "channel_index": int(channel_idx),
+                        "channel": str(channel_names[channel_idx]),
+                        "routing_scope": routing_scope,
+                    }
+                    if fixed_candidate_mode:
+                        penalty_idx = int(fixed_penalty_cpu[channel_idx].item())
+                        if penalty_idx < 0:
+                            continue
+                        channel_meta.update(
+                            {
+                                "penalty_index": penalty_idx,
+                                "penalty": str(penalty_names[penalty_idx]),
+                            }
+                        )
+                    per_channel.append(
+                        {
+                            **channel_meta,
+                            **summarize(
+                                tensors[score_key][:, channel_idx],
+                                tensors["gain"][:, channel_idx],
+                                tensors["base_mse"][:, channel_idx],
+                                tensors["cross"][:, channel_idx],
+                                tensors["delta_sq"][:, channel_idx],
+                            ),
+                        }
+                    )
+                return {**aggregate, "per_channel": per_channel}
+
+            for head_name, head_spec in head_specs.items():
+                if (
+                    patch_router_score_threshold_heads is not None
+                    and head_name not in patch_router_score_threshold_heads
+                ):
+                    continue
+                tensor_key = str(head_spec["tensor_key"])
+                if (
+                    tensor_key not in train_score_tensors
+                    or tensor_key not in val_score_tensors
+                    or int(train_score_tensors[tensor_key].numel()) == 0
+                    or int(val_score_tensors[tensor_key].numel()) == 0
+                ):
+                    continue
+                threshold = float(head_spec["fixed_threshold"])
+                head_target_overlap[head_name] = {
+                    **head_spec,
+                    "train": score_curve_for_split(
+                        train_score_tensors,
+                        score_key=tensor_key,
+                        fixed_threshold=threshold,
+                    ),
+                    "validation": score_curve_for_split(
+                        val_score_tensors,
+                        score_key=tensor_key,
+                        fixed_threshold=threshold,
+                    ),
+                    "train_chronological_blocks": chronological_head_overlap(
+                        train_score_tensors,
+                        score_key=tensor_key,
+                        fixed_threshold=threshold,
+                    ),
+                    "validation_chronological_blocks": chronological_head_overlap(
+                        val_score_tensors,
+                        score_key=tensor_key,
+                        fixed_threshold=threshold,
+                    ),
+                    "train_complementarity": score_complementarity_summary(
+                        train_score_tensors,
+                        score_key=tensor_key,
+                    ),
+                    "validation_complementarity": score_complementarity_summary(
+                        val_score_tensors,
+                        score_key=tensor_key,
+                    ),
+                }
+            moe_residual_summary["patch_router"]["head_target_overlap"] = {
+                "test_read": False,
+                "routing_scope": routing_scope,
+                "chronological_block_count": int(overlap_temporal_blocks),
+                "target": (
+                    "executed-candidate patch MSE gain > 0 on the exact eval output-anchor path"
+                ),
+                "heads": head_target_overlap,
+            }
+        if patch_router_walk_forward_enable and len(dtr) > 0 and len(dva) > 0:
+            fixed_penalty_c = pred_residual.patch_router.fixed_penalty_index_by_channel_c
+            if int(fixed_penalty_c.numel()) != C:
+                raise ValueError(
+                    "walk_forward_reliability requires one fixed penalty index per channel."
+                )
+            chronological_train_loader = DataLoader(
+                dtr,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            train_risk_tensors = collect_patch_risk_calibration_tensors(
+                chronological_train_loader,
+                eval_start=0,
+            )
+            val_risk_tensors = collect_patch_risk_calibration_tensors(
+                dl_va,
+                eval_start=val_eval_start,
+                include_patch_values=(
+                    patch_router_walk_forward_scale_mode
+                    in {"least_squares", "feature_ridge"}
+                ),
+            )
+            train_time_n = train_risk_tensors["time"][:, 0, 0]
+            val_time_n = val_risk_tensors["time"][:, 0, 0]
+            patch_label_delay_q = (
+                torch.arange(
+                    1,
+                    int(pred_residual.patch_router.num_patches) + 1,
+                    dtype=torch.long,
+                )
+                * int(pred_residual.patch_router.patch_len)
+                if patch_router_walk_forward_label_delay_mode == "patch_end"
+                else None
+            )
+            train_audit_start = max(
+                1,
+                min(
+                    int(train_time_n.numel()) - 1,
+                    round(
+                        int(train_time_n.numel())
+                        * (1.0 - patch_router_walk_forward_train_audit_fraction)
+                    ),
+                ),
+            )
+            moe_residual_summary["patch_router"]["train_walk_forward_audit"] = (
+                _walk_forward_patch_reliability_metrics(
+                    train_time_n=train_time_n[:train_audit_start],
+                    train_gain_ncq=train_risk_tensors["gain"][:train_audit_start],
+                    eval_time_n=train_time_n[train_audit_start:],
+                    eval_base_mse_ncq=train_risk_tensors["base_mse"][train_audit_start:],
+                    eval_candidate_mse_ncq=train_risk_tensors["candidate_mse"][train_audit_start:],
+                    eval_base_mae_ncq=train_risk_tensors["base_mae"][train_audit_start:],
+                    eval_candidate_mae_ncq=train_risk_tensors["candidate_mae"][train_audit_start:],
+                    active_channel_mask_c=(fixed_penalty_c >= 0),
+                    train_regime_ncf=train_risk_tensors["regime"][:train_audit_start],
+                    eval_regime_ncf=train_risk_tensors["regime"][train_audit_start:],
+                    max_abs_regime_z=patch_router_walk_forward_max_abs_regime_z,
+                    train_cross_ncq=train_risk_tensors["cross"][:train_audit_start],
+                    train_delta_sq_ncq=train_risk_tensors["delta_sq"][:train_audit_start],
+                    eval_cross_ncq=train_risk_tensors["cross"][train_audit_start:],
+                    eval_delta_sq_ncq=train_risk_tensors["delta_sq"][train_audit_start:],
+                    train_scale_feature_ncqf=train_risk_tensors["scale_feature"][:train_audit_start],
+                    eval_scale_feature_ncqf=train_risk_tensors["scale_feature"][train_audit_start:],
+                    scale_mode=patch_router_walk_forward_scale_mode,
+                    max_scale=patch_router_walk_forward_max_scale,
+                    scale_consensus_blocks=(
+                        patch_router_walk_forward_scale_consensus_blocks
+                    ),
+                    feature_ridge=patch_router_walk_forward_feature_ridge,
+                    feature_update_blocks=(
+                        patch_router_walk_forward_feature_update_blocks
+                    ),
+                    patch_label_delay_q=patch_label_delay_q,
+                    label_delay=patch_router_walk_forward_label_delay,
+                    lookback_windows=patch_router_walk_forward_lookback,
+                    min_history_windows=patch_router_walk_forward_min_history,
+                    history_stride=patch_router_walk_forward_history_stride,
+                    min_mean_gain=patch_router_walk_forward_min_mean_gain,
+                    temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                )
+            )
+            moe_residual_summary["patch_router"]["walk_forward_reliability"] = (
+                _walk_forward_patch_reliability_metrics(
+                    train_time_n=train_time_n,
+                    train_gain_ncq=train_risk_tensors["gain"],
+                    eval_time_n=val_time_n,
+                    eval_base_mse_ncq=val_risk_tensors["base_mse"],
+                    eval_candidate_mse_ncq=val_risk_tensors["candidate_mse"],
+                    eval_base_mae_ncq=val_risk_tensors["base_mae"],
+                    eval_candidate_mae_ncq=val_risk_tensors["candidate_mae"],
+                    active_channel_mask_c=(fixed_penalty_c >= 0),
+                    train_regime_ncf=train_risk_tensors["regime"],
+                    eval_regime_ncf=val_risk_tensors["regime"],
+                    max_abs_regime_z=patch_router_walk_forward_max_abs_regime_z,
+                    train_cross_ncq=train_risk_tensors["cross"],
+                    train_delta_sq_ncq=train_risk_tensors["delta_sq"],
+                    eval_cross_ncq=val_risk_tensors["cross"],
+                    eval_delta_sq_ncq=val_risk_tensors["delta_sq"],
+                    eval_base_residual_ncqr=val_risk_tensors[
+                        "base_residual_patch"
+                    ],
+                    eval_candidate_delta_ncqr=val_risk_tensors[
+                        "candidate_delta_patch"
+                    ],
+                    train_scale_feature_ncqf=train_risk_tensors["scale_feature"],
+                    eval_scale_feature_ncqf=val_risk_tensors["scale_feature"],
+                    scale_mode=patch_router_walk_forward_scale_mode,
+                    max_scale=patch_router_walk_forward_max_scale,
+                    scale_consensus_blocks=(
+                        patch_router_walk_forward_scale_consensus_blocks
+                    ),
+                    feature_ridge=patch_router_walk_forward_feature_ridge,
+                    feature_update_blocks=(
+                        patch_router_walk_forward_feature_update_blocks
+                    ),
+                    patch_label_delay_q=patch_label_delay_q,
+                    label_delay=patch_router_walk_forward_label_delay,
+                    lookback_windows=patch_router_walk_forward_lookback,
+                    min_history_windows=patch_router_walk_forward_min_history,
+                    history_stride=patch_router_walk_forward_history_stride,
+                    min_mean_gain=patch_router_walk_forward_min_mean_gain,
+                    temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                )
+            )
     if bool(portrait_cfg.get("enable", False)) and (avg_probs_summary is not None) and len(penalty_names) > 0:
         portrait_dir = portrait_cfg.get("out_dir", os.path.join(out_dir, "cluster_portraits"))
         portrait_dpi = int(portrait_cfg.get("dpi", 140))
@@ -13134,6 +7846,8 @@ def main():
     pred_residual_selector_model = None
     pred_residual_selector_summary = None
     pred_residual_selection_summary = None
+    learnable_output_anchor_refiner_summary = None
+    learnable_output_anchor_test_refiner_summary = None
     moe_gate_penalty_hit_summary = None
     penalty_explainability_summary = None
     penalty_route_learnability_summary = None
@@ -13143,6 +7857,9 @@ def main():
     )
     if skip_test:
         print("eval.skip_test=true: test split windows, evaluation, and metrics are disabled.")
+    if learnable_output_anchor is not None:
+        learnable_output_anchor.clear_active_channel_mask()
+        learnable_output_anchor.clear_active_channel_horizon_mask()
     if len(dva) > 0:
         val_loader_summary = DataLoader(dva, batch_size=int(cfg["train"]["batch_size"]), shuffle=False)
         val_loss_best_k, val_mse_best_k, val_mae_best_k, val_mse_c_base, val_mae_c_base, _, _, _ = eval_loop_with_history(
@@ -13175,26 +7892,524 @@ def main():
             "per_channel_mse": [float(v) for v in val_mse_c_base.detach().cpu().tolist()],
             "per_channel_mae": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
         }
-        residual_selection_policy = str(pred_residual_cfg.get("selection_policy", "none")).lower()
-        if residual_selection_policy in {"false", "off", "disable", "disabled"}:
-            residual_selection_policy = "none"
+        if learnable_output_anchor is not None:
+            (
+                val_loss_static_k,
+                val_mse_static_k,
+                val_mae_static_k,
+                val_mse_c_static,
+                val_mae_c_static,
+                _,
+                _,
+                _,
+            ) = eval_loop_with_history(
+                model, gate, lam_kp_best,
+                penalty_names, penalty_fns,
+                val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                select_ranks=select_ranks,
+                collect_plot=False, channel_count=C,
+                mse_weight=mse_weight,
+                gate_entropy_weight=gate_entropy_weight,
+                gate_balance_weight=gate_balance_weight,
+                gate_soft_weight=gate_soft_weight,
+                gate_entropy_target_frac=gate_entropy_target_frac,
+                penalty_scale=penalty_scale,
+                dynamic_lambda=dynamic_lambda,
+                lambda_min_kp=lambda_min_kp,
+                mae_objective_weight=mae_eval_weight,
+                mae_objective_kind=mae_objective_kind,
+                mae_objective_beta=mae_objective_beta,
+                pred_residual=pred_residual,
+                eval_start=val_eval_start,
+                learnable_output_anchor=None,
+            )
+            static_val_summary = {
+                "avg_loss": float(reduce_cluster_metric(val_loss_static_k, cluster_weight_k).item()),
+                "avg_mse": float(reduce_cluster_metric(val_mse_static_k, cluster_weight_k).item()),
+                "avg_mae": float(reduce_cluster_metric(val_mae_static_k, cluster_weight_k).item()),
+                "per_cluster_loss": [float(v) for v in val_loss_static_k.detach().cpu().tolist()],
+                "per_cluster_mse": [float(v) for v in val_mse_static_k.detach().cpu().tolist()],
+                "per_cluster_mae": [float(v) for v in val_mae_static_k.detach().cpu().tolist()],
+                "per_channel_mse": [float(v) for v in val_mse_c_static.detach().cpu().tolist()],
+                "per_channel_mae": [float(v) for v in val_mae_c_static.detach().cpu().tolist()],
+            }
+            learnable_adoption_cfg = learnable_output_anchor_cfg.get("adoption", {}) or {}
+            if not isinstance(learnable_adoption_cfg, dict):
+                learnable_adoption_cfg = {"adopt_on_val": bool(learnable_adoption_cfg)}
+            segment_count_cfg = int(learnable_adoption_cfg.get("eval_segments", 4))
+            segment_ranges = _contiguous_segment_ranges(len(dva), segment_count_cfg)
+
+            def _collect_learnable_segment_metrics(
+                *,
+                collect_channel_horizon: bool = False,
+            ) -> Tuple[
+                List[Dict[str, float]],
+                List[Dict[str, torch.Tensor]],
+                List[Dict[str, torch.Tensor]],
+            ]:
+                metrics: List[Dict[str, float]] = []
+                channel_metrics: List[Dict[str, torch.Tensor]] = []
+                channel_horizon_metrics: List[Dict[str, torch.Tensor]] = []
+                if len(segment_ranges) <= 1:
+                    return metrics, channel_metrics, channel_horizon_metrics
+                for segment_start, segment_end in segment_ranges:
+                    segment_loader = DataLoader(
+                        Subset(dva, range(segment_start, segment_end)),
+                        batch_size=int(cfg["train"]["batch_size"]),
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=pin_mem,
+                    )
+                    refined_ch_collector: Optional[Dict[str, object]] = {} if collect_channel_horizon else None
+                    (
+                        _,
+                        segment_mse_refined_k,
+                        segment_mae_refined_k,
+                        segment_mse_refined_c,
+                        segment_mae_refined_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop_with_history(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        segment_loader, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        eval_start=val_eval_start,
+                        learnable_output_anchor=learnable_output_anchor,
+                        channel_horizon_metric_collector=refined_ch_collector,
+                    )
+                    static_ch_collector: Optional[Dict[str, object]] = {} if collect_channel_horizon else None
+                    (
+                        _,
+                        segment_mse_static_k,
+                        segment_mae_static_k,
+                        segment_mse_static_c,
+                        segment_mae_static_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop_with_history(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        segment_loader, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        eval_start=val_eval_start,
+                        learnable_output_anchor=None,
+                        channel_horizon_metric_collector=static_ch_collector,
+                    )
+                    metrics.append(
+                        {
+                            "start": float(segment_start),
+                            "end": float(segment_end),
+                            "static_mse": float(
+                                reduce_cluster_metric(segment_mse_static_k, cluster_weight_k).item()
+                            ),
+                            "static_mae": float(
+                                reduce_cluster_metric(segment_mae_static_k, cluster_weight_k).item()
+                            ),
+                            "refined_mse": float(
+                                reduce_cluster_metric(segment_mse_refined_k, cluster_weight_k).item()
+                            ),
+                            "refined_mae": float(
+                                reduce_cluster_metric(segment_mae_refined_k, cluster_weight_k).item()
+                            ),
+                        }
+                    )
+                    channel_metrics.append(
+                        {
+                            "static_mse_c": segment_mse_static_c.detach().cpu(),
+                            "static_mae_c": segment_mae_static_c.detach().cpu(),
+                            "refined_mse_c": segment_mse_refined_c.detach().cpu(),
+                            "refined_mae_c": segment_mae_refined_c.detach().cpu(),
+                        }
+                    )
+                    if collect_channel_horizon and refined_ch_collector is not None and static_ch_collector is not None:
+                        segment_mse_refined_ch, segment_mae_refined_ch = _finalize_channel_horizon_metric_collector(
+                            refined_ch_collector
+                        )
+                        segment_mse_static_ch, segment_mae_static_ch = _finalize_channel_horizon_metric_collector(
+                            static_ch_collector
+                        )
+                        channel_horizon_metrics.append(
+                            {
+                                "static_mse_ch": segment_mse_static_ch,
+                                "static_mae_ch": segment_mae_static_ch,
+                                "refined_mse_ch": segment_mse_refined_ch,
+                                "refined_mae_ch": segment_mae_refined_ch,
+                            }
+                        )
+                return metrics, channel_metrics, channel_horizon_metrics
+
+            segment_metrics, segment_channel_metrics, segment_channel_horizon_metrics = _collect_learnable_segment_metrics()
+            unmasked_val_summary = dict(val_summary)
+            adopted_channel_mask = None
+            adopted_channel_horizon_mask = None
+            learnable_channel_adoption_summary = None
+            learnable_channel_horizon_adoption_summary = None
+            adoption_scope = str(learnable_adoption_cfg.get("adoption_scope", "global")).lower()
+            adoption_scope_norm = _normalize_learnable_output_anchor_adoption_scope(adoption_scope)
+            apply_selected_learnable_mask = False
+
+            def _collect_learnable_channel_horizon_metrics(
+                *,
+                use_learnable: bool,
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
+                metric_collector: Dict[str, object] = {}
+                eval_loop_with_history(
+                    model, gate, lam_kp_best,
+                    penalty_names, penalty_fns,
+                    val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    eval_start=val_eval_start,
+                    learnable_output_anchor=learnable_output_anchor if use_learnable else None,
+                    channel_horizon_metric_collector=metric_collector,
+                )
+                return _finalize_channel_horizon_metric_collector(metric_collector)
+
+            if adoption_scope_norm in {"channel", "hybrid"}:
+                keep_c, learnable_channel_adoption_summary = _select_learnable_output_anchor_channel_mask(
+                    static_mse_c=val_mse_c_static,
+                    refined_mse_c=val_mse_c_base,
+                    static_mae_c=val_mae_c_static,
+                    refined_mae_c=val_mae_c_base,
+                    segment_channel_metrics=segment_channel_metrics,
+                    adoption_cfg=learnable_adoption_cfg,
+                )
+                learnable_output_anchor.set_active_channel_mask(keep_c.to(device=device, dtype=torch.float32))
+                learnable_output_anchor.clear_active_channel_horizon_mask()
+                adopted_channel_mask = [bool(v) for v in keep_c.tolist()]
+                apply_selected_learnable_mask = True
+            elif adoption_scope_norm == "channel_horizon":
+                learnable_output_anchor.clear_active_channel_mask()
+                learnable_output_anchor.clear_active_channel_horizon_mask()
+                segment_metrics, segment_channel_metrics, segment_channel_horizon_metrics = (
+                    _collect_learnable_segment_metrics(collect_channel_horizon=True)
+                )
+                static_mse_ch, static_mae_ch = _collect_learnable_channel_horizon_metrics(use_learnable=False)
+                refined_mse_ch, refined_mae_ch = _collect_learnable_channel_horizon_metrics(use_learnable=True)
+                keep_ch, learnable_channel_horizon_adoption_summary = (
+                    _select_learnable_output_anchor_channel_horizon_mask(
+                        static_mse_ch=static_mse_ch,
+                        refined_mse_ch=refined_mse_ch,
+                        static_mae_ch=static_mae_ch,
+                        refined_mae_ch=refined_mae_ch,
+                        adoption_cfg=learnable_adoption_cfg,
+                        segment_channel_horizon_metrics=segment_channel_horizon_metrics,
+                    )
+                )
+                learnable_output_anchor.set_active_channel_horizon_mask(
+                    keep_ch.to(device=device, dtype=torch.float32)
+                )
+                adopted_channel_horizon_mask = [
+                    [bool(v) for v in row] for row in keep_ch.tolist()
+                ]
+                adopted_channel_mask = [any(row) for row in adopted_channel_horizon_mask]
+                apply_selected_learnable_mask = True
+
+            if apply_selected_learnable_mask:
+                (
+                    val_loss_best_k,
+                    val_mse_best_k,
+                    val_mae_best_k,
+                    val_mse_c_base,
+                    val_mae_c_base,
+                    _,
+                    _,
+                    _,
+                ) = eval_loop_with_history(
+                    model, gate, lam_kp_best,
+                    penalty_names, penalty_fns,
+                    val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    eval_start=val_eval_start,
+                    learnable_output_anchor=learnable_output_anchor,
+                )
+                val_summary = {
+                    "avg_loss": float(reduce_cluster_metric(val_loss_best_k, cluster_weight_k).item()),
+                    "avg_mse": float(reduce_cluster_metric(val_mse_best_k, cluster_weight_k).item()),
+                    "avg_mae": float(reduce_cluster_metric(val_mae_best_k, cluster_weight_k).item()),
+                    "per_cluster_loss": [float(v) for v in val_loss_best_k.detach().cpu().tolist()],
+                    "per_cluster_mse": [float(v) for v in val_mse_best_k.detach().cpu().tolist()],
+                    "per_cluster_mae": [float(v) for v in val_mae_best_k.detach().cpu().tolist()],
+                    "per_channel_mse": [float(v) for v in val_mse_c_base.detach().cpu().tolist()],
+                    "per_channel_mae": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
+                }
+                segment_metrics, _, _ = _collect_learnable_segment_metrics()
+            learnable_output_anchor_refiner_summary = _summarize_learnable_output_anchor_refiner(
+                static_mse=float(static_val_summary["avg_mse"]),
+                static_mae=float(static_val_summary["avg_mae"]),
+                refined_mse=float(val_summary["avg_mse"]),
+                refined_mae=float(val_summary["avg_mae"]),
+                unmasked_refined_mse=float(unmasked_val_summary["avg_mse"]),
+                unmasked_refined_mae=float(unmasked_val_summary["avg_mae"]),
+                cfg=learnable_output_anchor_cfg,
+                skip_test=skip_test,
+                num_channels=C,
+                segment_metrics=segment_metrics,
+                adopted_channel_mask=adopted_channel_mask,
+                adopted_channel_horizon_mask=adopted_channel_horizon_mask,
+            )
+            if learnable_channel_adoption_summary is not None:
+                learnable_output_anchor_refiner_summary["channel_adoption"] = (
+                    learnable_channel_adoption_summary
+                )
+            if learnable_channel_horizon_adoption_summary is not None:
+                learnable_output_anchor_refiner_summary["channel_horizon_adoption"] = (
+                    learnable_channel_horizon_adoption_summary
+                )
+            learnable_output_anchor_summary["adoption_guard_applied"] = True
+            learnable_output_anchor_summary["adopted_on_val"] = bool(
+                learnable_output_anchor_refiner_summary["adopted"]
+            )
+            if not bool(learnable_output_anchor_refiner_summary["final_eval_uses_learnable"]):
+                learnable_output_anchor_summary["final_eval_enable"] = False
+                learnable_output_anchor_summary["final_eval_reason"] = str(
+                    learnable_output_anchor_refiner_summary["fallback_reason"]
+                )
+                val_summary = static_val_summary
+                val_mse_c_base = val_mse_c_static
+                val_mae_c_base = val_mae_c_static
+                learnable_output_anchor.clear_active_channel_mask()
+                learnable_output_anchor.clear_active_channel_horizon_mask()
+                best_checkpoint_learnable_output_anchor_state = _clone_module_state_dict(learnable_output_anchor)
+                learnable_output_anchor = None
+                print(
+                    "Learnable output anchor rejected by val guard; "
+                    "final evaluation falls back to static anchors."
+                )
+            else:
+                learnable_output_anchor_summary["final_eval_enable"] = True
+                learnable_output_anchor_summary["final_eval_reason"] = (
+                    "val_guard_adopted"
+                    if bool(learnable_output_anchor_refiner_summary["adopted"])
+                    else "adopt_on_val_disabled"
+                )
+                best_checkpoint_learnable_output_anchor_state = _clone_module_state_dict(learnable_output_anchor)
+            if (
+                best_checkpoint_path is not None
+                and best_checkpoint_meta is not None
+                and best_checkpoint_model_state is not None
+                and best_checkpoint_gate_state is not None
+            ):
+                best_checkpoint_meta["learnable_output_anchor_refiner"] = dict(
+                    learnable_output_anchor_refiner_summary
+                )
+                best_checkpoint_meta["learnable_output_anchor_final_eval_enable"] = bool(
+                    learnable_output_anchor_refiner_summary["final_eval_uses_learnable"]
+                )
+                best_checkpoint_meta["learnable_output_anchor_state_status"] = (
+                    "trained_refiner_state_adopted"
+                    if bool(learnable_output_anchor_refiner_summary["final_eval_uses_learnable"])
+                    else "trained_refiner_state_rejected_by_val_guard"
+                )
+                save_cluster_checkpoint(
+                    best_checkpoint_path,
+                    best_checkpoint_model_state,
+                    best_checkpoint_gate_state,
+                    best_checkpoint_meta,
+                    pred_residual_state=best_checkpoint_pred_residual_state,
+                    dynamic_lambda_state=best_checkpoint_dynamic_lambda_state,
+                    learnable_lambda_state=best_checkpoint_learnable_lambda_state,
+                    learnable_output_anchor_state=best_checkpoint_learnable_output_anchor_state,
+                )
+                print(
+                    "Updated best checkpoint learnable-output-anchor adoption metadata: "
+                    f"{best_checkpoint_path}"
+                )
+            if not skip_test and len(dte) > 0:
+                test_loader_summary = DataLoader(
+                    dte,
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+                (
+                    _,
+                    test_mse_static_k,
+                    test_mae_static_k,
+                    test_mse_static_c,
+                    test_mae_static_c,
+                    _,
+                    _,
+                    _,
+                ) = eval_loop_with_history(
+                    model, gate, lam_kp_best,
+                    penalty_names, penalty_fns,
+                    test_loader_summary, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    eval_start=test_eval_start,
+                    learnable_output_anchor=None,
+                )
+                if learnable_output_anchor is None:
+                    test_mse_refined_k = test_mse_static_k
+                    test_mae_refined_k = test_mae_static_k
+                    test_mse_refined_c = test_mse_static_c
+                    test_mae_refined_c = test_mae_static_c
+                else:
+                    (
+                        _,
+                        test_mse_refined_k,
+                        test_mae_refined_k,
+                        test_mse_refined_c,
+                        test_mae_refined_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop_with_history(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        test_loader_summary, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        eval_start=test_eval_start,
+                        learnable_output_anchor=learnable_output_anchor,
+                    )
+                test_static_mse = float(reduce_cluster_metric(test_mse_static_k, cluster_weight_k).item())
+                test_static_mae = float(reduce_cluster_metric(test_mae_static_k, cluster_weight_k).item())
+                test_refined_mse = float(reduce_cluster_metric(test_mse_refined_k, cluster_weight_k).item())
+                test_refined_mae = float(reduce_cluster_metric(test_mae_refined_k, cluster_weight_k).item())
+                test_mse_gain = test_static_mse - test_refined_mse
+                test_mae_gain = test_static_mae - test_refined_mae
+
+                def _rel_pct(delta: float, denom: float) -> Optional[float]:
+                    denom = abs(float(denom))
+                    if denom <= 0.0:
+                        return None
+                    return 100.0 * float(delta) / denom
+
+                learnable_output_anchor_test_refiner_summary = {
+                    "enable": True,
+                    "test_read": True,
+                    "selection_source": "val_guard_only",
+                    "final_eval_uses_learnable": bool(
+                        learnable_output_anchor_refiner_summary["final_eval_uses_learnable"]
+                    ),
+                    "val_adopted": bool(learnable_output_anchor_refiner_summary["adopted"]),
+                    "test_static_mse": test_static_mse,
+                    "test_static_mae": test_static_mae,
+                    "test_refined_mse": test_refined_mse,
+                    "test_refined_mae": test_refined_mae,
+                    "test_mse_gain": float(test_mse_gain),
+                    "test_mae_gain": float(test_mae_gain),
+                    "test_mse_gain_rel_pct": _rel_pct(test_mse_gain, test_static_mse),
+                    "test_mae_gain_rel_pct": _rel_pct(test_mae_gain, test_static_mae),
+                    "per_cluster_static_mse": [float(v) for v in test_mse_static_k.detach().cpu().tolist()],
+                    "per_cluster_static_mae": [float(v) for v in test_mae_static_k.detach().cpu().tolist()],
+                    "per_cluster_refined_mse": [float(v) for v in test_mse_refined_k.detach().cpu().tolist()],
+                    "per_cluster_refined_mae": [float(v) for v in test_mae_refined_k.detach().cpu().tolist()],
+                    "per_channel_static_mse": [float(v) for v in test_mse_static_c.detach().cpu().tolist()],
+                    "per_channel_static_mae": [float(v) for v in test_mae_static_c.detach().cpu().tolist()],
+                    "per_channel_refined_mse": [float(v) for v in test_mse_refined_c.detach().cpu().tolist()],
+                    "per_channel_refined_mae": [float(v) for v in test_mae_refined_c.detach().cpu().tolist()],
+                }
+                print(
+                    "Learnable output anchor test check: "
+                    f"static={test_static_mse:.6f}/{test_static_mae:.6f}, "
+                    f"refined={test_refined_mse:.6f}/{test_refined_mae:.6f}, "
+                    f"gain={test_mse_gain:.6f}/{test_mae_gain:.6f}"
+                )
+        residual_selection_policy = _normalize_pred_residual_selection_policy(
+            pred_residual_cfg.get("selection_policy", "none")
+        )
         if residual_selection_policy not in {
             "none",
             "val_mse_channel",
             "val_mse_scale",
             "val_mse_scale_holdout",
             "val_mse_candidate_channel",
+            "val_mae_candidate_channel",
         }:
             raise ValueError(
                 "Unsupported moe.pred_side_residual.selection_policy="
                 f"'{residual_selection_policy}'. Expected none, val_mse_channel, val_mse_scale, "
-                "val_mse_scale_holdout, or val_mse_candidate_channel."
+                "val_mse_scale_holdout, val_mse_candidate_channel, val_mae_candidate_channel, or "
+                "val_mse_candidate_channel_guarded."
             )
         if pred_residual is not None and residual_selection_policy in {
             "val_mse_channel",
             "val_mse_scale",
             "val_mse_scale_holdout",
             "val_mse_candidate_channel",
+            "val_mae_candidate_channel",
         }:
             zero_residual_scale_c = torch.zeros(C, device=device, dtype=torch.float32)
             residual_scale_mean_value = 0.0
@@ -13586,9 +8801,36 @@ def main():
                 use_residual_c = pred_residual_channel_scale_c.detach().cpu() > 1.0e-8
                 scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
-            elif residual_selection_policy == "val_mse_candidate_channel":
+            elif residual_selection_policy in {"val_mse_candidate_channel", "val_mae_candidate_channel"}:
+                selector_metric = str(
+                    pred_residual_cfg.get(
+                        "selection_metric",
+                        "mae" if residual_selection_policy == "val_mae_candidate_channel" else "mse",
+                    )
+                )
                 min_abs = float(pred_residual_cfg.get("selection_min_abs_improvement", 0.0))
                 min_rel = float(pred_residual_cfg.get("selection_min_rel_improvement", 0.0))
+                min_abs_mae_raw = pred_residual_cfg.get("selection_min_abs_mae_improvement", None)
+                min_abs_mae = float(min_abs_mae_raw) if min_abs_mae_raw is not None else None
+                confirm_fraction = float(pred_residual_cfg.get("selection_confirm_fraction", 0.0))
+                confirm_min_abs_raw = pred_residual_cfg.get("selection_confirm_min_abs_improvement", None)
+                confirm_min_abs = float(confirm_min_abs_raw) if confirm_min_abs_raw is not None else None
+                confirm_min_rel = float(pred_residual_cfg.get("selection_confirm_min_rel_improvement", 0.0))
+                confirm_min_abs_mae_raw = pred_residual_cfg.get("selection_confirm_min_abs_mae_improvement", None)
+                confirm_min_abs_mae = (
+                    float(confirm_min_abs_mae_raw) if confirm_min_abs_mae_raw is not None else None
+                )
+                segment_count = int(pred_residual_cfg.get("selection_segment_count", 0))
+                segment_min_positive_raw = pred_residual_cfg.get("selection_segment_min_positive", None)
+                segment_min_positive = (
+                    int(segment_min_positive_raw) if segment_min_positive_raw is not None else None
+                )
+                segment_min_abs_raw = pred_residual_cfg.get("selection_segment_min_abs_improvement", None)
+                segment_min_abs = float(segment_min_abs_raw) if segment_min_abs_raw is not None else None
+                segment_min_abs_mae_raw = pred_residual_cfg.get("selection_segment_min_abs_mae_improvement", None)
+                segment_min_abs_mae = (
+                    float(segment_min_abs_mae_raw) if segment_min_abs_mae_raw is not None else None
+                )
                 allowed_mask_cp = None
                 if cluster_penalty_allowed_mask_kp is not None and int(cluster_penalty_allowed_mask_kp.numel()) > 0:
                     allowed_kp = cluster_penalty_allowed_mask_kp.detach().cpu().to(dtype=torch.bool)
@@ -13612,6 +8854,7 @@ def main():
                     model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                     train_stat_anchor_pc=train_stat_anchor_pc,
                     train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
                     candidate_feature_mode="base",
                 )
                 if candidate_tensors is None:
@@ -13619,13 +8862,30 @@ def main():
                     scale_values = [0.0 for _ in range(C)]
                     residual_scale_mean_value = 0.0
                 else:
+                    candidate_select_indices, candidate_confirm_indices = _candidate_selector_select_confirm_indices(
+                        int(candidate_tensors["base"].shape[0]),
+                        confirm_fraction,
+                    )
+                    if candidate_confirm_indices is not None and confirm_min_abs is None:
+                        confirm_min_abs = min_abs
                     static_selector, candidate_channel_selector_summary = _fit_static_candidate_channel_selector_from_tensors(
                         tensors=candidate_tensors,
                         allowed_mask_cp=allowed_mask_cp,
                         penalty_names=penalty_names,
                         channel_names=channel_names,
+                        select_indices=candidate_select_indices,
+                        eval_indices=candidate_confirm_indices,
                         min_abs_improvement=min_abs,
                         min_rel_improvement=min_rel,
+                        min_abs_mae_improvement=min_abs_mae,
+                        selection_metric=selector_metric,
+                        confirm_min_abs_improvement=confirm_min_abs,
+                        confirm_min_rel_improvement=confirm_min_rel,
+                        confirm_min_abs_mae_improvement=confirm_min_abs_mae,
+                        segment_count=segment_count,
+                        segment_min_positive=segment_min_positive,
+                        segment_min_abs_improvement=segment_min_abs,
+                        segment_min_abs_mae_improvement=segment_min_abs_mae,
                     )
                     pred_residual_selector_model = static_selector.to(device)
                     pred_residual_channel_scale_c = None
@@ -13677,6 +8937,13 @@ def main():
                     min_rel * val_mse_c_pred_base.abs().clamp_min(1.0e-12),
                 )
                 use_residual_c = (val_mse_c_pred_base - val_mse_c_base) > required
+                val_scaled_mse_c, val_scaled_mae_c = _mix_selected_channel_metrics(
+                    base_mse_c=val_mse_c_pred_base,
+                    base_mae_c=val_mae_c_pred_base,
+                    residual_mse_c=val_mse_c_base,
+                    residual_mae_c=val_mae_c_base,
+                    use_residual_c=use_residual_c,
+                )
                 pred_residual_channel_scale_c = use_residual_c.to(device=device, dtype=torch.float32)
                 scale_values = [float(v) for v in pred_residual_channel_scale_c.detach().cpu().tolist()]
                 residual_scale_mean_value = float(pred_residual_channel_scale_c.mean().item())
@@ -13771,6 +9038,7 @@ def main():
         selector_cfg = pred_residual_cfg.get("candidate_selector", {}) or {}
         if pred_residual is not None and moe_enable and P > 0 and bool(selector_cfg.get("enable", False)):
             selector_source_split = str(selector_cfg.get("source_split", "val")).lower()
+            selector_precollected_tensors = None
             if selector_source_split in {"train", "training"}:
                 selector_loader = DataLoader(
                     dtr,
@@ -13785,15 +9053,72 @@ def main():
                 selector_loader = val_loader_summary
                 selector_source_split = "val"
                 selector_eval_start = val_eval_start
+            elif selector_source_split in {"train_val", "train+val", "trainval"}:
+                selector_loader = val_loader_summary
+                selector_source_split = "train_val"
+                selector_eval_start = val_eval_start
             else:
                 raise ValueError(
-                    "moe.pred_side_residual.candidate_selector.source_split must be train or val "
+                    "moe.pred_side_residual.candidate_selector.source_split must be train, val, or train_val "
                     f"(got {selector_source_split!r})."
                 )
             selector_candidate_scale_c, selector_candidate_scale_mode = _candidate_selector_candidate_scale(
                 pred_residual_scale_c=pred_residual_channel_scale_c,
                 selector_cfg=selector_cfg,
             )
+            if selector_source_split == "train_val":
+                train_selector_loader = DataLoader(
+                    dtr,
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+                train_selector_tensors = _collect_pred_residual_selector_tensors(
+                    model=model,
+                    pred_residual=pred_residual,
+                    loader=train_selector_loader,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_count=len(penalty_names),
+                    pred_residual_scale_c=selector_candidate_scale_c,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=0,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
+                    candidate_feature_mode=str(selector_cfg.get("feature_mode", "base")).lower(),
+                )
+                val_selector_tensors = _collect_pred_residual_selector_tensors(
+                    model=model,
+                    pred_residual=pred_residual,
+                    loader=val_loader_summary,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_count=len(penalty_names),
+                    pred_residual_scale_c=selector_candidate_scale_c,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=val_eval_start,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
+                    candidate_feature_mode=str(selector_cfg.get("feature_mode", "base")).lower(),
+                )
+                selector_precollected_tensors = _concat_pred_residual_selector_tensors(
+                    [train_selector_tensors, val_selector_tensors]
+                )
             candidate_selector_model, pred_residual_selector_summary = train_pred_residual_candidate_selector(
                 model=model,
                 pred_residual=pred_residual,
@@ -13814,8 +9139,10 @@ def main():
                 model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
                 allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                 gate_feature_mode=gate_feature_mode,
+                precollected_tensors=selector_precollected_tensors,
             )
             if pred_residual_selector_summary is not None:
                 pred_residual_selector_summary["source_split"] = selector_source_split
@@ -13898,6 +9225,26 @@ def main():
                     ),
                     max_rel_mae_regression=float(selector_cfg.get("adopt_max_rel_mae_regression", 0.0)),
                 )
+                temporal_guard_min_gain_raw = selector_cfg.get("adopt_temporal_block_min_gain_pct", None)
+                if temporal_guard_min_gain_raw is not None:
+                    temporal_metrics = (pred_residual_selector_summary or {}).get("temporal_block_metrics") or {}
+                    temporal_source = str(selector_cfg.get("adopt_temporal_block_source", "holdout")).lower()
+                    temporal_blocks = temporal_metrics.get(temporal_source, [])
+                    min_positive_raw = selector_cfg.get(
+                        "adopt_temporal_block_min_positive_blocks",
+                        selector_cfg.get("adopt_temporal_block_min_positive", None),
+                    )
+                    min_positive = None if min_positive_raw is None else int(min_positive_raw)
+                    temporal_guard = _candidate_selector_temporal_block_adoption_guard(
+                        blocks=temporal_blocks,
+                        min_gain_pct=float(temporal_guard_min_gain_raw),
+                        min_positive_blocks=min_positive,
+                    )
+                    temporal_guard["source"] = temporal_source
+                    selector_adoption["temporal_block_guard"] = temporal_guard
+                    if not bool(temporal_guard.get("passed", False)):
+                        selector_adoption["adopt"] = False
+                        selector_adoption["reason"] = "temporal_block_guard_failed"
                 pred_residual_selector_summary["adoption"] = selector_adoption
                 pred_residual_selection_summary["candidate_selector"] = pred_residual_selector_summary
                 pred_residual_selection_summary["val_selector_avg_mse"] = float(selector_val_summary["avg_mse"])
@@ -13959,6 +9306,7 @@ def main():
                 model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
                 allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                 gate_feature_mode=gate_feature_mode,
             )
@@ -14042,6 +9390,9 @@ def main():
     diagnostics_cfg = cfg.get("diagnostics", {}) or {}
     prediction_diag = bool(diagnostics_cfg.get("save_prediction_intermediates", False))
     prediction_diag_collector = None
+    test_base_metric_collector: Optional[Dict[str, object]] = (
+        {} if not skip_test else None
+    )
     if prediction_diag:
         prediction_sample_count = int(diagnostics_cfg.get("prediction_sample_count", 32))
         prediction_sample_strategy = str(diagnostics_cfg.get("prediction_sample_strategy", "first"))
@@ -14084,6 +9435,7 @@ def main():
             pred_residual_scale_c=pred_residual_channel_scale_c,
             eval_start=test_eval_start,
             diagnostic_collector=prediction_diag_collector,
+            base_metric_collector=test_base_metric_collector,
         )
         gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
         gate_penalty_hit_enable = bool(gate_penalty_hit_cfg.get("enable", True))
@@ -14116,6 +9468,7 @@ def main():
                 model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
                 allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                 gate_feature_mode=gate_feature_mode,
             )
@@ -14217,6 +9570,7 @@ def main():
                 model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
                 gate_feature_mode=gate_feature_mode,
             )
             if payload is not None:
@@ -14275,6 +9629,7 @@ def main():
                     model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                     train_stat_anchor_pc=train_stat_anchor_pc,
                     train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
                     gate_feature_mode=gate_feature_mode,
                 )
                 if tensors is not None:
@@ -14395,6 +9750,9 @@ def main():
     selected_selection_policy = "base"
     selected_avg_mae = None
     selected_avg_mse = None
+    base_avg_mae = None
+    base_avg_mse = None
+    test_gain_pct_vs_base = None
     if not skip_test:
         df = pd.DataFrame({
             "channel": channel_names,
@@ -14406,8 +9764,31 @@ def main():
         avg_mse = float(reduce_cluster_metric(test_mse_k, cluster_weight_k).item())
         selected_avg_mae = avg_mae
         selected_avg_mse = avg_mse
+        if test_base_metric_collector:
+            base_mse_k = test_base_metric_collector["avg_mse_k"]
+            base_mae_c = test_base_metric_collector["mae_c"]
+            base_avg_mse = float(
+                reduce_cluster_metric(
+                    base_mse_k.to(device=cluster_weight_k.device), cluster_weight_k
+                ).item()
+            )
+            base_avg_mae = float(base_mae_c.mean().item())
+            test_gain_pct_vs_base = float(
+                100.0
+                * (base_avg_mse - selected_avg_mse)
+                / max(abs(base_avg_mse), 1.0e-12)
+            )
 
     moe_residual_variant = "none"
+    if pred_residual is not None and moe_enable and P > 0:
+        moe_residual_variant = (
+            "moe_residual_patch_router"
+            if bool(patch_router_cfg.get("enable", False))
+            else "moe_residual"
+        )
+        selected_variant = moe_residual_variant
+        selected_criterion = "checkpoint_validation"
+        selected_selection_policy = "trained_prediction_residual"
     if pred_residual_selection_summary is not None:
         moe_residual_variant = "moe_residual_channel"
         if int(pred_residual_selection_summary.get("num_residual_channels", 0) or 0) > 0:
@@ -14444,7 +9825,9 @@ def main():
     else:
         print(
             f"\nOverall(selected={selected_variant}, moe_residual={moe_residual_variant}): "
-            f"test_MAE={selected_avg_mae:.6f}, test_MSE={selected_avg_mse:.6f}"
+            f"test_MAE={selected_avg_mae:.6f}, test_MSE={selected_avg_mse:.6f}, "
+            f"pre_moe_base_MSE={base_avg_mse:.6f}, "
+            f"gain_vs_pre_moe={test_gain_pct_vs_base:.4f}%"
         )
         final_print(
             "FINAL_TEST "
@@ -14582,6 +9965,7 @@ def main():
             "val_label_start": int(t_train),
             "test_label_start": int(t_val),
             "num_train_windows": int(len(dtr)),
+            "num_optimization_windows": int(len(optimization_dataset)),
             "num_val_windows": int(len(dva)),
             "num_test_windows": int(len(dte)),
             "normalize_train_only": bool(norm_cfg.get("train_only", False)),
@@ -14600,10 +9984,35 @@ def main():
             "shuffle_seed": None if shuffle_seed is None else int(shuffle_seed),
             "freeze_backbone": bool(freeze_backbone),
             "frozen_backbone_params": int(frozen_backbone_params),
+            "backbone_lr": None if backbone_lr is None else float(backbone_lr),
             "loss_normalization": dict(loss_normalization_cfg),
             "lr_warmup_epochs": int(lr_warmup_epochs),
             "lr_warmup_start_factor": float(lr_warmup_start_factor),
             "swa": dict(swa_summary),
+            "overfit_diagnostic": {
+                "enable": bool(overfit_diagnostic_range is not None),
+                "train_window_range": (
+                    [int(overfit_diagnostic_range[0]), int(overfit_diagnostic_range[1])]
+                    if overfit_diagnostic_range is not None
+                    else None
+                ),
+                "num_windows": int(len(optimization_dataset)),
+                "epoch_eval_source": (
+                    "train_subset" if overfit_diagnostic_range is not None else "validation"
+                ),
+                "official_validation_evaluated_each_epoch": bool(
+                    overfit_diagnostic_range is None
+                ),
+                "metric_epochs": [int(v) for v in overfit_diagnostic_metric_epochs],
+                "metrics": overfit_diagnostic_history,
+            },
+        },
+        "stage2_trainable_parameter_groups": stage2_trainable_parameter_groups,
+        "shared_moe": {
+            "shared_across_clusters": bool(shared_moe_across_clusters),
+            "best_epoch": int(shared_moe_best_epoch) if shared_moe_across_clusters else None,
+            "patch_router_replaces_cluster_gate": bool(patch_router_replaces_cluster_gate),
+            "frozen_cluster_gate_params": int(frozen_cluster_gate_for_patch_router),
         },
         "eval": {
             "skip_test": bool(skip_test),
@@ -14643,6 +10052,9 @@ def main():
         "model_train_stat_adapter": model_train_stat_adapter_summary,
         "train_stat_anchor_expert": train_stat_anchor_summary,
         "train_residual_anchor_expert": train_residual_anchor_summary,
+        "learnable_output_anchor": learnable_output_anchor_summary,
+        "learnable_output_anchor_refiner": learnable_output_anchor_refiner_summary,
+        "learnable_output_anchor_test_refiner": learnable_output_anchor_test_refiner_summary,
         "moe_gate_penalty_hit": moe_gate_penalty_hit_summary,
         "penalty_explainability": penalty_explainability_summary,
         "penalty_route_learnability": penalty_route_learnability_summary,
@@ -14745,11 +10157,31 @@ def main():
         "test": None if skip_test else {
             "avg_mae": avg_mae,
             "avg_mse": avg_mse,
+            "base_avg_mae": base_avg_mae,
+            "base_avg_mse": base_avg_mse,
+            "gain_pct_vs_base": test_gain_pct_vs_base,
+            "pre_moe_base_avg_mae": base_avg_mae,
+            "pre_moe_base_avg_mse": base_avg_mse,
+            "gain_pct_vs_pre_moe_base": test_gain_pct_vs_base,
             "per_cluster_loss": [float(v) for v in test_loss_k.detach().cpu().tolist()],
             "per_cluster_mse": [float(v) for v in test_mse_k.detach().cpu().tolist()],
             "per_cluster_mae": [float(v) for v in test_mae_k.detach().cpu().tolist()],
             "per_channel_mse": [float(v) for v in mse_c.detach().cpu().tolist()],
             "per_channel_mae": [float(v) for v in mae_c.detach().cpu().tolist()],
+            "base_per_cluster_mse": [
+                float(v)
+                for v in test_base_metric_collector["avg_mse_k"].tolist()
+            ],
+            "base_per_cluster_mae": [
+                float(v)
+                for v in test_base_metric_collector["avg_mae_k"].tolist()
+            ],
+            "base_per_channel_mse": [
+                float(v) for v in test_base_metric_collector["mse_c"].tolist()
+            ],
+            "base_per_channel_mae": [
+                float(v) for v in test_base_metric_collector["mae_c"].tolist()
+            ],
         },
         "selected": {
             "variant": selected_variant,

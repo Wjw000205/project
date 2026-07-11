@@ -277,6 +277,7 @@ def save_cluster_checkpoint(
     pred_residual_state: Optional[Dict[str, torch.Tensor]] = None,
     dynamic_lambda_state: Optional[Dict[str, torch.Tensor]] = None,
     learnable_lambda_state: Optional[Dict[str, torch.Tensor]] = None,
+    learnable_output_anchor_state: Optional[Dict[str, torch.Tensor]] = None,
     learnable_mse_weight_state: Optional[Dict[str, torch.Tensor]] = None,
 ) -> str:
     payload = {
@@ -290,6 +291,8 @@ def save_cluster_checkpoint(
         payload["dynamic_lambda_state"] = dynamic_lambda_state
     if learnable_lambda_state is not None:
         payload["learnable_lambda_state"] = learnable_lambda_state
+    if learnable_output_anchor_state is not None:
+        payload["learnable_output_anchor_state"] = learnable_output_anchor_state
     if learnable_mse_weight_state is not None:
         payload["learnable_mse_weight_state"] = learnable_mse_weight_state
     torch.save(payload, path)
