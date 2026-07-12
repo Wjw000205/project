@@ -11482,3 +11482,38 @@ Hand back the report and STOP. Do not start a follow-up without me.
   line-ending warnings. Next recommended action is not another test-tuned sweep. If
   further gate improvement is required, add a true patch-level continuous utility
   regression/no-op head and select it on val before any new test read.
+
+## 2026-07-13: anchor participation gate no-harm exploration rejected and restored
+
+- Before exploration, committed the exact delivered named-adapter/periodic-anchor
+  implementation as local rollback point `16424443828e4c5749b56fabe96730749ec86210`.
+  Unrelated untracked figure assets were excluded and preserved.
+- Pre-registered hypothesis: a top-k-external continuous anchor participation head,
+  bounded to `scale in [0.95,1.05]`, could improve both validation MSE and MAE while
+  keeping the four PKR adapters and their gate frozen. Acceptance required (1) a
+  zero-initialized, bit-exact `scale=1` no-op and (2) candidate val MSE and MAE both
+  no worse than the current always-on anchor.
+- The temporary implementation left the gate's existing four-output API and PKR
+  top-k unchanged, added only a zero-initialized scale head, supported old cluster
+  states, and froze the existing gate/backbone/adapter bank/anchor source. Targeted
+  no-op, gradient-isolation, shared-state, and optimizer tests passed `19 passed`.
+- Val-only exact replay (test windows were disabled) produced
+  `0.631745160 MSE / 0.530777037 MAE`, differing from the prior recorded MSE by one
+  float32 ULP (`-5.96e-8`) and matching MAE exactly. The candidate trained only 97
+  shared-gate head parameters for six epochs with direct `MSE + 0.3*MAE` forecast
+  loss. Its selected checkpoint produced
+  `0.632488072 MSE / 0.530561149 MAE`: MAE improved `0.0407%`, but MSE regressed
+  `0.1176%`, so it failed the dual-metric no-harm rule.
+- Failure localization: the shared head improved only singleton cluster 2
+  (`+0.2418%` MSE / `+0.3179%` MAE) while regressing cluster 0
+  (`-0.1156%` / `-0.0137%`) and cluster 1 (`-0.2895%` / `-0.0075%`). This is a
+  shared-head expressivity/aggregation and MSE-vs-MAE selection tradeoff, not an
+  eval-path wiring failure: the disabled replay matched, the head parameters moved
+  (`L2=1.2139`), and the two metrics changed in opposite directions.
+- Verdict: reject this anchor-gate path. No test read was made. All temporary runtime,
+  test, and runner changes were removed; tracked runtime code is exactly rollback
+  point `1642444`. Diagnostic artifacts remain under
+  `outputs/etth1_h96_anchor_gate_val_exploration_20260713/`. Do not promote its
+  candidate checkpoint. If explicitly revisited, first measure a val-only discrete
+  anchor-scale patch oracle; do not tune another learned head without an epoch-0
+  no-op candidate and a dual-metric/temporal adoption guard.
