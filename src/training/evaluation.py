@@ -24,6 +24,7 @@ from .anchors import (
     apply_moe_output_anchor_experts,
     apply_train_stat_anchor_expert,
     apply_train_stat_input_centering,
+    build_moe_output_anchor_fixed_expert_delta,
 )
 from .core import (
     _apply_mae_objective_weight,
@@ -44,6 +45,23 @@ from .selectors import (
     _cluster_utility_threshold_stats,
     _pred_residual_candidates_on_eval_path,
 )
+
+
+def _fixed_expert_candidate_base(
+    y_base_bch: torch.Tensor,
+    pred_residual: Optional[ClusterwisePredResidualMoE],
+    fixed_expert_delta_bch: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Return the exact base seen by PKR adapters when a fixed expert is active."""
+    if (
+        pred_residual is None
+        or fixed_expert_delta_bch is None
+        or not bool(getattr(pred_residual, "periodic_anchor_expert_enable", False))
+    ):
+        return y_base_bch
+    return y_base_bch + float(
+        getattr(pred_residual, "periodic_anchor_expert_scale", 1.0)
+    ) * fixed_expert_delta_bch.to(device=y_base_bch.device, dtype=y_base_bch.dtype)
 
 
 @torch.no_grad()
@@ -184,9 +202,37 @@ def eval_loop(
             accumulate_channel_errors(base_se_c, base_ae_c, yhat_base, y)
             base_denom += int(x.shape[0] * y.shape[2])
 
-        # Route on the base prediction. This keeps the router's penalty
-        # context independent from the residual expert it is selecting.
-        gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
+        fixed_expert_delta_bch = None
+        candidate_base_bch = yhat_base
+        if pred_residual is not None and moe_enable and P > 0:
+            fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+                yhat_base,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                input_len=int(input_len or x.shape[-1]),
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=observed_history_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
+            )
+            candidate_base_bch = _fixed_expert_candidate_base(
+                yhat_base,
+                pred_residual,
+                fixed_expert_delta_bch,
+            )
+
+        # Route on the fixed-expert base. This keeps the router independent
+        # from the PKR adapter it is selecting while matching deployment.
+        gate_feat_bkf = _build_gate_routing_features(
+            x,
+            candidate_base_bch,
+            cluster_id_c,
+            K,
+            mode=gate_feature_mode,
+        )
         if dynamic_lambda is None:
             feat_bkf = gate_feat_bkf
             series_bkl = None
@@ -198,7 +244,7 @@ def eval_loop(
             series_bkl = scatter_mean_bcl_to_bkl(x, cluster_id_c, K)  # [B,K,L]
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
-            yhat_base_bch=yhat_base,
+            yhat_base_bch=candidate_base_bch,
             penalty_names=penalty_names,
             penalty_fns=penalty_fns,
             penalty_scale=penalty_scale,
@@ -246,6 +292,7 @@ def eval_loop(
                 mask_bkp,
                 skip_bk=skip_bk if allow_skip else None,
                 query_start_abs_b=query_start_abs_b,
+                fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
             yhat_residual_raw = pred_out["y_final"]
             yhat = yhat_residual_raw
@@ -283,7 +330,8 @@ def eval_loop(
             elif pred_residual_scale_c is not None:
                 scale = pred_residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
                 residual_gate_scale = scale.expand(yhat.shape[0], -1, -1)
-                yhat = yhat_base + scale * (yhat - yhat_base)
+                residual_base_bch = pred_out.get("candidate_base_bch", candidate_base_bch)
+                yhat = residual_base_bch + scale * (yhat - residual_base_bch)
         else:
             yhat = yhat_base
 
@@ -916,10 +964,34 @@ def evaluate_gate_penalty_hit_metrics(
             stat_anchor_pc=model_train_stat_adapter_pc,
             cfg=model_train_stat_adapter_cfg,
         )
-        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
+        fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+            y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            learnable_output_anchor=learnable_output_anchor,
+            cluster_id_c=cluster_id_c,
+        )
+        candidate_base_bch = _fixed_expert_candidate_base(
+            y_base,
+            pred_residual,
+            fixed_expert_delta_bch,
+        )
+        feat_bkf = _build_gate_routing_features(
+            x,
+            candidate_base_bch,
+            cluster_id_c,
+            K,
+            mode=gate_feature_mode,
+        )
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
-            yhat_base_bch=y_base,
+            yhat_base_bch=candidate_base_bch,
             penalty_names=penalty_names,
             penalty_fns=penalty_fns,
             penalty_scale=penalty_scale,
@@ -956,6 +1028,7 @@ def evaluate_gate_penalty_hit_metrics(
             mask_bkp,
             skip_bk=skip_bk if allow_skip else None,
             query_start_abs_b=query_start_abs_b,
+            fixed_expert_delta_bch=fixed_expert_delta_bch,
         )
         residuals = pred_out.get("residuals")
         intervention_bcp = pred_out.get("intervention_bcp")
@@ -1645,10 +1718,34 @@ def _collect_penalty_route_learnability_tensors(
             stat_anchor_pc=model_train_stat_adapter_pc,
             cfg=model_train_stat_adapter_cfg,
         )
-        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
+        fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+            y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            learnable_output_anchor=learnable_output_anchor,
+            cluster_id_c=cluster_id_c,
+        )
+        candidate_base_bch = _fixed_expert_candidate_base(
+            y_base,
+            pred_residual,
+            fixed_expert_delta_bch,
+        )
+        feat_bkf = _build_gate_routing_features(
+            x,
+            candidate_base_bch,
+            cluster_id_c,
+            K,
+            mode=gate_feature_mode,
+        )
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
-            yhat_base_bch=y_base,
+            yhat_base_bch=candidate_base_bch,
             penalty_names=penalty_names,
             penalty_fns=penalty_fns,
             penalty_scale=penalty_scale,
@@ -1685,6 +1782,7 @@ def _collect_penalty_route_learnability_tensors(
             mask_bkp,
             skip_bk=skip_bk if allow_skip else None,
             query_start_abs_b=query_start_abs_b,
+            fixed_expert_delta_bch=fixed_expert_delta_bch,
         )
         y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
             y_base,
@@ -2366,10 +2464,34 @@ def evaluate_penalty_explainability(
             stat_anchor_pc=model_train_stat_adapter_pc,
             cfg=model_train_stat_adapter_cfg,
         )
-        feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
+        fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+            y_base,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            learnable_output_anchor=learnable_output_anchor,
+            cluster_id_c=cluster_id_c,
+        )
+        candidate_base_bch = _fixed_expert_candidate_base(
+            y_base,
+            pred_residual,
+            fixed_expert_delta_bch,
+        )
+        feat_bkf = _build_gate_routing_features(
+            x,
+            candidate_base_bch,
+            cluster_id_c,
+            K,
+            mode=gate_feature_mode,
+        )
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
-            yhat_base_bch=y_base,
+            yhat_base_bch=candidate_base_bch,
             penalty_names=penalty_names,
             penalty_fns=penalty_fns,
             penalty_scale=penalty_scale,
@@ -2406,6 +2528,7 @@ def evaluate_penalty_explainability(
             mask_bkp,
             skip_bk=skip_bk if allow_skip else None,
             query_start_abs_b=query_start_abs_b,
+            fixed_expert_delta_bch=fixed_expert_delta_bch,
         )
         residuals = pred_out.get("residuals")
         alpha_cp = pred_out.get("alpha_cp")

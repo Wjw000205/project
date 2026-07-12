@@ -1492,6 +1492,11 @@ class ClusterwisePredResidualMoE(nn.Module):
         phase_residual_candidate_scale: float = 1.0,
         shared_across_clusters: bool = False,
         patch_router_cfg: Optional[Dict[str, Any]] = None,
+        named_output_projection_enable: bool = False,
+        named_output_projection_fixed_alpha: bool = False,
+        named_output_projection_scale_by_name: Optional[Dict[str, float]] = None,
+        periodic_anchor_expert_enable: bool = False,
+        periodic_anchor_expert_scale: float = 1.0,
     ):
         super().__init__()
         self.K = int(num_clusters)
@@ -1542,6 +1547,10 @@ class ClusterwisePredResidualMoE(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.alpha_scale = float(alpha_scale)
         self.residual_clip = float(max(0.0, residual_clip))
+        self.named_output_projection_enable = bool(named_output_projection_enable)
+        self.named_output_projection_fixed_alpha = bool(named_output_projection_fixed_alpha)
+        self.periodic_anchor_expert_enable = bool(periodic_anchor_expert_enable)
+        self.periodic_anchor_expert_scale = float(periodic_anchor_expert_scale)
         self.use_y_base_input = bool(use_y_base_input)
         self.feature_mode = str(feature_mode).lower()
         if self.feature_mode not in {"legacy", "safe_augmented"}:
@@ -1584,6 +1593,11 @@ class ClusterwisePredResidualMoE(nn.Module):
             if len(names) != self.P:
                 raise ValueError(f"penalty_names must have {self.P} entries, got {len(names)}")
         self.penalty_names = names
+        projection_scale_by_name = named_output_projection_scale_by_name or {}
+        projection_scale_p = torch.tensor(
+            [float(projection_scale_by_name.get(name, 1.0)) for name in self.penalty_names],
+            dtype=torch.float32,
+        )
         anchor_name_set = {str(name) for name in (seasonal_anchor_names or [])}
         self.seasonal_anchor_period = max(int(seasonal_anchor_period), 1)
         self.seasonal_anchor_num_periods = max(int(seasonal_anchor_num_periods), 1)
@@ -1703,6 +1717,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         self.register_buffer("channel_expert_cluster_id_c", parent, persistent=False)
         self.register_buffer("channel_penalty_allowed_mask_cp", torch.empty(0), persistent=False)
         self.register_buffer("seasonal_anchor_mask_p", seasonal_mask, persistent=False)
+        self.register_buffer("named_output_projection_scale_p", projection_scale_p, persistent=False)
         self.register_buffer("seasonal_anchor_index_hp", seasonal_index, persistent=False)
         self.register_buffer("seasonal_anchor_valid_hp", seasonal_valid, persistent=False)
         self.register_buffer("phase_residual_candidate_mask_p", phase_residual_mask, persistent=False)
@@ -1983,6 +1998,82 @@ class ClusterwisePredResidualMoE(nn.Module):
         y_centered = y_base_bch - last
         return torch.cat([x_centered, y_centered], dim=-1)
 
+    @staticmethod
+    def _remove_affine_component(values_bch: torch.Tensor) -> torch.Tensor:
+        """Remove the constant and linear null-space of a second difference."""
+        centered = values_bch - values_bch.mean(dim=-1, keepdim=True)
+        if int(values_bch.shape[-1]) <= 1:
+            return centered
+        trend_h = torch.linspace(
+            -1.0,
+            1.0,
+            int(values_bch.shape[-1]),
+            device=values_bch.device,
+            dtype=values_bch.dtype,
+        )
+        trend_h = trend_h - trend_h.mean()
+        denom = trend_h.pow(2).sum().clamp_min(1.0e-12)
+        coef_bc = (centered * trend_h.view(1, 1, -1)).sum(dim=-1, keepdim=True) / denom
+        return centered - coef_bc * trend_h.view(1, 1, -1)
+
+    def _project_named_segment(
+        self,
+        raw_bch: torch.Tensor,
+        base_bch: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        """Map a free residual onto the correction space named by ``name``."""
+        if name == "level":
+            projected = raw_bch.mean(dim=-1, keepdim=True).expand_as(raw_bch)
+        elif name == "delta":
+            projected = raw_bch - raw_bch.mean(dim=-1, keepdim=True)
+        elif name == "d2_match":
+            projected = self._remove_affine_component(raw_bch)
+        elif name in {"diff_amp", "amp", "amp_under"}:
+            # Amplitude experts may only rescale the current centered shape.
+            # A tanh-bounded coefficient gives a deployed factor in [0.5, 1.5].
+            carrier = base_bch - base_bch.mean(dim=-1, keepdim=True)
+            denom = carrier.pow(2).sum(dim=-1, keepdim=True)
+            raw_coef = (raw_bch * carrier).sum(dim=-1, keepdim=True) / denom.clamp_min(1.0e-12)
+            coef = 0.5 * torch.tanh(raw_coef / 0.5)
+            projected = coef * carrier
+            projected = torch.where(denom > 1.0e-12, projected, torch.zeros_like(projected))
+        else:
+            projected = raw_bch
+
+        # Keep residual_clip as a true bound without destroying the projection
+        # invariants through a second pointwise tanh.
+        if self.residual_clip > 0.0:
+            max_abs = projected.abs().amax(dim=-1, keepdim=True)
+            scale = torch.clamp(float(self.residual_clip) / max_abs.clamp_min(1.0e-12), max=1.0)
+            projected = projected * scale
+        return projected
+
+    def _project_named_residuals(
+        self,
+        residuals_bcph: torch.Tensor,
+        base_bch: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.named_output_projection_enable:
+            return residuals_bcph
+        patch_len = self.H
+        if self.patch_router is not None:
+            patch_len = max(1, int(self.patch_router.patch_len))
+        projected_p = []
+        for p, name in enumerate(self.penalty_names):
+            pieces = []
+            for start in range(0, self.H, patch_len):
+                end = min(start + patch_len, self.H)
+                pieces.append(
+                    self._project_named_segment(
+                        residuals_bcph[:, :, p, start:end],
+                        base_bch[:, :, start:end],
+                        name,
+                    )
+                )
+            projected_p.append(torch.cat(pieces, dim=-1))
+        return torch.stack(projected_p, dim=2)
+
     def _cluster_context_features(
         self,
         feat_bcd: torch.Tensor,
@@ -2003,6 +2094,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         mask_bkp: torch.Tensor,
         skip_bk: Optional[torch.Tensor] = None,
         query_start_abs_b: Optional[torch.Tensor] = None,
+        fixed_expert_delta_bch: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns:
@@ -2014,20 +2106,41 @@ class ClusterwisePredResidualMoE(nn.Module):
           effective_route_bcp: [B,C,P] route_bcp * intervention_bcp
           alpha_cp: [C,P]
         """
+        if self.periodic_anchor_expert_enable:
+            if fixed_expert_delta_bch is None:
+                raise ValueError(
+                    "fixed_expert_delta_bch is required when periodic_anchor_expert is enabled."
+                )
+            if fixed_expert_delta_bch.shape != y_base_bch.shape:
+                raise ValueError(
+                    "fixed_expert_delta_bch must match y_base_bch, got "
+                    f"{tuple(fixed_expert_delta_bch.shape)} vs {tuple(y_base_bch.shape)}."
+                )
+            periodic_expert_branch_bch = (
+                float(self.periodic_anchor_expert_scale)
+                * fixed_expert_delta_bch.to(device=y_base_bch.device, dtype=y_base_bch.dtype)
+            )
+        else:
+            periodic_expert_branch_bch = torch.zeros_like(y_base_bch)
+        candidate_base_bch = y_base_bch + periodic_expert_branch_bch
+
         if self.P <= 0:
             zero_res = y_base_bch.new_zeros((*y_base_bch.shape[:2], 0, y_base_bch.shape[-1]))
             zero_route = y_base_bch.new_zeros((*y_base_bch.shape[:2], 0))
             return {
-                "y_final": y_base_bch,
+                "y_final": candidate_base_bch,
                 "residuals": zero_res,
                 "branches": zero_res,
                 "route_bcp": zero_route,
                 "intervention_bcp": zero_route,
                 "effective_route_bcp": zero_route,
                 "alpha_cp": y_base_bch.new_zeros((y_base_bch.shape[1], 0)),
+                "candidate_base_bch": candidate_base_bch,
+                "periodic_expert_branch_bch": periodic_expert_branch_bch,
+                "periodic_expert_route_bc": torch.ones_like(y_base_bch[..., 0]),
             }
 
-        feat_bcd = self._input_features(x_bcl, y_base_bch)
+        feat_bcd = self._input_features(x_bcl, candidate_base_bch)
         cluster_id_c = cluster_id_c.to(device=x_bcl.device, dtype=torch.long)
 
         W1_kpdm = self._stack_expert_params(self.W1)
@@ -2052,7 +2165,7 @@ class ClusterwisePredResidualMoE(nn.Module):
             and bool((self.seasonal_anchor_mask_p > 0).any().item())
         ):
             seasonal_anchor = self._seasonal_anchor_forecast(x_bcl)
-            anchor_residual = seasonal_anchor - y_base_bch
+            anchor_residual = seasonal_anchor - candidate_base_bch
             mask_p = self.seasonal_anchor_mask_p.to(device=x_bcl.device, dtype=residuals.dtype)
             residuals = residuals + (
                 float(self.seasonal_anchor_scale)
@@ -2103,6 +2216,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         if self.residual_clip > 0.0:
             clip = float(self.residual_clip)
             residuals = clip * torch.tanh(residuals / clip)
+        residuals = self._project_named_residuals(residuals, candidate_base_bch)
 
         alpha_cp = self.alpha_values().index_select(0, cluster_id_c)  # [C,P]
         if self.channel_expert_enable:
@@ -2111,6 +2225,11 @@ class ClusterwisePredResidualMoE(nn.Module):
             )
             ch_mask_cp = self.channel_expert_mask_c.to(device=x_bcl.device).view(-1, 1)
             alpha_cp = torch.where(ch_mask_cp, ch_alpha_cp, alpha_cp)
+        if self.named_output_projection_enable and self.named_output_projection_fixed_alpha:
+            alpha_cp = self.named_output_projection_scale_p.to(
+                device=x_bcl.device,
+                dtype=residuals.dtype,
+            ).view(1, self.P).expand(int(residuals.shape[1]), self.P)
         patch_router_out: Optional[Dict[str, torch.Tensor]] = None
         route_bcph: Optional[torch.Tensor] = None
         if self.patch_router is not None:
@@ -2132,7 +2251,7 @@ class ClusterwisePredResidualMoE(nn.Module):
             )
             patch_router_out = self.patch_router(
                 x_bcl,
-                y_base_bch=y_base_bch,
+                y_base_bch=candidate_base_bch,
                 candidate_delta_bcpH=candidate_delta_bcpH,
                 regime_context_bcl=regime_context_bcl,
                 query_start_abs_b=query_start_abs_b,
@@ -2233,7 +2352,7 @@ class ClusterwisePredResidualMoE(nn.Module):
             fusion_bc = torch.sigmoid(torch.einsum("bcd,cd->bc", fusion_feat, Wf) + bf.unsqueeze(0))
         else:
             fusion_bc = torch.ones_like(route_bcp[..., 0])
-        y_final = y_base_bch + fusion_bc.unsqueeze(-1) * branch_sum_bch
+        y_final = candidate_base_bch + fusion_bc.unsqueeze(-1) * branch_sum_bch
 
         result = {
             "y_final": y_final,
@@ -2247,6 +2366,9 @@ class ClusterwisePredResidualMoE(nn.Module):
             "effective_route_bcp": effective_route_bcp,
             "fusion_bc": fusion_bc,
             "alpha_cp": alpha_cp,
+            "candidate_base_bch": candidate_base_bch,
+            "periodic_expert_branch_bch": periodic_expert_branch_bch,
+            "periodic_expert_route_bc": torch.ones_like(candidate_base_bch[..., 0]),
         }
         if patch_router_out is not None:
             result.update(patch_router_out)

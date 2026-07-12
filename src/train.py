@@ -728,6 +728,22 @@ def main():
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
     pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
     pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
+    named_output_projection_cfg = pred_residual_cfg.get("named_output_projection", {}) or {}
+    if not isinstance(named_output_projection_cfg, dict):
+        named_output_projection_cfg = {"enable": bool(named_output_projection_cfg)}
+    named_output_projection_enable = bool(named_output_projection_cfg.get("enable", False))
+    named_output_projection_fixed_alpha = bool(named_output_projection_cfg.get("fixed_alpha", False))
+    named_output_projection_scale_by_name = {
+        str(name): float(value)
+        for name, value in (named_output_projection_cfg.get("scale_by_name", {}) or {}).items()
+    }
+    periodic_anchor_expert_cfg = pred_residual_cfg.get("periodic_anchor_expert", {}) or {}
+    if not isinstance(periodic_anchor_expert_cfg, dict):
+        periodic_anchor_expert_cfg = {"enable": bool(periodic_anchor_expert_cfg)}
+    periodic_anchor_expert_enable = bool(periodic_anchor_expert_cfg.get("enable", False)) and pred_residual_enable
+    periodic_anchor_expert_scale = float(periodic_anchor_expert_cfg.get("scale", 1.0))
+    periodic_anchor_expert_freeze_source = bool(periodic_anchor_expert_cfg.get("freeze_source", True))
+    pred_residual_freeze_adapter_bank = bool(pred_residual_cfg.get("freeze_adapter_bank", False))
     patch_router_cfg = pred_residual_cfg.get("patch_router", {}) or {}
     if not isinstance(patch_router_cfg, dict):
         patch_router_cfg = {"enable": bool(patch_router_cfg)}
@@ -1147,6 +1163,9 @@ def main():
     pred_residual_candidate_supervision_include_selector = bool(
         pred_residual_candidate_supervision_cfg.get("include_selector", False)
     )
+    pred_residual_candidate_supervision_include_patch_route = bool(
+        pred_residual_candidate_supervision_cfg.get("include_patch_route", True)
+    )
     pred_residual_intervention_supervision_cfg = pred_residual_cfg.get("intervention_supervision", {}) or {}
     if not isinstance(pred_residual_intervention_supervision_cfg, dict):
         pred_residual_intervention_supervision_cfg = {"weight": float(pred_residual_intervention_supervision_cfg)}
@@ -1240,6 +1259,7 @@ def main():
     mse_utility_gate_weight = float(mse_utility_gate_cfg.get("weight", 0.0)) if mse_utility_gate_enable else 0.0
     mse_utility_gate_temperature = float(mse_utility_gate_cfg.get("temperature", 1.0))
     mse_utility_gate_min_gain = float(mse_utility_gate_cfg.get("min_gain", 0.0))
+    mse_utility_gate_mae_weight = float(mse_utility_gate_cfg.get("mae_weight", 0.0))
     mse_utility_gate_target_power = float(mse_utility_gate_cfg.get("target_power", 1.0))
     mse_utility_gate_target_mode = str(mse_utility_gate_cfg.get("target_mode", "soft_utility"))
     mse_utility_gate_include_skip = bool(
@@ -1585,6 +1605,11 @@ def main():
             phase_residual_candidate_scale=phase_residual_candidate_scale,
             shared_across_clusters=shared_moe_across_clusters,
             patch_router_cfg=patch_router_cfg,
+            named_output_projection_enable=named_output_projection_enable,
+            named_output_projection_fixed_alpha=named_output_projection_fixed_alpha,
+            named_output_projection_scale_by_name=named_output_projection_scale_by_name,
+            periodic_anchor_expert_enable=periodic_anchor_expert_enable,
+            periodic_anchor_expert_scale=periodic_anchor_expert_scale,
         ).to(device)
         if (
             pred_residual.patch_router is not None
@@ -1602,6 +1627,10 @@ def main():
             f"phase_residual_candidate={phase_residual_candidate_names}, "
             f"phase_residual_period={int(phase_residual_candidate_period)}, "
             f"phase_residual_scale={float(phase_residual_candidate_scale):.3f}, "
+            f"named_output_projection={bool(named_output_projection_enable)}, "
+            f"named_output_projection_fixed_alpha={bool(named_output_projection_fixed_alpha)}, "
+            f"periodic_anchor_expert={bool(periodic_anchor_expert_enable)}, "
+            f"periodic_anchor_scale={float(periodic_anchor_expert_scale):.3f}, "
             f"patch_router={bool(pred_residual.patch_router is not None)}, "
             f"patch_len={int(pred_residual.patch_router.patch_len) if pred_residual.patch_router is not None else 0}, "
             f"history_projection={pred_residual.patch_router.history_patch_projection if pred_residual.patch_router is not None else 'none'}, "
@@ -1611,6 +1640,7 @@ def main():
             f"intervention_weight={pred_residual_intervention_weight:.6f}, "
             f"candidate_supervision_weight={pred_residual_candidate_supervision_weight:.6f}, "
             f"candidate_supervision_loss={pred_residual_candidate_supervision_loss}, "
+            f"candidate_supervision_include_patch_route={pred_residual_candidate_supervision_include_patch_route}, "
             f"ignore_skip_during_training={pred_residual_ignore_skip_during_training}, "
             f"intervention_supervision_weight={pred_residual_intervention_supervision_weight:.6f}, "
             f"route_ce_weight={route_ce_weight:.6f}, "
@@ -2243,6 +2273,22 @@ def main():
         print(f"Fine-tune target->source cluster map: {finetune_summary['target_to_source_cluster']}")
 
     apply_finetune_warm_start()
+
+    periodic_anchor_source_frozen_params = 0
+    if (
+        periodic_anchor_expert_enable
+        and periodic_anchor_expert_freeze_source
+        and learnable_output_anchor is not None
+    ):
+        periodic_anchor_source_frozen_params = _freeze_module_params(learnable_output_anchor)
+        print(
+            "Periodic anchor expert source frozen: "
+            f"learnable_params={periodic_anchor_source_frozen_params}"
+        )
+    frozen_adapter_bank_params = 0
+    if pred_residual_freeze_adapter_bank and pred_residual is not None:
+        frozen_adapter_bank_params = _freeze_module_params(pred_residual)
+        print(f"Prediction adapter bank frozen for gate training: params={frozen_adapter_bank_params}")
 
     freeze_backbone = bool(moe_cfg.get("freeze_backbone", cfg.get("train", {}).get("freeze_backbone", False)))
     frozen_backbone_params = 0
@@ -2929,7 +2975,22 @@ def main():
             "candidate_supervision_only_allowed": bool(pred_residual_candidate_supervision_only_allowed),
             "candidate_supervision_include_intervention": bool(pred_residual_candidate_supervision_include_intervention),
             "candidate_supervision_include_selector": bool(pred_residual_candidate_supervision_include_selector),
+            "candidate_supervision_include_patch_route": bool(pred_residual_candidate_supervision_include_patch_route),
             "ignore_skip_during_training": bool(pred_residual_ignore_skip_during_training),
+            "freeze_adapter_bank": bool(pred_residual_freeze_adapter_bank),
+            "frozen_adapter_bank_params": int(frozen_adapter_bank_params),
+            "named_output_projection_enable": bool(named_output_projection_enable),
+            "named_output_projection_fixed_alpha": bool(named_output_projection_fixed_alpha),
+            "named_output_projection_scale_by_name": dict(named_output_projection_scale_by_name),
+            "periodic_anchor_expert": {
+                "enable": bool(periodic_anchor_expert_enable),
+                "role": "reserved_always_on" if periodic_anchor_expert_enable else None,
+                "participation": 1.0 if periodic_anchor_expert_enable else 0.0,
+                "gate_excluded": bool(periodic_anchor_expert_enable),
+                "scale": float(periodic_anchor_expert_scale),
+                "source_frozen": bool(periodic_anchor_expert_freeze_source),
+                "frozen_params": int(periodic_anchor_source_frozen_params),
+            },
             "intervention_supervision_weight": float(pred_residual_intervention_supervision_weight),
             "intervention_supervision_min_gain": float(pred_residual_intervention_supervision_min_gain),
             "intervention_supervision_pos_weight": float(pred_residual_intervention_supervision_pos_weight),
@@ -3311,9 +3372,27 @@ def main():
             idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
             query_start_abs_b = int(eval_start) + idx
             y_base = _eval_path_base_prediction(x, query_start_abs_b)
+            fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+                y_base,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
+            )
+            routing_base_bch = (
+                y_base
+                if fixed_expert_delta_bch is None
+                else y_base + float(periodic_anchor_expert_scale) * fixed_expert_delta_bch
+            )
             route_pen_bkp = _router_penalty_context_from_history(
                 x_bcl=x,
-                yhat_base_bch=y_base,
+                yhat_base_bch=routing_base_bch,
                 penalty_names=penalty_names,
                 penalty_fns=penalty_fns,
                 penalty_scale=penalty_scale,
@@ -3321,7 +3400,9 @@ def main():
                 K=K,
                 router_mode=router_mode,
             )
-            feat_bkf = _build_gate_routing_features(x, y_base, cluster_id_c, K, mode=gate_feature_mode)
+            feat_bkf = _build_gate_routing_features(
+                x, routing_base_bch, cluster_id_c, K, mode=gate_feature_mode
+            )
             mask_bkp, probs_bkp, skip_bk, _ = gate(
                 feat_bkf,
                 straight_through=False,
@@ -3340,6 +3421,7 @@ def main():
                 mask_bkp,
                 skip_bk=skip_bk if allow_skip else None,
                 query_start_abs_b=query_start_abs_b,
+                fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
             y_final = pred_out["y_final"]
             terms = _pred_residual_loss_terms(
@@ -3763,9 +3845,27 @@ def main():
             idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
             query_start_abs_b = int(eval_start) + idx
             y_base = _eval_path_base_prediction(x, query_start_abs_b)
+            fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+                y_base,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
+            )
+            routing_base_bch = (
+                y_base
+                if fixed_expert_delta_bch is None
+                else y_base + float(periodic_anchor_expert_scale) * fixed_expert_delta_bch
+            )
             route_pen_bkp = _router_penalty_context_from_history(
                 x_bcl=x,
-                yhat_base_bch=y_base,
+                yhat_base_bch=routing_base_bch,
                 penalty_names=penalty_names,
                 penalty_fns=penalty_fns,
                 penalty_scale=penalty_scale,
@@ -3775,7 +3875,7 @@ def main():
             )
             feat_bkf = _build_gate_routing_features(
                 x,
-                y_base,
+                routing_base_bch,
                 cluster_id_c,
                 K,
                 mode=gate_feature_mode,
@@ -3802,6 +3902,7 @@ def main():
                 mask_bkp,
                 skip_bk=skip_bk if allow_skip else None,
                 query_start_abs_b=query_start_abs_b,
+                fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
             selected_score_bcq = pred_out.get("patch_selected_risk_score_bcq")
             selected_penalty_bcq = pred_out.get("patch_selected_penalty_index_bcq")
@@ -4073,7 +4174,27 @@ def main():
             stat_anchor_pc=model_train_stat_adapter_pc,
             cfg=model_train_stat_adapter_cfg,
         )
-        gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
+        fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+            yhat_base,
+            x_bcl=x,
+            query_start_abs_b=idx,
+            input_len=L,
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=data_window_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            learnable_output_anchor=learnable_output_anchor,
+            cluster_id_c=cluster_id_c,
+        )
+        routing_base_bch = (
+            yhat_base
+            if fixed_expert_delta_bch is None
+            else yhat_base + float(periodic_anchor_expert_scale) * fixed_expert_delta_bch
+        )
+        gate_feat_bkf = _build_gate_routing_features(
+            x, routing_base_bch, cluster_id_c, K, mode=gate_feature_mode
+        )
         if dynamic_lambda is None:
             lambda_feat_bkf = gate_feat_bkf
             series_bkl = None
@@ -4090,7 +4211,7 @@ def main():
 
         route_pen_bkp = _router_penalty_context_from_history(
             x_bcl=x,
-            yhat_base_bch=yhat_base,
+            yhat_base_bch=routing_base_bch,
             penalty_names=penalty_names,
             penalty_fns=penalty_fns,
             penalty_scale=penalty_scale,
@@ -4140,6 +4261,7 @@ def main():
                     ignore_skip_during_training=pred_residual_ignore_skip_during_training,
                 ),
                 query_start_abs_b=idx,
+                fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
             yhat_residual_raw = pred_out["y_final"]
             yhat = yhat_residual_raw
@@ -4250,6 +4372,7 @@ def main():
                 min_rel_improvement=pred_residual_candidate_supervision_min_rel,
                 include_intervention=pred_residual_candidate_supervision_include_intervention,
                 include_selector=pred_residual_candidate_supervision_include_selector,
+                include_patch_route=pred_residual_candidate_supervision_include_patch_route,
                 apply_output_anchors=output_anchor_train_with_eval,
                 x_bcl=x,
                 query_start_abs_b=idx,
@@ -4497,6 +4620,7 @@ def main():
                 cand_eval_bcpH=utility_cand_bcpH,
                 temperature=mse_utility_gate_temperature,
                 min_gain=mse_utility_gate_min_gain,
+                mae_weight=mse_utility_gate_mae_weight,
                 target_power=mse_utility_gate_target_power,
                 include_skip=mse_utility_gate_include_skip,
                 probs_include_skip_mass=bool(skip_competes),
@@ -5025,7 +5149,27 @@ def main():
                 stat_anchor_pc=model_train_stat_adapter_pc,
                 cfg=model_train_stat_adapter_cfg,
             )
-            gate_feat_bkf = _build_gate_routing_features(x, yhat_base, cluster_id_c, K, mode=gate_feature_mode)
+            fixed_expert_delta_bch = build_moe_output_anchor_fixed_expert_delta(
+                yhat_base,
+                x_bcl=x,
+                query_start_abs_b=idx,
+                input_len=L,
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=data_window_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
+            )
+            routing_base_bch = (
+                yhat_base
+                if fixed_expert_delta_bch is None
+                else yhat_base + float(periodic_anchor_expert_scale) * fixed_expert_delta_bch
+            )
+            gate_feat_bkf = _build_gate_routing_features(
+                x, routing_base_bch, cluster_id_c, K, mode=gate_feature_mode
+            )
             if dynamic_lambda is None:
                 feat_bkf = gate_feat_bkf
                 series_bkl = None
@@ -5041,7 +5185,7 @@ def main():
             objective_overlap_reference_bk = None
             route_pen_bkp = _router_penalty_context_from_history(
                 x_bcl=x,
-                yhat_base_bch=yhat_base,
+                yhat_base_bch=routing_base_bch,
                 penalty_names=penalty_names,
                 penalty_fns=penalty_fns,
                 penalty_scale=penalty_scale,
@@ -5113,6 +5257,7 @@ def main():
                         ignore_skip_during_training=pred_residual_ignore_skip_during_training,
                     ),
                     query_start_abs_b=idx,
+                    fixed_expert_delta_bch=fixed_expert_delta_bch,
                 )
                 yhat_residual_raw = pred_out["y_final"]
                 yhat = yhat_residual_raw
@@ -5230,6 +5375,7 @@ def main():
                         min_rel_improvement=pred_residual_candidate_supervision_min_rel,
                         include_intervention=pred_residual_candidate_supervision_include_intervention,
                         include_selector=pred_residual_candidate_supervision_include_selector,
+                        include_patch_route=pred_residual_candidate_supervision_include_patch_route,
                         apply_output_anchors=output_anchor_train_with_eval,
                         x_bcl=x,
                         query_start_abs_b=idx,
@@ -5698,9 +5844,11 @@ def main():
                             mask_bkp.detach(),
                             skip_bk=None,
                             query_start_abs_b=idx,
+                            fixed_expert_delta_bch=fixed_expert_delta_bch,
                         )
                         yhat_no_skip = pred_no_skip["y_final"]
-                        base_mse_bc_for_skip = (yhat_base - y).pow(2).mean(dim=-1)
+                        no_op_base_bch = pred_no_skip.get("candidate_base_bch", yhat_base)
+                        base_mse_bc_for_skip = (no_op_base_bch - y).pow(2).mean(dim=-1)
                         no_skip_mse_bc = (yhat_no_skip - y).pow(2).mean(dim=-1)
                         base_mse_bk_for_skip = scatter_mean_bc_to_bk(base_mse_bc_for_skip, cluster_id_c, K)
                         no_skip_mse_bk = scatter_mean_bc_to_bk(no_skip_mse_bc, cluster_id_c, K)
@@ -5728,6 +5876,7 @@ def main():
                         cand_eval_bcpH=utility_cand_bcpH,
                         temperature=mse_utility_gate_temperature,
                         min_gain=mse_utility_gate_min_gain,
+                        mae_weight=mse_utility_gate_mae_weight,
                         target_power=mse_utility_gate_target_power,
                         include_skip=mse_utility_gate_include_skip,
                         probs_include_skip_mass=bool(skip_competes),
@@ -6055,6 +6204,7 @@ def main():
                     "epoch": int(ep),
                     "weight": float(mse_utility_gate_weight),
                     "min_gain": float(mse_utility_gate_min_gain),
+                    "mae_weight": float(mse_utility_gate_mae_weight),
                     "target_mode": str(mse_utility_gate_target_mode),
                     "include_skip": bool(mse_utility_gate_include_skip),
                     "per_cluster": [
@@ -6379,7 +6529,13 @@ def main():
         )
         print(f"Saved MSE curves to: {loss_dir}")
 
-    load_best_all()
+    checkpoint_selection = str(memory_cfg.get("checkpoint_selection", "best")).lower()
+    if checkpoint_selection not in {"best", "last"}:
+        raise ValueError("memory.checkpoint_selection must be 'best' or 'last'.")
+    if checkpoint_selection == "best":
+        load_best_all()
+    else:
+        print("Checkpoint selection uses the final epoch state (adapter-bank training mode).")
     assert_pairwise_frozen_parameters_unchanged("post_load_best")
     swa_summary["updates"] = int(swa_updates)
     if swa_enable and swa_updates <= 0:
@@ -10146,6 +10302,7 @@ def main():
                 "weight": float(mse_utility_gate_weight),
                 "temperature": float(mse_utility_gate_temperature),
                 "min_gain": float(mse_utility_gate_min_gain),
+                "mae_weight": float(mse_utility_gate_mae_weight),
                 "target_power": float(mse_utility_gate_target_power),
                 "target_mode": str(mse_utility_gate_target_mode),
                 "include_skip": bool(mse_utility_gate_include_skip),

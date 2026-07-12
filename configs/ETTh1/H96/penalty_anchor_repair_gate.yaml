@@ -1,0 +1,202 @@
+exp:
+  name: ETTh1_H96_penalty_anchor_repair_gate
+  out_dir: outputs/etth1_h96_penalty_anchor_repair_20260713/runs/gate
+  seed: 2026
+  deterministic: true
+  device: cuda:0
+data:
+  csv_path: data/ETTh1.csv
+  date_col: 0
+  max_rows: 14400
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+window:
+  input_len: 96
+  pred_len: 96
+  past_context: true
+normalize:
+  global_zscore: true
+  train_only: true
+corr:
+  compute: true
+  save_path: outputs/etth1_h96_penalty_anchor_repair_20260713/runs/gate/corr.npy
+cluster:
+  method: leader
+  n_clusters: 3
+  distance_threshold: 0.7
+  linkage: average
+  random_state: 2026
+  min_cluster_size: 2
+  merge_small_clusters: true
+  no_merge_if_channels_lt: 7
+  train_only: true
+model:
+  predictor: mlp
+  hidden_dim: 128
+  dropout: 0.0
+  dlinear_kernel_size: 13
+  channel_adapter:
+    enable: false
+    rank: 8
+    init: zero_delta
+    scale: 1.0
+  revin: true
+moe:
+  enable: true
+  shared_across_clusters: true
+  topk: 1
+  select_ranks: [1]
+  gate_hidden_dim: 96
+  detach_penalty_grad: false
+  freeze_backbone: true
+  gate_route_on_penalty_only: false
+  router_mode: learned
+  router_penalty_context_weight: 0.0
+  router_detach_penalty_context: true
+  router_penalty_context_score: high_violation
+  allow_skip: true
+  skip_cost: 0.0
+  skip_init_bias: -2.0
+  gate_temperature: 1.0
+  gate_noise_std: 0.2
+  gate_soft_weight: 0.0
+  gate_entropy_weight: 0.0
+  gate_balance_weight: 0.0
+  gate_penalty_hit:
+    enable: false
+  lambda_init:
+    level: 0.0
+    delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_min:
+    level: 0.0
+    delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_schedule:
+    level: none
+    delta: none
+    d2_match: none
+    diff_amp: none
+  dynamic_lambda:
+    enable: false
+  learnable_lambda:
+    enable: false
+  cluster_penalty_prior:
+    enable: false
+  mse_utility_gate_supervision:
+    enable: true
+    weight: 1.0
+    temperature: 0.5
+    min_gain: 0.0001
+    mae_weight: 0.3
+    target_power: 1.0
+    target_mode: soft_utility
+    include_skip: true
+  pred_side_residual:
+    enable: true
+    feature_mode: safe_augmented
+    corrector_hidden: 64
+    residual_clip: 5.0
+    init_alpha: 8.0
+    alpha_scale: 1.0
+    use_y_base_input: true
+    intervention_enable: false
+    specialization_weight: 0.0
+    norm_weight: 0.0
+    intervention_weight: 0.0
+    freeze_adapter_bank: true
+    named_output_projection:
+      enable: true
+      fixed_alpha: true
+      scale_by_name:
+        level: 0.05
+        delta: 0.5
+        d2_match: 0.75
+        diff_amp: 1.0
+    periodic_anchor_expert:
+      enable: true
+      scale: 1.0
+      freeze_source: true
+    adapter_attribute_supervision:
+      weight: 0.0
+      loss: direct_attribute
+      only_allowed: false
+      include_intervention: false
+      include_selector: false
+      include_patch_route: false
+    diagnostics:
+      enable: true
+  learnable_output_anchor:
+    enable: true
+    train_mode: joint
+    scale_parameterization: channel
+    bias_parameterization: channel
+    scale_temporal_basis_rank: 1
+    max_scale_delta: 0.3
+    learn_stat_scale: true
+    learn_residual_scale: true
+    learn_bias: false
+    max_bias: 0.0
+    learn_history_trend: true
+    max_history_trend_delta: 0.2
+    history_trend_window: 24
+    history_trend_feature: last_minus_mean
+    history_trend_projection: linear
+    history_trend_parameterization: channel
+penalties:
+  enabled: [level, delta, d2_match, diff_amp]
+  jump_threshold: 0.6
+train:
+  epochs: 6
+  batch_size: 64
+  lr: 0.001
+  mse_weight: 0.0
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  selection_metric: val_mse
+  penalty_warmup_epochs: 0
+  mae_objective:
+    enable: false
+    kind: l1
+    weight: 0.0
+    warmup_epochs: 5
+  lr_scheduler:
+    name: plateau
+    factor: 0.5
+    patience: 3
+    min_lr: 0.000001
+early_stop:
+  patience: 10
+  min_delta: 0.000001
+eval:
+  skip_test: false
+diagnostics:
+  stage2_loss_audit:
+    enable: true
+plot:
+  enable: false
+portrait:
+  enable: false
+memory:
+  enable: false
+  save_checkpoint: true
+  checkpoint_selection: best
+  checkpoint_path: outputs/etth1_h96_penalty_anchor_repair_20260713/runs/gate/best_checkpoint.pt
+finetune:
+  enable: true
+  checkpoint_path: outputs/etth1_h96_penalty_anchor_repair_20260713/runs/bank/best_checkpoint.pt
+  strict_window: true
+  strict_model: true
+  cluster_map: index
+  load_model: true
+  load_gate: false
+  load_pred_residual: true
+  strict_pred_residual: true
+  load_dynamic_lambda: false
+  load_learnable_lambda: false
+  load_learnable_output_anchor: true
+calendar_residual:
+  enable: false

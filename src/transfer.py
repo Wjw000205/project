@@ -137,6 +137,20 @@ def _build_moe_modules(
 
     pred_state = ckpt.get("pred_residual_state", None)
     pred_cfg = dict((moe_cfg.get("pred_side_residual", {}) or {}))
+    projection_cfg = pred_cfg.get("named_output_projection", {}) or {}
+    if not isinstance(projection_cfg, dict):
+        projection_cfg = {"enable": bool(projection_cfg)}
+    periodic_cfg = pred_cfg.get("periodic_anchor_expert", {}) or {}
+    periodic_enabled = (
+        bool(periodic_cfg.get("enable", False))
+        if isinstance(periodic_cfg, dict)
+        else bool(periodic_cfg)
+    )
+    if periodic_enabled:
+        raise ValueError(
+            "src.transfer cannot reconstruct a reserved periodic_anchor_expert without its "
+            "train-derived anchor tables/module. Use src.train evaluation for this checkpoint."
+        )
     pred_residual = None
     if pred_state is not None and bool(pred_cfg.get("enable", False)):
         pred_residual = ClusterwisePredResidualMoE(
@@ -163,6 +177,12 @@ def _build_moe_modules(
             seasonal_anchor_period=int(pred_cfg.get("seasonal_anchor_period", 96)),
             seasonal_anchor_num_periods=int(pred_cfg.get("seasonal_anchor_num_periods", 1)),
             seasonal_anchor_scale=float(pred_cfg.get("seasonal_anchor_scale", 1.0)),
+            named_output_projection_enable=bool(projection_cfg.get("enable", False)),
+            named_output_projection_fixed_alpha=bool(projection_cfg.get("fixed_alpha", False)),
+            named_output_projection_scale_by_name={
+                str(name): float(value)
+                for name, value in (projection_cfg.get("scale_by_name", {}) or {}).items()
+            },
         ).to(device)
         pred_residual.load_state_dict(pred_state, strict=True)
         pred_residual.eval()
@@ -208,7 +228,8 @@ def _predict_with_optional_residual(
     yhat = pred_out["y_final"]
     if residual_scale_c is not None:
         scale = residual_scale_c.to(device=yhat.device, dtype=yhat.dtype).view(1, -1, 1)
-        yhat = yhat_base + scale * (yhat - yhat_base)
+        candidate_base = pred_out.get("candidate_base_bch", yhat_base)
+        yhat = candidate_base + scale * (yhat - candidate_base)
     return yhat_base, yhat
 
 

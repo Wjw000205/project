@@ -11401,3 +11401,84 @@ Hand back the report and STOP. Do not start a follow-up without me.
       root remains inappropriate because historical `outputs/_pytest_tmp_*` folders
       are discovered and several have Windows access restrictions; use the explicit
       `tests/` target.
+
+## 2026-07-13: ETTh1-H96 named-adapter and periodic-expert repair after clean rollback
+
+- User explicitly authorized a code rollback followed by a single test-based parameter
+  search. Tracked code/config/test/script paths were reset to repository
+  `HEAD=551910a`; output/data artifacts and unrelated untracked figure assets were
+  preserved. The exact reproducible comparison baseline is
+  `0.3581557274 MSE / 0.3869410455 MAE`; the paper table displays `0.358 / 0.386`.
+- Root-cause implementation audit on clean HEAD:
+  - hard-routed forecast MSE and route-weighted specialization starved unselected
+    experts;
+  - named residual MLPs had unrestricted horizon outputs;
+  - the old `seasonal_anchor_names` path added a fixed anchor delta to a learned MLP,
+    then attenuated it through pointwise residual clip and learned alpha;
+  - output anchors were applied after MoE, so PKR corrections and gate features did
+    not share a single post-periodic base.
+- Implemented a default-off named output contract in
+  `src/models/residual_moe.py`:
+  - `level` is constant over each routed horizon/patch;
+  - `delta` is zero mean;
+  - `d2_match` removes constant and linear components;
+  - `diff_amp` is a bounded `[0.5,1.5]` rescaling of the current centered base shape.
+  Projection occurs after pointwise clip, followed only by a uniform bound-preserving
+  rescale, so clip cannot reintroduce forbidden components. Optional fixed per-name
+  alpha makes deployed branch scales explicit rather than hidden in learned alpha.
+- Added `direct_attribute` independent candidate supervision in
+  `src/training/selectors.py`. It predicts future level, zero-mean shape,
+  de-affined shape, or difference standard deviation directly. The candidate path can
+  explicitly ignore hard route, skip, intervention, selector, and patch route. Added
+  config wiring for `include_patch_route` and a `memory.checkpoint_selection:last`
+  mode so adapter-bank training can deliberately save its final independently trained
+  bank instead of selecting on an untrained gate.
+- Migrated the existing output-anchor stack into the MoE as a reserved periodic
+  expert. `build_moe_output_anchor_fixed_expert_delta` computes the exact
+  `anchor(base)-base`; `ClusterwisePredResidualMoE` applies it first with participation
+  `1.0`, outside PKR top-k/skip/clip/alpha, then exposes `candidate_base_bch` to all
+  PKR candidates. Normal post-hoc anchor application becomes a no-op in this mode, so
+  the anchor is not double counted. Gate features, penalty context, utility/no-op
+  labels, patch-router candidate context, evaluation residual scaling, and candidate
+  diagnostics now all use the post-periodic base. `src.transfer` fails loudly for such
+  checkpoints because it cannot reconstruct train-derived anchor tables, rather than
+  silently dropping the periodic expert.
+- Two-stage controlled training configs:
+  - bank: `configs/ETTh1/H96/penalty_anchor_repair_bank.yaml`;
+  - gate: `configs/ETTh1/H96/penalty_anchor_repair_gate.yaml`.
+  The bank uses eight epochs of independent direct-attribute supervision with frozen
+  backbone/periodic anchor and zero gate gradient. Its candidate supervision falls
+  `0.683386 -> 0.664397`; pred-residual gradient L2 remains nonzero
+  (`0.04224 -> 0.02020`) while gate gradient is exactly zero. Bank checkpoint:
+  `outputs/etth1_h96_penalty_anchor_repair_20260713/runs/bank/best_checkpoint.pt`.
+- Gate diagnosis/fix: an initial configuration combined hard-routed forecast loss with
+  utility loss and delayed checkpoint selection until epoch 6; validation degraded
+  monotonically, demonstrating that reading val without allowing it to select does
+  not prevent overfitting. The final gate config starts validation selection at epoch
+  1, freezes the 126344-parameter adapter bank, and trains only signed
+  `MSE + 0.3*MAE` utility (with skip/no-op target). Gate checkpoint:
+  `outputs/etth1_h96_penalty_anchor_repair_20260713/runs/gate/best_checkpoint.pt`.
+- Per the user's explicit authorization, ran one and only one fixed-weight test search
+  over global positive PKR shrink `s in {0,0.25,0.5,0.75,1}` using
+  `scripts/run_etth1_penalty_anchor_test_search.py`. Results:
+  - `s=0`: `0.357187331 / 0.386568129`;
+  - `s=0.25`: **`0.357116342 / 0.386601031`** (selected);
+  - `s=0.5`: `0.357133746 / 0.386704445`;
+  - `s=0.75`: `0.357239604 / 0.386876732`;
+  - `s=1`: `0.357434034 / 0.387117386`.
+  The selected active-adapter setting improves the reproducible baseline by
+  `0.2902% MSE / 0.0879% MAE`. It is better than the printed table MSE and remains in
+  the same `0.386x` MAE band. Test routes are approximately level `0.24%`, delta
+  `96.19%`, d2 `1.67%`, diff-amp `1.90%`; periodic participation is `100%`.
+- Saved delivery artifacts under
+  `outputs/etth1_h96_penalty_anchor_repair_20260713/test_search_once/`:
+  `best_config.yaml`, `best_checkpoint.pt`, `selection_manifest.json`,
+  `search_results.csv/json`, per-candidate run summaries, and `RESULTS.md`. The
+  manifest records explicit test-selection authorization and the source checkpoint
+  SHA-256.
+- Verification: full `pytest -q tests` passes `585 passed`
+  with one pre-existing single-sample `std()` warning; `py_compile` passes for all
+  edited runtime/search modules and `git diff --check` reports only existing Windows
+  line-ending warnings. Next recommended action is not another test-tuned sweep. If
+  further gate improvement is required, add a true patch-level continuous utility
+  regression/no-op head and select it on val before any new test read.

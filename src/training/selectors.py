@@ -17,6 +17,7 @@ from .anchors import (
     apply_moe_output_anchor_experts,
     apply_train_stat_anchor_expert,
     apply_train_stat_input_centering,
+    build_moe_output_anchor_fixed_expert_delta,
 )
 from .core import (
     _contiguous_segment_ranges,
@@ -316,6 +317,7 @@ def _pred_residual_candidate_predictions(
     include_selector: bool = True,
     include_patch_route: bool = True,
 ) -> Optional[torch.Tensor]:
+    candidate_base_bch = pred_out.get("candidate_base_bch", y_base_bch)
     residuals = pred_out.get("residuals")
     alpha_cp = pred_out.get("alpha_cp")
     intervention_bcp = pred_out.get("intervention_bcp")
@@ -338,20 +340,23 @@ def _pred_residual_candidate_predictions(
         selector_bcp = torch.ones_like(selector_bcp)
     scale_bcp = intervention_bcp * selector_bcp * confidence_active_bcp * alpha_cp.unsqueeze(0)
     if patch_candidate_scale_c is not None and int(patch_candidate_scale_c.numel()) > 0:
-        if int(patch_candidate_scale_c.numel()) != int(y_base_bch.shape[1]):
+        if int(patch_candidate_scale_c.numel()) != int(candidate_base_bch.shape[1]):
             raise ValueError(
                 "patch candidate scale length must match the channel count."
             )
         scale_bcp = scale_bcp * patch_candidate_scale_c.to(
-            device=y_base_bch.device,
-            dtype=y_base_bch.dtype,
+            device=candidate_base_bch.device,
+            dtype=candidate_base_bch.dtype,
         ).view(1, -1, 1)
     if pred_residual_scale_c is not None:
-        channel_scale = pred_residual_scale_c.to(device=y_base_bch.device, dtype=y_base_bch.dtype).view(1, -1, 1)
+        channel_scale = pred_residual_scale_c.to(
+            device=candidate_base_bch.device,
+            dtype=candidate_base_bch.dtype,
+        ).view(1, -1, 1)
         scale_bcp = scale_bcp * channel_scale
     if patch_route_bcph is not None and bool(include_patch_route):
-        return y_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * patch_route_bcph * residuals
-    return y_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
+        return candidate_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * patch_route_bcph * residuals
+    return candidate_base_bch.unsqueeze(2) + scale_bcp.unsqueeze(-1) * residuals
 
 
 def _pred_residual_candidates_on_eval_path(
@@ -374,6 +379,7 @@ def _pred_residual_candidates_on_eval_path(
     include_selector: bool = True,
     include_patch_route: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    candidate_base_bch = pred_out.get("candidate_base_bch", y_base_bch)
     cand_bcpH = _pred_residual_candidate_predictions(
         y_base_bch,
         pred_out,
@@ -383,11 +389,11 @@ def _pred_residual_candidates_on_eval_path(
         include_patch_route=include_patch_route,
     )
     if cand_bcpH is None or not apply_output_anchors:
-        return y_base_bch, cand_bcpH
+        return candidate_base_bch, cand_bcpH
     if x_bcl is None or query_start_abs_b is None:
         raise ValueError("Output-anchor candidate evaluation requires x_bcl and query_start_abs_b.")
     y_base_final = apply_moe_output_anchor_experts(
-        y_base_bch,
+        candidate_base_bch,
         base_pred_bch=y_base_bch,
         x_bcl=x_bcl,
         query_start_abs_b=query_start_abs_b,
@@ -713,6 +719,7 @@ def _mse_utility_gate_supervision_loss(
     cand_eval_bcpH: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
     min_gain: float = 0.0,
+    mae_weight: float = 0.0,
     target_power: float = 1.0,
     include_skip: bool = False,
     probs_include_skip_mass: bool = False,
@@ -738,6 +745,12 @@ def _mse_utility_gate_supervision_loss(
         base_err_bc = (base_bch - y_bch).pow(2).mean(dim=-1)
         cand_err_bcp = (cand_bcpH - y_bch.unsqueeze(2)).pow(2).mean(dim=-1)
         gain_bcp = base_err_bc.unsqueeze(-1) - cand_err_bcp
+        if float(mae_weight) != 0.0:
+            base_mae_bc = (base_bch - y_bch).abs().mean(dim=-1)
+            cand_mae_bcp = (cand_bcpH - y_bch.unsqueeze(2)).abs().mean(dim=-1)
+            gain_bcp = gain_bcp + float(mae_weight) * (
+                base_mae_bc.unsqueeze(-1) - cand_mae_bcp
+            )
         gain_bkp = scatter_mean_bcf_to_bkf(gain_bcp, cluster_id_c, K)
         if allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
             allowed = allowed_mask_kp.to(device=probs_bkp.device, dtype=torch.bool)
@@ -3072,6 +3085,56 @@ def _patch_router_oracle_batch_stats(
     }
 
 
+def _remove_forecast_affine_component(values_bch: torch.Tensor) -> torch.Tensor:
+    centered = values_bch - values_bch.mean(dim=-1, keepdim=True)
+    if int(values_bch.shape[-1]) <= 1:
+        return centered
+    trend_h = torch.linspace(
+        -1.0,
+        1.0,
+        int(values_bch.shape[-1]),
+        device=values_bch.device,
+        dtype=values_bch.dtype,
+    )
+    trend_h = trend_h - trend_h.mean()
+    coef_bc = (
+        (centered * trend_h.view(1, 1, -1)).sum(dim=-1, keepdim=True)
+        / trend_h.pow(2).sum().clamp_min(1.0e-12)
+    )
+    return centered - coef_bc * trend_h.view(1, 1, -1)
+
+
+def _named_forecast_attribute_error(
+    candidate_bch: torch.Tensor,
+    target_bch: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    """Direct future-attribute error used to train one named adapter."""
+    if name == "level":
+        return (candidate_bch.mean(dim=-1) - target_bch.mean(dim=-1)).pow(2)
+    if name == "delta":
+        cand_shape = candidate_bch - candidate_bch.mean(dim=-1, keepdim=True)
+        target_shape = target_bch - target_bch.mean(dim=-1, keepdim=True)
+        return (cand_shape - target_shape).pow(2).mean(dim=-1)
+    if name == "d2_match":
+        cand_shape = _remove_forecast_affine_component(candidate_bch)
+        target_shape = _remove_forecast_affine_component(target_bch)
+        return (cand_shape - target_shape).pow(2).mean(dim=-1)
+    if name == "diff_amp":
+        if int(candidate_bch.shape[-1]) <= 1 or int(target_bch.shape[-1]) <= 1:
+            return torch.zeros_like(candidate_bch[..., 0])
+        cand_std = candidate_bch.diff(dim=-1).std(dim=-1)
+        target_std = target_bch.diff(dim=-1).std(dim=-1)
+        return (cand_std - target_std).pow(2)
+    if name in {"amp", "amp_under"}:
+        cand_std = candidate_bch.std(dim=-1)
+        target_std = target_bch.std(dim=-1)
+        if name == "amp_under":
+            return (target_std - cand_std).clamp_min(0.0).pow(2)
+        return (cand_std - target_std).pow(2)
+    raise ValueError(f"No direct future-attribute target is defined for penalty {name!r}.")
+
+
 def _pred_residual_candidate_supervision_loss(
     *,
     y_base_bch: torch.Tensor,
@@ -3124,7 +3187,18 @@ def _pred_residual_candidate_supervision_loss(
     if cand_bcpH is None or cand_bcpH.numel() == 0:
         return None
     loss_mode = str(loss_kind).lower()
-    if loss_mode in {"own_penalty", "penalty", "attribute", "shape"}:
+    if loss_mode in {"direct_attribute", "attribute_mse", "future_attribute"}:
+        if penalty_names is None or len(penalty_names) != int(cand_bcpH.shape[2]):
+            raise ValueError("direct_attribute candidate supervision requires one penalty name per branch.")
+        per_penalty = []
+        for p, name in enumerate(penalty_names):
+            err_bc = _named_forecast_attribute_error(cand_bcpH[:, :, p, :], y_bch, name)
+            if penalty_scale is not None and penalty_scale.numel() > p:
+                scale_p = penalty_scale[p].to(device=err_bc.device, dtype=err_bc.dtype).clamp_min(1.0e-6)
+                err_bc = err_bc / scale_p
+            per_penalty.append(err_bc)
+        err_bcp = torch.stack(per_penalty, dim=-1)
+    elif loss_mode in {"own_penalty", "penalty", "attribute", "shape"}:
         if penalty_names is None or penalty_fns is None or len(penalty_names) != int(cand_bcpH.shape[2]):
             raise ValueError("own_penalty candidate supervision requires one penalty name/function per branch.")
         per_penalty = []
@@ -3160,6 +3234,7 @@ def _pred_residual_candidate_supervision_loss(
     else:
         raise ValueError(
             "moe.pred_side_residual.candidate_supervision.loss must be mse, mae, own_penalty, "
+            "direct_attribute, "
             "gain_hinge_mse, or gain_hinge_mae "
             f"(got {loss_kind!r})."
         )
@@ -3749,6 +3824,19 @@ def _collect_pred_residual_selector_tensors(
             mask_all_bkp,
             skip_bk=None,
             query_start_abs_b=query_start_abs_b,
+            fixed_expert_delta_bch=build_moe_output_anchor_fixed_expert_delta(
+                y_base,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                input_len=int(input_len),
+                moe_cfg=moe_cfg,
+                moe_enable=True,
+                observed_history_tc=observed_history_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+                learnable_output_anchor=learnable_output_anchor,
+                cluster_id_c=cluster_id_c,
+            ),
         )
         y_base_final, cand_bcpH = _pred_residual_candidates_on_eval_path(
             y_base,

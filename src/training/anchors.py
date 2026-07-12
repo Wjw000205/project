@@ -648,8 +648,26 @@ def apply_moe_output_anchor_experts(
     train_residual_anchor_phc: Optional[torch.Tensor] = None,
     learnable_output_anchor: Optional[ClusterwiseLearnableOutputAnchor] = None,
     cluster_id_c: Optional[torch.Tensor] = None,
+    force_apply: bool = False,
 ) -> torch.Tensor:
     moe_cfg = moe_cfg or {}
+    pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
+    periodic_anchor_expert_cfg = pred_residual_cfg.get("periodic_anchor_expert", {}) or {}
+    periodic_anchor_expert_enabled = (
+        bool(periodic_anchor_expert_cfg.get("enable", False))
+        if isinstance(periodic_anchor_expert_cfg, dict)
+        else bool(periodic_anchor_expert_cfg)
+    )
+    if (
+        bool(moe_enable)
+        and bool(pred_residual_cfg.get("enable", False))
+        and periodic_anchor_expert_enabled
+        and not bool(force_apply)
+    ):
+        # In fixed-expert mode the same anchor delta is routed inside the
+        # prediction-residual MoE. Applying it here as well would count the
+        # correction twice (once as a candidate and once post hoc).
+        return pred_bch
     out = pred_bch
     history_cfg = moe_cfg.get("history_anchor_expert", {}) or {}
     stat_cfg = moe_cfg.get("train_stat_anchor_expert", {}) or {}
@@ -700,6 +718,61 @@ def apply_moe_output_anchor_experts(
             residual_delta_bch=residual_delta_bch,
         )
     return out
+
+
+def build_moe_output_anchor_fixed_expert_delta(
+    base_pred_bch: torch.Tensor,
+    *,
+    x_bcl: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    input_len: int,
+    moe_cfg: Optional[dict],
+    moe_enable: bool,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    learnable_output_anchor: Optional[ClusterwiseLearnableOutputAnchor] = None,
+    cluster_id_c: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Build the configured output anchor as a fixed MoE candidate delta.
+
+    This bridge is deliberately disabled unless
+    ``moe.pred_side_residual.periodic_anchor_expert.enable`` is true.  The
+    anchor stack is evaluated from the uncorrected base prediction so the
+    returned tensor has the exact candidate contract ``anchor(base) - base``.
+    ``force_apply=True`` bypasses the post-hoc duplicate guard above.
+    """
+
+    moe_cfg = moe_cfg or {}
+    pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
+    periodic_anchor_expert_cfg = pred_residual_cfg.get("periodic_anchor_expert", {}) or {}
+    periodic_anchor_expert_enabled = (
+        bool(periodic_anchor_expert_cfg.get("enable", False))
+        if isinstance(periodic_anchor_expert_cfg, dict)
+        else bool(periodic_anchor_expert_cfg)
+    )
+    if not (
+        bool(moe_enable)
+        and bool(pred_residual_cfg.get("enable", False))
+        and periodic_anchor_expert_enabled
+    ):
+        return None
+    anchor_pred_bch = apply_moe_output_anchor_experts(
+        base_pred_bch,
+        base_pred_bch=base_pred_bch,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len),
+        moe_cfg=moe_cfg,
+        moe_enable=moe_enable,
+        observed_history_tc=observed_history_tc,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+        learnable_output_anchor=learnable_output_anchor,
+        cluster_id_c=cluster_id_c,
+        force_apply=True,
+    )
+    return anchor_pred_bch - base_pred_bch
 
 
 def apply_train_stat_input_centering(
@@ -1331,6 +1404,7 @@ __all__ = [
     '_anchor_alpha_from_cfg',
     'apply_train_residual_anchor_expert',
     'apply_moe_output_anchor_experts',
+    'build_moe_output_anchor_fixed_expert_delta',
     'apply_train_stat_input_centering',
     'apply_train_stat_anchor_expert',
     'select_channel_anchor_scales',
