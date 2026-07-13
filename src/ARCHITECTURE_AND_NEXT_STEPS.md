@@ -11517,3 +11517,55 @@ Hand back the report and STOP. Do not start a follow-up without me.
   candidate checkpoint. If explicitly revisited, first measure a val-only discrete
   anchor-scale patch oracle; do not tune another learned head without an epoch-0
   no-op candidate and a dual-metric/temporal adoption guard.
+
+## 2026-07-13: periodic activation opportunity re-audit — oracle exists, learned gate rejected
+
+- User explicitly asked to re-study stable periodic-expert activation. All new runs
+  were val-only with `eval.skip_test=true`; the frozen delivered PKR shrink remained
+  `s=0.25`. The pre-registered activation-oracle threshold required at least `0.3%`
+  MSE headroom, non-regressing MAE, four dual-safe temporal blocks, and non-degenerate
+  off/on support. The learned-gate adoption rule additionally required aggregate val
+  MSE gain `>=0.10%`, non-regressing MAE, at least 5/6 nonnegative-MSE embargoed
+  blocks, a dual-safe last block, and worst-block regression no larger than `0.10%`.
+- Full periodic-branch counterfactual (`scale in {0,.25,.5,.75,1}`) showed that the
+  periodic core is a foundation, not a normal competing expert. Fixed scale results
+  were `0.694113/0.541951`, `0.671145/0.535943`, `0.653835/0.532152`,
+  `0.640699/0.530474`, and `0.631745/0.530777`; full off therefore regresses MSE by
+  `9.8723%`. A target-aware channel-patch off/on oracle still had large headroom
+  (`0.585488/0.499743`, `+7.3221%/+5.8470%`, off rate `43.82%`) and all four val
+  blocks were positive, but a leave-one-block-out static channel-patch policy
+  regressed `3.6374%/0.7491%`. Verdict: never gate the whole periodic core directly;
+  its apparent patch oracle is input-conditional and its static transfer is unsafe.
+- Decomposed the branch into an always-on static periodic core and the loaded
+  history-conditioned learnable refiner. Fixed refiner on improves off from
+  `0.639264/0.534232` to `0.631745/0.530777` (`+1.1762%/+0.6466%`). The refiner-only
+  channel-patch oracle has additional real space: `0.621471/0.525109`,
+  `+1.6263%/+1.0679%`, off rate `45.54%`; all six continuous val blocks with a
+  96-window boundary embargo were dual-positive (MSE gains `0.9205%` to `2.0855%`).
+  However, its leave-one-block-out static channel-patch policy still regressed
+  `0.0205% MSE / 0.0479% MAE`, proving that a deployable selector must be genuinely
+  input-conditioned rather than a channel/patch lookup.
+- Ran one controlled learned activation attempt and stopped after failure. Candidate
+  features were target-free observed-history, off/on forecast, off-minus-on, PKR
+  probability, patch-position, and time summaries. Two separate per-channel ridge
+  heads predicted signed MSE and MAE utility from the first 75% of train; a 96-window
+  embargo separated a train-tail calibration segment, whose 10th-percentile residual
+  defined both utility lower bounds. Deployment selected refiner-off only when
+  `LCB_MSE>0` and `LCB_MAE>0`, otherwise exact refiner-on identity.
+- The learned risk gate activated off on only `1.86%` of val channel-patches and
+  scored `0.631863/0.530926`, a regression of `0.0186% MSE / 0.0281% MAE`. Only 2/6
+  embargoed blocks had nonnegative MSE gain; the last block regressed
+  `0.0471%/0.0222%`. Channel 4 was positive (`+0.1113%/+0.0245%`), but channels 1
+  and 5 regressed (`-0.0941%/-0.0937%` and `-0.1702%/-0.0994%`). Classification:
+  genuine candidate space but non-transferable signed-utility calibration / feature
+  expressivity under train-to-val shift, not an eval-path wiring or candidate-quality
+  failure. Do not tune the ridge alpha/quantile against val after this rejection.
+- Diagnostic artifacts:
+  `outputs/etth1_h96_periodic_activation_val_oracle_20260713/`,
+  `outputs/etth1_h96_periodic_refiner_activation_val_oracle_20260713/`, and
+  `outputs/etth1_h96_periodic_refiner_activation_risk_gate_20260713/`. No test read
+  occurred. All temporary runtime collectors and runners were removed; tracked
+  runtime remains exactly the delivered always-on implementation at `1642444`
+  (with audit-log-only commits after it). Current adoption verdict: keep static
+  periodic core and learnable refiner always on; the stable oracle opportunity is
+  real but not yet learnably activated.
