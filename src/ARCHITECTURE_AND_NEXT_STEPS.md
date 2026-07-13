@@ -11735,3 +11735,67 @@ Hand back the report and STOP. Do not start a follow-up without me.
   candidates fail that contract, so runtime stays at rollback point `1642444`.
   Consolidated artifact:
   `outputs/etth1_h96_gate_stability_20260713/RESULTS.md`.
+
+## 2026-07-13: ETTm1-H96 periodic-plus-other signed-utility gate study
+
+- Switched the controlled gate-stability investigation from ETTh1 to ETTm1-H96.
+  All new work was train/val-only: replay configs set `eval.skip_test=true`,
+  prediction diagnostics requested only `train/val`, both summaries omit test
+  metrics, and no test loader was traversed. The historical test numbers below
+  are provenance from an existing summary, not a new read or selection signal.
+- Froze the two deployment candidates. A is backbone plus the historical
+  period-96 train-stat/train-residual anchors; their saved alpha arrays were
+  restored explicitly and fresh scale selection was disabled. B is A plus the
+  legacy static candidate selector classes `[2,3,2,3,0,0,1]`, corresponding to
+  `[delta,d2_match,delta,d2_match,skip,skip,level]`. A temporary default-off
+  fixed-selector runtime path was used during the study so this policy was not
+  re-fit on val. Exact replay passed the `5e-6` guard: A val
+  `0.350771144/0.390539066`, B val `0.347121649/0.388248276`; B therefore gains
+  `1.0404%/0.5866%`. Epoch 0 is exactly B.
+- First controlled gate used the existing continuous patch mixture and direct
+  `MSE+0.3*MAE` forecast loss on all train. Val improved
+  `0.1580%/0.1845%`, but a 96-window-embargoed prefix-to-tail OOF regressed
+  `0.7817%/0.5400%`; val MSE was positive in only 3/6 blocks and its last block
+  regressed MSE `0.2738%`. It was rejected and operational output remained B.
+  The original expanding OOF also had 25% fewer optimizer updates than the full
+  fit, but the equal-window follow-up below rules that out as the main cause.
+- Failure audit found true conditional-utility shift rather than a reshape,
+  feature-normalization, or eval-wiring bug. Switching B to A is strongly
+  favorable in the old prefix, then reverses in the recent train tail; prefix to
+  tail channel-patch MSE utility correlation is `0.009`, whereas recent tail to
+  val is about `0.845`. Replacing expanding train with one equal-length rolling
+  recent window was the only change in the next run. Every learned val epoch
+  regressed, so epoch 0/no-op won. Do not sweep the rolling-window length.
+- The dual-safe endpoint oracle remains real: OOF tail gains about
+  `3.998% MSE / 2.695% MAE`, val gains about `3.996%/2.926%`, at roughly
+  `39%-40%` patch action. The direct gate nevertheless had val scale-to-utility
+  rank correlation only about `0.056/0.069`, identifying routing-target and
+  dual-metric calibration as a second failure layer.
+- Ran the requested direct signed-utility formulation as the final target audit:
+  two heads regress robustly transformed continuous `U_MSE` and `U_MAE`; the
+  smaller positive prediction supplies an exact-zero continuous action without
+  binary labels or a confidence threshold. Recent rolling OOF improved
+  `0.3984%/0.1111%`; val improved `0.2665%/0.0433%`. OOF utility-decile rank
+  correlations were `0.8803/0.9193`, val `0.5614/0.4313`, and the top decile was
+  dual-positive on both. This proves that signed-utility targets materially fix
+  the old calibration error. The candidate was still rejected because the last
+  val block regressed MAE `0.0342%`, violating the pre-registered last-block
+  dual-safety guard.
+- One final risk-bound diagnostic replaced the mean utility with a learned
+  heteroscedastic Laplace lower bound `mu-b` (approximately the one-sided 18th
+  percentile); no threshold, multiplier, quantile, or guard was tuned. It
+  collapsed safely to epoch 0/no-op. Stop this A/B gate path: do not tune LCB
+  scale, confidence threshold, quantile, window length, or block guards on this
+  val. Primary blocker is conditional utility regime shift / selection-policy
+  risk; secondary blocker is routing-target calibration. Candidate quality and
+  eval wiring are not the blockers.
+- Consolidated evidence lives at
+  `outputs/ettm1_h96_periodic_other_soft_gate_20260713/RESULTS.md`, with JSON and
+  decision artifacts beside it. The frozen B path historically reported test
+  `0.294655/0.348242`, close to the ETTm1-H96 main-table
+  `0.294715/0.348713`; no new test read occurred. Because the legacy anchors and
+  selector were historically selected on this same val period, these gate
+  results are an engineering stability study rather than a clean outer-holdout
+  generalization claim. Per the rollback rule, temporary collector, selector,
+  runner, and tests are removed after recording; tracked runtime remains at the
+  pre-study version.
