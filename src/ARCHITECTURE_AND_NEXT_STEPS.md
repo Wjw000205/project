@@ -11569,3 +11569,52 @@ Hand back the report and STOP. Do not start a follow-up without me.
   (with audit-log-only commits after it). Current adoption verdict: keep static
   periodic core and learnable refiner always on; the stable oracle opportunity is
   real but not yet learnably activated.
+
+## 2026-07-13: true `periodic-only` vs `periodic+other` input gate exploration
+
+- User clarified that a fixed channel/cluster rule is not acceptable: the gate must
+  make a real input-conditioned choice. The legal routes were therefore frozen as
+  `p = backbone + periodic_core + periodic_refiner` and
+  `p+r = p + current_routed_PKR_other`, where the delivered global PKR shrink remains
+  `s=0.25`. Periodic participation is exactly one in both routes and never consumes a
+  PKR top-k slot. The operational epoch-0 identity is `p+r`, because it is already
+  better on val than `p`: `0.631745/0.530777` versus `0.632823/0.531116`
+  (`+0.1703%/+0.0638%`).
+- Collected target-free features and exact frozen-candidate train/val predictions at
+  channel x 24-step-patch granularity. Both candidates traverse their complete
+  deployment paths and share bit-equal `idx/x/y/cluster_id`. The true dual-safe
+  target oracle confirms learnable candidate space: train oracle
+  `+0.2606% MSE / +0.1798% MAE`, val oracle `+0.3780%/+0.2423%`; the val oracle chose
+  periodic-only on `47.99%` of patches and was positive in all six embargoed blocks.
+- First real gate: a per-channel MLP predicted the 20th percentile of the two signed
+  utilities for switching from `p+r` to `p`. It made input-conditioned decisions but
+  collapsed toward no-op: its best aggregate-dual checkpoint selected periodic-only
+  on `0.98%` of patches and improved only `0.0012%/0.0018%`; just 4/6 blocks had
+  nonnegative MSE. Rejected as overly conservative objective calibration.
+- Per the user's clarification, replaced the conservative quantile objective—not the
+  model, candidates, features, or training hyperparameters—with direct dual signed-
+  utility Smooth-L1 regression. The gate then made substantive real choices
+  (`40%`-`45%` periodic-only across epochs). Val was read every epoch and epoch-0
+  identity participated explicitly in checkpoint selection. A temporary aggregate-
+  only selector exposed a wiring error: it selected epoch 16 at
+  `0.631095/0.530724` (about `+0.1029%/+0.0101%`) even though only 3/6 blocks had
+  nonnegative MSE. Corrected selection so every epoch must pass the full pre-
+  registered aggregate and six-block guard before it can replace epoch 0, then reran
+  the identical deterministic training.
+- Final result: no one of 20 learned checkpoints passed the full guard. Early epochs
+  had 5-6 nonnegative blocks but aggregate MSE gain below `0.10%`; epochs reaching the
+  aggregate magnitude had only 3-4 nonnegative blocks. The saved operational choice
+  is therefore epoch-0 `p+r` with exact `0%` change and no learned gate adoption.
+  Classification: correct composite candidate/routing caliber and real gate
+  expressivity, but forecast-utility magnitude versus temporal-stability tradeoff;
+  the current in-sample train stacking signal is insufficiently causal/stable. This
+  is not a missing candidate-space, hardcoded-rule, or eval-path failure.
+- Artifacts:
+  `outputs/etth1_h96_periodic_plus_other_utility_gate_20260713/` (rejected conservative
+  quantile gate) and
+  `outputs/etth1_h96_periodic_plus_other_mean_utility_gate_20260713/` (direct signed-
+  utility gate with full epoch guard). No test loader was traversed and no test metric
+  was used for training or selection. All temporary collectors/runners were removed;
+  runtime remains exactly `1642444`. If this line is resumed, the next principled
+  lever is causal expanding-prefix train-domain utility estimation with an identity
+  fallback—not a fixed channel rule and not another val-tuned activation threshold.
