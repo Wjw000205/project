@@ -11618,3 +11618,73 @@ Hand back the report and STOP. Do not start a follow-up without me.
   runtime remains exactly `1642444`. If this line is resumed, the next principled
   lever is causal expanding-prefix train-domain utility estimation with an identity
   fallback—not a fixed channel rule and not another val-tuned activation threshold.
+
+## 2026-07-13: periodic-plus-other causal follow-up and chronological adapter/gate verdict
+
+- Continued only with real input-conditioned routing; no channel/cluster lookup or
+  written activation rule was accepted. All runs were train/val-only. No test loader
+  was traversed and no test metric was used.
+- Utility-shift audit of the frozen two-candidate archives found that exact utility is
+  highly local and tail-sensitive rather than a simple class-prior shift. Adjacent
+  origin dual-label agreement is about `86%` because windows overlap, but lag-96
+  agreement falls to chance (`~50%`). Train-to-val channel-patch mean utility
+  correlation is only `0.061` for MSE; `12/28` group signs flip. The worst `1%` val
+  negative utilities contribute `55.2%` of all negative cost. Correction energy has
+  a large val extrapolation tail (mean `18.8x` train; top `1%` holds `93.6%` of val
+  energy), but amplitude is not a safety label because its sign remains mixed.
+- Replacing the 67-dimensional summary with exact target-free raw features (own raw96,
+  cross-channel mean96, periodic prediction96, actual correction96, patch/time/PKR
+  context) did not solve the stability/magnitude tradeoff. The best late checkpoint
+  made substantive choices and reached about `+0.019% MSE / +0.030% MAE` with five
+  MSE-safe blocks, below the pre-registered `0.10%` magnitude. Epoch-0 identity was
+  retained. Artifacts:
+  `outputs/etth1_h96_periodic_plus_other_raw96_gate_20260713/`.
+- A three-vintage causal expanding-prefix gate used prefix ends
+  `2113/4225/6337`, a 96-window embargo before each 2016-window future calibration
+  block, absolute dual utility, Q90 optimism risk, and cross-vintage disagreement.
+  It made genuine but extremely sparse decisions. Epoch 20 selected only
+  `124/77980` patches (`0.159%`) and improved MSE `0.0970%`, but MAE regressed
+  `0.0203%`; it was rejected. The apparent `6/6` positive-block count was partly a
+  reporting artifact: only two blocks had active choices and zero-activation blocks
+  were counted as nonnegative. The MAE failure was concentrated in channel 4 patch 0
+  over 46 consecutive origins (`abs idx 9309..9354`), where all three vintages
+  predicted positive MAE utility while actual mean utility was `-0.244`. Tightening
+  vintage consensus cannot fix this unseen regime. Artifacts:
+  `outputs/etth1_h96_periodic_plus_other_causal_oof_gate_20260713/`.
+- One fixed adapter-support diagnostic uniformly rescaled a sample-channel's entire
+  96-step correction to the train-only Q99.5 RMS (`0.0262456`), preserving direction
+  and named projections. It affected only `1.07%` of val sample-channels but regressed
+  MSE/MAE by `0.1583%/0.0928%`, chiefly in the second temporal block. This proves that
+  the large correction tail contains necessary gains and must not be converted into a
+  hard amplitude rule. Artifacts:
+  `outputs/etth1_h96_periodic_other_support_cap_20260713/`.
+- Per the user's request to train adapters before the gate without strict four-fold
+  routing, ran a single chronological two-stage study: direct-attribute adapter bank
+  on train windows `[0,6337)`, embargo `[6337,6433)`, and gate domain
+  `[6433,8449)`. Val remained the checkpoint/overfit guard. The first inherited
+  cluster-window gate was wrong granularity and failed even after replaying the locked
+  delivered correction scale `s=0.25`: `0.633416/0.531233` versus current identity
+  `0.631745/0.530777`.
+- The clean follow-up bypassed the cluster route and exposed five channel-patch actions:
+  periodic-only plus each independently trained `level/delta/d2_match/diff_amp`
+  candidate. Rebuilding the periodic residual anchor from the recent train gate domain
+  itself produced a much stronger periodic-only base
+  `0.628222995/0.530326284`. This is a genuine stable periodic-expert opportunity, not
+  a gate result. Beyond that base, the validation dual-safe oracle remained large:
+  `+3.4999% MSE / +2.4212% MAE`, action rate `91.07%`.
+- The one formal five-action channel-patch gate trained on the first 75% of the gate
+  domain and selected checkpoint/risk margin on the last 25%. It optimized expected
+  signed forecast utility `MSE + 0.3*MAE` (not a binary safe label), kept the bank and
+  periodic branch frozen, and required all six holdout blocks to have strictly
+  positive MSE gain. It made real choices: non-skip `6.60%` (mostly `diff_amp`) and
+  would score `0.628138105/0.530044491`, an additional
+  `+0.0135% MSE / +0.0531% MAE` on val. It was correctly rejected because immediate
+  train-tail holdout MSE regressed `0.0449%`, only `3/6` blocks were positive, and the
+  worst block regressed `1.1375%`. No selector checkpoint/config is deployable.
+- Final classification: adapter candidate space and recent-train periodic stability are
+  real; the blocker is conditional utility regime shift and selection policy, not
+  penalty naming, missing experts, gate capacity, or eval wiring. Do not tune more
+  confidence/margin thresholds on val, and do not convert correction magnitude into a
+  hard rule. The requested learned periodic-plus-other gate has not passed stability;
+  restore the delivered runtime at `1642444`. Consolidated results:
+  `outputs/etth1_h96_chronological_adapter_gate_20260713/RESULTS.md`.
