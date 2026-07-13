@@ -11688,3 +11688,50 @@ Hand back the report and STOP. Do not start a follow-up without me.
   hard rule. The requested learned periodic-plus-other gate has not passed stability;
   restore the delivered runtime at `1642444`. Consolidated results:
   `outputs/etth1_h96_chronological_adapter_gate_20260713/RESULTS.md`.
+
+## 2026-07-13: gate stability reframe — continuous proposal and causal safety layers
+
+- Investigated the persistent gate instability without reading test and without
+  changing the delivered runtime. The frozen operational identity was
+  `periodic+other` (`0.631745191/0.530777060` on val); `periodic-only` was the only
+  alternative. Validation remained the outer early-stop/overfit guard. A separate
+  chronological train-tail OOF segment checked whether the learned direction existed
+  before validation; this was not a return to four-fold adapter/gate training.
+- A causal delayed least-squares gate (`delay=96`, `lookback=192`) failed immediately:
+  train-tail OOF regressed `0.0341%/0.0082%` MSE/MAE and val regressed
+  `0.1926%/0.0323%`, with only `2/6` val MSE-positive blocks. This confirms that
+  matured utility is too stale to replace a true input-conditioned gate.
+- Replaced utility labels and hard decisions with a direct continuous channel-patch
+  mixture trained on final `MSE+0.3*MAE`. Epoch 1 was dual-positive on val
+  (`+0.0125%/+0.0194%`, 5/6 MSE-positive blocks), but the effect was immaterial.
+  Later epochs made MSE temporally consistent (up to 6/6 and about `+0.06%`) while
+  MAE reversed slightly. Classification: the hard zero boundary contributed to
+  instability, but a fixed weighted-sum objective still moves along an MSE/MAE
+  Pareto front.
+- Tested a structural delayed safety wrapper rather than another confidence
+  threshold. Ninety-six phase learners make a 96-step feedback delay causal: the
+  previous observation for a phase matures before that phase is reused. A scalar
+  dual-safe projected AdaGrad weight was train-tail dual-positive
+  (`+0.0098%/+0.0081%`) and val MSE-positive (`+0.0338%`) but regressed val MAE
+  `0.0311%`. Moving only the safety granularity to phase x channel x patch fixed val
+  aggregate MAE and produced `+0.0548%/+0.0047%` with 5/6 val MSE-positive blocks,
+  but train-tail MSE reversed `0.0024%` and only 3/6 blocks were positive. It was
+  rejected rather than selected from val alone.
+- Aligning the proposal itself to mean channel-patch
+  `max(normalized MSE excess, normalized MAE excess)` reduced its scale but did not
+  fix transfer: train-tail was `+0.0049%/+0.0119%` with 3/6 blocks and val was only
+  `+0.0068%/+0.0146%` with 2/6 blocks. Stop tuning objective weights, AdaGrad step
+  sizes, or safety granularity on val; the residual blocker is conditional utility
+  regime shift / selection policy.
+- Important certificate correction: the AdaGrad inequality is a regret bound versus
+  no-op over the complete history, not a no-harm certificate for the val subinterval.
+  Train gains can mask val loss. It may be used as a causal monitoring/attenuation
+  layer, but cannot authorize adoption by itself.
+- Stable gate contract going forward: independently train and freeze named adapters;
+  keep a bit-exact identity action; train one continuous channel-patch proposal on
+  train; use val for early stopping and overfit detection; require independent
+  train-tail OOF and val to be materially dual-positive. Temporal blocks diagnose
+  drift concentration rather than serving as four optimized folds. Current
+  candidates fail that contract, so runtime stays at rollback point `1642444`.
+  Consolidated artifact:
+  `outputs/etth1_h96_gate_stability_20260713/RESULTS.md`.
