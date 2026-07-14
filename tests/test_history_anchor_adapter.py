@@ -23,6 +23,7 @@ from src.train import (
     _candidate_selector_targets,
     _concat_pred_residual_selector_tensors,
     _collect_pred_residual_selector_tensors,
+    _copy_learnable_output_anchor_active_masks,
     _fit_static_candidate_channel_selector_from_tensors,
     _cluster_penalty_mask_to_channel_mask,
     _load_finetune_pred_residual_state,
@@ -127,6 +128,55 @@ def test_finetune_pred_residual_state_load_restores_checkpoint_weights() -> None
     target_out = target(x, y_base, cluster_id, route)
     for key, source_value in source_out.items():
         assert torch.equal(target_out[key], source_value), key
+
+
+def test_non_strict_pred_residual_load_keeps_new_router_head_and_loads_experts() -> None:
+    common = {
+        "num_clusters": 1,
+        "num_penalties": 2,
+        "input_len": 8,
+        "pred_len": 8,
+        "hidden_dim": 3,
+        "num_channels": 2,
+        "penalty_names": ["a", "b"],
+        "shared_across_clusters": True,
+        "intervention_enable": False,
+    }
+    source = ClusterwisePredResidualMoE(
+        **common,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 4,
+            "hidden_dim": 4,
+            "allow_skip": True,
+        },
+    )
+    target = ClusterwisePredResidualMoE(
+        **common,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 4,
+            "hidden_dim": 4,
+            "allow_skip": True,
+            "hierarchical_recall": {"enable": True},
+        },
+    )
+    with torch.no_grad():
+        source.b2[0].fill_(0.25)
+        target.b2[0].zero_()
+    target_router_head_before = target.patch_router.W2.detach().clone()
+
+    loaded = _load_finetune_pred_residual_state(
+        pred_residual=target,
+        checkpoint={"pred_residual_state": source.state_dict()},
+        source_penalty_names=["a", "b"],
+        target_penalty_names=["a", "b"],
+        strict=False,
+    )
+
+    assert loaded is True
+    assert torch.equal(target.b2[0], source.b2[0])
+    assert torch.equal(target.patch_router.W2, target_router_head_before)
 
 
 def test_cluster_penalty_mask_broadcasts_to_channel_penalty_mask() -> None:
@@ -2326,6 +2376,48 @@ def test_learnable_output_anchor_hybrid_mask_adds_safe_margin_channels() -> None
     assert diagnostics["added_channel_count"] == 1
     assert diagnostics["aggregate"]["metric_gain"] == pytest.approx(0.053333, abs=1.0e-6)
     assert diagnostics["aggregate"]["passed"] is True
+
+
+def test_learnable_output_anchor_frozen_periodic_source_copies_adoption_masks() -> None:
+    cfg = {
+        "enable": True,
+        "scale_parameterization": "channel",
+        "bias_parameterization": "channel",
+    }
+    source = ClusterwiseLearnableOutputAnchor(
+        num_clusters=2, num_channels=3, pred_len=4, cfg=cfg
+    )
+    target = ClusterwiseLearnableOutputAnchor(
+        num_clusters=2, num_channels=3, pred_len=4, cfg=cfg
+    )
+    source.set_active_channel_mask(torch.tensor([1.0, 0.0, 1.0]))
+    source.set_active_channel_horizon_mask(
+        torch.tensor(
+            [
+                [1.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+            ]
+        )
+    )
+
+    summary = _copy_learnable_output_anchor_active_masks(target, source)
+
+    assert target.active_channel_mask_c.tolist() == [1.0, 0.0, 1.0]
+    assert target.active_channel_horizon_mask_ch.tolist() == source.active_channel_horizon_mask_ch.tolist()
+    assert summary["active_channel_mask"] == [1.0, 0.0, 1.0]
+
+
+def test_learnable_output_anchor_frozen_periodic_source_rejects_mask_shape_mismatch() -> None:
+    source = ClusterwiseLearnableOutputAnchor(
+        num_clusters=1, num_channels=3, pred_len=4, cfg={"enable": True}
+    )
+    target = ClusterwiseLearnableOutputAnchor(
+        num_clusters=1, num_channels=2, pred_len=4, cfg={"enable": True}
+    )
+
+    with pytest.raises(ValueError, match="channel-mask shape mismatch"):
+        _copy_learnable_output_anchor_active_masks(target, source)
 
 
 def test_learnable_output_anchor_channel_horizon_mask_selects_stable_blocks() -> None:

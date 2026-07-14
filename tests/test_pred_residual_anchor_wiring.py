@@ -158,6 +158,69 @@ class _TwoPenaltyResidual(torch.nn.Module):
         }
 
 
+class _PatchRouterResidual(torch.nn.Module):
+    """Patch route skips the first patch while the outer gate never skips."""
+
+    def eval(self):
+        return self
+
+    def forward(
+        self,
+        x_bcl: torch.Tensor,
+        y_base_bch: torch.Tensor,
+        cluster_id_c: torch.Tensor,
+        mask_bkp: torch.Tensor,
+        skip_bk=None,
+        **kwargs,
+    ):
+        batch, channels, horizon = y_base_bch.shape
+        assert horizon == 2
+        residuals = torch.zeros(
+            batch,
+            channels,
+            2,
+            horizon,
+            device=x_bcl.device,
+            dtype=x_bcl.dtype,
+        )
+        residuals[:, :, 0, :] = 1.0
+        residuals[:, :, 1, :] = -1.0
+        patch_route = torch.zeros_like(residuals)
+        patch_route[:, :, 0, 1] = 1.0
+        branches = patch_route * residuals
+        route = patch_route.mean(dim=-1)
+        patch_skip = torch.tensor(
+            [[[1.0, 0.0]]],
+            device=x_bcl.device,
+            dtype=x_bcl.dtype,
+        ).expand(batch, channels, 2)
+        selected_penalty = torch.zeros(
+            batch,
+            channels,
+            2,
+            device=x_bcl.device,
+            dtype=torch.long,
+        )
+        return {
+            "y_final": y_base_bch + branches.sum(dim=2),
+            "residuals": residuals,
+            "branches": branches,
+            "route_bcp": route,
+            "intervention_bcp": torch.ones_like(route),
+            "selector_bcp": torch.ones_like(route),
+            "effective_route_bcp": route,
+            "alpha_cp": torch.ones(
+                channels,
+                2,
+                device=x_bcl.device,
+                dtype=x_bcl.dtype,
+            ),
+            "patch_route_bcph": patch_route,
+            "patch_skip_bcq": patch_skip,
+            "patch_selected_penalty_index_bcq": selected_penalty,
+        }
+
+
 class _SelectorAnchorPathResidual(torch.nn.Module):
     def eval(self):
         return self
@@ -1333,6 +1396,52 @@ def test_candidate_supervision_can_use_own_penalty_instead_of_mse() -> None:
     assert torch.allclose(loss, torch.full((1, 1), 2.5))
 
 
+def test_candidate_supervision_can_add_forecast_mse_to_own_penalty() -> None:
+    cluster_id_c = torch.zeros(1, dtype=torch.long)
+    y_base = torch.zeros(1, 1, 2)
+    y = torch.ones(1, 1, 2)
+    residuals = torch.tensor(
+        [[[[0.0, 0.0], [5.0, 5.0]]]],
+        requires_grad=True,
+    )
+    pred_out = {
+        "residuals": residuals,
+        "alpha_cp": torch.ones(1, 2),
+        "intervention_bcp": torch.ones(1, 1, 2),
+    }
+
+    loss = _pred_residual_candidate_supervision_loss(
+        y_base_bch=y_base,
+        pred_out=pred_out,
+        y_bch=y,
+        cluster_id_c=cluster_id_c,
+        K=1,
+        penalty_names=["zero", "mean"],
+        penalty_fns={
+            "zero": lambda yhat, ytrue: torch.zeros(
+                yhat.shape[:2],
+                dtype=yhat.dtype,
+                device=yhat.device,
+            ),
+            "mean": lambda yhat, ytrue: yhat.mean(dim=-1),
+        },
+        loss_kind="own_penalty_mse",
+        forecast_mse_weight=2.0,
+        only_allowed=False,
+        include_intervention=False,
+        include_selector=False,
+        include_patch_route=False,
+    )
+
+    # Own-penalty mean is (0 + 5) / 2 = 2.5. Candidate MSE mean is
+    # (1 + 16) / 2 = 8.5, so weight 2 makes the composite equal 19.5.
+    assert loss is not None
+    assert torch.allclose(loss, torch.full((1, 1), 19.5))
+    loss.mean().backward()
+    assert residuals.grad is not None
+    assert torch.all(residuals.grad.abs().sum(dim=-1) > 0.0)
+
+
 def test_candidate_supervision_gain_hinge_penalizes_only_worse_than_base() -> None:
     cluster_id_c = torch.zeros(1, dtype=torch.long)
     y_base = torch.zeros(1, 1, 2)
@@ -1641,6 +1750,93 @@ def test_penalty_explainability_reports_oracle_top1_and_skip_by_cluster() -> Non
     assert good_row["top1_selected_positive_rate"] == 1.0
     assert bad_row["top1_selected_count"] == 0
     assert bad_row["skipped_on_oracle_positive_count"] == 2
+
+
+def test_penalty_explainability_uses_the_deployed_patch_skip_route() -> None:
+    x = torch.zeros(1, 1, 3)
+    y = torch.ones(1, 1, 2)
+    idx = torch.zeros(1, dtype=torch.long)
+
+    payload = evaluate_penalty_explainability(
+        model=_ZeroBackbone(),
+        gate=_FirstPenaltyGate(),
+        pred_residual=_PatchRouterResidual(),
+        loader=[(x, y, idx)],
+        cluster_id_c=torch.zeros(1, dtype=torch.long),
+        K=1,
+        moe_cfg={
+            "enable": True,
+            "allow_skip": True,
+            "explainability": {
+                "adapter_specialization": {
+                    "enable": True,
+                    "scale_sweep": [0.0, 0.5, 1.0],
+                },
+                "periodic_action_space": {"enable": True},
+            },
+        },
+        device=torch.device("cpu"),
+        penalty_names=["good", "bad"],
+        penalty_fns={
+            "good": lambda yhat, ytrue: (yhat - ytrue).square().mean(dim=-1),
+            "bad": lambda yhat, ytrue: (yhat - ytrue).square().mean(dim=-1),
+        },
+        penalty_scale=None,
+        select_ranks=None,
+        gate_soft_weight=0.0,
+        split_name="val",
+    )
+
+    assert payload is not None
+    # The legacy outer gate never skips, which is precisely the old diagnostic
+    # bug this integration test distinguishes from the deployed patch route.
+    assert payload["per_cluster"][0]["skip_rate"] == 0.0
+    assert payload["routing_diagnostic_sources"]["legacy_fields"] == {
+        "routing_granularity": "sample_channel_full_horizon",
+        "skip_source": "outer_cluster_gate_skip_bk",
+        "selected_penalty_source": "outer_cluster_gate_mask_and_probs",
+        "replaced_by_patch_router": True,
+    }
+    patch = payload["patch_router_route_diagnostics"]
+    assert patch["routing_granularity"] == "sample_channel_patch"
+    assert patch["skip_source"] == "patch_skip_bcq"
+    assert patch["aggregate"]["decision_count"] == 2
+    assert patch["aggregate"]["actual_skip_count"] == 1
+    assert patch["aggregate"]["actual_skip_rate"] == 0.5
+    assert patch["aggregate"]["route_skip_mismatch_count"] == 0
+    assert patch["aggregate"]["route_skip_mismatch_rate"] == 0.0
+    assert patch["aggregate"]["missed_dual_action_count"] == 1
+    assert patch["per_cluster"][0]["actual_skip_rate"] == 0.5
+    assert patch["per_cluster"][0]["per_penalty"][0]["selected_count"] == 1
+    gated_good = patch["aggregate"]["per_penalty"][0]
+    assert gated_good["named_penalty_available_rate"] == 1.0
+    assert gated_good["selected_named_penalty_positive_precision"] == 1.0
+    assert gated_good["selected_named_penalty_reduction_pct"] == 100.0
+    assert gated_good["selected_mean_mse_gain"] == 1.0
+    assert gated_good["selected_mean_mae_gain"] == 1.0
+    assert gated_good["selected_region_proof_pass"] is True
+    assert (
+        patch["aggregate"]["conditional_specialization_proof"]
+        ["all_activated_experts_pass"]
+        is True
+    )
+    gated_scale = payload["gated_adapter_scale_sweep"]
+    assert gated_scale["all_activated_experts_have_joint_safe_nonzero_scale"] is True
+    assert gated_scale["rows"][0]["expert"] == "good"
+    assert gated_scale["rows"][0]["best_joint_scale"] == 1.0
+    action_oracle = payload["periodic_action_space_oracle"]
+    assert action_oracle["action_space"] == [
+        "backbone",
+        "periodic",
+        "periodic+good",
+        "periodic+bad",
+    ]
+    assert action_oracle["periodic_selectable_dual_safe_oracle"]["mse"] == 0.0
+    assert (
+        action_oracle["periodic_selectable_dual_safe_oracle"]
+        ["periodic_plus_other_action_rate"]
+        == 1.0
+    )
 
 
 def test_penalty_explainability_reports_cluster_route_oracle_with_skip() -> None:

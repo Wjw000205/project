@@ -388,6 +388,23 @@ def _pred_residual_candidates_on_eval_path(
         include_selector=include_selector,
         include_patch_route=include_patch_route,
     )
+    patch_application_scale_p = pred_out.get("patch_application_scale_p")
+    if (
+        cand_bcpH is not None
+        and patch_application_scale_p is not None
+        and int(patch_application_scale_p.numel()) > 0
+    ):
+        if int(patch_application_scale_p.numel()) != int(cand_bcpH.shape[2]):
+            raise ValueError(
+                "patch application scale length must match candidate penalties."
+            )
+        application_scale = patch_application_scale_p.to(
+            device=cand_bcpH.device,
+            dtype=cand_bcpH.dtype,
+        ).view(1, 1, -1, 1)
+        cand_bcpH = candidate_base_bch.unsqueeze(2) + application_scale * (
+            cand_bcpH - candidate_base_bch.unsqueeze(2)
+        )
     if cand_bcpH is None or not apply_output_anchors:
         return candidate_base_bch, cand_bcpH
     if x_bcl is None or query_start_abs_b is None:
@@ -834,8 +851,9 @@ def _patch_router_expected_mse_loss_bk(
     patch_skip_prob_bcq: torch.Tensor,
     cluster_id_c: torch.Tensor,
     K: int,
+    mae_weight: float = 0.0,
 ) -> torch.Tensor:
-    """Train the input-only patch router against detached patch candidate utility."""
+    """Train the input-only patch router against detached patch forecast error."""
     if base_bch.ndim != 3 or y_bch.shape != base_bch.shape:
         raise ValueError("patch router utility expects base/y with shape [B,C,H].")
     if candidate_bcpH.ndim != 4 or candidate_bcpH.shape[:2] != base_bch.shape[:2]:
@@ -853,24 +871,84 @@ def _patch_router_expected_mse_loss_bk(
         raise ValueError("patch router utility skip probability shape does not match.")
 
     patch_len = horizon // patches
-    base_error_bcq = (base_bch - y_bch).square().reshape(
+    base_delta_bch = base_bch - y_bch
+    candidate_delta_bcpH = candidate_bcpH - y_bch.unsqueeze(2)
+    base_error_bcq = base_delta_bch.square().reshape(
         batch,
         channels,
         patches,
         patch_len,
     ).mean(dim=-1)
-    candidate_error_bcqp = (candidate_bcpH - y_bch.unsqueeze(2)).square().reshape(
+    candidate_error_bcqp = candidate_delta_bcpH.square().reshape(
         batch,
         channels,
         penalties,
         patches,
         patch_len,
     ).mean(dim=-1).permute(0, 1, 3, 2)
+    mae_weight = max(0.0, float(mae_weight))
+    if mae_weight > 0.0:
+        base_error_bcq = base_error_bcq + mae_weight * base_delta_bch.abs().reshape(
+            batch,
+            channels,
+            patches,
+            patch_len,
+        ).mean(dim=-1)
+        candidate_error_bcqp = candidate_error_bcqp + mae_weight * candidate_delta_bcpH.abs().reshape(
+            batch,
+            channels,
+            penalties,
+            patches,
+            patch_len,
+        ).mean(dim=-1).permute(0, 1, 3, 2)
     expected_error_bcq = (
         patch_skip_prob_bcq * base_error_bcq.detach()
         + (patch_probs_bcqp * candidate_error_bcqp.detach()).sum(dim=-1)
     )
     return scatter_mean_bc_to_bk(expected_error_bcq.mean(dim=-1), cluster_id_c, int(K))
+
+
+def _patch_router_mixture_mse_loss_bk(
+    *,
+    base_bch: torch.Tensor,
+    candidate_bcpH: torch.Tensor,
+    y_bch: torch.Tensor,
+    patch_probs_bcqp: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    mae_weight: float = 0.0,
+) -> torch.Tensor:
+    """Train input probabilities on the exact deterministic mixture forecast."""
+    if base_bch.ndim != 3 or y_bch.shape != base_bch.shape:
+        raise ValueError("patch router mixture expects base/y with shape [B,C,H].")
+    if candidate_bcpH.ndim != 4 or candidate_bcpH.shape[:2] != base_bch.shape[:2]:
+        raise ValueError("patch router mixture expects candidates with shape [B,C,P,H].")
+    if patch_probs_bcqp.ndim != 4:
+        raise ValueError("patch router mixture expects probabilities with shape [B,C,Q,P].")
+    batch, channels, horizon = base_bch.shape
+    patches = int(patch_probs_bcqp.shape[2])
+    penalties = int(patch_probs_bcqp.shape[3])
+    if patches <= 0 or horizon % patches != 0:
+        raise ValueError("patch router mixture requires patch count to divide horizon.")
+    if tuple(candidate_bcpH.shape) != (batch, channels, penalties, horizon):
+        raise ValueError("patch router mixture candidate/probability dimensions do not match.")
+
+    patch_len = horizon // patches
+    weight_bcpH = (
+        patch_probs_bcqp.permute(0, 1, 3, 2)
+        .unsqueeze(-1)
+        .expand(-1, -1, -1, -1, patch_len)
+        .reshape(batch, channels, penalties, horizon)
+    )
+    base_fixed = base_bch.detach()
+    candidate_delta = candidate_bcpH.detach() - base_fixed.unsqueeze(2)
+    mixed_bch = base_fixed + (weight_bcpH * candidate_delta).sum(dim=2)
+    error_bch = mixed_bch - y_bch
+    loss_bc = error_bch.square().mean(dim=-1)
+    mae_weight = max(0.0, float(mae_weight))
+    if mae_weight > 0.0:
+        loss_bc = loss_bc + mae_weight * error_bch.abs().mean(dim=-1)
+    return scatter_mean_bc_to_bk(loss_bc, cluster_id_c, int(K))
 
 
 def _patch_router_oracle_ce_loss_bk(
@@ -1576,6 +1654,8 @@ def _walk_forward_patch_reliability_metrics(
     eval_base_mae_ncq: torch.Tensor,
     eval_candidate_mae_ncq: torch.Tensor,
     active_channel_mask_c: torch.Tensor,
+    train_penalty_ncq: Optional[torch.Tensor] = None,
+    eval_penalty_ncq: Optional[torch.Tensor] = None,
     train_regime_ncf: Optional[torch.Tensor] = None,
     eval_regime_ncf: Optional[torch.Tensor] = None,
     max_abs_regime_z: Optional[float] = None,
@@ -1636,6 +1716,29 @@ def _walk_forward_patch_reliability_metrics(
         raise ValueError("walk-forward eval times must match eval windows.")
     if int(active_c.numel()) != int(base_mse.shape[1]):
         raise ValueError("walk-forward active mask must match channel count.")
+    train_penalty = None
+    eval_penalty = None
+    if (train_penalty_ncq is None) != (eval_penalty_ncq is None):
+        raise ValueError(
+            "walk-forward expert conditioning requires both train and eval penalties."
+        )
+    if train_penalty_ncq is not None and eval_penalty_ncq is not None:
+        train_penalty = train_penalty_ncq.detach().to(
+            dtype=torch.long,
+            device="cpu",
+        )
+        eval_penalty = eval_penalty_ncq.detach().to(
+            dtype=torch.long,
+            device="cpu",
+        )
+        if tuple(train_penalty.shape) != tuple(train_gain.shape):
+            raise ValueError(
+                "walk-forward train penalty identities must match train gains."
+            )
+        if tuple(eval_penalty.shape) != tuple(base_mse.shape):
+            raise ValueError(
+                "walk-forward eval penalty identities must match eval errors."
+            )
     scale_policy = str(scale_mode).strip().lower()
     if scale_policy not in {"binary", "least_squares", "feature_ridge"}:
         raise ValueError(
@@ -1797,6 +1900,13 @@ def _walk_forward_patch_reliability_metrics(
             raise ValueError(
                 "walk-forward scale consensus currently requires history_stride=1."
             )
+    if train_penalty is not None and (
+        regime_enabled or scale_policy != "binary"
+    ):
+        raise ValueError(
+            "walk-forward expert conditioning currently supports binary scale "
+            "without regime filtering."
+        )
     if int(eval_time.numel()) == 0:
         return {
             "status": "empty",
@@ -1815,6 +1925,11 @@ def _walk_forward_patch_reliability_metrics(
     order = torch.argsort(history_time, stable=True)
     history_time = history_time.index_select(0, order)
     history_gain = history_gain.index_select(0, order)
+    history_penalty = (
+        torch.cat([train_penalty, eval_penalty], dim=0).index_select(0, order)
+        if train_penalty is not None and eval_penalty is not None
+        else None
+    )
     if patch_delay is None:
         maturity_cutoff = (eval_time - delay).view(-1, 1).expand(
             -1,
@@ -1918,12 +2033,39 @@ def _walk_forward_patch_reliability_metrics(
             rolling_count.index_copy_(0, eval_index, phase_right - phase_left)
         return rolling_sum, rolling_count, None, None
 
-    history_sum, history_count, left, right = rolling_patch_history_sum(
-        history_gain
-    )
-    history_mean = history_sum / history_count.clamp_min(1).to(
+    if history_penalty is None or eval_penalty is None:
+        history_sum, history_count, left, right = rolling_patch_history_sum(
+            history_gain
+        )
+        history_count_ncq = history_count.unsqueeze(1).expand_as(history_sum)
+    else:
+        history_sum = torch.zeros_like(base_mse)
+        history_count_ncq = torch.zeros_like(base_mse)
+        left = None
+        right = None
+        for penalty_idx in torch.unique(eval_penalty).tolist():
+            penalty_value = int(penalty_idx)
+            history_match = (history_penalty == penalty_value).to(
+                dtype=history_gain.dtype
+            )
+            penalty_sum, _, penalty_left, penalty_right = (
+                rolling_patch_history_sum(history_gain * history_match)
+            )
+            penalty_count, _, _, _ = rolling_patch_history_sum(history_match)
+            eval_match = eval_penalty == penalty_value
+            history_sum = torch.where(eval_match, penalty_sum, history_sum)
+            history_count_ncq = torch.where(
+                eval_match,
+                penalty_count,
+                history_count_ncq,
+            )
+            if left is None:
+                left = penalty_left
+                right = penalty_right
+        history_count = history_count_ncq
+    history_mean = history_sum / history_count_ncq.clamp_min(1).to(
         dtype=history_sum.dtype
-    ).unsqueeze(1)
+    )
     regime_support_nc = torch.ones(
         (int(eval_time.numel()), int(base_mse.shape[1])),
         dtype=torch.bool,
@@ -1978,7 +2120,7 @@ def _walk_forward_patch_reliability_metrics(
         regime_max_z_nc = ((eval_regime - regime_mean) / regime_std).abs().amax(dim=-1)
         regime_support_nc = regime_max_z_nc <= float(max_abs_regime_z)
     eligible_ncq = (
-        (history_count >= min_history).unsqueeze(1)
+        (history_count_ncq >= min_history)
         & active_c.view(1, -1, 1)
         & regime_support_nc.unsqueeze(-1)
     )
@@ -2223,7 +2365,11 @@ def _walk_forward_patch_reliability_metrics(
             else (
                 "matured_rolling_least_squares_scale_channel_patch"
                 if scale_policy == "least_squares"
-                else "matured_rolling_mean_gain_channel_patch"
+                else (
+                    "matured_rolling_mean_gain_channel_patch_selected_expert"
+                    if history_penalty is not None
+                    else "matured_rolling_mean_gain_channel_patch"
+                )
             )
         ),
         "scale_mode": scale_policy,
@@ -2323,6 +2469,701 @@ def _walk_forward_patch_reliability_metrics(
     }
 
 
+@torch.no_grad()
+def _causal_expert_feedback_ridge_metrics(
+    *,
+    train_time_n: torch.Tensor,
+    train_base_mse_ncq: torch.Tensor,
+    train_candidate_mse_ncqp: torch.Tensor,
+    train_base_mae_ncq: torch.Tensor,
+    train_candidate_mae_ncqp: torch.Tensor,
+    train_score_ncqp: torch.Tensor,
+    eval_time_n: torch.Tensor,
+    eval_base_mse_ncq: torch.Tensor,
+    eval_candidate_mse_ncqp: torch.Tensor,
+    eval_base_mae_ncq: torch.Tensor,
+    eval_candidate_mae_ncqp: torch.Tensor,
+    eval_score_ncqp: torch.Tensor,
+    active_channel_mask_c: torch.Tensor,
+    label_delay: int,
+    lookback_windows: int,
+    min_history_windows: int,
+    history_stride: int = 1,
+    ridge: float = 0.1,
+    target_clip: float = 2.0,
+    temporal_blocks: int = 0,
+) -> Dict[str, object]:
+    """Fit dual utility from current input score plus matured expert feedback."""
+    train_time = train_time_n.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+    eval_time = eval_time_n.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+    train_base_mse = train_base_mse_ncq.detach().to(dtype=torch.float64, device="cpu")
+    train_candidate_mse = train_candidate_mse_ncqp.detach().to(
+        dtype=torch.float64,
+        device="cpu",
+    )
+    train_base_mae = train_base_mae_ncq.detach().to(dtype=torch.float64, device="cpu")
+    train_candidate_mae = train_candidate_mae_ncqp.detach().to(
+        dtype=torch.float64,
+        device="cpu",
+    )
+    train_score = train_score_ncqp.detach().to(dtype=torch.float64, device="cpu")
+    eval_base_mse = eval_base_mse_ncq.detach().to(dtype=torch.float64, device="cpu")
+    eval_candidate_mse = eval_candidate_mse_ncqp.detach().to(
+        dtype=torch.float64,
+        device="cpu",
+    )
+    eval_base_mae = eval_base_mae_ncq.detach().to(dtype=torch.float64, device="cpu")
+    eval_candidate_mae = eval_candidate_mae_ncqp.detach().to(
+        dtype=torch.float64,
+        device="cpu",
+    )
+    eval_score = eval_score_ncqp.detach().to(dtype=torch.float64, device="cpu")
+    active_c = active_channel_mask_c.detach().reshape(-1).to(
+        dtype=torch.bool,
+        device="cpu",
+    )
+    train_shape = tuple(train_candidate_mse.shape)
+    eval_shape = tuple(eval_candidate_mse.shape)
+    if train_candidate_mse.ndim != 4 or eval_candidate_mse.ndim != 4:
+        raise ValueError("expert feedback candidates must have shape [N,C,Q,P].")
+    if train_shape[1:] != eval_shape[1:]:
+        raise ValueError("expert feedback train/eval candidate shapes must match.")
+    if any(
+        tuple(value.shape) != train_shape
+        for value in (train_candidate_mae, train_score)
+    ) or any(
+        tuple(value.shape) != eval_shape
+        for value in (eval_candidate_mae, eval_score)
+    ):
+        raise ValueError("expert feedback candidate errors and scores must match.")
+    if any(
+        tuple(value.shape) != train_shape[:3]
+        for value in (train_base_mse, train_base_mae)
+    ) or any(
+        tuple(value.shape) != eval_shape[:3]
+        for value in (eval_base_mse, eval_base_mae)
+    ):
+        raise ValueError("expert feedback base errors must have shape [N,C,Q].")
+    if int(train_time.numel()) != train_shape[0] or int(eval_time.numel()) != eval_shape[0]:
+        raise ValueError("expert feedback times must match their split windows.")
+    if int(active_c.numel()) != train_shape[1]:
+        raise ValueError("expert feedback active mask must match channels.")
+    delay = int(label_delay)
+    lookback = int(lookback_windows)
+    min_history = int(min_history_windows)
+    stride = int(history_stride)
+    if delay <= 0:
+        raise ValueError("expert feedback label_delay must be positive.")
+    if lookback <= 0 or min_history <= 0 or min_history > lookback:
+        raise ValueError(
+            "expert feedback requires 0 < min_history_windows <= lookback_windows."
+        )
+    if stride <= 0:
+        raise ValueError("expert feedback history_stride must be positive.")
+    if float(ridge) < 0.0 or float(target_clip) <= 0.0:
+        raise ValueError("expert feedback ridge must be nonnegative and target_clip positive.")
+
+    train_mse_gain = (
+        (train_base_mse.unsqueeze(-1) - train_candidate_mse)
+        / train_base_mse.unsqueeze(-1).clamp_min(1.0e-6)
+    ).clamp(-float(target_clip), float(target_clip))
+    train_mae_gain = (
+        (train_base_mae.unsqueeze(-1) - train_candidate_mae)
+        / train_base_mae.unsqueeze(-1).clamp_min(1.0e-6)
+    ).clamp(-float(target_clip), float(target_clip))
+    eval_mse_gain = (
+        (eval_base_mse.unsqueeze(-1) - eval_candidate_mse)
+        / eval_base_mse.unsqueeze(-1).clamp_min(1.0e-6)
+    ).clamp(-float(target_clip), float(target_clip))
+    eval_mae_gain = (
+        (eval_base_mae.unsqueeze(-1) - eval_candidate_mae)
+        / eval_base_mae.unsqueeze(-1).clamp_min(1.0e-6)
+    ).clamp(-float(target_clip), float(target_clip))
+
+    def causal_mean(
+        history_time_n: torch.Tensor,
+        history_value_ncqp: torch.Tensor,
+        query_time_n: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        order = torch.argsort(history_time_n, stable=True)
+        history_time_sorted = history_time_n.index_select(0, order)
+        history_value = history_value_ncqp.index_select(0, order)
+        result = torch.zeros(
+            (int(query_time_n.numel()), *history_value.shape[1:]),
+            dtype=history_value.dtype,
+        )
+        count = torch.zeros(int(query_time_n.numel()), dtype=torch.long)
+        history_phase = torch.remainder(history_time_sorted, stride)
+        query_phase = torch.remainder(query_time_n, stride)
+        for phase_value in torch.unique(query_phase).tolist():
+            phase = int(phase_value)
+            query_index = torch.nonzero(query_phase == phase, as_tuple=False).reshape(-1)
+            history_index = torch.nonzero(
+                history_phase == phase,
+                as_tuple=False,
+            ).reshape(-1)
+            phase_time = history_time_sorted.index_select(0, history_index)
+            phase_value_ncqp = history_value.index_select(0, history_index)
+            cumulative = torch.cat(
+                [
+                    torch.zeros_like(phase_value_ncqp[:1]),
+                    phase_value_ncqp.cumsum(dim=0),
+                ],
+                dim=0,
+            )
+            query_time = query_time_n.index_select(0, query_index)
+            cutoff = query_time - delay
+            start = cutoff - lookback + 1
+            right = torch.searchsorted(phase_time, cutoff, right=True)
+            left = torch.searchsorted(phase_time, start, right=False)
+            phase_count = right - left
+            result.index_copy_(
+                0,
+                query_index,
+                (cumulative.index_select(0, right) - cumulative.index_select(0, left))
+                / phase_count.clamp_min(1).to(dtype=torch.float64).view(-1, 1, 1, 1),
+            )
+            count.index_copy_(0, query_index, phase_count)
+        return result, count
+
+    train_history_mse, train_history_count = causal_mean(
+        train_time,
+        train_mse_gain,
+        train_time,
+    )
+    train_history_mae, _ = causal_mean(
+        train_time,
+        train_mae_gain,
+        train_time,
+    )
+    combined_time = torch.cat([train_time, eval_time], dim=0)
+    eval_history_mse, eval_history_count = causal_mean(
+        combined_time,
+        torch.cat([train_mse_gain, eval_mse_gain], dim=0),
+        eval_time,
+    )
+    eval_history_mae, _ = causal_mean(
+        combined_time,
+        torch.cat([train_mae_gain, eval_mae_gain], dim=0),
+        eval_time,
+    )
+    train_eligible = (
+        (train_history_count >= min_history).view(-1, 1, 1)
+        & active_c.view(1, -1, 1)
+    )
+    eval_eligible = (
+        (eval_history_count >= min_history).view(-1, 1, 1)
+        & active_c.view(1, -1, 1)
+    )
+    penalty_count = int(train_shape[-1])
+    predicted_mse = torch.zeros_like(eval_candidate_mse)
+    predicted_mae = torch.zeros_like(eval_candidate_mae)
+    coefficient_norms: List[float] = []
+
+    def raw_features(
+        score_ncqp: torch.Tensor,
+        history_mse_ncqp: torch.Tensor,
+        history_mae_ncqp: torch.Tensor,
+        penalty: int,
+    ) -> torch.Tensor:
+        score_ncq = score_ncqp[..., penalty]
+        mse_ncq = history_mse_ncqp[..., penalty]
+        mae_ncq = history_mae_ncqp[..., penalty]
+        return torch.stack(
+            [
+                score_ncq,
+                mse_ncq,
+                mae_ncq,
+                score_ncq * mse_ncq,
+                score_ncq * mae_ncq,
+                mse_ncq * mae_ncq,
+            ],
+            dim=-1,
+        )
+
+    for penalty in range(penalty_count):
+        fit_raw = raw_features(
+            train_score,
+            train_history_mse,
+            train_history_mae,
+            penalty,
+        )
+        eval_raw = raw_features(
+            eval_score,
+            eval_history_mse,
+            eval_history_mae,
+            penalty,
+        )
+        weight = train_eligible.to(dtype=torch.float64)
+        sample_count = weight.sum(dim=0).clamp_min(1.0)
+        feature_mean = (
+            (fit_raw * weight.unsqueeze(-1)).sum(dim=0)
+            / sample_count.unsqueeze(-1)
+        )
+        centered = fit_raw - feature_mean.unsqueeze(0)
+        feature_var = (
+            (centered.square() * weight.unsqueeze(-1)).sum(dim=0)
+            / sample_count.unsqueeze(-1)
+        )
+        feature_std = feature_var.sqrt().clamp_min(1.0e-4)
+        fit_standard = (centered / feature_std.unsqueeze(0)).clamp(-8.0, 8.0)
+        eval_standard = (
+            (eval_raw - feature_mean.unsqueeze(0)) / feature_std.unsqueeze(0)
+        ).clamp(-8.0, 8.0)
+        fit_design = torch.cat(
+            [torch.ones_like(fit_standard[..., :1]), fit_standard],
+            dim=-1,
+        )
+        eval_design = torch.cat(
+            [torch.ones_like(eval_standard[..., :1]), eval_standard],
+            dim=-1,
+        )
+        normal = torch.einsum(
+            "ncqf,ncqg,ncq->cqfg",
+            fit_design,
+            fit_design,
+            weight,
+        ) / sample_count.unsqueeze(-1).unsqueeze(-1)
+        ridge_diag = torch.full(
+            (int(fit_design.shape[-1]),),
+            float(ridge),
+            dtype=torch.float64,
+        )
+        ridge_diag[0] = max(float(ridge) * 0.01, 1.0e-8)
+        normal = normal + torch.diag(ridge_diag).view(
+            1,
+            1,
+            int(fit_design.shape[-1]),
+            int(fit_design.shape[-1]),
+        )
+
+        def fit_target(target_ncq: torch.Tensor) -> torch.Tensor:
+            rhs = torch.einsum(
+                "ncqf,ncq,ncq->cqf",
+                fit_design,
+                target_ncq,
+                weight,
+            ) / sample_count.unsqueeze(-1)
+            return torch.linalg.solve(normal, rhs.unsqueeze(-1)).squeeze(-1)
+
+        coef_mse = fit_target(train_mse_gain[..., penalty])
+        coef_mae = fit_target(train_mae_gain[..., penalty])
+        predicted_mse[..., penalty] = torch.einsum(
+            "ncqf,cqf->ncq",
+            eval_design,
+            coef_mse,
+        )
+        predicted_mae[..., penalty] = torch.einsum(
+            "ncqf,cqf->ncq",
+            eval_design,
+            coef_mae,
+        )
+        coefficient_norms.append(
+            float((coef_mse.square().mean() + coef_mae.square().mean()).sqrt().item())
+        )
+    predicted_dual = torch.minimum(predicted_mse, predicted_mae)
+    predicted_dual = predicted_dual.masked_fill(
+        ~eval_eligible.unsqueeze(-1),
+        -torch.inf,
+    )
+    selected_score, selected_penalty = predicted_dual.max(dim=-1)
+    route = (selected_score > 0.0) & eval_eligible
+    selected_index = selected_penalty.unsqueeze(-1)
+    chosen_mse = eval_candidate_mse.gather(dim=-1, index=selected_index).squeeze(-1)
+    chosen_mae = eval_candidate_mae.gather(dim=-1, index=selected_index).squeeze(-1)
+    selected_mse = torch.where(route, chosen_mse, eval_base_mse)
+    selected_mae = torch.where(route, chosen_mae, eval_base_mae)
+    selected_positive = route & (chosen_mse < eval_base_mse)
+    selected_dual_positive = selected_positive & (chosen_mae < eval_base_mae)
+    route_count = int(route.sum().item())
+
+    def mean(value: torch.Tensor) -> float:
+        return float(value.mean().item())
+
+    def gain_pct(base: torch.Tensor, selected: torch.Tensor) -> float:
+        base_mean = mean(base)
+        return 100.0 * (base_mean - mean(selected)) / max(base_mean, 1.0e-12)
+
+    blocks = max(0, min(int(temporal_blocks), int(eval_time.numel())))
+    block_rows: List[Dict[str, object]] = []
+    if blocks > 1:
+        for block_idx in range(blocks):
+            start_idx = block_idx * int(eval_time.numel()) // blocks
+            end_idx = (block_idx + 1) * int(eval_time.numel()) // blocks
+            if end_idx <= start_idx:
+                continue
+            block_rows.append(
+                {
+                    "block": int(block_idx),
+                    "start_window": int(start_idx),
+                    "end_window": int(end_idx),
+                    "mse_gain_pct": gain_pct(
+                        eval_base_mse[start_idx:end_idx],
+                        selected_mse[start_idx:end_idx],
+                    ),
+                    "mae_gain_pct": gain_pct(
+                        eval_base_mae[start_idx:end_idx],
+                        selected_mae[start_idx:end_idx],
+                    ),
+                    "route_rate": float(
+                        route[start_idx:end_idx].to(torch.float64).mean().item()
+                    ),
+                }
+            )
+    return {
+        "status": "ok",
+        "test_read": False,
+        "policy": "ridge_dual_utility_from_input_score_and_matured_expert_feedback",
+        "label_delay": delay,
+        "lookback_windows": lookback,
+        "min_history_windows": min_history,
+        "history_stride": stride,
+        "ridge": float(ridge),
+        "target_clip": float(target_clip),
+        "feature_names": [
+            "input_gate_score",
+            "history_mse_gain",
+            "history_mae_gain",
+            "score_x_history_mse",
+            "score_x_history_mae",
+            "history_mse_x_mae",
+        ],
+        "base_mse": mean(eval_base_mse),
+        "selected_mse": mean(selected_mse),
+        "mse_gain_pct": gain_pct(eval_base_mse, selected_mse),
+        "base_mae": mean(eval_base_mae),
+        "selected_mae": mean(selected_mae),
+        "mae_gain_pct": gain_pct(eval_base_mae, selected_mae),
+        "route_rate": float(route.to(torch.float64).mean().item()),
+        "selected_mse_precision": float(
+            selected_positive.sum().item() / max(route_count, 1)
+        ),
+        "selected_dual_precision": float(
+            selected_dual_positive.sum().item() / max(route_count, 1)
+        ),
+        "history_count_min": int(eval_history_count.min().item()),
+        "history_count_max": int(eval_history_count.max().item()),
+        "coefficient_norm_by_penalty": coefficient_norms,
+        "per_channel": [
+            {
+                "channel_index": int(channel),
+                "mse_gain_pct": gain_pct(
+                    eval_base_mse[:, channel],
+                    selected_mse[:, channel],
+                ),
+                "mae_gain_pct": gain_pct(
+                    eval_base_mae[:, channel],
+                    selected_mae[:, channel],
+                ),
+                "route_rate": float(
+                    route[:, channel].to(torch.float64).mean().item()
+                ),
+            }
+            for channel in range(int(eval_base_mse.shape[1]))
+        ],
+        "temporal_blocks": block_rows,
+    }
+
+
+@torch.no_grad()
+def _walk_forward_expert_reliability_rerank_metrics(
+    *,
+    train_time_n: torch.Tensor,
+    train_gain_ncqp: torch.Tensor,
+    eval_time_n: torch.Tensor,
+    eval_base_mse_ncq: torch.Tensor,
+    eval_candidate_mse_ncqp: torch.Tensor,
+    eval_base_mae_ncq: torch.Tensor,
+    eval_candidate_mae_ncqp: torch.Tensor,
+    eval_score_ncqp: torch.Tensor,
+    active_channel_mask_c: torch.Tensor,
+    label_delay: int,
+    lookback_windows: int,
+    min_history_windows: int,
+    history_stride: int = 1,
+    min_mean_gain: float = 0.0,
+    require_positive_input_score: bool = True,
+    temporal_blocks: int = 0,
+) -> Dict[str, object]:
+    """Causally mask unreliable experts, then preserve input-gate ordering.
+
+    Every expert's counterfactual error is recorded only after its target has
+    matured.  Historical gain never ranks the deployed action: it only marks
+    experts as reliable.  The current input-conditioned gate score chooses among
+    reliable experts.  A history-ranked result is reported solely as a diagnostic
+    causal upper bound.
+    """
+    train_time = train_time_n.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+    eval_time = eval_time_n.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+    train_gain = train_gain_ncqp.detach().to(dtype=torch.float64, device="cpu")
+    base_mse = eval_base_mse_ncq.detach().to(dtype=torch.float64, device="cpu")
+    candidate_mse = eval_candidate_mse_ncqp.detach().to(
+        dtype=torch.float64,
+        device="cpu",
+    )
+    base_mae = eval_base_mae_ncq.detach().to(dtype=torch.float64, device="cpu")
+    candidate_mae = eval_candidate_mae_ncqp.detach().to(
+        dtype=torch.float64,
+        device="cpu",
+    )
+    score = eval_score_ncqp.detach().to(dtype=torch.float64, device="cpu")
+    active_c = active_channel_mask_c.detach().reshape(-1).to(
+        dtype=torch.bool,
+        device="cpu",
+    )
+    if train_gain.ndim != 4:
+        raise ValueError("expert rerank train gain must have shape [N,C,Q,P].")
+    eval_shape = tuple(candidate_mse.shape)
+    if candidate_mse.ndim != 4 or any(
+        tuple(value.shape) != eval_shape for value in (candidate_mae, score)
+    ):
+        raise ValueError(
+            "expert rerank candidate errors and scores must share shape [N,C,Q,P]."
+        )
+    if tuple(base_mse.shape) != eval_shape[:3] or tuple(base_mae.shape) != eval_shape[:3]:
+        raise ValueError("expert rerank base errors must have shape [N,C,Q].")
+    if tuple(train_gain.shape[1:]) != eval_shape[1:]:
+        raise ValueError("expert rerank train/eval candidate shapes must match.")
+    if int(train_time.numel()) != int(train_gain.shape[0]):
+        raise ValueError("expert rerank train times must match train gains.")
+    if int(eval_time.numel()) != int(candidate_mse.shape[0]):
+        raise ValueError("expert rerank eval times must match eval candidates.")
+    if int(active_c.numel()) != int(candidate_mse.shape[1]):
+        raise ValueError("expert rerank active mask must match channel count.")
+    delay = int(label_delay)
+    lookback = int(lookback_windows)
+    min_history = int(min_history_windows)
+    stride = int(history_stride)
+    if delay <= 0:
+        raise ValueError("expert rerank label_delay must be positive.")
+    if lookback <= 0 or min_history <= 0 or min_history > lookback:
+        raise ValueError(
+            "expert rerank requires 0 < min_history_windows <= lookback_windows."
+        )
+    if stride <= 0:
+        raise ValueError("expert rerank history_stride must be positive.")
+    if int(eval_time.numel()) == 0:
+        return {
+            "status": "empty",
+            "test_read": False,
+            "label_delay": delay,
+        }
+    if bool((eval_time[1:] < eval_time[:-1]).any().item()):
+        raise ValueError("expert rerank eval times must be chronological.")
+
+    eval_gain = base_mse.unsqueeze(-1) - candidate_mse
+    history_time = torch.cat([train_time, eval_time], dim=0)
+    history_gain = torch.cat([train_gain, eval_gain], dim=0)
+    order = torch.argsort(history_time, stable=True)
+    history_time = history_time.index_select(0, order)
+    history_gain = history_gain.index_select(0, order)
+    history_sum = torch.zeros_like(candidate_mse)
+    history_count = torch.zeros(int(eval_time.numel()), dtype=torch.long)
+    history_phase = torch.remainder(history_time, stride)
+    eval_phase = torch.remainder(eval_time, stride)
+    for phase_value in torch.unique(eval_phase).tolist():
+        phase = int(phase_value)
+        eval_index = torch.nonzero(eval_phase == phase, as_tuple=False).reshape(-1)
+        history_index = torch.nonzero(history_phase == phase, as_tuple=False).reshape(-1)
+        phase_time = history_time.index_select(0, history_index)
+        phase_gain = history_gain.index_select(0, history_index)
+        cumulative = torch.cat(
+            [torch.zeros_like(phase_gain[:1]), phase_gain.cumsum(dim=0)],
+            dim=0,
+        )
+        phase_eval_time = eval_time.index_select(0, eval_index)
+        cutoff = phase_eval_time - delay
+        start = cutoff - lookback + 1
+        right = torch.searchsorted(phase_time, cutoff, right=True)
+        left = torch.searchsorted(phase_time, start, right=False)
+        history_sum.index_copy_(
+            0,
+            eval_index,
+            cumulative.index_select(0, right) - cumulative.index_select(0, left),
+        )
+        history_count.index_copy_(0, eval_index, right - left)
+    history_mean = history_sum / history_count.clamp_min(1).to(
+        dtype=torch.float64
+    ).view(-1, 1, 1, 1)
+    finite_score = torch.nan_to_num(
+        score,
+        nan=-torch.inf,
+        posinf=torch.finfo(torch.float64).max,
+        neginf=-torch.inf,
+    )
+    reliable = (
+        (history_count >= min_history).view(-1, 1, 1, 1)
+        & active_c.view(1, -1, 1, 1)
+        & (history_mean > float(min_mean_gain))
+    )
+    deploy_eligible = reliable
+    if bool(require_positive_input_score):
+        deploy_eligible = deploy_eligible & (finite_score > 0.0)
+    masked_gate_score = finite_score.masked_fill(~deploy_eligible, -torch.inf)
+    selected_penalty = masked_gate_score.argmax(dim=-1)
+    route = deploy_eligible.any(dim=-1)
+    selected_index = selected_penalty.unsqueeze(-1)
+    chosen_mse = candidate_mse.gather(dim=-1, index=selected_index).squeeze(-1)
+    chosen_mae = candidate_mae.gather(dim=-1, index=selected_index).squeeze(-1)
+    selected_mse = torch.where(route, chosen_mse, base_mse)
+    selected_mae = torch.where(route, chosen_mae, base_mae)
+
+    original_penalty = finite_score.argmax(dim=-1)
+    original_route = (
+        finite_score.max(dim=-1).values > 0.0
+        if bool(require_positive_input_score)
+        else torch.ones_like(route)
+    ) & active_c.view(1, -1, 1)
+    original_mse = torch.where(
+        original_route,
+        candidate_mse.gather(
+            dim=-1,
+            index=original_penalty.unsqueeze(-1),
+        ).squeeze(-1),
+        base_mse,
+    )
+    original_mae = torch.where(
+        original_route,
+        candidate_mae.gather(
+            dim=-1,
+            index=original_penalty.unsqueeze(-1),
+        ).squeeze(-1),
+        base_mae,
+    )
+
+    history_masked = history_mean.masked_fill(~reliable, -torch.inf)
+    history_penalty = history_masked.argmax(dim=-1)
+    history_route = reliable.any(dim=-1)
+    history_mse = torch.where(
+        history_route,
+        candidate_mse.gather(
+            dim=-1,
+            index=history_penalty.unsqueeze(-1),
+        ).squeeze(-1),
+        base_mse,
+    )
+    history_mae = torch.where(
+        history_route,
+        candidate_mae.gather(
+            dim=-1,
+            index=history_penalty.unsqueeze(-1),
+        ).squeeze(-1),
+        base_mae,
+    )
+    oracle_mse = torch.minimum(base_mse, candidate_mse.amin(dim=-1))
+    selected_mse_gain = base_mse - chosen_mse
+    selected_mae_gain = base_mae - chosen_mae
+    selected_positive = route & (selected_mse_gain > 0.0)
+    selected_dual_positive = selected_positive & (selected_mae_gain > 0.0)
+    route_count = int(route.sum().item())
+    positive_count = int(selected_positive.sum().item())
+    dual_positive_count = int(selected_dual_positive.sum().item())
+    original_positive_prevalence = float(
+        (eval_gain > 0.0).to(torch.float64).mean().item()
+    )
+
+    def mean(value: torch.Tensor) -> float:
+        return float(value.mean().item())
+
+    def gain_pct(base: torch.Tensor, selected: torch.Tensor) -> float:
+        base_mean = mean(base)
+        return 100.0 * (base_mean - mean(selected)) / max(base_mean, 1.0e-12)
+
+    blocks = max(0, min(int(temporal_blocks), int(eval_time.numel())))
+    block_rows: List[Dict[str, object]] = []
+    if blocks > 1:
+        for block_idx in range(blocks):
+            start_idx = block_idx * int(eval_time.numel()) // blocks
+            end_idx = (block_idx + 1) * int(eval_time.numel()) // blocks
+            if end_idx <= start_idx:
+                continue
+            block_rows.append(
+                {
+                    "block": int(block_idx),
+                    "start_window": int(start_idx),
+                    "end_window": int(end_idx),
+                    "mse_gain_pct": gain_pct(
+                        base_mse[start_idx:end_idx],
+                        selected_mse[start_idx:end_idx],
+                    ),
+                    "mae_gain_pct": gain_pct(
+                        base_mae[start_idx:end_idx],
+                        selected_mae[start_idx:end_idx],
+                    ),
+                    "route_rate": float(
+                        route[start_idx:end_idx].to(torch.float64).mean().item()
+                    ),
+                }
+            )
+    penalty_count = int(candidate_mse.shape[-1])
+    routed_penalties = selected_penalty[route]
+    selected_counts = torch.bincount(
+        routed_penalties,
+        minlength=penalty_count,
+    ).to(torch.float64)
+    return {
+        "status": "ok",
+        "test_read": False,
+        "policy": "matured_same_expert_reliability_mask_then_input_gate_order",
+        "label_delay": delay,
+        "lookback_windows": lookback,
+        "min_history_windows": min_history,
+        "history_stride": stride,
+        "min_mean_gain": float(min_mean_gain),
+        "require_positive_input_score": bool(require_positive_input_score),
+        "base_mse": mean(base_mse),
+        "selected_mse": mean(selected_mse),
+        "mse_gain_pct": gain_pct(base_mse, selected_mse),
+        "base_mae": mean(base_mae),
+        "selected_mae": mean(selected_mae),
+        "mae_gain_pct": gain_pct(base_mae, selected_mae),
+        "original_gate_mse": mean(original_mse),
+        "original_gate_mse_gain_pct": gain_pct(base_mse, original_mse),
+        "original_gate_mae": mean(original_mae),
+        "original_gate_mae_gain_pct": gain_pct(base_mae, original_mae),
+        "history_ranked_diagnostic_mse": mean(history_mse),
+        "history_ranked_diagnostic_mse_gain_pct": gain_pct(base_mse, history_mse),
+        "history_ranked_diagnostic_mae": mean(history_mae),
+        "history_ranked_diagnostic_mae_gain_pct": gain_pct(base_mae, history_mae),
+        "oracle_mse": mean(oracle_mse),
+        "oracle_mse_gain_pct": gain_pct(base_mse, oracle_mse),
+        "route_rate": float(route.to(torch.float64).mean().item()),
+        "fallback_rate": float(
+            (route & (selected_penalty != original_penalty)).to(torch.float64).mean().item()
+        ),
+        "fallback_rate_given_route": float(
+            (route & (selected_penalty != original_penalty)).sum().item()
+            / max(route_count, 1)
+        ),
+        "selected_mse_precision": float(positive_count / max(route_count, 1)),
+        "selected_dual_precision": float(dual_positive_count / max(route_count, 1)),
+        "all_candidate_positive_prevalence": original_positive_prevalence,
+        "history_count_min": int(history_count.min().item()),
+        "history_count_max": int(history_count.max().item()),
+        "selected_penalty_rate": [
+            float(value / max(route_count, 1)) for value in selected_counts.tolist()
+        ],
+        "per_channel": [
+            {
+                "channel_index": int(channel),
+                "mse_gain_pct": gain_pct(
+                    base_mse[:, channel],
+                    selected_mse[:, channel],
+                ),
+                "mae_gain_pct": gain_pct(
+                    base_mae[:, channel],
+                    selected_mae[:, channel],
+                ),
+                "route_rate": float(
+                    route[:, channel].to(torch.float64).mean().item()
+                ),
+            }
+            for channel in range(int(base_mse.shape[1]))
+        ],
+        "temporal_blocks": block_rows,
+    }
+
+
 def _patch_router_hierarchical_recall_loss_terms(
     *,
     base_bch: torch.Tensor,
@@ -2334,6 +3175,8 @@ def _patch_router_hierarchical_recall_loss_terms(
     patch_penalty_utility_scores_bcqp: torch.Tensor,
     cluster_id_c: torch.Tensor,
     K: int,
+    patch_penalty_mse_utility_scores_bcqp: Optional[torch.Tensor] = None,
+    patch_penalty_mae_utility_scores_bcqp: Optional[torch.Tensor] = None,
     patch_penalty_risk_benefit_probs_bcqp: Optional[torch.Tensor] = None,
     patch_penalty_risk_positive_magnitude_bcqp: Optional[torch.Tensor] = None,
     patch_penalty_risk_negative_magnitude_bcqp: Optional[torch.Tensor] = None,
@@ -2389,6 +3232,23 @@ def _patch_router_hierarchical_recall_loss_terms(
         raise ValueError("hierarchical patch recall benefit probability shape does not match.")
     if tuple(patch_penalty_utility_scores_bcqp.shape) != expected_penalty_shape:
         raise ValueError("hierarchical patch recall utility score shape does not match.")
+    dual_utility_outputs = (
+        patch_penalty_mse_utility_scores_bcqp,
+        patch_penalty_mae_utility_scores_bcqp,
+    )
+    if any(value is not None for value in dual_utility_outputs):
+        if not all(value is not None for value in dual_utility_outputs):
+            raise ValueError(
+                "hierarchical dual signed utility requires both MSE and MAE scores."
+            )
+        if any(
+            tuple(value.shape) != expected_penalty_shape
+            for value in dual_utility_outputs
+            if value is not None
+        ):
+            raise ValueError(
+                "hierarchical dual signed utility score shape does not match."
+            )
     risk_outputs = (
         patch_penalty_risk_benefit_probs_bcqp,
         patch_penalty_risk_positive_magnitude_bcqp,
@@ -2477,6 +3337,41 @@ def _patch_router_hierarchical_recall_loss_terms(
         normalized_gain_bcqp = (
             improvement_bcqp / (base_error_bcq.unsqueeze(-1) + error_floor)
         ).clamp(-1.0, 1.0)
+        if patch_penalty_mse_utility_scores_bcqp is not None:
+            base_mae_bcq = (base_bch - y_bch).abs().reshape(
+                batch,
+                channels,
+                patches,
+                patch_len,
+            ).mean(dim=-1)
+            candidate_mae_bcqp = (
+                (candidate_bcpH - y_bch.unsqueeze(2))
+                .abs()
+                .reshape(
+                    batch,
+                    channels,
+                    penalties,
+                    patches,
+                    patch_len,
+                )
+                .mean(dim=-1)
+                .permute(0, 1, 3, 2)
+            )
+            mae_improvement_bcqp = (
+                base_mae_bcq.unsqueeze(-1) - candidate_mae_bcqp
+            )
+            mae_floor_source = (
+                base_mae_bcq[active_mask_bcq]
+                if masked_support
+                else base_mae_bcq
+            )
+            mae_floor = mae_floor_source.median().clamp_min(1.0e-6) * 0.05
+            normalized_mae_gain_bcqp = (
+                mae_improvement_bcqp
+                / (base_mae_bcq.unsqueeze(-1) + mae_floor)
+            ).clamp(-1.0, 1.0)
+        else:
+            normalized_mae_gain_bcqp = None
 
     probability_eps = max(
         float(eps),
@@ -2641,12 +3536,36 @@ def _patch_router_hierarchical_recall_loss_terms(
             ).reshape_as(best_penalty_bcq)
             * rescue_target_bcq.to(dtype=rescue_nll_bcq.dtype)
         )
-    utility_regression_bcq = torch.nn.functional.smooth_l1_loss(
+    mse_utility_regression_bcq = torch.nn.functional.smooth_l1_loss(
         utility_scores,
         normalized_gain_bcqp.to(dtype=utility_scores.dtype),
         reduction="none",
         beta=0.1,
     ).mean(dim=-1)
+    mae_utility_regression_bcq = torch.zeros_like(mse_utility_regression_bcq)
+    utility_regression_bcq = mse_utility_regression_bcq
+    if patch_penalty_mse_utility_scores_bcqp is not None:
+        assert (
+            patch_penalty_mae_utility_scores_bcqp is not None
+            and normalized_mae_gain_bcqp is not None
+        )
+        mse_utility_scores = patch_penalty_mse_utility_scores_bcqp.clamp(-1.0, 1.0)
+        mae_utility_scores = patch_penalty_mae_utility_scores_bcqp.clamp(-1.0, 1.0)
+        mse_utility_regression_bcq = torch.nn.functional.smooth_l1_loss(
+            mse_utility_scores,
+            normalized_gain_bcqp.to(dtype=mse_utility_scores.dtype),
+            reduction="none",
+            beta=0.1,
+        ).mean(dim=-1)
+        mae_utility_regression_bcq = torch.nn.functional.smooth_l1_loss(
+            mae_utility_scores,
+            normalized_mae_gain_bcqp.to(dtype=mae_utility_scores.dtype),
+            reduction="none",
+            beta=0.1,
+        ).mean(dim=-1)
+        utility_regression_bcq = 0.5 * (
+            mse_utility_regression_bcq + mae_utility_regression_bcq
+        )
     risk_calibration_bcq = torch.zeros_like(adoption_bce_bcq)
     risk_sign_bce_bcq = torch.zeros_like(adoption_bce_bcq)
     risk_magnitude_bcq = torch.zeros_like(adoption_bce_bcq)
@@ -2839,6 +3758,8 @@ def _patch_router_hierarchical_recall_loss_terms(
         "pairwise_rank_bk": reduce_bcq(pairwise_rank_bcq),
         "ranking_ce_bk": reduce_bcq(ranking_ce_bcq),
         "utility_regression_bk": reduce_bcq(utility_regression_bcq),
+        "mse_utility_regression_bk": reduce_bcq(mse_utility_regression_bcq),
+        "mae_utility_regression_bk": reduce_bcq(mae_utility_regression_bcq),
         "risk_calibration_bk": reduce_bcq(risk_calibration_bcq),
         "risk_sign_bce_bk": reduce_bcq(risk_sign_bce_bcq),
         "risk_magnitude_bk": reduce_bcq(risk_magnitude_bcq),
@@ -2913,8 +3834,25 @@ def _patch_router_oracle_batch_stats(
         patches,
         patch_len,
     ).mean(dim=-1).permute(0, 1, 3, 2)
+    base_mae_bcq = (base_bch - y_bch).abs().reshape(
+        batch,
+        channels,
+        patches,
+        patch_len,
+    ).mean(dim=-1)
+    candidate_mae_bcqp = (candidate_bcpH - y_bch.unsqueeze(2)).abs().reshape(
+        batch,
+        channels,
+        penalties,
+        patches,
+        patch_len,
+    ).mean(dim=-1).permute(0, 1, 3, 2)
     all_error_bcqk = torch.cat([base_error_bcq.unsqueeze(-1), candidate_error_bcqp], dim=-1)
+    all_mae_bcqk = torch.cat([base_mae_bcq.unsqueeze(-1), candidate_mae_bcqp], dim=-1)
     beneficial_bcqp = candidate_error_bcqp < base_error_bcq.unsqueeze(-1)
+    dual_beneficial_bcqp = beneficial_bcqp & (
+        candidate_mae_bcqp < base_mae_bcq.unsqueeze(-1)
+    )
     risk_sign_positive_count = torch.tensor(0.0, device=base_bch.device)
     risk_sign_predicted_positive_count = torch.tensor(0.0, device=base_bch.device)
     risk_sign_true_positive_count = torch.tensor(0.0, device=base_bch.device)
@@ -2947,6 +3885,13 @@ def _patch_router_oracle_batch_stats(
             raise ValueError("patch router benefit probability shape does not match candidates.")
         proposed_bcqp = patch_penalty_benefit_probs_bcqp > 0.5
     oracle_error_bcq, oracle_class_bcq = all_error_bcqk.min(dim=-1)
+    # Report both metrics for one realizable oracle route.  Independently
+    # minimizing MAE here would splice together two different actions and make
+    # the displayed MSE/MAE pair impossible for any selector to attain.
+    oracle_mae_bcq = all_mae_bcqk.gather(
+        dim=-1,
+        index=oracle_class_bcq.unsqueeze(dim=-1),
+    ).squeeze(dim=-1)
 
     route_bcqp = patch_route_bcph.reshape(
         batch,
@@ -3001,6 +3946,10 @@ def _patch_router_oracle_batch_stats(
         dim=-1,
         index=selected_class_bcq.unsqueeze(-1),
     ).squeeze(-1)
+    selected_mae_bcq = all_mae_bcqk.gather(
+        dim=-1,
+        index=selected_class_bcq.unsqueeze(-1),
+    ).squeeze(-1)
     selected_gain_bcq = base_error_bcq - selected_error_bcq
     selected_beneficial_bcq = selected_penalty_bcq & (selected_gain_bcq > 0.0)
     selected_harmful_bcq = selected_penalty_bcq & (selected_gain_bcq <= 0.0)
@@ -3010,6 +3959,11 @@ def _patch_router_oracle_batch_stats(
     ).to(dtype=torch.bool)
     selected_penalty_one_hot_bcqp &= selected_penalty_bcq.unsqueeze(-1)
     selected_beneficial_by_penalty_bcqp = selected_penalty_one_hot_bcqp & beneficial_bcqp
+    selected_dual_beneficial_bcq = (
+        selected_penalty_one_hot_bcqp & dual_beneficial_bcqp
+    ).any(dim=-1)
+    selected_dual_harmful_bcq = selected_penalty_bcq & (~selected_dual_beneficial_bcq)
+    dual_oracle_penalty_bcq = dual_beneficial_bcqp.any(dim=-1)
     selected_gain_by_penalty_bcqp = (
         selected_penalty_one_hot_bcqp.to(dtype=base_bch.dtype)
         * (base_error_bcq.unsqueeze(-1) - candidate_error_bcqp)
@@ -3021,6 +3975,9 @@ def _patch_router_oracle_batch_stats(
         "base_error_sum": base_error_bcq.sum(),
         "oracle_error_sum": oracle_error_bcq.sum(),
         "selected_error_sum": selected_error_bcq.sum(),
+        "base_mae_sum": base_mae_bcq.sum(),
+        "oracle_mae_sum": oracle_mae_bcq.sum(),
+        "selected_mae_sum": selected_mae_bcq.sum(),
         "correct_count": (selected_class_bcq == oracle_class_bcq).sum().to(dtype=base_bch.dtype),
         "oracle_penalty_count": oracle_penalty_bcq.sum().to(dtype=base_bch.dtype),
         "selected_penalty_count": selected_penalty_bcq.sum().to(dtype=base_bch.dtype),
@@ -3029,6 +3986,13 @@ def _patch_router_oracle_batch_stats(
         ).sum().to(dtype=base_bch.dtype),
         "selected_beneficial_count": selected_beneficial_bcq.sum().to(dtype=base_bch.dtype),
         "selected_harmful_count": selected_harmful_bcq.sum().to(dtype=base_bch.dtype),
+        "dual_oracle_penalty_count": dual_oracle_penalty_bcq.sum().to(dtype=base_bch.dtype),
+        "selected_dual_beneficial_count": selected_dual_beneficial_bcq.sum().to(
+            dtype=base_bch.dtype
+        ),
+        "selected_dual_harmful_count": selected_dual_harmful_bcq.sum().to(
+            dtype=base_bch.dtype
+        ),
         "selected_positive_gain_sum": selected_gain_bcq.clamp_min(0.0).sum(),
         "selected_negative_cost_sum": (-selected_gain_bcq).clamp_min(0.0).sum(),
         "risk_sign_positive_count": risk_sign_positive_count,
@@ -3148,6 +4112,7 @@ def _pred_residual_candidate_supervision_loss(
     allowed_mask_kp: Optional[torch.Tensor] = None,
     only_allowed: bool = True,
     loss_kind: str = "mse",
+    forecast_mse_weight: float = 1.0,
     min_abs_improvement: float = 0.0,
     min_rel_improvement: float = 0.0,
     include_intervention: bool = True,
@@ -3198,7 +4163,14 @@ def _pred_residual_candidate_supervision_loss(
                 err_bc = err_bc / scale_p
             per_penalty.append(err_bc)
         err_bcp = torch.stack(per_penalty, dim=-1)
-    elif loss_mode in {"own_penalty", "penalty", "attribute", "shape"}:
+    elif loss_mode in {
+        "own_penalty",
+        "penalty",
+        "attribute",
+        "shape",
+        "own_penalty_mse",
+        "mse_own_penalty",
+    }:
         if penalty_names is None or penalty_fns is None or len(penalty_names) != int(cand_bcpH.shape[2]):
             raise ValueError("own_penalty candidate supervision requires one penalty name/function per branch.")
         per_penalty = []
@@ -3209,6 +4181,11 @@ def _pred_residual_candidate_supervision_loss(
                 pen_bc = pen_bc / scale_p
             per_penalty.append(pen_bc)
         err_bcp = torch.stack(per_penalty, dim=-1)
+        if loss_mode in {"own_penalty_mse", "mse_own_penalty"}:
+            forecast_mse_bcp = (
+                cand_bcpH - y_bch.unsqueeze(2)
+            ).square().mean(dim=-1)
+            err_bcp = err_bcp + float(forecast_mse_weight) * forecast_mse_bcp
     elif loss_mode in {"mse", "l2"}:
         err_bcpH = cand_bcpH - y_bch.unsqueeze(2)
         err_bcp = err_bcpH.pow(2).mean(dim=-1)
@@ -3234,6 +4211,7 @@ def _pred_residual_candidate_supervision_loss(
     else:
         raise ValueError(
             "moe.pred_side_residual.candidate_supervision.loss must be mse, mae, own_penalty, "
+            "own_penalty_mse, "
             "direct_attribute, "
             "gain_hinge_mse, or gain_hinge_mae "
             f"(got {loss_kind!r})."
@@ -5396,6 +6374,7 @@ __all__ = [
     '_cluster_utility_threshold_stats',
     '_mse_utility_gate_supervision_loss',
     '_patch_router_expected_mse_loss_bk',
+    '_patch_router_mixture_mse_loss_bk',
     '_patch_router_oracle_ce_loss_bk',
     '_select_recall_constrained_risk_threshold',
     '_risk_score_threshold_curve_summary',
@@ -5405,6 +6384,8 @@ __all__ = [
     '_causal_patch_regime_descriptor',
     '_causal_patch_scale_features',
     '_walk_forward_patch_reliability_metrics',
+    '_causal_expert_feedback_ridge_metrics',
+    '_walk_forward_expert_reliability_rerank_metrics',
     '_patch_router_hierarchical_recall_loss_terms',
     '_patch_router_oracle_batch_stats',
     '_pred_residual_candidate_supervision_loss',

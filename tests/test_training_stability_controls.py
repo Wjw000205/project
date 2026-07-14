@@ -14,6 +14,7 @@ from src.train import (  # noqa: E402
     _lr_warmup_scale,
     _make_torch_generator,
     _normalize_loss_terms,
+    _set_module_train_mode,
     _should_update_swa,
     _top_positive_improvement_mask,
     _validation_holdout_split_counts,
@@ -104,6 +105,23 @@ def test_freeze_module_params_disables_gradients_and_counts_params() -> None:
 
     assert frozen == sum(param.numel() for param in module.parameters())
     assert all(not param.requires_grad for param in module.parameters())
+
+
+def test_frozen_module_can_remain_in_eval_mode_during_training_stage() -> None:
+    module = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Dropout(p=0.5))
+
+    effective_training = _set_module_train_mode(
+        module,
+        training=True,
+        keep_frozen_eval=True,
+    )
+
+    assert not effective_training
+    assert not module.training
+    assert all(not child.training for child in module.modules())
+
+    assert _set_module_train_mode(module, training=True, keep_frozen_eval=False)
+    assert module.training
 
 
 def test_validation_holdout_split_counts_keep_nonempty_splits() -> None:

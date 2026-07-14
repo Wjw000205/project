@@ -158,6 +158,7 @@ def _build_moe_modules(
             num_penalties=len(penalty_names),
             input_len=int(meta["input_len"]),
             pred_len=int(meta["pred_len"]),
+            num_channels=len(meta.get("channel_names", []) or []),
             hidden_dim=int(pred_cfg.get("corrector_hidden", 32)),
             init_alpha=float(pred_cfg.get("init_alpha", -3.0)),
             alpha_scale=float(pred_cfg.get("alpha_scale", 0.5)),
@@ -183,6 +184,13 @@ def _build_moe_modules(
                 str(name): float(value)
                 for name, value in (projection_cfg.get("scale_by_name", {}) or {}).items()
             },
+            named_output_projection_carrier_names=[
+                str(name)
+                for name in (projection_cfg.get("carrier_names", []) or [])
+            ],
+            named_output_projection_patch_len=int(
+                projection_cfg.get("patch_len", 0) or 0
+            ),
         ).to(device)
         pred_residual.load_state_dict(pred_state, strict=True)
         pred_residual.eval()

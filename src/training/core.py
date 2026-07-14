@@ -125,6 +125,8 @@ def _make_torch_generator(seed: Optional[int]) -> Optional[torch.Generator]:
 def _resolve_overfit_diagnostic_range(
     num_windows: int,
     cfg: Optional[dict],
+    *,
+    config_name: str = "train.overfit_diagnostic",
 ) -> Optional[Tuple[int, int]]:
     """Resolve the fixed contiguous train-window range used by a gate overfit audit."""
     cfg = cfg or {}
@@ -132,11 +134,11 @@ def _resolve_overfit_diagnostic_range(
         return None
     total = int(num_windows)
     if total <= 0:
-        raise ValueError("train.overfit_diagnostic requires a non-empty training split.")
+        raise ValueError(f"{config_name} requires a non-empty training split.")
     count = int(cfg.get("num_windows", 256))
     if count <= 0 or count > total:
         raise ValueError(
-            "train.overfit_diagnostic.num_windows must be in "
+            f"{config_name}.num_windows must be in "
             f"[1, {total}], got {count}."
         )
     position = str(cfg.get("position", "head")).strip().lower()
@@ -150,13 +152,13 @@ def _resolve_overfit_diagnostic_range(
         start = total - count
     else:
         raise ValueError(
-            "train.overfit_diagnostic.position must be head, center, or tail "
+            f"{config_name}.position must be head, center, or tail "
             f"(got {position!r})."
         )
     end = start + count
     if start < 0 or end > total:
         raise ValueError(
-            "train.overfit_diagnostic range is outside the training split: "
+            f"{config_name} range is outside the training split: "
             f"start={start}, end={end}, total={total}."
         )
     return int(start), int(end)
@@ -168,6 +170,18 @@ def _freeze_module_params(module: nn.Module) -> int:
         param.requires_grad_(False)
         frozen += int(param.numel())
     return frozen
+
+
+def _set_module_train_mode(
+    module: nn.Module,
+    *,
+    training: bool,
+    keep_frozen_eval: bool = False,
+) -> bool:
+    """Set train/eval state without re-enabling stochastic frozen modules."""
+    effective_training = bool(training) and not bool(keep_frozen_eval)
+    module.train(effective_training)
+    return bool(module.training)
 
 
 def _freeze_module_params_except_prefixes(
@@ -276,6 +290,41 @@ def _clone_module_state_dict(module: Optional[nn.Module]) -> Optional[Dict[str, 
     if module is None:
         return None
     return {name: value.detach().cpu().clone() for name, value in module.state_dict().items()}
+
+
+@torch.no_grad()
+def _copy_learnable_output_anchor_active_masks(
+    target: nn.Module,
+    source: nn.Module,
+) -> Dict[str, List[float]]:
+    """Copy the deployment adoption masks of a frozen learnable anchor source."""
+    target_channel = getattr(target, "active_channel_mask_c", None)
+    source_channel = getattr(source, "active_channel_mask_c", None)
+    target_horizon = getattr(target, "active_channel_horizon_mask_ch", None)
+    source_horizon = getattr(source, "active_channel_horizon_mask_ch", None)
+    if not all(
+        isinstance(value, torch.Tensor)
+        for value in (target_channel, source_channel, target_horizon, source_horizon)
+    ):
+        raise ValueError("learnable output anchor source/target must expose persistent active masks.")
+    if tuple(target_channel.shape) != tuple(source_channel.shape):
+        raise ValueError(
+            "learnable output anchor channel-mask shape mismatch: "
+            f"source={tuple(source_channel.shape)}, target={tuple(target_channel.shape)}."
+        )
+    if tuple(target_horizon.shape) != tuple(source_horizon.shape):
+        raise ValueError(
+            "learnable output anchor channel-horizon-mask shape mismatch: "
+            f"source={tuple(source_horizon.shape)}, target={tuple(target_horizon.shape)}."
+        )
+    target_channel.copy_(source_channel.to(device=target_channel.device, dtype=target_channel.dtype))
+    target_horizon.copy_(source_horizon.to(device=target_horizon.device, dtype=target_horizon.dtype))
+    return {
+        "active_channel_mask": [float(v) for v in target_channel.detach().cpu().tolist()],
+        "active_channel_horizon_mask_flat": [
+            float(v) for v in target_horizon.detach().cpu().reshape(-1).tolist()
+        ],
+    }
 
 
 def _normalize_learnable_output_anchor_adoption_scope(scope: object) -> str:
@@ -1308,7 +1357,27 @@ def _load_finetune_pred_residual_state(
             "Fine-tune pred_residual loading requires identical penalty_names: "
             f"source={list(source_penalty_names)}, target={list(target_penalty_names)}"
         )
-    pred_residual.load_state_dict(checkpoint["pred_residual_state"], strict=bool(strict))
+    source_state = checkpoint["pred_residual_state"]
+    if bool(strict):
+        pred_residual.load_state_dict(source_state, strict=True)
+        return True
+    target_state = pred_residual.state_dict()
+    compatible_state = {}
+    incompatible_keys = []
+    for name, value in source_state.items():
+        target_value = target_state.get(name)
+        if target_value is None or tuple(target_value.shape) != tuple(value.shape):
+            incompatible_keys.append(str(name))
+            continue
+        compatible_state[name] = value
+    if not compatible_state:
+        return False
+    pred_residual.load_state_dict(compatible_state, strict=False)
+    if incompatible_keys:
+        print(
+            "Non-strict pred_residual warm start skipped incompatible keys: "
+            + ", ".join(incompatible_keys)
+        )
     return True
 
 
@@ -3149,6 +3218,7 @@ __all__ = [
     '_make_torch_generator',
     '_resolve_overfit_diagnostic_range',
     '_freeze_module_params',
+    '_set_module_train_mode',
     '_freeze_module_params_except_prefixes',
     '_validation_holdout_split_counts',
     '_normalize_confidence_gate_source_split',
@@ -3158,6 +3228,7 @@ __all__ = [
     '_top_positive_improvement_mask',
     '_normalize_learnable_output_anchor_cfg',
     '_clone_module_state_dict',
+    '_copy_learnable_output_anchor_active_masks',
     '_normalize_learnable_output_anchor_adoption_scope',
     '_summarize_learnable_output_anchor_refiner',
     '_select_learnable_output_anchor_channel_mask',

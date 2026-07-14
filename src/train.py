@@ -285,6 +285,15 @@ def main():
     calendar_residual_summary: Dict[str, object] = {
         "enable": bool(calendar_residual_cfg.get("enable", False)),
     }
+    position_daily_residual_cfg = cfg.get("position_daily_residual_ridge", {}) or {}
+    if not isinstance(position_daily_residual_cfg, dict):
+        position_daily_residual_cfg = {
+            "enable": bool(position_daily_residual_cfg)
+        }
+    position_daily_residual_coef_cfh = None
+    position_daily_residual_summary: Dict[str, object] = {
+        "enable": bool(position_daily_residual_cfg.get("enable", False)),
+    }
     if bool(calendar_residual_cfg.get("enable", False)):
         calendar_feature_tf, calendar_feature_names = build_calendar_feature_tensor(
             data_cfg["csv_path"],
@@ -367,8 +376,40 @@ def main():
         len(dtr),
         overfit_diagnostic_cfg,
     )
-    optimization_dataset = dtr
-    if overfit_diagnostic_range is not None:
+    optimization_window_cfg = cfg["train"].get("optimization_window", {}) or {}
+    if isinstance(optimization_window_cfg, bool):
+        optimization_window_cfg = {"enable": bool(optimization_window_cfg)}
+    optimization_source = str(
+        cfg["train"].get("optimization_source", "train")
+    ).strip().lower()
+    if optimization_source not in {"train", "val"}:
+        raise ValueError("train.optimization_source must be train or val.")
+    if optimization_source == "val" and overfit_diagnostic_range is not None:
+        raise ValueError(
+            "train.optimization_source=val is incompatible with train.overfit_diagnostic."
+        )
+    optimization_source_dataset = dtr if optimization_source == "train" else dva
+    optimization_index_offset = 0 if optimization_source == "train" else int(val_eval_start)
+    optimization_window_range = _resolve_overfit_diagnostic_range(
+        len(optimization_source_dataset),
+        optimization_window_cfg,
+        config_name="train.optimization_window",
+    )
+    if (
+        overfit_diagnostic_range is not None
+        and optimization_window_range is not None
+    ):
+        raise ValueError(
+            "train.optimization_window and train.overfit_diagnostic cannot both be enabled."
+        )
+    optimization_dataset = optimization_source_dataset
+    if optimization_window_range is not None:
+        optimization_start, optimization_end = optimization_window_range
+        optimization_dataset = Subset(
+            optimization_source_dataset,
+            range(optimization_start, optimization_end),
+        )
+    elif overfit_diagnostic_range is not None:
         overfit_start, overfit_end = overfit_diagnostic_range
         optimization_dataset = Subset(dtr, range(overfit_start, overfit_end))
 
@@ -386,6 +427,13 @@ def main():
         pin_memory=pin_mem,
         generator=train_generator,
     )
+    dl_tr_source = DataLoader(
+        dtr,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_mem,
+    )
     dl_overfit_eval = (
         DataLoader(
             optimization_dataset,
@@ -399,11 +447,58 @@ def main():
     )
     dl_va = DataLoader(dva, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin_mem)
     dl_te = DataLoader(dte, batch_size=bs, shuffle=False, num_workers=0, pin_memory=pin_mem)
+    epoch_eval_window_cfg = cfg["train"].get("epoch_eval_window", {}) or {}
+    if isinstance(epoch_eval_window_cfg, bool):
+        epoch_eval_window_cfg = {"enable": bool(epoch_eval_window_cfg)}
+    epoch_eval_window_range = _resolve_overfit_diagnostic_range(
+        len(dva),
+        epoch_eval_window_cfg,
+        config_name="train.epoch_eval_window",
+    )
+    dl_stage2_epoch_eval = None
+    stage2_epoch_eval_start = int(val_eval_start)
+    if epoch_eval_window_range is not None:
+        epoch_eval_start_idx, epoch_eval_end_idx = epoch_eval_window_range
+        dl_stage2_epoch_eval = DataLoader(
+            Subset(dva, range(epoch_eval_start_idx, epoch_eval_end_idx)),
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_mem,
+        )
+        if optimization_source == "val":
+            purge_windows = max(
+                0,
+                int(epoch_eval_window_cfg.get("purge_windows", 0)),
+            )
+            if optimization_window_range is None:
+                raise ValueError(
+                    "validation gate optimization with epoch_eval_window requires "
+                    "an explicit optimization_window."
+                )
+            if epoch_eval_start_idx - optimization_end < purge_windows:
+                raise ValueError(
+                    "validation gate optimization and epoch evaluation overlap or "
+                    "violate the configured purge_windows."
+                )
     if overfit_diagnostic_range is not None:
         print(
             "Gate overfit diagnostic: "
             f"train_windows=[{overfit_start}:{overfit_end}], "
             f"count={len(optimization_dataset)}, epoch_eval=train_subset"
+        )
+    elif optimization_window_range is not None:
+        print(
+            "Stage-2 optimization window: "
+            f"source={optimization_source}, "
+            f"windows=[{optimization_start}:{optimization_end}], "
+            f"count={len(optimization_dataset)}, epoch_eval=validation"
+        )
+    if epoch_eval_window_range is not None:
+        print(
+            "Stage-2 epoch evaluation window: "
+            f"val_windows=[{epoch_eval_start_idx}:{epoch_eval_end_idx}], "
+            f"count={epoch_eval_end_idx - epoch_eval_start_idx}"
         )
     # penalties
     penalty_names = list(cfg["penalties"]["enabled"])
@@ -571,7 +666,7 @@ def main():
         scale = torch.where(cnt_pos > 0, mean_pos, mean_all)
         return scale.clamp_min(penalty_scale_floor)
 
-    penalty_scale = compute_penalty_scale(dl_tr, H)
+    penalty_scale = compute_penalty_scale(dl_tr_source, H)
 
     _validate_strict_history_anchor_scope(
         cfg.get("moe", {}).get("history_anchor_expert", {}) or {},
@@ -633,6 +728,14 @@ def main():
         kwargs.setdefault("gate_feature_mode", gate_feature_mode)
         kwargs.setdefault("calendar_feature_tf", calendar_feature_tf)
         kwargs.setdefault("calendar_residual_coef_cf", calendar_residual_coef_cf)
+        kwargs.setdefault(
+            "position_daily_residual_coef_cfh",
+            position_daily_residual_coef_cfh,
+        )
+        kwargs.setdefault(
+            "position_daily_residual_cfg",
+            position_daily_residual_cfg,
+        )
         return eval_loop(*args, **kwargs)
 
     # cluster portraits (prototype + penalty metrics)
@@ -728,6 +831,43 @@ def main():
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
     pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
     pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
+    position_daily_residual_expert_cfg = pred_residual_cfg.get(
+        "position_daily_residual_expert", {}
+    ) or {}
+    if not isinstance(position_daily_residual_expert_cfg, dict):
+        position_daily_residual_expert_cfg = {
+            "enable": bool(position_daily_residual_expert_cfg)
+        }
+    position_daily_residual_expert_enable = bool(
+        position_daily_residual_expert_cfg.get("enable", False)
+    ) and pred_residual_enable
+    anchor_ridge_gate_cfg = pred_residual_cfg.get("anchor_ridge_gate", {}) or {}
+    if not isinstance(anchor_ridge_gate_cfg, dict):
+        anchor_ridge_gate_cfg = {"enable": bool(anchor_ridge_gate_cfg)}
+    anchor_ridge_gate_enable = bool(
+        anchor_ridge_gate_cfg.get("enable", False)
+    ) and pred_residual_enable
+    if anchor_ridge_gate_enable and not position_daily_residual_expert_enable:
+        raise ValueError(
+            "pred_side_residual.anchor_ridge_gate requires "
+            "position_daily_residual_expert.enable=true."
+        )
+    anchor_ridge_gate_summary: Dict[str, object] = {
+        "enable": bool(anchor_ridge_gate_enable),
+        "inside_pred_residual_forward": bool(anchor_ridge_gate_enable),
+    }
+    if position_daily_residual_expert_enable and bool(
+        position_daily_residual_cfg.get("enable", False)
+    ):
+        raise ValueError(
+            "Enable either pred_side_residual.position_daily_residual_expert "
+            "or top-level position_daily_residual_ridge, not both."
+        )
+    position_daily_residual_expert_summary: Dict[str, object] = {
+        "enable": bool(position_daily_residual_expert_enable),
+        "inside_pred_residual_forward": bool(position_daily_residual_expert_enable),
+        "top_level_postprocess": False,
+    }
     named_output_projection_cfg = pred_residual_cfg.get("named_output_projection", {}) or {}
     if not isinstance(named_output_projection_cfg, dict):
         named_output_projection_cfg = {"enable": bool(named_output_projection_cfg)}
@@ -737,18 +877,65 @@ def main():
         str(name): float(value)
         for name, value in (named_output_projection_cfg.get("scale_by_name", {}) or {}).items()
     }
+    named_output_projection_carrier_names = [
+        str(name)
+        for name in (named_output_projection_cfg.get("carrier_names", []) or [])
+    ]
+    named_output_projection_patch_len = int(
+        named_output_projection_cfg.get("patch_len", 0) or 0
+    )
     periodic_anchor_expert_cfg = pred_residual_cfg.get("periodic_anchor_expert", {}) or {}
     if not isinstance(periodic_anchor_expert_cfg, dict):
         periodic_anchor_expert_cfg = {"enable": bool(periodic_anchor_expert_cfg)}
     periodic_anchor_expert_enable = bool(periodic_anchor_expert_cfg.get("enable", False)) and pred_residual_enable
     periodic_anchor_expert_scale = float(periodic_anchor_expert_cfg.get("scale", 1.0))
     periodic_anchor_expert_freeze_source = bool(periodic_anchor_expert_cfg.get("freeze_source", True))
+    periodic_anchor_expert_preserve_loaded_source_mask = bool(
+        periodic_anchor_expert_cfg.get("preserve_loaded_source_mask", False)
+    )
+    if periodic_anchor_expert_preserve_loaded_source_mask and not (
+        periodic_anchor_expert_enable and periodic_anchor_expert_freeze_source
+    ):
+        raise ValueError(
+            "periodic_anchor_expert.preserve_loaded_source_mask=true requires "
+            "periodic_anchor_expert.enable=true and freeze_source=true."
+        )
     pred_residual_freeze_adapter_bank = bool(pred_residual_cfg.get("freeze_adapter_bank", False))
     patch_router_cfg = pred_residual_cfg.get("patch_router", {}) or {}
     if not isinstance(patch_router_cfg, dict):
         patch_router_cfg = {"enable": bool(patch_router_cfg)}
+    patch_router_epoch0_noop_cfg = patch_router_cfg.get(
+        "epoch0_noop_selection",
+        {},
+    ) or {}
+    if not isinstance(patch_router_epoch0_noop_cfg, dict):
+        patch_router_epoch0_noop_cfg = {
+            "enable": bool(patch_router_epoch0_noop_cfg)
+        }
+    patch_router_epoch0_noop_enable = bool(
+        patch_router_cfg.get("enable", False)
+        and patch_router_epoch0_noop_cfg.get("enable", False)
+    )
+    patch_router_epoch0_require_dual = bool(
+        patch_router_epoch0_noop_cfg.get("require_dual_improvement", True)
+    )
     patch_router_expected_mse_weight = (
         max(0.0, float(patch_router_cfg.get("expected_mse_weight", 0.0)))
+        if bool(patch_router_cfg.get("enable", False))
+        else 0.0
+    )
+    patch_router_expected_mae_weight = (
+        max(0.0, float(patch_router_cfg.get("expected_mae_weight", 0.0)))
+        if bool(patch_router_cfg.get("enable", False))
+        else 0.0
+    )
+    patch_router_mixture_mse_weight = (
+        max(0.0, float(patch_router_cfg.get("mixture_mse_weight", 0.0)))
+        if bool(patch_router_cfg.get("enable", False))
+        else 0.0
+    )
+    patch_router_mixture_mae_weight = (
+        max(0.0, float(patch_router_cfg.get("mixture_mae_weight", 0.0)))
         if bool(patch_router_cfg.get("enable", False))
         else 0.0
     )
@@ -840,6 +1027,30 @@ def main():
         }
     patch_router_walk_forward_enable = bool(
         patch_router_walk_forward_cfg.get("enable", False)
+    )
+    patch_router_walk_forward_test_enable = bool(
+        patch_router_walk_forward_cfg.get("test_enable", False)
+    )
+    patch_router_walk_forward_condition_on_selected_penalty = bool(
+        patch_router_walk_forward_cfg.get(
+            "condition_on_selected_penalty",
+            False,
+        )
+    )
+    patch_router_walk_forward_rerank_all_candidates = bool(
+        patch_router_walk_forward_cfg.get(
+            "rerank_all_candidates",
+            False,
+        )
+    )
+    patch_router_walk_forward_feedback_ridge = bool(
+        patch_router_walk_forward_cfg.get("feedback_ridge", False)
+    )
+    patch_router_walk_forward_feedback_ridge_strength = float(
+        patch_router_walk_forward_cfg.get("feedback_ridge_strength", 0.1)
+    )
+    patch_router_walk_forward_feedback_target_clip = float(
+        patch_router_walk_forward_cfg.get("feedback_target_clip", 2.0)
     )
     patch_router_walk_forward_label_delay = int(
         patch_router_walk_forward_cfg.get("label_delay", H)
@@ -1148,6 +1359,9 @@ def main():
     pred_residual_candidate_supervision_loss = str(
         pred_residual_candidate_supervision_cfg.get("loss", "mse")
     ).lower()
+    pred_residual_candidate_supervision_forecast_mse_weight = float(
+        pred_residual_candidate_supervision_cfg.get("forecast_mse_weight", 1.0)
+    )
     pred_residual_candidate_supervision_min_abs = float(
         pred_residual_candidate_supervision_cfg.get("min_abs_improvement", 0.0)
     )
@@ -1582,6 +1796,9 @@ def main():
             init_alpha=float(pred_residual_cfg.get("init_alpha", -3.0)),
             alpha_scale=float(pred_residual_cfg.get("alpha_scale", 0.5)),
             use_y_base_input=bool(pred_residual_cfg.get("use_y_base_input", True)),
+            use_channel_identity_features=bool(
+                pred_residual_cfg.get("use_channel_identity_features", False)
+            ),
             feature_mode=str(pred_residual_cfg.get("feature_mode", "legacy")),
             residual_clip=float(pred_residual_cfg.get("residual_clip", 0.0)),
             intervention_enable=bool(pred_residual_cfg.get("intervention_enable", False)),
@@ -1608,8 +1825,18 @@ def main():
             named_output_projection_enable=named_output_projection_enable,
             named_output_projection_fixed_alpha=named_output_projection_fixed_alpha,
             named_output_projection_scale_by_name=named_output_projection_scale_by_name,
+            named_output_projection_carrier_names=named_output_projection_carrier_names,
+            named_output_projection_patch_len=named_output_projection_patch_len,
             periodic_anchor_expert_enable=periodic_anchor_expert_enable,
             periodic_anchor_expert_scale=periodic_anchor_expert_scale,
+            position_daily_residual_expert_enable=position_daily_residual_expert_enable,
+            position_daily_residual_period=int(
+                position_daily_residual_expert_cfg.get("daily_period", 96)
+            ),
+            position_daily_residual_harmonics=int(
+                position_daily_residual_expert_cfg.get("daily_harmonics", 4)
+            ),
+            anchor_ridge_gate_cfg=anchor_ridge_gate_cfg,
         ).to(device)
         if (
             pred_residual.patch_router is not None
@@ -1619,6 +1846,7 @@ def main():
         print(
             "Prediction residual MoE enabled: "
             f"hidden={pred_residual.hidden_dim}, feature_mode={pred_residual.feature_mode}, "
+            f"channel_identity={bool(pred_residual.use_channel_identity_features)}, "
             f"alpha_scale={pred_residual.alpha_scale:.3f}, "
             f"residual_clip={pred_residual.residual_clip:.3f}, "
             f"seasonal_anchor_names={list(pred_residual_cfg.get('seasonal_anchor_names', []))}, "
@@ -1629,8 +1857,12 @@ def main():
             f"phase_residual_scale={float(phase_residual_candidate_scale):.3f}, "
             f"named_output_projection={bool(named_output_projection_enable)}, "
             f"named_output_projection_fixed_alpha={bool(named_output_projection_fixed_alpha)}, "
+            f"named_output_projection_carrier_names={named_output_projection_carrier_names}, "
+            f"named_output_projection_patch_len={named_output_projection_patch_len}, "
             f"periodic_anchor_expert={bool(periodic_anchor_expert_enable)}, "
             f"periodic_anchor_scale={float(periodic_anchor_expert_scale):.3f}, "
+            f"position_daily_residual_expert={bool(position_daily_residual_expert_enable)}, "
+            f"anchor_ridge_gate={bool(anchor_ridge_gate_enable)}, "
             f"patch_router={bool(pred_residual.patch_router is not None)}, "
             f"patch_len={int(pred_residual.patch_router.patch_len) if pred_residual.patch_router is not None else 0}, "
             f"history_projection={pred_residual.patch_router.history_patch_projection if pred_residual.patch_router is not None else 'none'}, "
@@ -1987,7 +2219,7 @@ def main():
             return learnable_lambda().detach()
         rows = [
             torch.tensor(
-                [lambda_value_at(int(e), p) for p in range(P)],
+                [lambda_value_at(max(1, int(e)), p) for p in range(P)],
                 device=device,
                 dtype=torch.float32,
             )
@@ -2254,6 +2486,17 @@ def main():
                             k,
                             source_learnable_output_anchor.get_cluster_state(src_k),
                         )
+                    if periodic_anchor_expert_preserve_loaded_source_mask:
+                        preserved_masks = _copy_learnable_output_anchor_active_masks(
+                            learnable_output_anchor,
+                            source_learnable_output_anchor,
+                        )
+                        learnable_output_anchor_summary[
+                            "periodic_source_mask_preserved"
+                        ] = True
+                        learnable_output_anchor_summary[
+                            "preserved_active_channel_mask"
+                        ] = preserved_masks["active_channel_mask"]
                     learnable_output_anchor_summary["loaded_from_checkpoint"] = True
                     learnable_output_anchor_summary["loaded_with_cluster_map"] = [
                         int(v) for v in target_to_source_k.detach().cpu().tolist()
@@ -2274,6 +2517,15 @@ def main():
 
     apply_finetune_warm_start()
 
+    periodic_anchor_source_mask_preserved = bool(
+        learnable_output_anchor_summary.get("periodic_source_mask_preserved", False)
+    )
+    if periodic_anchor_expert_preserve_loaded_source_mask and not periodic_anchor_source_mask_preserved:
+        raise ValueError(
+            "periodic_anchor_expert.preserve_loaded_source_mask=true requires a compatible "
+            "loaded learnable_output_anchor_state."
+        )
+
     periodic_anchor_source_frozen_params = 0
     if (
         periodic_anchor_expert_enable
@@ -2291,10 +2543,20 @@ def main():
         print(f"Prediction adapter bank frozen for gate training: params={frozen_adapter_bank_params}")
 
     freeze_backbone = bool(moe_cfg.get("freeze_backbone", cfg.get("train", {}).get("freeze_backbone", False)))
+    frozen_backbone_eval_mode = bool(
+        cfg.get("train", {}).get("frozen_backbone_eval_mode", False)
+    )
+    if frozen_backbone_eval_mode and not freeze_backbone:
+        raise ValueError("train.frozen_backbone_eval_mode requires moe.freeze_backbone=true.")
     frozen_backbone_params = 0
     if freeze_backbone:
         frozen_backbone_params = _freeze_module_params(model)
         print(f"Backbone frozen for MoE training: params={frozen_backbone_params}")
+        if frozen_backbone_eval_mode:
+            print(
+                "Frozen backbone stays in eval mode during MoE training "
+                "so dropout cannot perturb gate utility targets."
+            )
     patch_router_replaces_cluster_gate = bool(
         pred_residual is not None and getattr(pred_residual, "patch_router", None) is not None
     )
@@ -2702,6 +2964,9 @@ def main():
         "gate": None,
         "pred_residual": None,
     }
+    patch_router_epoch0_noop_summary: Optional[Dict[str, object]] = None
+    patch_router_epoch0_val_mse_k: Optional[torch.Tensor] = None
+    patch_router_epoch0_val_mae_k: Optional[torch.Tensor] = None
     train_mse_hist = []
     val_mse_hist = []
     epoch_times = []
@@ -2970,6 +3235,9 @@ def main():
             "intervention_weight": float(pred_residual_intervention_weight),
             "candidate_supervision_weight": float(pred_residual_candidate_supervision_weight),
             "candidate_supervision_loss": str(pred_residual_candidate_supervision_loss),
+            "candidate_supervision_forecast_mse_weight": float(
+                pred_residual_candidate_supervision_forecast_mse_weight
+            ),
             "candidate_supervision_min_abs_improvement": float(pred_residual_candidate_supervision_min_abs),
             "candidate_supervision_min_rel_improvement": float(pred_residual_candidate_supervision_min_rel),
             "candidate_supervision_only_allowed": bool(pred_residual_candidate_supervision_only_allowed),
@@ -2978,10 +3246,17 @@ def main():
             "candidate_supervision_include_patch_route": bool(pred_residual_candidate_supervision_include_patch_route),
             "ignore_skip_during_training": bool(pred_residual_ignore_skip_during_training),
             "freeze_adapter_bank": bool(pred_residual_freeze_adapter_bank),
+            "use_channel_identity_features": bool(
+                pred_residual.use_channel_identity_features
+                if pred_residual is not None
+                else False
+            ),
             "frozen_adapter_bank_params": int(frozen_adapter_bank_params),
             "named_output_projection_enable": bool(named_output_projection_enable),
             "named_output_projection_fixed_alpha": bool(named_output_projection_fixed_alpha),
             "named_output_projection_scale_by_name": dict(named_output_projection_scale_by_name),
+            "named_output_projection_carrier_names": list(named_output_projection_carrier_names),
+            "named_output_projection_patch_len": int(named_output_projection_patch_len),
             "periodic_anchor_expert": {
                 "enable": bool(periodic_anchor_expert_enable),
                 "role": "reserved_always_on" if periodic_anchor_expert_enable else None,
@@ -2990,6 +3265,10 @@ def main():
                 "scale": float(periodic_anchor_expert_scale),
                 "source_frozen": bool(periodic_anchor_expert_freeze_source),
                 "frozen_params": int(periodic_anchor_source_frozen_params),
+                "preserve_loaded_source_mask": bool(
+                    periodic_anchor_expert_preserve_loaded_source_mask
+                ),
+                "loaded_source_mask_preserved": bool(periodic_anchor_source_mask_preserved),
             },
             "intervention_supervision_weight": float(pred_residual_intervention_supervision_weight),
             "intervention_supervision_min_gain": float(pred_residual_intervention_supervision_min_gain),
@@ -3054,6 +3333,22 @@ def main():
             "patch_len": int(patch_router.patch_len) if patch_router is not None else 0,
             "num_patches": int(patch_router.num_patches) if patch_router is not None else 0,
             "feature_source": str(patch_router.feature_source) if patch_router is not None else None,
+            "use_full_history_features": bool(
+                patch_router is not None and patch_router.use_full_history_features
+            ),
+            "use_channel_identity_features": bool(
+                patch_router is not None and patch_router.use_channel_identity_features
+            ),
+            "time_phase_periods": (
+                [int(v) for v in patch_router.time_phase_periods]
+                if patch_router is not None
+                else []
+            ),
+            "lagged_delta_periods": (
+                [int(v) for v in patch_router.lagged_delta_periods]
+                if patch_router is not None
+                else []
+            ),
             "history_patch_projection": (
                 str(patch_router.history_patch_projection)
                 if patch_router is not None
@@ -3106,6 +3401,33 @@ def main():
             ),
             "expert_conditional_risk_enable": bool(
                 patch_router is not None and patch_router.expert_conditional_risk_enable
+            ),
+            "application_scale_by_penalty": (
+                [
+                    float(v)
+                    for v in pred_residual.patch_application_scale_p.detach()
+                    .cpu()
+                    .tolist()
+                ]
+                if int(pred_residual.patch_application_scale_p.numel()) > 0
+                else None
+            ),
+            "expert_risk_dual_signed_utility_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_dual_signed_utility_enable
+            ),
+            "expert_risk_analytic_residual_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_analytic_residual_enable
+            ),
+            "expert_risk_analytic_residual_floor": (
+                float(patch_router.expert_risk_analytic_residual_floor)
+                if patch_router is not None
+                else None
+            ),
+            "expert_risk_independent_activation_enable": bool(
+                patch_router is not None
+                and patch_router.expert_risk_independent_activation_enable
             ),
             "expert_risk_decoupled_encoder": bool(
                 patch_router is not None and patch_router.expert_risk_decoupled_encoder
@@ -3207,6 +3529,9 @@ def main():
                 patch_router_pairwise_frozen_other_params
             ),
             "expected_mse_weight": float(patch_router_expected_mse_weight),
+            "expected_mae_weight": float(patch_router_expected_mae_weight),
+            "mixture_mse_weight": float(patch_router_mixture_mse_weight),
+            "mixture_mae_weight": float(patch_router_mixture_mae_weight),
             "temporal_group_dro": {
                 "enable": bool(patch_router_temporal_group_dro_enable),
                 "weight": float(patch_router_temporal_group_dro_weight),
@@ -3220,6 +3545,16 @@ def main():
             "oracle_ce_warmup_epochs": int(patch_router_oracle_ce_warmup_epochs),
             "freeze_experts_after_warmup": bool(patch_router_freeze_experts_after_warmup),
             "supervision_only": bool(patch_router_supervision_only),
+            "epoch0_noop_selection": (
+                dict(patch_router_epoch0_noop_summary)
+                if patch_router_epoch0_noop_summary is not None
+                else {
+                    "enable": bool(patch_router_epoch0_noop_enable),
+                    "require_dual_improvement": bool(
+                        patch_router_epoch0_require_dual
+                    ),
+                }
+            ),
             "train_oracle_diagnostic_enable": bool(patch_router_train_oracle_diagnostic),
             "score_threshold_curve_enable": bool(
                 patch_router_score_threshold_curve
@@ -3238,6 +3573,22 @@ def main():
             ),
             "walk_forward_reliability": {
                 "enable": bool(patch_router_walk_forward_enable),
+                "test_enable": bool(patch_router_walk_forward_test_enable),
+                "condition_on_selected_penalty": bool(
+                    patch_router_walk_forward_condition_on_selected_penalty
+                ),
+                "rerank_all_candidates": bool(
+                    patch_router_walk_forward_rerank_all_candidates
+                ),
+                "feedback_ridge": bool(
+                    patch_router_walk_forward_feedback_ridge
+                ),
+                "feedback_ridge_strength": float(
+                    patch_router_walk_forward_feedback_ridge_strength
+                ),
+                "feedback_target_clip": float(
+                    patch_router_walk_forward_feedback_target_clip
+                ),
                 "label_delay": int(patch_router_walk_forward_label_delay),
                 "label_delay_mode": str(
                     patch_router_walk_forward_label_delay_mode
@@ -3323,12 +3674,18 @@ def main():
         patch_oracle_base_error_sum = torch.tensor(0.0, device=device)
         patch_oracle_error_sum = torch.tensor(0.0, device=device)
         patch_selected_error_sum = torch.tensor(0.0, device=device)
+        patch_oracle_base_mae_sum = torch.tensor(0.0, device=device)
+        patch_oracle_mae_sum = torch.tensor(0.0, device=device)
+        patch_selected_mae_sum = torch.tensor(0.0, device=device)
         patch_correct_count = torch.tensor(0.0, device=device)
         patch_oracle_penalty_count = torch.tensor(0.0, device=device)
         patch_selected_penalty_count = torch.tensor(0.0, device=device)
         patch_adoption_true_positive_count = torch.tensor(0.0, device=device)
         patch_selected_beneficial_count = torch.tensor(0.0, device=device)
         patch_selected_harmful_count = torch.tensor(0.0, device=device)
+        patch_dual_oracle_penalty_count = torch.tensor(0.0, device=device)
+        patch_selected_dual_beneficial_count = torch.tensor(0.0, device=device)
+        patch_selected_dual_harmful_count = torch.tensor(0.0, device=device)
         patch_selected_positive_gain_sum = torch.tensor(0.0, device=device)
         patch_selected_negative_cost_sum = torch.tensor(0.0, device=device)
         patch_risk_sign_positive_count = torch.tensor(0.0, device=device)
@@ -3507,6 +3864,9 @@ def main():
                         patch_oracle_base_error_sum += oracle_stats["base_error_sum"]
                         patch_oracle_error_sum += oracle_stats["oracle_error_sum"]
                         patch_selected_error_sum += oracle_stats["selected_error_sum"]
+                        patch_oracle_base_mae_sum += oracle_stats["base_mae_sum"]
+                        patch_oracle_mae_sum += oracle_stats["oracle_mae_sum"]
+                        patch_selected_mae_sum += oracle_stats["selected_mae_sum"]
                         patch_correct_count += oracle_stats["correct_count"]
                         patch_oracle_penalty_count += oracle_stats["oracle_penalty_count"]
                         patch_selected_penalty_count += oracle_stats["selected_penalty_count"]
@@ -3517,6 +3877,15 @@ def main():
                             "selected_beneficial_count"
                         ]
                         patch_selected_harmful_count += oracle_stats["selected_harmful_count"]
+                        patch_dual_oracle_penalty_count += oracle_stats[
+                            "dual_oracle_penalty_count"
+                        ]
+                        patch_selected_dual_beneficial_count += oracle_stats[
+                            "selected_dual_beneficial_count"
+                        ]
+                        patch_selected_dual_harmful_count += oracle_stats[
+                            "selected_dual_harmful_count"
+                        ]
                         patch_selected_positive_gain_sum += oracle_stats[
                             "selected_positive_gain_sum"
                         ]
@@ -3622,6 +3991,9 @@ def main():
             base_patch_mse = float((patch_oracle_base_error_sum / oracle_count).item())
             oracle_patch_mse = float((patch_oracle_error_sum / oracle_count).item())
             selected_patch_mse = float((patch_selected_error_sum / oracle_count).item())
+            base_patch_mae = float((patch_oracle_base_mae_sum / oracle_count).item())
+            oracle_patch_mae = float((patch_oracle_mae_sum / oracle_count).item())
+            selected_patch_mae = float((patch_selected_mae_sum / oracle_count).item())
             headroom = base_patch_mse - oracle_patch_mse
             class_names = ["skip", *penalty_names]
             true_positive = patch_confusion_matrix.diag()
@@ -3648,7 +4020,11 @@ def main():
                 "base_patch_mse": base_patch_mse,
                 "selected_patch_mse": selected_patch_mse,
                 "oracle_patch_mse": oracle_patch_mse,
+                "base_patch_mae": base_patch_mae,
+                "selected_patch_mae": selected_patch_mae,
+                "oracle_patch_mae": oracle_patch_mae,
                 "selected_gain_pct": 100.0 * (base_patch_mse - selected_patch_mse) / max(base_patch_mse, 1.0e-12),
+                "selected_mae_gain_pct": 100.0 * (base_patch_mae - selected_patch_mae) / max(base_patch_mae, 1.0e-12),
                 "oracle_gain_pct": 100.0 * headroom / max(base_patch_mse, 1.0e-12),
                 "captured_oracle_headroom_pct": (
                     100.0 * (base_patch_mse - selected_patch_mse) / headroom
@@ -3670,6 +4046,27 @@ def main():
                 ),
                 "selected_harmful_rate": float(
                     (patch_selected_harmful_count / patch_selected_penalty_count.clamp_min(1.0)).item()
+                ),
+                "dual_oracle_action_rate": float(
+                    (patch_dual_oracle_penalty_count / patch_oracle_count).item()
+                ),
+                "selected_dual_utility_recall": float(
+                    (
+                        patch_selected_dual_beneficial_count
+                        / patch_dual_oracle_penalty_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "selected_dual_utility_precision": float(
+                    (
+                        patch_selected_dual_beneficial_count
+                        / patch_selected_penalty_count.clamp_min(1.0)
+                    ).item()
+                ),
+                "selected_dual_harmful_rate": float(
+                    (
+                        patch_selected_dual_harmful_count
+                        / patch_selected_penalty_count.clamp_min(1.0)
+                    ).item()
                 ),
                 "selected_positive_gain_sum": float(patch_selected_positive_gain_sum.item()),
                 "selected_negative_cost_sum": float(patch_selected_negative_cost_sum.item()),
@@ -3808,6 +4205,7 @@ def main():
         *,
         eval_start: int = 0,
         include_patch_values: bool = False,
+        include_all_candidates: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if pred_residual is None or getattr(pred_residual, "patch_router", None) is None:
             raise ValueError("patch risk calibration requires an enabled patch router.")
@@ -3822,6 +4220,9 @@ def main():
         candidate_mse_parts = []
         base_mae_parts = []
         candidate_mae_parts = []
+        candidate_mse_all_parts = []
+        candidate_mae_all_parts = []
+        candidate_score_all_parts = []
         regime_parts = []
         cross_parts = []
         delta_sq_parts = []
@@ -3906,6 +4307,9 @@ def main():
             )
             selected_score_bcq = pred_out.get("patch_selected_risk_score_bcq")
             selected_penalty_bcq = pred_out.get("patch_selected_penalty_index_bcq")
+            candidate_score_bcqp = pred_out.get(
+                "patch_penalty_utility_scores_bcqp"
+            )
             calibration_base_bch, candidate_bcpH = _pred_residual_candidates_on_eval_path(
                 y_base,
                 pred_out,
@@ -4063,6 +4467,18 @@ def main():
             candidate_mse_parts.append(selected_error_bcq.detach().cpu())
             base_mae_parts.append(base_abs_error_bcq.detach().cpu())
             candidate_mae_parts.append(selected_abs_error_bcq.detach().cpu())
+            if include_all_candidates:
+                if candidate_score_bcqp is None or tuple(
+                    candidate_score_bcqp.shape
+                ) != tuple(candidate_error_bcqp.shape):
+                    raise ValueError(
+                        "all-candidate rerank requires utility scores with shape [B,C,Q,P]."
+                    )
+                candidate_mse_all_parts.append(candidate_error_bcqp.detach().cpu())
+                candidate_mae_all_parts.append(
+                    candidate_abs_error_bcqp.detach().cpu()
+                )
+                candidate_score_all_parts.append(candidate_score_bcqp.detach().cpu())
             regime_parts.append(_causal_patch_regime_descriptor(x).detach().cpu())
             cross_parts.append(cross_bcq.detach().cpu())
             delta_sq_parts.append(delta_sq_bcq.detach().cpu())
@@ -4093,6 +4509,9 @@ def main():
                 "candidate_mse": torch.empty(0),
                 "base_mae": torch.empty(0),
                 "candidate_mae": torch.empty(0),
+                "candidate_mse_all": torch.empty(0),
+                "candidate_mae_all": torch.empty(0),
+                "candidate_score_all": torch.empty(0),
                 "regime": torch.empty(0),
                 "cross": torch.empty(0),
                 "delta_sq": torch.empty(0),
@@ -4113,6 +4532,21 @@ def main():
             "candidate_mse": torch.cat(candidate_mse_parts, dim=0),
             "base_mae": torch.cat(base_mae_parts, dim=0),
             "candidate_mae": torch.cat(candidate_mae_parts, dim=0),
+            "candidate_mse_all": (
+                torch.cat(candidate_mse_all_parts, dim=0)
+                if candidate_mse_all_parts
+                else torch.empty(0)
+            ),
+            "candidate_mae_all": (
+                torch.cat(candidate_mae_all_parts, dim=0)
+                if candidate_mae_all_parts
+                else torch.empty(0)
+            ),
+            "candidate_score_all": (
+                torch.cat(candidate_score_all_parts, dim=0)
+                if candidate_score_all_parts
+                else torch.empty(0)
+            ),
             "regime": torch.cat(regime_parts, dim=0),
             "cross": torch.cat(cross_parts, dim=0),
             "delta_sq": torch.cat(delta_sq_parts, dim=0),
@@ -4368,6 +4802,9 @@ def main():
                 allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                 only_allowed=pred_residual_candidate_supervision_only_allowed,
                 loss_kind=pred_residual_candidate_supervision_loss,
+                forecast_mse_weight=(
+                    pred_residual_candidate_supervision_forecast_mse_weight
+                ),
                 min_abs_improvement=pred_residual_candidate_supervision_min_abs,
                 min_rel_improvement=pred_residual_candidate_supervision_min_rel,
                 include_intervention=pred_residual_candidate_supervision_include_intervention,
@@ -4697,7 +5134,7 @@ def main():
                 horizon_segments = int(stat_scale_cfg.get("horizon_segments", 1))
                 scales_c, scores_c, selection_count = select_train_stat_anchor_scales_from_loader(
                     model=model,
-                    loader=dl_tr,
+                    loader=dl_tr_source,
                     cluster_id_c=cluster_id_c,
                     device=device,
                     history_anchor_cfg=history_anchor_cfg,
@@ -4737,7 +5174,7 @@ def main():
             train_residual_anchor_phc, train_residual_anchor_counts, residual_train_count = (
                 build_train_residual_anchor_table_from_loader(
                     model=model,
-                    loader=dl_tr,
+                    loader=dl_tr_source,
                     cluster_id_c=cluster_id_c,
                     device=device,
                     history_anchor_cfg=history_anchor_cfg,
@@ -4767,7 +5204,7 @@ def main():
                 horizon_segments = int(residual_scale_cfg.get("horizon_segments", 1))
                 scales_c, scores_c, selection_count = select_train_residual_anchor_scales_from_loader(
                     model=model,
-                    loader=dl_tr,
+                    loader=dl_tr_source,
                     cluster_id_c=cluster_id_c,
                     device=device,
                     history_anchor_cfg=history_anchor_cfg,
@@ -4810,7 +5247,7 @@ def main():
             return
         table_phc, counts_p, train_windows = build_train_residual_anchor_table_from_loader(
             model=model,
-            loader=dl_tr,
+            loader=dl_tr_source,
             cluster_id_c=cluster_id_c,
             device=device,
             history_anchor_cfg=history_anchor_cfg,
@@ -5017,6 +5454,144 @@ def main():
         )
     stage2_route_audit_frequency = max(1, int(stage2_route_audit_cfg.get("frequency_epochs", 1)))
 
+    if patch_router_epoch0_noop_enable:
+        if len(dva) <= 0:
+            raise ValueError(
+                "patch_router.epoch0_noop_selection requires a validation split."
+            )
+        if monitor_metric not in {"val_mse", "val_mae", "val_loss"}:
+            raise ValueError(
+                "patch_router.epoch0_noop_selection requires a validation selection metric."
+            )
+        (
+            epoch0_val_loss_k,
+            epoch0_val_mse_k,
+            epoch0_val_mae_k,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = eval_loop_with_history(
+            model,
+            gate,
+            lambda_kp_at(1, detach=True),
+            penalty_names,
+            penalty_fns,
+            dl_stage2_epoch_eval if dl_stage2_epoch_eval is not None else dl_va,
+            cluster_id_c,
+            K,
+            moe_cfg,
+            device,
+            select_ranks=select_ranks,
+            collect_plot=False,
+            channel_count=C,
+            collect_samples=False,
+            mse_weight=mse_weight,
+            gate_entropy_weight=gate_entropy_weight,
+            gate_balance_weight=gate_balance_weight,
+            gate_soft_weight=gate_soft_weight,
+            gate_entropy_target_frac=gate_entropy_target_frac,
+            penalty_scale=penalty_scale,
+            dynamic_lambda=dynamic_lambda,
+            lambda_min_kp=lambda_min_kp,
+            mae_objective_weight=mae_objective_weight_at(1),
+            mae_objective_kind=mae_objective_kind,
+            mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
+            eval_start=stage2_epoch_eval_start,
+        )
+        patch_router_epoch0_val_mse_k = epoch0_val_mse_k.detach().clone()
+        patch_router_epoch0_val_mae_k = epoch0_val_mae_k.detach().clone()
+        epoch0_monitor_k = _select_monitor_k(
+            epoch0_val_loss_k,
+            epoch0_val_mse_k,
+            epoch0_val_mae_k,
+            epoch0_val_loss_k,
+            epoch0_val_mse_k,
+            epoch0_val_mae_k,
+        )
+        best_monitor.copy_(epoch0_monitor_k)
+        for k in range(K):
+            save_best(k, 0)
+        if shared_moe_across_clusters:
+            shared_moe_best_monitor = float(
+                reduce_cluster_metric(epoch0_monitor_k, cluster_weight_k).item()
+            )
+            shared_moe_best_epoch = 0
+            shared_moe_best_state["gate"] = gate.get_cluster_state(0)
+            shared_moe_best_state["pred_residual"] = (
+                pred_residual.get_cluster_state(0)
+                if pred_residual is not None
+                else None
+            )
+        patch_router_epoch0_noop_summary = {
+            "enable": True,
+            "require_dual_improvement": bool(
+                patch_router_epoch0_require_dual
+            ),
+            "val_mse": float(
+                reduce_cluster_metric(
+                    epoch0_val_mse_k,
+                    cluster_weight_k,
+                ).item()
+            ),
+            "val_mae": float(
+                reduce_cluster_metric(
+                    epoch0_val_mae_k,
+                    cluster_weight_k,
+                ).item()
+            ),
+        }
+        expected_epoch0_mse = patch_router_epoch0_noop_cfg.get(
+            "expected_val_mse",
+            None,
+        )
+        expected_epoch0_mae = patch_router_epoch0_noop_cfg.get(
+            "expected_val_mae",
+            None,
+        )
+        epoch0_atol = max(
+            0.0,
+            float(patch_router_epoch0_noop_cfg.get("expected_atol", 5.0e-6)),
+        )
+        for metric_name, expected_value in (
+            ("val_mse", expected_epoch0_mse),
+            ("val_mae", expected_epoch0_mae),
+        ):
+            if expected_value is None:
+                continue
+            actual_value = float(patch_router_epoch0_noop_summary[metric_name])
+            if abs(actual_value - float(expected_value)) > epoch0_atol:
+                raise ValueError(
+                    "patch-router epoch-0 no-op baseline mismatch: "
+                    f"{metric_name}={actual_value:.9f}, "
+                    f"expected={float(expected_value):.9f}, "
+                    f"atol={epoch0_atol:.3g}."
+                )
+        patch_router_epoch0_noop_summary.update(
+            {
+                "expected_val_mse": (
+                    None
+                    if expected_epoch0_mse is None
+                    else float(expected_epoch0_mse)
+                ),
+                "expected_val_mae": (
+                    None
+                    if expected_epoch0_mae is None
+                    else float(expected_epoch0_mae)
+                ),
+                "expected_atol": float(epoch0_atol),
+                "baseline_match": True,
+            }
+        )
+        print(
+            "Patch-router epoch-0 no-op candidate: "
+            f"val_MSE={patch_router_epoch0_noop_summary['val_mse']:.6f}, "
+            f"val_MAE={patch_router_epoch0_noop_summary['val_mae']:.6f}, "
+            f"require_dual={patch_router_epoch0_require_dual}"
+        )
+
     for ep in range(1, epochs + 1):
         t_ep0 = time.perf_counter()
         if (
@@ -5064,7 +5639,11 @@ def main():
             if ep > patch_router_hierarchical_warmup_epochs
             else 0.0
         )
-        model.train()
+        _set_module_train_mode(
+            model,
+            training=True,
+            keep_frozen_eval=bool(freeze_backbone and frozen_backbone_eval_mode),
+        )
         gate.train()
         if pred_residual is not None:
             pred_residual.train()
@@ -5120,7 +5699,7 @@ def main():
         for x, y, idx in dl_tr:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            idx = idx.to(torch.long)
+            idx = idx.to(torch.long) + int(optimization_index_offset)
             if cluster_memory_bank is not None:
                 train_window = torch.cat([x, y], dim=-1)
                 cluster_memory_bank.update(train_window, idx, cluster_id_c)
@@ -5371,6 +5950,9 @@ def main():
                         allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                         only_allowed=pred_residual_candidate_supervision_only_allowed,
                         loss_kind=pred_residual_candidate_supervision_loss,
+                        forecast_mse_weight=(
+                            pred_residual_candidate_supervision_forecast_mse_weight
+                        ),
                         min_abs_improvement=pred_residual_candidate_supervision_min_abs,
                         min_rel_improvement=pred_residual_candidate_supervision_min_rel,
                         include_intervention=pred_residual_candidate_supervision_include_intervention,
@@ -5458,6 +6040,7 @@ def main():
                     or route_precision_recall_weight > 0.0
                     or mse_utility_gate_weight > 0.0
                     or patch_router_expected_mse_weight > 0.0
+                    or patch_router_mixture_mse_weight > 0.0
                     or patch_router_oracle_ce_weight_ep > 0.0
                     or patch_router_hierarchical_weight_ep > 0.0
                 ):
@@ -5477,6 +6060,7 @@ def main():
                         cluster_id_c=cluster_id_c,
                         include_patch_route=not (
                             patch_router_expected_mse_weight > 0.0
+                            or patch_router_mixture_mse_weight > 0.0
                             or patch_router_oracle_ce_weight_ep > 0.0
                             or patch_router_hierarchical_weight_ep > 0.0
                         ),
@@ -5496,6 +6080,7 @@ def main():
                         patch_skip_prob_bcq=patch_skip_prob_bcq,
                         cluster_id_c=cluster_id_c,
                         K=K,
+                        mae_weight=patch_router_expected_mae_weight,
                     )
                     patch_utility_component_bk = (
                         patch_router_expected_mse_weight * patch_utility_loss_bk
@@ -5550,6 +6135,28 @@ def main():
                             + group_dro_component_bk
                         )
                         loss_bk = loss_bk + group_dro_component_bk
+                if patch_router_mixture_mse_weight > 0.0 and utility_cand_bcpH is not None:
+                    patch_probs_bcqp = pred_out.get("patch_probs_bcqp")
+                    if patch_probs_bcqp is None:
+                        raise ValueError(
+                            "patch_router.mixture_mse_weight requires patch router probabilities."
+                        )
+                    patch_mixture_loss_bk = _patch_router_mixture_mse_loss_bk(
+                        base_bch=utility_base_bch,
+                        candidate_bcpH=utility_cand_bcpH,
+                        y_bch=y,
+                        patch_probs_bcqp=patch_probs_bcqp,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        mae_weight=patch_router_mixture_mae_weight,
+                    )
+                    patch_mixture_component_bk = (
+                        patch_router_mixture_mse_weight * patch_mixture_loss_bk
+                    )
+                    gate_utility_component_bk = (
+                        gate_utility_component_bk + patch_mixture_component_bk
+                    )
+                    loss_bk = loss_bk + patch_mixture_component_bk
                 if patch_router_oracle_ce_weight_ep > 0.0 and utility_cand_bcpH is not None:
                     patch_probs_bcqp = pred_out.get("patch_probs_bcqp")
                     patch_skip_prob_bcq = pred_out.get("patch_skip_prob_bcq")
@@ -5595,6 +6202,12 @@ def main():
                         patch_penalty_conditional_probs_bcqp=patch_conditional_probs_bcqp,
                         patch_penalty_benefit_probs_bcqp=patch_benefit_probs_bcqp,
                         patch_penalty_utility_scores_bcqp=patch_utility_scores_bcqp,
+                        patch_penalty_mse_utility_scores_bcqp=pred_out.get(
+                            "patch_penalty_mse_utility_scores_bcqp"
+                        ),
+                        patch_penalty_mae_utility_scores_bcqp=pred_out.get(
+                            "patch_penalty_mae_utility_scores_bcqp"
+                        ),
                         patch_penalty_risk_benefit_probs_bcqp=pred_out.get(
                             "patch_penalty_risk_benefit_probs_bcqp"
                         ),
@@ -6171,8 +6784,20 @@ def main():
                 suffix=f"epoch={ep}/{epochs} loss={running / max(n_batches, 1):.6f} validating",
                 force=True,
             )
-        epoch_eval_loader = dl_overfit_eval if dl_overfit_eval is not None else dl_va
-        epoch_eval_start = 0 if dl_overfit_eval is not None else val_eval_start
+        epoch_eval_loader = (
+            dl_overfit_eval
+            if dl_overfit_eval is not None
+            else (
+                dl_stage2_epoch_eval
+                if dl_stage2_epoch_eval is not None
+                else dl_va
+            )
+        )
+        epoch_eval_start = (
+            0
+            if dl_overfit_eval is not None
+            else int(stage2_epoch_eval_start)
+        )
         val_loss_k, val_mse_k, val_mae_k, _, _, _, _, _ = eval_loop_with_history(
             model, gate, lambda_kp_at(ep, detach=True),
             penalty_names, penalty_fns,
@@ -6229,7 +6854,41 @@ def main():
         selection_active = ep >= selection_start_epoch
         if shared_moe_across_clusters and selection_active:
             shared_monitor = float(reduce_cluster_metric(monitor_k, cluster_weight_k).item())
-            if (shared_moe_best_monitor - shared_monitor) > min_delta:
+            shared_dual_safe = True
+            if (
+                patch_router_epoch0_noop_enable
+                and patch_router_epoch0_require_dual
+            ):
+                assert (
+                    patch_router_epoch0_val_mse_k is not None
+                    and patch_router_epoch0_val_mae_k is not None
+                )
+                epoch0_mse = float(
+                    reduce_cluster_metric(
+                        patch_router_epoch0_val_mse_k,
+                        cluster_weight_k,
+                    ).item()
+                )
+                epoch0_mae = float(
+                    reduce_cluster_metric(
+                        patch_router_epoch0_val_mae_k,
+                        cluster_weight_k,
+                    ).item()
+                )
+                current_mse = float(
+                    reduce_cluster_metric(val_mse_k, cluster_weight_k).item()
+                )
+                current_mae = float(
+                    reduce_cluster_metric(val_mae_k, cluster_weight_k).item()
+                )
+                shared_dual_safe = bool(
+                    (epoch0_mse - current_mse) > min_delta
+                    and (epoch0_mae - current_mae) > min_delta
+                )
+            if (
+                shared_dual_safe
+                and (shared_moe_best_monitor - shared_monitor) > min_delta
+            ):
                 shared_moe_best_monitor = shared_monitor
                 shared_moe_best_epoch = int(ep)
                 shared_moe_best_state["gate"] = gate.get_cluster_state(0)
@@ -6237,6 +6896,20 @@ def main():
                     pred_residual.get_cluster_state(0) if pred_residual is not None else None
                 )
         improved = (best_monitor - monitor_k) > min_delta if selection_active else torch.zeros_like(stopped)
+        if (
+            selection_active
+            and patch_router_epoch0_noop_enable
+            and patch_router_epoch0_require_dual
+        ):
+            assert (
+                patch_router_epoch0_val_mse_k is not None
+                and patch_router_epoch0_val_mae_k is not None
+            )
+            improved = improved & (
+                (patch_router_epoch0_val_mse_k - val_mse_k) > min_delta
+            ) & (
+                (patch_router_epoch0_val_mae_k - val_mae_k) > min_delta
+            )
         for k in range(K):
             if stopped[k]:
                 continue
@@ -6536,6 +7209,28 @@ def main():
         load_best_all()
     else:
         print("Checkpoint selection uses the final epoch state (adapter-bank training mode).")
+    if patch_router_epoch0_noop_summary is not None:
+        selected_epoch_payload: object = (
+            int(shared_moe_best_epoch)
+            if shared_moe_across_clusters
+            else [int(v) for v in best_epoch.detach().cpu().tolist()]
+        )
+        retained_noop = bool(
+            int(shared_moe_best_epoch) == 0
+            if shared_moe_across_clusters
+            else bool((best_epoch == 0).all().item())
+        )
+        patch_router_epoch0_noop_summary.update(
+            {
+                "selected_epoch": selected_epoch_payload,
+                "retained_noop": retained_noop,
+                "selection_reason": (
+                    "no_learned_epoch_dual_improved_validation"
+                    if retained_noop
+                    else "learned_epoch_dual_improved_validation"
+                ),
+            }
+        )
     assert_pairwise_frozen_parameters_unchanged("post_load_best")
     swa_summary["updates"] = int(swa_updates)
     if swa_enable and swa_updates <= 0:
@@ -6739,7 +7434,7 @@ def main():
         train_residual_anchor_phc, train_residual_anchor_counts, residual_train_count = (
             build_train_residual_anchor_table_from_loader(
                 model=model,
-                loader=dl_tr,
+                loader=dl_tr_source,
                 cluster_id_c=cluster_id_c,
                 device=device,
                 history_anchor_cfg=history_anchor_cfg,
@@ -7310,6 +8005,9 @@ def main():
                     "selected_gain_pct": float(
                         block_oracle.get("selected_gain_pct", 0.0)
                     ),
+                    "selected_mae_gain_pct": float(
+                        block_oracle.get("selected_mae_gain_pct", 0.0)
+                    ),
                     "proposal_oracle_best_recall_at_k": float(
                         block_oracle.get("proposal_oracle_best_recall_at_k", 0.0)
                     ),
@@ -7327,6 +8025,15 @@ def main():
                     ),
                     "selected_utility_precision": float(
                         block_oracle.get("selected_utility_precision", 0.0)
+                    ),
+                    "selected_dual_utility_precision": float(
+                        block_oracle.get(
+                            "selected_dual_utility_precision",
+                            0.0,
+                        )
+                    ),
+                    "selected_dual_harmful_rate": float(
+                        block_oracle.get("selected_dual_harmful_rate", 0.0)
                     ),
                     "selected_gain_to_cost_ratio": float(
                         block_oracle.get("selected_gain_to_cost_ratio", 0.0)
@@ -7843,10 +8550,11 @@ def main():
             }
         if patch_router_walk_forward_enable and len(dtr) > 0 and len(dva) > 0:
             fixed_penalty_c = pred_residual.patch_router.fixed_penalty_index_by_channel_c
-            if int(fixed_penalty_c.numel()) != C:
-                raise ValueError(
-                    "walk_forward_reliability requires one fixed penalty index per channel."
-                )
+            walk_forward_active_channel_c = (
+                fixed_penalty_c >= 0
+                if int(fixed_penalty_c.numel()) == C
+                else torch.ones(C, dtype=torch.bool)
+            )
             chronological_train_loader = DataLoader(
                 dtr,
                 batch_size=bs,
@@ -7857,6 +8565,10 @@ def main():
             train_risk_tensors = collect_patch_risk_calibration_tensors(
                 chronological_train_loader,
                 eval_start=0,
+                include_all_candidates=(
+                    patch_router_walk_forward_rerank_all_candidates
+                    or patch_router_walk_forward_feedback_ridge
+                ),
             )
             val_risk_tensors = collect_patch_risk_calibration_tensors(
                 dl_va,
@@ -7864,6 +8576,10 @@ def main():
                 include_patch_values=(
                     patch_router_walk_forward_scale_mode
                     in {"least_squares", "feature_ridge"}
+                ),
+                include_all_candidates=(
+                    patch_router_walk_forward_rerank_all_candidates
+                    or patch_router_walk_forward_feedback_ridge
                 ),
             )
             train_time_n = train_risk_tensors["time"][:, 0, 0]
@@ -7897,7 +8613,17 @@ def main():
                     eval_candidate_mse_ncq=train_risk_tensors["candidate_mse"][train_audit_start:],
                     eval_base_mae_ncq=train_risk_tensors["base_mae"][train_audit_start:],
                     eval_candidate_mae_ncq=train_risk_tensors["candidate_mae"][train_audit_start:],
-                    active_channel_mask_c=(fixed_penalty_c >= 0),
+                    active_channel_mask_c=walk_forward_active_channel_c,
+                    train_penalty_ncq=(
+                        train_risk_tensors["penalty"][:train_audit_start]
+                        if patch_router_walk_forward_condition_on_selected_penalty
+                        else None
+                    ),
+                    eval_penalty_ncq=(
+                        train_risk_tensors["penalty"][train_audit_start:]
+                        if patch_router_walk_forward_condition_on_selected_penalty
+                        else None
+                    ),
                     train_regime_ncf=train_risk_tensors["regime"][:train_audit_start],
                     eval_regime_ncf=train_risk_tensors["regime"][train_audit_start:],
                     max_abs_regime_z=patch_router_walk_forward_max_abs_regime_z,
@@ -7934,7 +8660,17 @@ def main():
                     eval_candidate_mse_ncq=val_risk_tensors["candidate_mse"],
                     eval_base_mae_ncq=val_risk_tensors["base_mae"],
                     eval_candidate_mae_ncq=val_risk_tensors["candidate_mae"],
-                    active_channel_mask_c=(fixed_penalty_c >= 0),
+                    active_channel_mask_c=walk_forward_active_channel_c,
+                    train_penalty_ncq=(
+                        train_risk_tensors["penalty"]
+                        if patch_router_walk_forward_condition_on_selected_penalty
+                        else None
+                    ),
+                    eval_penalty_ncq=(
+                        val_risk_tensors["penalty"]
+                        if patch_router_walk_forward_condition_on_selected_penalty
+                        else None
+                    ),
                     train_regime_ncf=train_risk_tensors["regime"],
                     eval_regime_ncf=val_risk_tensors["regime"],
                     max_abs_regime_z=patch_router_walk_forward_max_abs_regime_z,
@@ -7968,6 +8704,291 @@ def main():
                     temporal_blocks=patch_router_walk_forward_temporal_blocks,
                 )
             )
+            if patch_router_walk_forward_rerank_all_candidates:
+                train_gain_all = (
+                    train_risk_tensors["base_mse"].unsqueeze(-1)
+                    - train_risk_tensors["candidate_mse_all"]
+                )
+                moe_residual_summary["patch_router"][
+                    "train_expert_reliability_rerank_audit"
+                ] = _walk_forward_expert_reliability_rerank_metrics(
+                    train_time_n=train_time_n[:train_audit_start],
+                    train_gain_ncqp=train_gain_all[:train_audit_start],
+                    eval_time_n=train_time_n[train_audit_start:],
+                    eval_base_mse_ncq=train_risk_tensors["base_mse"][train_audit_start:],
+                    eval_candidate_mse_ncqp=train_risk_tensors[
+                        "candidate_mse_all"
+                    ][train_audit_start:],
+                    eval_base_mae_ncq=train_risk_tensors["base_mae"][train_audit_start:],
+                    eval_candidate_mae_ncqp=train_risk_tensors[
+                        "candidate_mae_all"
+                    ][train_audit_start:],
+                    eval_score_ncqp=train_risk_tensors[
+                        "candidate_score_all"
+                    ][train_audit_start:],
+                    active_channel_mask_c=walk_forward_active_channel_c,
+                    label_delay=patch_router_walk_forward_label_delay,
+                    lookback_windows=patch_router_walk_forward_lookback,
+                    min_history_windows=patch_router_walk_forward_min_history,
+                    history_stride=patch_router_walk_forward_history_stride,
+                    min_mean_gain=patch_router_walk_forward_min_mean_gain,
+                    temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                )
+                moe_residual_summary["patch_router"][
+                    "expert_reliability_rerank"
+                ] = _walk_forward_expert_reliability_rerank_metrics(
+                    train_time_n=train_time_n,
+                    train_gain_ncqp=train_gain_all,
+                    eval_time_n=val_time_n,
+                    eval_base_mse_ncq=val_risk_tensors["base_mse"],
+                    eval_candidate_mse_ncqp=val_risk_tensors[
+                        "candidate_mse_all"
+                    ],
+                    eval_base_mae_ncq=val_risk_tensors["base_mae"],
+                    eval_candidate_mae_ncqp=val_risk_tensors[
+                        "candidate_mae_all"
+                    ],
+                    eval_score_ncqp=val_risk_tensors["candidate_score_all"],
+                    active_channel_mask_c=walk_forward_active_channel_c,
+                    label_delay=patch_router_walk_forward_label_delay,
+                    lookback_windows=patch_router_walk_forward_lookback,
+                    min_history_windows=patch_router_walk_forward_min_history,
+                    history_stride=patch_router_walk_forward_history_stride,
+                    min_mean_gain=patch_router_walk_forward_min_mean_gain,
+                    temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                )
+            if patch_router_walk_forward_feedback_ridge:
+                feedback_common = {
+                    "active_channel_mask_c": walk_forward_active_channel_c,
+                    "label_delay": patch_router_walk_forward_label_delay,
+                    "lookback_windows": patch_router_walk_forward_lookback,
+                    "min_history_windows": patch_router_walk_forward_min_history,
+                    "history_stride": patch_router_walk_forward_history_stride,
+                    "ridge": patch_router_walk_forward_feedback_ridge_strength,
+                    "target_clip": patch_router_walk_forward_feedback_target_clip,
+                    "temporal_blocks": patch_router_walk_forward_temporal_blocks,
+                }
+                moe_residual_summary["patch_router"][
+                    "train_expert_feedback_ridge_audit"
+                ] = _causal_expert_feedback_ridge_metrics(
+                    train_time_n=train_time_n[:train_audit_start],
+                    train_base_mse_ncq=train_risk_tensors["base_mse"][:train_audit_start],
+                    train_candidate_mse_ncqp=train_risk_tensors[
+                        "candidate_mse_all"
+                    ][:train_audit_start],
+                    train_base_mae_ncq=train_risk_tensors["base_mae"][:train_audit_start],
+                    train_candidate_mae_ncqp=train_risk_tensors[
+                        "candidate_mae_all"
+                    ][:train_audit_start],
+                    train_score_ncqp=train_risk_tensors[
+                        "candidate_score_all"
+                    ][:train_audit_start],
+                    eval_time_n=train_time_n[train_audit_start:],
+                    eval_base_mse_ncq=train_risk_tensors["base_mse"][train_audit_start:],
+                    eval_candidate_mse_ncqp=train_risk_tensors[
+                        "candidate_mse_all"
+                    ][train_audit_start:],
+                    eval_base_mae_ncq=train_risk_tensors["base_mae"][train_audit_start:],
+                    eval_candidate_mae_ncqp=train_risk_tensors[
+                        "candidate_mae_all"
+                    ][train_audit_start:],
+                    eval_score_ncqp=train_risk_tensors[
+                        "candidate_score_all"
+                    ][train_audit_start:],
+                    **feedback_common,
+                )
+                moe_residual_summary["patch_router"][
+                    "expert_feedback_ridge"
+                ] = _causal_expert_feedback_ridge_metrics(
+                    train_time_n=train_time_n,
+                    train_base_mse_ncq=train_risk_tensors["base_mse"],
+                    train_candidate_mse_ncqp=train_risk_tensors[
+                        "candidate_mse_all"
+                    ],
+                    train_base_mae_ncq=train_risk_tensors["base_mae"],
+                    train_candidate_mae_ncqp=train_risk_tensors[
+                        "candidate_mae_all"
+                    ],
+                    train_score_ncqp=train_risk_tensors["candidate_score_all"],
+                    eval_time_n=val_time_n,
+                    eval_base_mse_ncq=val_risk_tensors["base_mse"],
+                    eval_candidate_mse_ncqp=val_risk_tensors[
+                        "candidate_mse_all"
+                    ],
+                    eval_base_mae_ncq=val_risk_tensors["base_mae"],
+                    eval_candidate_mae_ncqp=val_risk_tensors[
+                        "candidate_mae_all"
+                    ],
+                    eval_score_ncqp=val_risk_tensors["candidate_score_all"],
+                    **feedback_common,
+                )
+            if patch_router_walk_forward_test_enable:
+                if len(dte) <= 0:
+                    raise ValueError(
+                        "walk_forward_reliability.test_enable requires test evaluation."
+                    )
+                test_risk_tensors = collect_patch_risk_calibration_tensors(
+                    dl_te,
+                    eval_start=test_eval_start,
+                    include_patch_values=(
+                        patch_router_walk_forward_scale_mode
+                        in {"least_squares", "feature_ridge"}
+                    ),
+                    include_all_candidates=(
+                        patch_router_walk_forward_rerank_all_candidates
+                        or patch_router_walk_forward_feedback_ridge
+                    ),
+                )
+                test_time_n = test_risk_tensors["time"][:, 0, 0]
+
+                def train_val_history(key: str) -> torch.Tensor:
+                    return torch.cat(
+                        [train_risk_tensors[key], val_risk_tensors[key]],
+                        dim=0,
+                    )
+
+                test_walk_forward = _walk_forward_patch_reliability_metrics(
+                    train_time_n=torch.cat([train_time_n, val_time_n], dim=0),
+                    train_gain_ncq=train_val_history("gain"),
+                    eval_time_n=test_time_n,
+                    eval_base_mse_ncq=test_risk_tensors["base_mse"],
+                    eval_candidate_mse_ncq=test_risk_tensors["candidate_mse"],
+                    eval_base_mae_ncq=test_risk_tensors["base_mae"],
+                    eval_candidate_mae_ncq=test_risk_tensors["candidate_mae"],
+                    active_channel_mask_c=walk_forward_active_channel_c,
+                    train_penalty_ncq=(
+                        train_val_history("penalty")
+                        if patch_router_walk_forward_condition_on_selected_penalty
+                        else None
+                    ),
+                    eval_penalty_ncq=(
+                        test_risk_tensors["penalty"]
+                        if patch_router_walk_forward_condition_on_selected_penalty
+                        else None
+                    ),
+                    train_regime_ncf=train_val_history("regime"),
+                    eval_regime_ncf=test_risk_tensors["regime"],
+                    max_abs_regime_z=patch_router_walk_forward_max_abs_regime_z,
+                    train_cross_ncq=train_val_history("cross"),
+                    train_delta_sq_ncq=train_val_history("delta_sq"),
+                    eval_cross_ncq=test_risk_tensors["cross"],
+                    eval_delta_sq_ncq=test_risk_tensors["delta_sq"],
+                    eval_base_residual_ncqr=test_risk_tensors[
+                        "base_residual_patch"
+                    ],
+                    eval_candidate_delta_ncqr=test_risk_tensors[
+                        "candidate_delta_patch"
+                    ],
+                    train_scale_feature_ncqf=train_val_history("scale_feature"),
+                    eval_scale_feature_ncqf=test_risk_tensors["scale_feature"],
+                    scale_mode=patch_router_walk_forward_scale_mode,
+                    max_scale=patch_router_walk_forward_max_scale,
+                    scale_consensus_blocks=(
+                        patch_router_walk_forward_scale_consensus_blocks
+                    ),
+                    feature_ridge=patch_router_walk_forward_feature_ridge,
+                    feature_update_blocks=(
+                        patch_router_walk_forward_feature_update_blocks
+                    ),
+                    patch_label_delay_q=patch_label_delay_q,
+                    label_delay=patch_router_walk_forward_label_delay,
+                    lookback_windows=patch_router_walk_forward_lookback,
+                    min_history_windows=patch_router_walk_forward_min_history,
+                    history_stride=patch_router_walk_forward_history_stride,
+                    min_mean_gain=patch_router_walk_forward_min_mean_gain,
+                    temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                )
+                test_walk_forward["test_read"] = True
+                test_walk_forward["history_splits"] = ["train", "validation"]
+                moe_residual_summary["patch_router"][
+                    "test_walk_forward_reliability"
+                ] = test_walk_forward
+                if patch_router_walk_forward_rerank_all_candidates:
+                    test_expert_rerank = (
+                        _walk_forward_expert_reliability_rerank_metrics(
+                            train_time_n=torch.cat(
+                                [train_time_n, val_time_n],
+                                dim=0,
+                            ),
+                            train_gain_ncqp=(
+                                train_val_history("base_mse").unsqueeze(-1)
+                                - train_val_history("candidate_mse_all")
+                            ),
+                            eval_time_n=test_time_n,
+                            eval_base_mse_ncq=test_risk_tensors["base_mse"],
+                            eval_candidate_mse_ncqp=test_risk_tensors[
+                                "candidate_mse_all"
+                            ],
+                            eval_base_mae_ncq=test_risk_tensors["base_mae"],
+                            eval_candidate_mae_ncqp=test_risk_tensors[
+                                "candidate_mae_all"
+                            ],
+                            eval_score_ncqp=test_risk_tensors[
+                                "candidate_score_all"
+                            ],
+                            active_channel_mask_c=walk_forward_active_channel_c,
+                            label_delay=patch_router_walk_forward_label_delay,
+                            lookback_windows=patch_router_walk_forward_lookback,
+                            min_history_windows=patch_router_walk_forward_min_history,
+                            history_stride=patch_router_walk_forward_history_stride,
+                            min_mean_gain=patch_router_walk_forward_min_mean_gain,
+                            temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                        )
+                    )
+                    test_expert_rerank["test_read"] = True
+                    test_expert_rerank["history_splits"] = [
+                        "train",
+                        "validation",
+                    ]
+                    moe_residual_summary["patch_router"][
+                        "test_expert_reliability_rerank"
+                    ] = test_expert_rerank
+                if patch_router_walk_forward_feedback_ridge:
+                    test_feedback_ridge = _causal_expert_feedback_ridge_metrics(
+                        train_time_n=torch.cat(
+                            [train_time_n, val_time_n],
+                            dim=0,
+                        ),
+                        train_base_mse_ncq=train_val_history("base_mse"),
+                        train_candidate_mse_ncqp=train_val_history(
+                            "candidate_mse_all"
+                        ),
+                        train_base_mae_ncq=train_val_history("base_mae"),
+                        train_candidate_mae_ncqp=train_val_history(
+                            "candidate_mae_all"
+                        ),
+                        train_score_ncqp=train_val_history(
+                            "candidate_score_all"
+                        ),
+                        eval_time_n=test_time_n,
+                        eval_base_mse_ncq=test_risk_tensors["base_mse"],
+                        eval_candidate_mse_ncqp=test_risk_tensors[
+                            "candidate_mse_all"
+                        ],
+                        eval_base_mae_ncq=test_risk_tensors["base_mae"],
+                        eval_candidate_mae_ncqp=test_risk_tensors[
+                            "candidate_mae_all"
+                        ],
+                        eval_score_ncqp=test_risk_tensors[
+                            "candidate_score_all"
+                        ],
+                        active_channel_mask_c=walk_forward_active_channel_c,
+                        label_delay=patch_router_walk_forward_label_delay,
+                        lookback_windows=patch_router_walk_forward_lookback,
+                        min_history_windows=patch_router_walk_forward_min_history,
+                        history_stride=patch_router_walk_forward_history_stride,
+                        ridge=patch_router_walk_forward_feedback_ridge_strength,
+                        target_clip=patch_router_walk_forward_feedback_target_clip,
+                        temporal_blocks=patch_router_walk_forward_temporal_blocks,
+                    )
+                    test_feedback_ridge["test_read"] = True
+                    test_feedback_ridge["history_splits"] = [
+                        "train",
+                        "validation",
+                    ]
+                    moe_residual_summary["patch_router"][
+                        "test_expert_feedback_ridge"
+                    ] = test_feedback_ridge
     if bool(portrait_cfg.get("enable", False)) and (avg_probs_summary is not None) and len(penalty_names) > 0:
         portrait_dir = portrait_cfg.get("out_dir", os.path.join(out_dir, "cluster_portraits"))
         portrait_dpi = int(portrait_cfg.get("dpi", 140))
@@ -8013,7 +9034,7 @@ def main():
     )
     if skip_test:
         print("eval.skip_test=true: test split windows, evaluation, and metrics are disabled.")
-    if learnable_output_anchor is not None:
+    if learnable_output_anchor is not None and not periodic_anchor_source_mask_preserved:
         learnable_output_anchor.clear_active_channel_mask()
         learnable_output_anchor.clear_active_channel_horizon_mask()
     if len(dva) > 0:
@@ -8262,7 +9283,12 @@ def main():
                 )
                 return _finalize_channel_horizon_metric_collector(metric_collector)
 
-            if adoption_scope_norm in {"channel", "hybrid"}:
+            if periodic_anchor_source_mask_preserved:
+                adopted_channel_mask = [
+                    bool(v)
+                    for v in learnable_output_anchor.active_channel_mask_c.detach().cpu().tolist()
+                ]
+            elif adoption_scope_norm in {"channel", "hybrid"}:
                 keep_c, learnable_channel_adoption_summary = _select_learnable_output_anchor_channel_mask(
                     static_mse_c=val_mse_c_static,
                     refined_mse_c=val_mse_c_base,
@@ -8344,6 +9370,13 @@ def main():
                     "per_channel_mae": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
                 }
                 segment_metrics, _, _ = _collect_learnable_segment_metrics()
+            learnable_summary_cfg = learnable_output_anchor_cfg
+            if periodic_anchor_source_mask_preserved:
+                learnable_summary_cfg = dict(learnable_output_anchor_cfg)
+                preserved_adoption_cfg = dict(learnable_adoption_cfg)
+                preserved_adoption_cfg["adopt_on_val"] = False
+                preserved_adoption_cfg["adoption_scope"] = "global"
+                learnable_summary_cfg["adoption"] = preserved_adoption_cfg
             learnable_output_anchor_refiner_summary = _summarize_learnable_output_anchor_refiner(
                 static_mse=float(static_val_summary["avg_mse"]),
                 static_mae=float(static_val_summary["avg_mae"]),
@@ -8351,7 +9384,7 @@ def main():
                 refined_mae=float(val_summary["avg_mae"]),
                 unmasked_refined_mse=float(unmasked_val_summary["avg_mse"]),
                 unmasked_refined_mae=float(unmasked_val_summary["avg_mae"]),
-                cfg=learnable_output_anchor_cfg,
+                cfg=learnable_summary_cfg,
                 skip_test=skip_test,
                 num_channels=C,
                 segment_metrics=segment_metrics,
@@ -8366,7 +9399,12 @@ def main():
                 learnable_output_anchor_refiner_summary["channel_horizon_adoption"] = (
                     learnable_channel_horizon_adoption_summary
                 )
-            learnable_output_anchor_summary["adoption_guard_applied"] = True
+            learnable_output_anchor_refiner_summary["periodic_source_mask_preserved"] = bool(
+                periodic_anchor_source_mask_preserved
+            )
+            learnable_output_anchor_summary["adoption_guard_applied"] = not bool(
+                periodic_anchor_source_mask_preserved
+            )
             learnable_output_anchor_summary["adopted_on_val"] = bool(
                 learnable_output_anchor_refiner_summary["adopted"]
             )
@@ -8389,7 +9427,9 @@ def main():
             else:
                 learnable_output_anchor_summary["final_eval_enable"] = True
                 learnable_output_anchor_summary["final_eval_reason"] = (
-                    "val_guard_adopted"
+                    "frozen_periodic_source_mask"
+                    if periodic_anchor_source_mask_preserved
+                    else "val_guard_adopted"
                     if bool(learnable_output_anchor_refiner_summary["adopted"])
                     else "adopt_on_val_disabled"
                 )
@@ -9537,6 +10577,130 @@ def main():
                 f"coef_mean_abs={float(calendar_residual_summary.get('coef_mean_abs', 0.0)):.6f}"
             )
 
+    position_daily_fit_cfg = (
+        position_daily_residual_expert_cfg
+        if position_daily_residual_expert_enable
+        else position_daily_residual_cfg
+    )
+    if position_daily_residual_expert_enable or bool(
+        position_daily_residual_cfg.get("enable", False)
+    ):
+        source_split = str(
+            position_daily_fit_cfg.get("source_split", "val")
+        ).lower()
+        if source_split not in {"val", "validation"}:
+            raise ValueError(
+                "position daily residual fit source_split must be val."
+            )
+        tail_fraction = float(
+            position_daily_fit_cfg.get("tail_fraction", 0.25)
+        )
+        if not 0.0 < tail_fraction <= 1.0:
+            raise ValueError(
+                "position daily residual fit tail_fraction must be in (0,1]."
+            )
+        fit_count = max(1, int(round(len(dva) * tail_fraction)))
+        fit_start = max(0, len(dva) - fit_count)
+        fit_loader = DataLoader(
+            Subset(dva, range(fit_start, len(dva))),
+            batch_size=int(cfg["train"]["batch_size"]),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_mem,
+        )
+        fit_collector: Dict[str, object] = {
+            "limit": int(fit_count),
+            "count": 0,
+            "parts": {},
+        }
+        eval_loop_with_history(
+            model, gate, lam_kp_best,
+            penalty_names, penalty_fns,
+            fit_loader, cluster_id_c, K, moe_cfg, device,
+            select_ranks=select_ranks,
+            collect_plot=False,
+            channel_count=C,
+            mse_weight=mse_weight,
+            gate_entropy_weight=gate_entropy_weight,
+            gate_balance_weight=gate_balance_weight,
+            gate_soft_weight=gate_soft_weight,
+            gate_entropy_target_frac=gate_entropy_target_frac,
+            penalty_scale=penalty_scale,
+            dynamic_lambda=dynamic_lambda,
+            lambda_min_kp=lambda_min_kp,
+            mae_objective_weight=mae_eval_weight,
+            mae_objective_kind=mae_objective_kind,
+            mae_objective_beta=mae_objective_beta,
+            pred_residual=pred_residual,
+            pred_residual_selector=pred_residual_selector_model,
+            pred_residual_scale_c=pred_residual_channel_scale_c,
+            eval_start=val_eval_start,
+            diagnostic_collector=fit_collector,
+        )
+        fit_parts = fit_collector.get("parts", {}) or {}
+        fitted_position_daily_coef_cfh, fit_summary = (
+            fit_position_daily_residual_ridge_from_prediction_parts(
+                idx_parts=list(fit_parts.get("idx", [])),
+                y_true_parts=list(fit_parts.get("y_true", [])),
+                y_pred_parts=list(fit_parts.get("y_final", [])),
+                input_len=L,
+                cfg=position_daily_fit_cfg,
+            )
+        )
+        fit_metadata = {
+            "source_window_range": [int(fit_start), int(len(dva))],
+            "tail_fraction": float(tail_fraction),
+            "test_labels_used_for_fit": False,
+        }
+        if position_daily_residual_expert_enable:
+            if pred_residual is None:
+                raise RuntimeError(
+                    "position_daily_residual_expert requires pred_residual."
+                )
+            pred_residual.set_position_daily_residual_expert(
+                fitted_position_daily_coef_cfh,
+                period=int(position_daily_fit_cfg.get("daily_period", 96)),
+                harmonics=int(position_daily_fit_cfg.get("daily_harmonics", 4)),
+            )
+            position_daily_residual_expert_summary.update(fit_summary)
+            position_daily_residual_expert_summary.update(fit_metadata)
+            position_daily_residual_expert_summary["role"] = (
+                "gated_pred_residual_expert"
+                if anchor_ridge_gate_enable
+                else "always_on_pred_residual_expert"
+            )
+            if anchor_ridge_gate_enable:
+                anchor_ridge_gate_summary.update(
+                    fit_anchor_ridge_gate_from_prediction_parts(
+                        pred_residual=pred_residual,
+                        parts=fit_parts,
+                        position_daily_coef_cfh=fitted_position_daily_coef_cfh,
+                        input_len=L,
+                        position_cfg=position_daily_fit_cfg,
+                        gate_cfg=anchor_ridge_gate_cfg,
+                    )
+                )
+                print(
+                    "Anchor/ridge input gate fitted: "
+                    f"adopted={bool(anchor_ridge_gate_summary.get('adopted', False))}, "
+                    f"holdout_gain={float(anchor_ridge_gate_summary.get('holdout_mse_improvement_pct', 0.0)):.4f}%, "
+                    f"anchor_mean={float(anchor_ridge_gate_summary.get('anchor_weight_mean', 1.0)):.4f}, "
+                    f"ridge_mean={float(anchor_ridge_gate_summary.get('ridge_weight_mean', 1.0)):.4f}"
+                )
+            active_position_daily_summary = position_daily_residual_expert_summary
+        else:
+            position_daily_residual_coef_cfh = fitted_position_daily_coef_cfh
+            position_daily_residual_summary.update(fit_summary)
+            position_daily_residual_summary.update(fit_metadata)
+            active_position_daily_summary = position_daily_residual_summary
+        print(
+            "Position daily residual fitted: "
+            f"role={'pred_residual_expert' if position_daily_residual_expert_enable else 'eval_postprocess'}, "
+            f"source=val[{fit_start}:{len(dva)}], "
+            f"ridge={float(active_position_daily_summary.get('ridge', 0.0)):.6f}, "
+            f"coef_mean_abs={float(active_position_daily_summary.get('coef_mean_abs', 0.0)):.6f}"
+        )
+
     lam_kp_test = lam_kp_best
     test_loss_k = test_mse_k = test_mae_k = None
     mse_c = mae_c = None
@@ -9737,6 +10901,67 @@ def main():
                     f"selected_events={payload['selected_penalty_events']}, "
                     f"oracle_positive_events={payload['oracle_positive_events']}"
                 )
+        gradient_isolation_summary = None
+        gradient_isolation_cfg = explain_cfg.get("gradient_isolation", {}) or {}
+        if not isinstance(gradient_isolation_cfg, dict):
+            gradient_isolation_cfg = {"enable": bool(gradient_isolation_cfg)}
+        if bool(gradient_isolation_cfg.get("enable", False)):
+            gradient_split = str(
+                gradient_isolation_cfg.get("split", "train_holdout")
+            ).lower()
+            allow_test_search = bool(
+                gradient_isolation_cfg.get("allow_test_search", False)
+            )
+            if gradient_split == "test" and not allow_test_search:
+                raise ValueError(
+                    "adapter gradient-isolation proof must use train/train_holdout/val; "
+                    "set explainability.gradient_isolation.allow_test_search=true only "
+                    "for an explicitly authorized test-selected proof"
+                )
+            if gradient_split not in split_loaders:
+                for fallback_split in ("train_holdout", "train_fit", "train", "val"):
+                    if fallback_split in split_loaders:
+                        gradient_split = fallback_split
+                        break
+            if gradient_split in split_loaders:
+                gradient_isolation_summary = evaluate_adapter_gradient_isolation(
+                    model=model,
+                    pred_residual=pred_residual,
+                    loader=split_loaders[gradient_split],
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    penalty_names=penalty_names,
+                    split_name=gradient_split,
+                    max_batches=int(gradient_isolation_cfg.get("max_batches", 4)),
+                    off_diagonal_tolerance=float(
+                        gradient_isolation_cfg.get(
+                            "off_diagonal_tolerance",
+                            1.0e-12,
+                        )
+                    ),
+                    min_diagonal_norm=float(
+                        gradient_isolation_cfg.get("min_diagonal_norm", 1.0e-12)
+                    ),
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    input_len=L,
+                    eval_start=int(split_eval_starts.get(gradient_split, 0)),
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    learnable_output_anchor=learnable_output_anchor,
+                )
+                if gradient_isolation_summary is not None:
+                    print(
+                        "Adapter gradient isolation"
+                        f"({gradient_split}): "
+                        f"diag_min={gradient_isolation_summary['diagonal_min']:.3e}, "
+                        f"offdiag_max={gradient_isolation_summary['off_diagonal_max']:.3e}, "
+                        f"passed={gradient_isolation_summary['passed']}"
+                    )
         route_probe_cfg = explain_cfg.get("route_learnability_probe", {}) or {}
         if not isinstance(route_probe_cfg, dict):
             route_probe_cfg = {"enable": bool(route_probe_cfg)}
@@ -9874,6 +11099,7 @@ def main():
                 for name, (start_i, end_i) in train_subsplit_ranges.items()
             },
             "splits": split_payloads,
+            "adapter_gradient_isolation": gradient_isolation_summary,
             "train_only_prior": {
                 "source": "train_split_penalty_portrait" if penalty_portrait_kp is not None else None,
                 "penalty_names": list(penalty_names),
@@ -10140,11 +11366,44 @@ def main():
             "shuffle_seed": None if shuffle_seed is None else int(shuffle_seed),
             "freeze_backbone": bool(freeze_backbone),
             "frozen_backbone_params": int(frozen_backbone_params),
+            "frozen_backbone_eval_mode": bool(frozen_backbone_eval_mode),
             "backbone_lr": None if backbone_lr is None else float(backbone_lr),
             "loss_normalization": dict(loss_normalization_cfg),
             "lr_warmup_epochs": int(lr_warmup_epochs),
             "lr_warmup_start_factor": float(lr_warmup_start_factor),
             "swa": dict(swa_summary),
+            "optimization_window": {
+                "enable": bool(optimization_window_range is not None),
+                "source": str(optimization_source),
+                "source_window_range": (
+                    [
+                        int(optimization_window_range[0]),
+                        int(optimization_window_range[1]),
+                    ]
+                    if optimization_window_range is not None
+                    else None
+                ),
+                "train_window_range": (
+                    [
+                        int(optimization_window_range[0]),
+                        int(optimization_window_range[1]),
+                    ]
+                    if optimization_source == "train"
+                    and optimization_window_range is not None
+                    else None
+                ),
+                "num_windows": int(len(optimization_dataset)),
+                "index_offset": int(optimization_index_offset),
+                "epoch_eval_source": "validation_window",
+                "epoch_eval_window_range": (
+                    [
+                        int(epoch_eval_window_range[0]),
+                        int(epoch_eval_window_range[1]),
+                    ]
+                    if epoch_eval_window_range is not None
+                    else None
+                ),
+            },
             "overfit_diagnostic": {
                 "enable": bool(overfit_diagnostic_range is not None),
                 "train_window_range": (
@@ -10174,6 +11433,9 @@ def main():
             "skip_test": bool(skip_test),
         },
         "calendar_residual": calendar_residual_summary,
+        "position_daily_residual_ridge": position_daily_residual_summary,
+        "position_daily_residual_expert": position_daily_residual_expert_summary,
+        "anchor_ridge_gate": anchor_ridge_gate_summary,
         "moe_residual": moe_residual_summary,
         "moe_residual_phase_candidate": phase_residual_candidate_summary,
         "moe_residual_confidence_gate": pred_residual_confidence_summary,

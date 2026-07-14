@@ -1,0 +1,353 @@
+exp:
+  name: ETTm1_H96_PKR_jointforecast_h32_lagdelta_channelid_dayweekphase_frozen_test
+  out_dir: outputs/ettm1_h96_pkr_adapter_magnitude_search_20260713/jointforecast_h32_lagdelta_channelid_dayweekphase_frozen_test
+  seed: 2026
+  deterministic: true
+  device: cuda:0
+
+data:
+  csv_path: data/ETTm1.csv
+  date_col: 0
+  max_rows: 57600
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+
+window:
+  input_len: 96
+  pred_len: 96
+  past_context: true
+
+normalize:
+  global_zscore: true
+  train_only: true
+
+corr:
+  compute: true
+  save_path: outputs/ettm1_h96_pkr_adapter_magnitude_search_20260713/jointforecast_h32_lagdelta_channelid_dayweekphase_frozen_test/corr.npy
+
+cluster:
+  method: leader
+  n_clusters: 3
+  distance_threshold: 0.7
+  linkage: average
+  random_state: 2026
+  min_cluster_size: 2
+  merge_small_clusters: true
+  no_merge_if_channels_lt: 7
+  train_only: true
+
+model:
+  predictor: mlp
+  hidden_dim: 256
+  dropout: 0.2
+  mlp_residual_anchor: true
+  temporal_basis_adapter:
+    enable: true
+    rank: 16
+    scale: 0.15
+    init: zero_delta
+  seasonal_blend_adapter:
+    enable: true
+    period: 96
+    num_periods: 1
+    max_mix: 0.1
+    init_mix: 0.005
+
+moe:
+  enable: true
+  shared_across_clusters: true
+  topk: 1
+  select_ranks: [1]
+  gate_hidden_dim: 96
+  detach_penalty_grad: false
+  freeze_backbone: true
+  gate_route_on_penalty_only: false
+  router_mode: learned
+  router_penalty_context_weight: 0.0
+  router_detach_penalty_context: true
+  router_penalty_context_score: high_violation
+  allow_skip: true
+  skip_cost: 0.0
+  skip_init_bias: -2.0
+  gate_temperature: 1.0
+  gate_noise_std: 0.0
+  gate_soft_weight: 0.0
+  gate_entropy_weight: 0.0
+  gate_balance_weight: 0.0
+  gate_penalty_hit:
+    enable: false
+  lambda_init:
+    level: 0.0
+    delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_min:
+    level: 0.0
+    delta: 0.0
+    d2_match: 0.0
+    diff_amp: 0.0
+  lambda_schedule:
+    level: none
+    delta: none
+    d2_match: none
+    diff_amp: none
+  dynamic_lambda:
+    enable: false
+  learnable_lambda:
+    enable: false
+  cluster_penalty_prior:
+    enable: false
+  train_stat_anchor_expert:
+    enable: true
+    period: 96
+    alpha: 0.0
+    mode: phase_mean
+    reference: last
+    blend_target: prediction
+    alpha_by_channel: [0.15, 0.125, 0.15, 0.125, 0.05, 0.075, 0.075]
+    scale_selection:
+      enable: false
+  train_residual_anchor_expert:
+    enable: true
+    period: 96
+    alpha: 0.0
+    blend_target: prediction
+    alpha_horizon_segments: 7
+    alpha_by_channel_horizon:
+      - [1.6, 1.6, 1.6, 1.6, 1.6, 1.6, 1.6]
+      - [1.175, 1.275, 1.075, 1.075, 1.3, 1.325, 1.15]
+      - [1.6, 1.6, 1.6, 1.6, 1.6, 1.6, 1.6]
+      - [1.3, 1.4, 1.175, 1.175, 1.475, 1.525, 1.325]
+      - [0.275, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      - [0.525, 0.775, 0.95, 1.0, 1.075, 1.025, 0.65]
+      - [0.975, 1.025, 1.125, 1.175, 1.25, 1.35, 1.475]
+    scale_selection:
+      enable: false
+  mse_utility_gate_supervision:
+    enable: false
+  explainability:
+    enable: true
+    splits: [train_holdout, val, test]
+    train_holdout_fraction: 0.25
+    max_batches: 0
+    adapter_specialization:
+      enable: true
+      scale_sweep: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+    gradient_isolation:
+      enable: true
+      split: train_holdout
+      max_batches: 4
+      off_diagonal_tolerance: 1.0e-12
+      min_diagonal_norm: 1.0e-12
+    periodic_action_space:
+      enable: true
+  pred_side_residual:
+    enable: true
+    feature_mode: safe_augmented
+    corrector_hidden: 32
+    residual_clip: 5.0
+    init_alpha: 8.0
+    alpha_scale: 1.0
+    use_y_base_input: true
+    intervention_enable: false
+    specialization_weight: 0.0
+    norm_weight: 0.0
+    intervention_weight: 0.0
+    ignore_skip_during_training: true
+    freeze_adapter_bank: false
+    named_output_projection:
+      enable: true
+      fixed_alpha: true
+      patch_len: 24
+      carrier_names: [delta, d2_match]
+      scale_by_name:
+        level: 0.05
+        delta: 0.5
+        d2_match: 0.75
+        diff_amp: 1.0
+    periodic_anchor_expert:
+      enable: true
+      scale: 1.0
+      freeze_source: true
+      preserve_loaded_source_mask: false
+    patch_router:
+      enable: true
+      patch_len: 12
+      hidden_dim: 64
+      topk: 1
+      inference_route_mode: soft
+      temperature: 1.0
+      noise_std: 0.0
+      allow_skip: true
+      skip_init_bias: 2.0
+      feature_clip: 8.0
+      use_base_forecast: true
+      use_channel_identity_features: true
+      time_phase_periods: [96, 672]
+      regime_context:
+        enable: true
+        lengths: [192, 384, 672]
+      lagged_delta_periods: [96]
+      expected_mse_weight: 0.0
+      expected_mae_weight: 0.0
+      mixture_mse_weight: 1.0
+      mixture_mae_weight: 0.0
+      oracle_ce_weight: 0.0
+      oracle_ce_warmup_epochs: 0
+      freeze_experts_after_warmup: true
+      supervision_only: true
+      epoch0_noop_selection:
+        enable: false
+        require_dual_improvement: true
+        expected_val_mse: 0.350771159
+        expected_val_mae: 0.390539080
+        expected_atol: 0.000005
+      hierarchical_recall:
+        enable: true
+        adopt_threshold: 0.5
+        adopt_init_bias: 0.0
+        supervision_weight: 0.0
+        warmup_epochs: 0
+        min_abs_improvement: 0.0
+        adoption_bce_weight: 0.0
+        proposal_bce_weight: 0.0
+        proposal_gain_listwise_weight: 0.0
+        proposal_rescue_ce_weight: 0.0
+        ranking_ce_weight: 0.0
+        utility_regression_weight: 1.0
+        risk_calibration_weight: 0.0
+        risk_sign_bce_weight: 0.0
+        risk_magnitude_weight: 0.0
+        selected_utility_policy_weight: 0.0
+        selected_adoption_bce_weight: 0.0
+        selected_adoption_recall_weight: 0.0
+        selected_false_adopt_weight: 0.0
+        adoption_recall_weight: 0.0
+        false_adopt_weight: 0.0
+        penalty_recall_weight: 0.0
+        false_penalty_weight: 0.0
+        expert_conditional_risk:
+          enable: true
+          decoupled_encoder: false
+          candidate_aware: true
+          candidate_compatibility: false
+          proposal_candidate_aware: false
+          proposal_topk: 4
+          temperature: 0.25
+          adoption_source: expected_utility
+          adopt_threshold: 0.0
+          dual_signed_utility:
+            enable: true
+      diagnostics:
+        train_oracle: true
+        train_temporal_blocks: 6
+        validation_temporal_blocks: 6
+    adapter_attribute_supervision:
+      weight: 0.0
+      loss: direct_attribute
+      only_allowed: false
+      include_intervention: false
+      include_selector: false
+      include_patch_route: false
+    diagnostics:
+      enable: true
+  learnable_output_anchor:
+    enable: false
+    train_mode: joint
+    scale_parameterization: channel
+    bias_parameterization: channel
+    scale_temporal_basis_rank: 1
+    max_scale_delta: 0.3
+    learn_stat_scale: true
+    learn_residual_scale: true
+    learn_bias: false
+    max_bias: 0.0
+    learn_history_trend: true
+    max_history_trend_delta: 0.2
+    history_trend_window: 24
+    history_trend_feature: last_minus_mean
+    history_trend_projection: linear
+    history_trend_parameterization: channel
+    adoption:
+      adopt_on_val: true
+      selection_metric: mse
+      max_abs_mae_regression: 0.0
+      eval_segments: 4
+      min_positive_segments: 4
+      max_segment_abs_degradation: 0.0
+      max_segment_rel_degradation: 0.0
+      adoption_scope: hybrid
+      aggregate_min_abs_improvement: 0.001
+      aggregate_max_abs_mae_regression: 0.0
+
+penalties:
+  enabled: [level, delta, d2_match, diff_amp]
+  jump_threshold: 0.6
+
+train:
+  epochs: 1
+  batch_size: 64
+  lr: 0.0
+  mse_weight: 0.0
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  selection_metric: val_mse
+  penalty_warmup_epochs: 0
+  model_selection_start_epoch: 1
+  fixed_shuffle_seed: true
+  frozen_backbone_eval_mode: true
+  optimization_window:
+    enable: true
+    num_windows: 34369
+    position: tail
+  mae_objective:
+    enable: false
+    kind: l1
+    weight: 0.0
+  lr_scheduler:
+    name: plateau
+    factor: 0.5
+    patience: 3
+    min_lr: 0.000001
+
+early_stop:
+  patience: 20
+  min_delta: 0.000001
+
+eval:
+  skip_test: false
+
+diagnostics:
+  stage2_loss_audit:
+    enable: true
+
+plot:
+  enable: false
+
+portrait:
+  enable: false
+
+memory:
+  enable: false
+  save_checkpoint: true
+  checkpoint_selection: best
+  checkpoint_path: outputs/ettm1_h96_pkr_adapter_magnitude_search_20260713/jointforecast_h32_lagdelta_channelid_dayweekphase_frozen_test/best_checkpoint.pt
+
+finetune:
+  enable: true
+  checkpoint_path: outputs/ettm1_h96_pkr_adapter_magnitude_search_20260713/jointforecast_h32_lagdelta_channelid_dayweekphase_mixturemse_p12_val/best_checkpoint.pt
+  strict_window: true
+  strict_model: true
+  cluster_map: index
+  load_model: true
+  load_gate: false
+  load_pred_residual: true
+  strict_pred_residual: false
+  load_dynamic_lambda: false
+  load_learnable_lambda: false
+  load_learnable_output_anchor: false
+  load_rejected_learnable_output_anchor: false
+
+calendar_residual:
+  enable: false

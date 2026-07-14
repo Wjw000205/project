@@ -9,22 +9,29 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.moe_gate import ClusterwiseMoEGate
-from src.models.residual_moe import ClusterwisePredResidualMoE
+from src.models.residual_moe import (
+    ChannelPatchPenaltyRouter,
+    ClusterwisePredResidualMoE,
+)
 from src.train import (
     _freeze_module_params_except_prefixes,
     _causal_patch_regime_descriptor,
     _causal_patch_scale_features,
     _patch_router_expected_mse_loss_bk,
+    _patch_router_mixture_mse_loss_bk,
     _patch_router_hierarchical_recall_loss_terms,
     _patch_router_oracle_batch_stats,
     _patch_router_oracle_ce_loss_bk,
     _pred_residual_candidate_predictions,
+    _pred_residual_candidates_on_eval_path,
     _loss_gradient_overlap_summary,
     _risk_score_threshold_curve_summary,
     _temporal_group_dro_incremental_loss,
     _select_recall_constrained_risk_threshold,
     _select_recall_constrained_risk_threshold_by_penalty,
     _walk_forward_patch_reliability_metrics,
+    _causal_expert_feedback_ridge_metrics,
+    _walk_forward_expert_reliability_rerank_metrics,
 )
 
 
@@ -442,6 +449,140 @@ def test_walk_forward_history_stride_uses_only_same_phase_origins() -> None:
     assert result["history_count_max"] == 4
     assert result["mean_scale"] == pytest.approx(1.0)
     assert result["selected_mse"] == pytest.approx(0.0)
+
+
+def test_walk_forward_can_condition_reliability_on_selected_expert() -> None:
+    result = _walk_forward_patch_reliability_metrics(
+        train_time_n=torch.arange(4),
+        train_gain_ncq=torch.tensor([1.0, -1.0, 1.0, -1.0]).view(4, 1, 1),
+        train_penalty_ncq=torch.tensor([0, 1, 0, 1]).view(4, 1, 1),
+        eval_time_n=torch.tensor([4, 5]),
+        eval_base_mse_ncq=torch.ones(2, 1, 1),
+        eval_candidate_mse_ncq=torch.tensor([0.0, 2.0]).view(2, 1, 1),
+        eval_base_mae_ncq=torch.ones(2, 1, 1),
+        eval_candidate_mae_ncq=torch.tensor([0.0, 2.0]).view(2, 1, 1),
+        eval_penalty_ncq=torch.tensor([0, 1]).view(2, 1, 1),
+        active_channel_mask_c=torch.tensor([True]),
+        label_delay=1,
+        lookback_windows=4,
+        min_history_windows=2,
+        history_stride=1,
+        min_mean_gain=0.0,
+    )
+
+    assert result["policy"].endswith("selected_expert")
+    assert result["adoption_rate"] == pytest.approx(0.5)
+    assert result["adoption_precision"] == pytest.approx(1.0)
+    assert result["mse_gain_pct"] == pytest.approx(50.0)
+
+
+def test_walk_forward_expert_rerank_falls_back_in_input_gate_order() -> None:
+    train_gain = torch.tensor(
+        [
+            [[[-1.0, 1.0]]],
+            [[[-1.0, 1.0]]],
+        ]
+    )
+    result = _walk_forward_expert_reliability_rerank_metrics(
+        train_time_n=torch.tensor([0, 1]),
+        train_gain_ncqp=train_gain,
+        eval_time_n=torch.tensor([3]),
+        eval_base_mse_ncq=torch.ones(1, 1, 1),
+        eval_candidate_mse_ncqp=torch.tensor([[[[2.0, 0.0]]]]),
+        eval_base_mae_ncq=torch.ones(1, 1, 1),
+        eval_candidate_mae_ncqp=torch.tensor([[[[2.0, 0.0]]]]),
+        eval_score_ncqp=torch.tensor([[[[0.9, 0.5]]]]),
+        active_channel_mask_c=torch.tensor([True]),
+        label_delay=1,
+        lookback_windows=4,
+        min_history_windows=2,
+    )
+
+    assert result["policy"].endswith("input_gate_order")
+    assert result["fallback_rate_given_route"] == pytest.approx(1.0)
+    assert result["selected_mse"] == pytest.approx(0.0)
+    assert result["selected_dual_precision"] == pytest.approx(1.0)
+
+
+def test_walk_forward_expert_rerank_waits_for_matured_counterfactuals() -> None:
+    result = _walk_forward_expert_reliability_rerank_metrics(
+        train_time_n=torch.tensor([0, 1]),
+        train_gain_ncqp=torch.ones(2, 1, 1, 2),
+        eval_time_n=torch.tensor([2, 4]),
+        eval_base_mse_ncq=torch.ones(2, 1, 1),
+        eval_candidate_mse_ncqp=torch.zeros(2, 1, 1, 2),
+        eval_base_mae_ncq=torch.ones(2, 1, 1),
+        eval_candidate_mae_ncqp=torch.zeros(2, 1, 1, 2),
+        eval_score_ncqp=torch.ones(2, 1, 1, 2),
+        active_channel_mask_c=torch.tensor([True]),
+        label_delay=2,
+        lookback_windows=8,
+        min_history_windows=2,
+    )
+
+    assert result["temporal_blocks"] == []
+    assert result["route_rate"] == pytest.approx(0.5)
+    assert result["mse_gain_pct"] == pytest.approx(50.0)
+
+
+def test_causal_expert_feedback_ridge_learns_input_plus_matured_state() -> None:
+    train_count = 8
+    base = torch.ones(train_count, 1, 1)
+    candidate = torch.tensor([0.0, 2.0]).view(1, 1, 1, 2).expand(
+        train_count,
+        -1,
+        -1,
+        -1,
+    )
+    score = torch.tensor([0.2, 0.9]).view(1, 1, 1, 2).expand_as(candidate)
+    result = _causal_expert_feedback_ridge_metrics(
+        train_time_n=torch.arange(train_count),
+        train_base_mse_ncq=base,
+        train_candidate_mse_ncqp=candidate,
+        train_base_mae_ncq=base,
+        train_candidate_mae_ncqp=candidate,
+        train_score_ncqp=score,
+        eval_time_n=torch.tensor([9]),
+        eval_base_mse_ncq=torch.ones(1, 1, 1),
+        eval_candidate_mse_ncqp=torch.tensor([[[[0.0, 2.0]]]]),
+        eval_base_mae_ncq=torch.ones(1, 1, 1),
+        eval_candidate_mae_ncqp=torch.tensor([[[[0.0, 2.0]]]]),
+        eval_score_ncqp=torch.tensor([[[[0.2, 0.9]]]]),
+        active_channel_mask_c=torch.tensor([True]),
+        label_delay=1,
+        lookback_windows=8,
+        min_history_windows=2,
+        ridge=0.1,
+    )
+
+    assert result["policy"].startswith("ridge_dual_utility")
+    assert result["route_rate"] == pytest.approx(1.0)
+    assert result["selected_mse"] == pytest.approx(0.0)
+    assert result["selected_dual_precision"] == pytest.approx(1.0)
+
+
+def test_causal_expert_feedback_ridge_rejects_zero_delay() -> None:
+    base = torch.ones(2, 1, 1)
+    candidate = torch.ones(2, 1, 1, 1)
+    with pytest.raises(ValueError, match="label_delay"):
+        _causal_expert_feedback_ridge_metrics(
+            train_time_n=torch.tensor([0, 1]),
+            train_base_mse_ncq=base,
+            train_candidate_mse_ncqp=candidate,
+            train_base_mae_ncq=base,
+            train_candidate_mae_ncqp=candidate,
+            train_score_ncqp=candidate,
+            eval_time_n=torch.tensor([2]),
+            eval_base_mse_ncq=torch.ones(1, 1, 1),
+            eval_candidate_mse_ncqp=torch.ones(1, 1, 1, 1),
+            eval_base_mae_ncq=torch.ones(1, 1, 1),
+            eval_candidate_mae_ncqp=torch.ones(1, 1, 1, 1),
+            eval_score_ncqp=torch.ones(1, 1, 1, 1),
+            active_channel_mask_c=torch.tensor([True]),
+            label_delay=0,
+            lookback_windows=4,
+            min_history_windows=1,
+        )
 
 
 def test_cluster_gate_can_route_noop_as_competing_class() -> None:
@@ -1814,6 +1955,320 @@ def test_patch_router_expected_mse_supervision_rewards_patch_specific_candidates
     assert correct_probs.grad[0, 0, 1, 1] < correct_probs.grad[0, 0, 1, 0]
 
 
+def test_patch_router_expected_mse_supervision_can_include_signed_mae_utility() -> None:
+    y = torch.zeros(1, 1, 2)
+    base = torch.ones_like(y)
+    candidates = torch.tensor(
+        [[[[1.0, 0.0], [2.0**-0.5, 2.0**-0.5]]]]
+    )
+    choose_sparse = torch.tensor([[[[1.0, 0.0]]]])
+    choose_dense = torch.tensor([[[[0.0, 1.0]]]])
+    no_skip = torch.zeros(1, 1, 1)
+
+    mse_sparse = _patch_router_expected_mse_loss_bk(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_probs_bcqp=choose_sparse,
+        patch_skip_prob_bcq=no_skip,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+    )
+    mse_dense = _patch_router_expected_mse_loss_bk(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_probs_bcqp=choose_dense,
+        patch_skip_prob_bcq=no_skip,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+    )
+    dual_sparse = _patch_router_expected_mse_loss_bk(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_probs_bcqp=choose_sparse,
+        patch_skip_prob_bcq=no_skip,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+        mae_weight=1.0,
+    )
+    dual_dense = _patch_router_expected_mse_loss_bk(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_probs_bcqp=choose_dense,
+        patch_skip_prob_bcq=no_skip,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+        mae_weight=1.0,
+    )
+
+    assert mse_sparse.item() == pytest.approx(mse_dense.item(), abs=1.0e-6)
+    assert dual_sparse.item() < dual_dense.item()
+
+
+def test_dual_signed_utility_router_starts_as_exact_skip_and_uses_zero_boundary() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        intervention_enable=False,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 3,
+            "topk": 1,
+            "allow_skip": True,
+            "use_base_forecast": True,
+            "hierarchical_recall": {
+                "enable": True,
+                "expert_conditional_risk": {
+                    "enable": True,
+                    "candidate_aware": True,
+                    "adoption_source": "expected_utility",
+                    "adopt_threshold": 0.0,
+                    "dual_signed_utility": {"enable": True},
+                },
+            },
+        },
+    )
+    model.eval()
+    assert model.patch_router is not None
+    router = model.patch_router
+    x = torch.randn(1, 1, 4)
+    base = torch.zeros(1, 1, 4)
+    candidates = torch.zeros(1, 1, 2, 4)
+
+    initial = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidates,
+        straight_through=False,
+    )
+    assert torch.equal(initial["patch_skip_bcq"], torch.ones(1, 1, 2))
+    assert torch.equal(initial["patch_route_bcph"], torch.zeros(1, 1, 2, 4))
+    assert torch.equal(
+        initial["patch_penalty_mse_utility_scores_bcqp"],
+        torch.zeros(1, 1, 2, 2),
+    )
+    assert torch.equal(
+        initial["patch_penalty_mae_utility_scores_bcqp"],
+        torch.zeros(1, 1, 2, 2),
+    )
+
+    assert router.b_risk_mse_utility is not None
+    assert router.b_risk_mae_utility is not None
+    with torch.no_grad():
+        router.b_risk_mse_utility.copy_(torch.tensor([2.0, 3.0]))
+        router.b_risk_mae_utility.copy_(torch.tensor([2.0, -1.0]))
+    accepted = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidates,
+        straight_through=False,
+    )
+    assert torch.equal(accepted["patch_skip_bcq"], torch.zeros(1, 1, 2))
+    assert torch.equal(
+        accepted["patch_selected_penalty_index_bcq"],
+        torch.zeros(1, 1, 2, dtype=torch.long),
+    )
+
+    with torch.no_grad():
+        router.b_risk_mse_utility.fill_(1.0)
+        router.b_risk_mae_utility.zero_()
+    zero_boundary = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidates,
+        straight_through=False,
+    )
+    assert torch.equal(zero_boundary["patch_skip_bcq"], torch.ones(1, 1, 2))
+
+    with torch.no_grad():
+        router.b_risk_mse_utility.fill_(-1.0)
+        router.b_risk_mae_utility.fill_(1.0)
+    rejected = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidates,
+        straight_through=False,
+    )
+    assert torch.equal(rejected["patch_skip_bcq"], torch.ones(1, 1, 2))
+
+
+def test_patch_router_soft_inference_uses_input_conditioned_probability_mass() -> None:
+    router = ChannelPatchPenaltyRouter(
+        input_len=4,
+        pred_len=4,
+        num_penalties=2,
+        cfg={
+            "patch_len": 2,
+            "hidden_dim": 3,
+            "allow_skip": True,
+            "skip_init_bias": 0.0,
+            "inference_route_mode": "soft",
+        },
+    )
+    router.eval()
+    out = router(torch.randn(1, 1, 4), straight_through=False)
+
+    probs = out["patch_probs_bcqp"]
+    skip_prob = out["patch_skip_prob_bcq"]
+    route = out["patch_route_bcph"].reshape(1, 1, 2, 2, 2)[..., 0]
+
+    assert torch.allclose(route, probs.permute(0, 1, 3, 2))
+    assert torch.allclose(out["patch_skip_bcq"], skip_prob)
+    assert torch.allclose(probs.sum(dim=-1) + skip_prob, torch.ones_like(skip_prob))
+
+
+def test_patch_router_mixture_loss_matches_forecast_and_trains_probabilities() -> None:
+    base = torch.zeros(1, 1, 4)
+    candidates = torch.tensor([[[[2.0, 2.0, 2.0, 2.0], [1.0, 1.0, 1.0, 1.0]]]])
+    y = torch.ones(1, 1, 4)
+    probs = torch.full((1, 1, 2, 2), 0.25, requires_grad=True)
+
+    loss = _patch_router_mixture_mse_loss_bk(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_probs_bcqp=probs,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+    )
+    loss.sum().backward()
+
+    assert loss.item() == pytest.approx(0.0625)
+    assert probs.grad is not None
+    assert torch.count_nonzero(probs.grad).item() == probs.numel()
+
+
+def test_patch_router_rejects_unknown_inference_route_mode() -> None:
+    with pytest.raises(ValueError, match="inference_route_mode"):
+        ChannelPatchPenaltyRouter(
+            input_len=4,
+            pred_len=4,
+            num_penalties=2,
+            cfg={"patch_len": 2, "inference_route_mode": "rank"},
+        )
+
+
+def test_dual_signed_utility_loss_learns_mse_and_mae_directions_separately() -> None:
+    y = torch.zeros(1, 1, 2)
+    base = torch.tensor([[[2.0, 0.0]]])
+    candidates = torch.tensor([[[[1.2, 1.2]]]])
+    adopt = torch.full((1, 1, 1), 0.5)
+    conditional = torch.ones(1, 1, 1, 1)
+    benefit = torch.full((1, 1, 1, 1), 0.5)
+    good_mse = torch.full((1, 1, 1, 1), 0.25, requires_grad=True)
+    good_mae = torch.full((1, 1, 1, 1), -0.2, requires_grad=True)
+    bad_mse = -good_mse
+    bad_mae = -good_mae
+
+    good = _patch_router_hierarchical_recall_loss_terms(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_adopt_prob_bcq=adopt,
+        patch_penalty_conditional_probs_bcqp=conditional,
+        patch_penalty_benefit_probs_bcqp=benefit,
+        patch_penalty_utility_scores_bcqp=torch.minimum(good_mse, good_mae),
+        patch_penalty_mse_utility_scores_bcqp=good_mse,
+        patch_penalty_mae_utility_scores_bcqp=good_mae,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+    )
+    bad = _patch_router_hierarchical_recall_loss_terms(
+        base_bch=base,
+        candidate_bcpH=candidates,
+        y_bch=y,
+        patch_adopt_prob_bcq=adopt,
+        patch_penalty_conditional_probs_bcqp=conditional,
+        patch_penalty_benefit_probs_bcqp=benefit,
+        patch_penalty_utility_scores_bcqp=torch.minimum(bad_mse, bad_mae),
+        patch_penalty_mse_utility_scores_bcqp=bad_mse,
+        patch_penalty_mae_utility_scores_bcqp=bad_mae,
+        cluster_id_c=torch.tensor([0]),
+        K=1,
+    )
+
+    assert good["mse_utility_regression_bk"].item() < bad[
+        "mse_utility_regression_bk"
+    ].item()
+    assert good["mae_utility_regression_bk"].item() < bad[
+        "mae_utility_regression_bk"
+    ].item()
+    assert good["utility_regression_bk"].item() < bad[
+        "utility_regression_bk"
+    ].item()
+    good["utility_regression_bk"].sum().backward()
+    assert good_mse.grad is not None
+    assert good_mae.grad is not None
+    assert float(good_mse.grad.abs().sum().item()) > 0.0
+    assert float(good_mae.grad.abs().sum().item()) > 0.0
+
+
+def test_dual_signed_utility_configuration_preserves_default_output_contract() -> None:
+    common = {
+        "enable": True,
+        "patch_len": 2,
+        "hidden_dim": 3,
+        "allow_skip": True,
+        "hierarchical_recall": {
+            "enable": True,
+            "expert_conditional_risk": {
+                "enable": True,
+                "candidate_aware": True,
+            },
+        },
+    }
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        intervention_enable=False,
+        shared_across_clusters=True,
+        patch_router_cfg=common,
+    )
+    assert model.patch_router is not None
+    out = model.patch_router(
+        torch.randn(1, 1, 4),
+        y_base_bch=torch.zeros(1, 1, 4),
+        candidate_delta_bcpH=torch.zeros(1, 1, 2, 4),
+        straight_through=False,
+    )
+    assert "patch_penalty_mse_utility_scores_bcqp" not in out
+    assert "patch_penalty_mae_utility_scores_bcqp" not in out
+
+    invalid = dict(common)
+    invalid["hierarchical_recall"] = {
+        "enable": True,
+        "expert_conditional_risk": {
+            "enable": True,
+            "candidate_aware": True,
+            "adoption_source": "expected_utility",
+            "adopt_threshold": 0.1,
+            "dual_signed_utility": {"enable": True},
+        },
+    }
+    with pytest.raises(ValueError, match="adopt_threshold must be 0"):
+        ClusterwisePredResidualMoE(
+            num_clusters=1,
+            num_penalties=2,
+            input_len=4,
+            pred_len=4,
+            hidden_dim=3,
+            intervention_enable=False,
+            shared_across_clusters=True,
+            patch_router_cfg=invalid,
+        )
+
+
 def test_patch_router_oracle_stats_use_patch_level_skip_and_penalty_labels() -> None:
     y = torch.tensor([[[1.0, 1.0, -1.0, -1.0]]])
     base = torch.zeros_like(y)
@@ -1855,6 +2310,9 @@ def test_patch_router_oracle_stats_use_patch_level_skip_and_penalty_labels() -> 
     assert stats["adoption_true_positive_count"].item() == 2
     assert stats["selected_beneficial_count"].item() == 1
     assert stats["selected_harmful_count"].item() == 1
+    assert stats["dual_oracle_penalty_count"].item() == 2
+    assert stats["selected_dual_beneficial_count"].item() == 1
+    assert stats["selected_dual_harmful_count"].item() == 1
     assert stats["selected_positive_gain_sum"].item() == pytest.approx(1.0)
     assert stats["selected_negative_cost_sum"].item() == pytest.approx(0.0)
     assert torch.equal(stats["selected_beneficial_count_by_penalty"], torch.tensor([1.0, 0.0]))
@@ -1876,6 +2334,9 @@ def test_patch_router_oracle_stats_use_patch_level_skip_and_penalty_labels() -> 
     assert stats["base_error_sum"].item() == pytest.approx(2.0)
     assert stats["oracle_error_sum"].item() == pytest.approx(0.0)
     assert stats["selected_error_sum"].item() == pytest.approx(1.0)
+    assert stats["base_mae_sum"].item() == pytest.approx(2.0)
+    assert stats["oracle_mae_sum"].item() == pytest.approx(0.0)
+    assert stats["selected_mae_sum"].item() == pytest.approx(1.0)
 
 
 def test_hierarchical_patch_recall_loss_rewards_recall_and_rejects_false_adoption() -> None:
@@ -2376,6 +2837,378 @@ def test_patch_router_can_add_target_free_base_forecast_mismatch_features() -> N
     assert router.feature_source == "input_base"
     assert features_a.shape[-1] == (2 * router.patch_len) + 9
     assert not torch.allclose(features_a, features_b)
+
+
+def test_patch_router_can_condition_every_decision_on_full_causal_history() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "use_base_forecast": True,
+            "use_full_history_features": True,
+        },
+    )
+    router = model.patch_router
+    assert router is not None
+    x_a = torch.tensor([[[0.0, 1.0, 0.0, 1.0]]])
+    x_b = x_a.clone()
+    x_b[..., 0] = 3.0
+    base = torch.zeros(1, 1, 4)
+
+    features_a = router._features(x_a, base)
+    features_b = router._features(x_b, base)
+
+    assert router.feature_source == "input_base_full_history"
+    assert features_a.shape[-1] == (2 * router.patch_len) + 9 + router.L
+    # Changing an early causal observation is visible even to the final
+    # forecast-patch decision through the repeated full-history shape.
+    assert not torch.allclose(features_a[:, :, -1], features_b[:, :, -1])
+
+
+def test_shared_patch_router_can_learn_stable_channel_identity() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        num_channels=2,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "use_base_forecast": True,
+            "use_channel_identity_features": True,
+        },
+    )
+    router = model.patch_router
+    assert router is not None
+    x = torch.tensor(
+        [[[0.0, 1.0, 0.0, 1.0]], [[0.0, 1.0, 0.0, 1.0]]]
+    ).permute(1, 0, 2)
+    base = torch.zeros(1, 2, 4)
+
+    features = router._features(x, base)
+
+    assert router.feature_source == "input_base_channel_id"
+    assert features.shape[-1] == (2 * router.patch_len) + 9 + 2
+    identity_start = router.patch_len + 6
+    identity_end = identity_start + 2
+    assert torch.equal(
+        features[0, 0, :, identity_start:identity_end],
+        torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+    )
+    assert torch.equal(
+        features[0, 1, :, identity_start:identity_end],
+        torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+    )
+
+
+def test_analytic_residual_gate_scores_candidate_from_predicted_base_error() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        num_channels=1,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "topk": 1,
+            "allow_skip": True,
+            "hierarchical_recall": {
+                "enable": True,
+                "expert_conditional_risk": {
+                    "enable": True,
+                    "candidate_aware": False,
+                    "proposal_topk": 2,
+                    "adoption_source": "expected_utility",
+                    "dual_signed_utility": {
+                        "enable": True,
+                        "analytic_residual": {"enable": True},
+                    },
+                },
+            },
+        },
+    )
+    router = model.patch_router
+    assert router is not None
+    x = torch.tensor([[[0.0, 1.0, 0.0, 1.0]]])
+    base = torch.zeros(1, 1, 4)
+    candidate_delta = torch.stack(
+        [torch.ones(1, 1, 4), -torch.ones(1, 1, 4)],
+        dim=2,
+    )
+
+    initial = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidate_delta,
+        straight_through=False,
+    )
+    assert bool(initial["patch_skip_bcq"].bool().all())
+
+    assert router.b_predicted_residual is not None
+    with torch.no_grad():
+        router.b_predicted_residual.fill_(2.0)
+    scored = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidate_delta,
+        straight_through=False,
+    )
+
+    mse_scores = scored["patch_penalty_mse_utility_scores_bcqp"]
+    mae_scores = scored["patch_penalty_mae_utility_scores_bcqp"]
+    assert bool((mse_scores[..., 0] > 0.0).all())
+    assert bool((mae_scores[..., 0] > 0.0).all())
+    assert bool((mse_scores[..., 1] < 0.0).all())
+    assert bool((mae_scores[..., 1] < 0.0).all())
+    assert torch.equal(
+        scored["patch_selected_penalty_index_bcq"],
+        torch.zeros(1, 1, 2, dtype=torch.long),
+    )
+    assert not bool(scored["patch_skip_bcq"].bool().any())
+
+
+def test_patch_router_time_phase_features_track_forecast_patch_position() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        num_channels=1,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "time_phase_periods": [4, 8],
+        },
+    )
+    router = model.patch_router
+    assert router is not None
+    x = torch.tensor([[[0.0, 1.0, 0.0, 1.0]]])
+
+    features_a = router._features(
+        x,
+        query_start_abs_b=torch.tensor([0]),
+    )
+    features_b = router._features(
+        x,
+        query_start_abs_b=torch.tensor([1]),
+    )
+
+    assert router.feature_source == "input_only_time_phase"
+    assert features_a.shape[-1] == router.patch_len + 6 + 4
+    assert not torch.allclose(features_a[..., -4:], features_b[..., -4:])
+    assert not torch.allclose(features_a[:, :, 0, -4:], features_a[:, :, 1, -4:])
+
+
+def test_patch_router_lagged_delta_features_preserve_same_phase_change() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        num_channels=1,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "regime_context": {"enable": True, "lengths": [8]},
+            "lagged_delta_periods": [4],
+        },
+    )
+    router = model.patch_router
+    assert router is not None
+    x = torch.tensor([[[3.0, 5.0, 7.0, 9.0]]])
+    context = torch.tensor([[[1.0, 2.0, 3.0, 4.0, 3.0, 5.0, 7.0, 9.0]]])
+
+    lagged = router._lagged_delta_features(x, context)
+    features = router._features(x, regime_context_bcl=context)
+
+    assert lagged is not None
+    scale = x.std(dim=-1, unbiased=False, keepdim=True)
+    expected_delta = (x - context[..., :4]) / scale
+    assert torch.allclose(lagged[:, :, 0, :2], expected_delta[..., :2])
+    assert torch.allclose(lagged[:, :, 1, :2], expected_delta[..., 2:])
+    assert router.feature_source == "input_only_lagged_delta"
+    assert features.shape[-1] == (router.patch_len + 6) * 2 + 6
+
+
+def test_patch_router_lagged_delta_features_require_sufficient_causal_context() -> None:
+    with pytest.raises(ValueError, match="input_len plus the largest"):
+        ClusterwisePredResidualMoE(
+            num_clusters=1,
+            num_penalties=2,
+            input_len=4,
+            pred_len=4,
+            hidden_dim=3,
+            num_channels=1,
+            shared_across_clusters=True,
+            patch_router_cfg={
+                "enable": True,
+                "patch_len": 2,
+                "hidden_dim": 4,
+                "regime_context": {"enable": True, "lengths": [4]},
+                "lagged_delta_periods": [4],
+            },
+        )
+
+
+def test_dual_utility_can_activate_multiple_structural_adapters_independently() -> None:
+    model = ClusterwisePredResidualMoE(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        num_channels=1,
+        shared_across_clusters=True,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "allow_skip": True,
+            "hierarchical_recall": {
+                "enable": True,
+                "expert_conditional_risk": {
+                    "enable": True,
+                    "candidate_aware": False,
+                    "proposal_topk": 2,
+                    "adoption_source": "expected_utility",
+                    "dual_signed_utility": {
+                        "enable": True,
+                        "independent_activation": {"enable": True},
+                    },
+                },
+            },
+        },
+    )
+    router = model.patch_router
+    assert router is not None
+    assert router.b_risk_mse_utility is not None
+    assert router.b_risk_mae_utility is not None
+    x = torch.tensor([[[0.0, 1.0, 0.0, 1.0]]])
+    base = torch.zeros(1, 1, 4)
+    candidate_delta = torch.zeros(1, 1, 2, 4)
+
+    initial = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidate_delta,
+        straight_through=False,
+    )
+    assert bool(initial["patch_skip_bcq"].bool().all())
+
+    with torch.no_grad():
+        router.b_risk_mse_utility.copy_(torch.tensor([0.5, 0.25]))
+        router.b_risk_mae_utility.copy_(torch.tensor([0.4, 0.2]))
+    activated = router(
+        x,
+        y_base_bch=base,
+        candidate_delta_bcpH=candidate_delta,
+        straight_through=False,
+    )
+
+    assert torch.equal(
+        activated["patch_route_bcph"],
+        torch.ones(1, 1, 2, 4),
+    )
+    assert not bool(activated["patch_skip_bcq"].bool().any())
+
+
+def test_patch_application_scale_changes_correction_without_changing_router_candidate() -> None:
+    torch.manual_seed(91)
+    base_kwargs = dict(
+        num_clusters=1,
+        num_penalties=2,
+        input_len=4,
+        pred_len=4,
+        hidden_dim=3,
+        num_channels=1,
+        shared_across_clusters=True,
+        intervention_enable=False,
+        patch_router_cfg={
+            "enable": True,
+            "patch_len": 2,
+            "hidden_dim": 4,
+            "allow_skip": False,
+        },
+    )
+    reference = ClusterwisePredResidualMoE(**base_kwargs)
+    scaled_kwargs = dict(base_kwargs)
+    scaled_kwargs["patch_router_cfg"] = {
+        **base_kwargs["patch_router_cfg"],
+        "application_scale_by_penalty": [0.0, 2.0],
+    }
+    scaled = ClusterwisePredResidualMoE(**scaled_kwargs)
+    scaled.load_state_dict(reference.state_dict(), strict=True)
+    x = torch.randn(2, 1, 4)
+    base = torch.randn(2, 1, 4)
+    cluster_id = torch.zeros(1, dtype=torch.long)
+    outer_mask = torch.ones(2, 1, 2)
+
+    out_reference = reference(x, base, cluster_id, outer_mask)
+    out_scaled = scaled(x, base, cluster_id, outer_mask)
+
+    assert torch.equal(
+        out_reference["patch_penalty_utility_scores_bcqp"],
+        out_scaled["patch_penalty_utility_scores_bcqp"],
+    )
+    assert torch.equal(
+        out_reference["patch_route_bcph"],
+        out_scaled["patch_route_bcph"],
+    )
+    route = out_reference["patch_route_bcph"]
+    residuals = out_reference["residuals"]
+    alpha = out_reference["alpha_cp"].view(1, 1, 2, 1)
+    expected = base + (
+        route
+        * residuals
+        * alpha
+        * torch.tensor([0.0, 2.0]).view(1, 1, 2, 1)
+    ).sum(dim=2)
+    assert torch.allclose(out_scaled["y_final"], expected, atol=1.0e-6)
+
+
+def test_eval_path_candidates_include_patch_application_scale() -> None:
+    base = torch.zeros(1, 1, 4)
+    residuals = torch.tensor([[[[1.0, 2.0, 3.0, 4.0], [2.0, 2.0, 2.0, 2.0]]]])
+    pred_out = {
+        "candidate_base_bch": base,
+        "residuals": residuals,
+        "alpha_cp": torch.ones(1, 2),
+        "intervention_bcp": torch.ones(1, 1, 2),
+        "selector_bcp": torch.ones(1, 1, 2),
+        "patch_application_scale_p": torch.tensor([0.5, 2.0]),
+    }
+
+    eval_base, candidates = _pred_residual_candidates_on_eval_path(
+        base,
+        pred_out,
+        include_patch_route=False,
+    )
+
+    assert torch.equal(eval_base, base)
+    assert candidates is not None
+    assert torch.equal(candidates[:, :, 0, :], 0.5 * residuals[:, :, 0, :])
+    assert torch.equal(candidates[:, :, 1, :], 2.0 * residuals[:, :, 1, :])
 
 
 def test_patch_router_regime_features_use_long_causal_context() -> None:
