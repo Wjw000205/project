@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from ..models.learnable_anchor import ClusterwiseLearnableOutputAnchor
@@ -917,6 +918,7 @@ def _patch_router_mixture_mse_loss_bk(
     cluster_id_c: torch.Tensor,
     K: int,
     mae_weight: float = 0.0,
+    allowed_penalty_mask_cp: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Train input probabilities on the exact deterministic mixture forecast."""
     if base_bch.ndim != 3 or y_bch.shape != base_bch.shape:
@@ -933,9 +935,24 @@ def _patch_router_mixture_mse_loss_bk(
     if tuple(candidate_bcpH.shape) != (batch, channels, penalties, horizon):
         raise ValueError("patch router mixture candidate/probability dimensions do not match.")
 
+    effective_probs_bcqp = patch_probs_bcqp
+    if allowed_penalty_mask_cp is not None and int(allowed_penalty_mask_cp.numel()) > 0:
+        if tuple(allowed_penalty_mask_cp.shape) != (channels, penalties):
+            raise ValueError(
+                "patch router mixture allowed penalty mask must have shape [C,P], "
+                f"got {tuple(allowed_penalty_mask_cp.shape)} vs {(channels, penalties)}."
+            )
+        effective_probs_bcqp = (
+            effective_probs_bcqp
+            * allowed_penalty_mask_cp.to(
+                device=patch_probs_bcqp.device,
+                dtype=patch_probs_bcqp.dtype,
+            ).view(1, channels, 1, penalties)
+        )
+
     patch_len = horizon // patches
     weight_bcpH = (
-        patch_probs_bcqp.permute(0, 1, 3, 2)
+        effective_probs_bcqp.permute(0, 1, 3, 2)
         .unsqueeze(-1)
         .expand(-1, -1, -1, -1, patch_len)
         .reshape(batch, channels, penalties, horizon)
@@ -4068,6 +4085,319 @@ def _remove_forecast_affine_component(values_bch: torch.Tensor) -> torch.Tensor:
     return centered - coef_bc * trend_h.view(1, 1, -1)
 
 
+def _patchwise_penalty_bcq(
+    prediction_bch: torch.Tensor,
+    target_bch: torch.Tensor,
+    penalty_fn,
+    *,
+    patch_len: int,
+) -> torch.Tensor:
+    """Evaluate one exact penalty independently on aligned horizon patches."""
+    if prediction_bch.ndim != 3 or target_bch.shape != prediction_bch.shape:
+        raise ValueError("patchwise penalty expects prediction/target with shape [B,C,H].")
+    patch_len = int(patch_len)
+    horizon = int(prediction_bch.shape[-1])
+    if patch_len <= 0 or horizon % patch_len != 0:
+        raise ValueError("patchwise penalty requires a positive patch_len dividing H.")
+    batch, channels = int(prediction_bch.shape[0]), int(prediction_bch.shape[1])
+    patches = horizon // patch_len
+    prediction = prediction_bch.reshape(batch, channels, patches, patch_len)
+    target = target_bch.reshape(batch, channels, patches, patch_len)
+    prediction = prediction.permute(0, 2, 1, 3).reshape(batch * patches, channels, patch_len)
+    target = target.permute(0, 2, 1, 3).reshape(batch * patches, channels, patch_len)
+    penalty = penalty_fn(prediction, target)
+    if tuple(penalty.shape) != (batch * patches, channels):
+        raise ValueError(
+            "patchwise penalty function must return [B*Q,C], got "
+            f"{tuple(penalty.shape)}."
+        )
+    return penalty.reshape(batch, patches, channels).permute(0, 2, 1).contiguous()
+
+
+def _level_oracle_patch_diagnostics(
+    base_patch: torch.Tensor,
+    target_patch: torch.Tensor,
+    candidate_patch: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Exact constant-correction oracle and learned LEVEL outcome per patch."""
+    if base_patch.shape != target_patch.shape or base_patch.shape != candidate_patch.shape:
+        raise ValueError("LEVEL oracle patches must have identical shapes.")
+    if base_patch.ndim < 1 or int(base_patch.shape[-1]) <= 0:
+        raise ValueError("LEVEL oracle patches must have a nonempty time dimension.")
+    base_mean = base_patch.mean(dim=-1)
+    target_mean = target_patch.mean(dim=-1)
+    candidate_mean = candidate_patch.mean(dim=-1)
+    oracle_correction = target_mean - base_mean
+    adapter_correction = candidate_mean - base_mean
+    oracle_patch = base_patch + oracle_correction.unsqueeze(-1)
+    base_penalty = (base_mean - target_mean).square()
+    candidate_penalty = (candidate_mean - target_mean).square()
+    oracle_penalty = (oracle_patch.mean(dim=-1) - target_mean).square()
+    base_mse = (base_patch - target_patch).square().mean(dim=-1)
+    candidate_mse = (candidate_patch - target_patch).square().mean(dim=-1)
+    oracle_mse = (oracle_patch - target_patch).square().mean(dim=-1)
+    return {
+        "base_mean": base_mean,
+        "target_mean": target_mean,
+        "candidate_mean": candidate_mean,
+        "oracle_correction": oracle_correction,
+        "adapter_correction": adapter_correction,
+        "oracle_patch": oracle_patch,
+        "base_penalty": base_penalty,
+        "candidate_penalty": candidate_penalty,
+        "oracle_penalty": oracle_penalty,
+        "base_mse": base_mse,
+        "candidate_mse": candidate_mse,
+        "oracle_mse": oracle_mse,
+        "oracle_mse_gain_identity_error": (
+            (base_mse - oracle_mse) - base_penalty
+        ).abs(),
+    }
+
+
+def _prediction_fit_sufficient_statistics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> Dict[str, object]:
+    """Return additive moments sufficient to reproduce zero-R2 and Pearson."""
+    if prediction.shape != target.shape:
+        raise ValueError("prediction-fit tensors must have identical shapes.")
+    prediction_flat = prediction.detach().reshape(-1).to(dtype=torch.float64)
+    target_flat = target.detach().reshape(-1).to(dtype=torch.float64)
+    if not bool(torch.isfinite(prediction_flat).all()) or not bool(
+        torch.isfinite(target_flat).all()
+    ):
+        raise ValueError("prediction-fit tensors must contain only finite values.")
+    error = prediction_flat - target_flat
+    return {
+        "count": int(target_flat.numel()),
+        "prediction_sum": float(prediction_flat.sum().item()),
+        "prediction_squared_sum": float(prediction_flat.square().sum().item()),
+        "target_sum": float(target_flat.sum().item()),
+        "target_squared_sum": float(target_flat.square().sum().item()),
+        "prediction_target_cross_sum": float(
+            (prediction_flat * target_flat).sum().item()
+        ),
+        "squared_error_sum": float(error.square().sum().item()),
+    }
+
+
+def _level_stage1_acceptance_candidate_patch(
+    *,
+    base_patch: torch.Tensor,
+    executed_candidate_patch: torch.Tensor,
+    raw_amplitude_bcq: torch.Tensor,
+    source: str,
+) -> torch.Tensor:
+    """Choose the LEVEL Stage-1 acceptance candidate without target leakage."""
+    if base_patch.shape != executed_candidate_patch.shape:
+        raise ValueError("LEVEL acceptance base/executed patches must have identical shapes.")
+    if base_patch.ndim != 4 or int(base_patch.shape[-1]) <= 0:
+        raise ValueError("LEVEL acceptance patches must have shape [B,C,Q,L].")
+    if tuple(raw_amplitude_bcq.shape) != tuple(base_patch.shape[:-1]):
+        raise ValueError(
+            "LEVEL raw amplitude must have shape [B,C,Q] matching the patches."
+        )
+    source_mode = str(source).strip().lower()
+    if source_mode == "executed":
+        return executed_candidate_patch
+    if source_mode == "raw_amplitude":
+        return base_patch + raw_amplitude_bcq.unsqueeze(-1)
+    raise ValueError(
+        "LEVEL Stage-1 acceptance candidate source must be executed or raw_amplitude."
+    )
+
+
+def _validate_level_executed_candidate_patch(
+    *,
+    base_patch: torch.Tensor,
+    executed_candidate_patch: torch.Tensor,
+    executed_correction_bcq: torch.Tensor,
+) -> None:
+    """Fail closed unless the observed LEVEL candidate is the hard execution."""
+    if base_patch.shape != executed_candidate_patch.shape:
+        raise ValueError("LEVEL executed base/candidate patches must have identical shapes.")
+    if base_patch.ndim != 4 or int(base_patch.shape[-1]) <= 0:
+        raise ValueError("LEVEL executed patches must have shape [B,C,Q,L].")
+    if tuple(executed_correction_bcq.shape) != tuple(base_patch.shape[:-1]):
+        raise ValueError(
+            "LEVEL executed correction must have shape [B,C,Q] matching the patches."
+        )
+    expected = base_patch + executed_correction_bcq.unsqueeze(-1)
+    if not torch.allclose(
+        executed_candidate_patch,
+        expected,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    ):
+        max_abs_error = float(
+            (executed_candidate_patch - expected).abs().max().item()
+        )
+        raise ValueError(
+            "LEVEL hard candidate does not equal base plus the controller's "
+            f"executed correction (max_abs_error={max_abs_error:.9g})."
+        )
+
+
+def _semantic_bank_acceptance_metrics(
+    *,
+    totals_by_penalty: List[Dict[str, float]],
+    penalty_names: List[str],
+    eps: float = 1.0e-8,
+) -> Dict[str, object]:
+    """Apply the Stage-1 candidate acceptance contract without approximation."""
+    if len(totals_by_penalty) != len(penalty_names):
+        raise ValueError("semantic bank acceptance totals must match penalty_names.")
+    eps = float(eps)
+    if eps <= 0.0:
+        raise ValueError("semantic bank acceptance eps must be positive.")
+    per_penalty: Dict[str, object] = {}
+    all_pass = True
+    for name, current in zip(penalty_names, totals_by_penalty):
+        high_count = int(current["high_count"])
+        low_count = int(current["low_count"])
+        high_base_penalty_sum = float(current["high_base_penalty"])
+        high_candidate_penalty_sum = float(current["high_candidate_penalty"])
+        high_base_mse = float(current["high_base_mse"]) / max(high_count, 1)
+        high_candidate_mse = float(current["high_candidate_mse"]) / max(high_count, 1)
+        low_base_mse = float(current["low_base_mse"]) / max(low_count, 1)
+        low_candidate_mse = float(current["low_candidate_mse"]) / max(low_count, 1)
+        high_rms = math.sqrt(
+            float(current["high_correction_sq_sum"])
+            / max(float(current["high_correction_numel"]), 1.0)
+        )
+        low_rms = math.sqrt(
+            float(current["low_correction_sq_sum"])
+            / max(float(current["low_correction_numel"]), 1.0)
+        )
+        matching_relative_gain = (
+            high_base_penalty_sum - high_candidate_penalty_sum
+        ) / max(high_base_penalty_sum, eps)
+        high_mse_regression = (
+            high_candidate_mse - high_base_mse
+        ) / max(high_base_mse, eps)
+        low_mse_regression = (
+            low_candidate_mse - low_base_mse
+        ) / max(low_base_mse, eps)
+        low_high_ratio = low_rms / max(high_rms, eps)
+        checks = {
+            "has_high_and_low_units": bool(high_count > 0 and low_count > 0),
+            "matching_penalty_relative_gain_ge_1e_4": bool(
+                matching_relative_gain >= 1.0e-4
+            ),
+            "high_need_mse_regression_le_1e_6": bool(
+                high_mse_regression <= 1.0e-6
+            ),
+            "high_correction_rms_gt_1e_8": bool(high_rms > 1.0e-8),
+            "low_high_correction_rms_ratio_le_0_25": bool(low_high_ratio <= 0.25),
+            "low_need_mse_regression_le_0_001": bool(low_mse_regression <= 0.001),
+        }
+        passed = all(checks.values())
+        all_pass = all_pass and passed
+        per_penalty[name] = {
+            "high_count": high_count,
+            "low_count": low_count,
+            "high_base_penalty_sum": high_base_penalty_sum,
+            "high_candidate_penalty_sum": high_candidate_penalty_sum,
+            "matching_penalty_relative_gain": matching_relative_gain,
+            "matching_penalty_gain_pct": 100.0 * matching_relative_gain,
+            "high_base_mse": high_base_mse,
+            "high_candidate_mse": high_candidate_mse,
+            "high_mse_regression_fraction": high_mse_regression,
+            "low_base_mse": low_base_mse,
+            "low_candidate_mse": low_candidate_mse,
+            "low_mse_regression_fraction": low_mse_regression,
+            "high_correction_rms": high_rms,
+            "low_correction_rms": low_rms,
+            "low_high_correction_rms_ratio": low_high_ratio,
+            "checks": checks,
+            "pass": bool(passed),
+        }
+    return {"per_penalty": per_penalty, "all_pass": bool(all_pass), "eps": eps}
+
+
+def _semantic_bank_semantic_only_acceptance_metrics(
+    *,
+    totals_by_penalty: List[Dict[str, float]],
+    temporal_totals_by_penalty: List[List[Dict[str, float]]],
+    penalty_names: List[str],
+    min_matching_gain_by_name: Dict[str, float],
+    eps: float = 1.0e-8,
+) -> Dict[str, object]:
+    """Stage-1 semantic ability gate; routing safety remains diagnostic only."""
+    diagnostics = _semantic_bank_acceptance_metrics(
+        totals_by_penalty=totals_by_penalty,
+        penalty_names=penalty_names,
+        eps=eps,
+    )
+    if len(temporal_totals_by_penalty) != len(penalty_names):
+        raise ValueError("semantic temporal totals must match penalty_names.")
+    per_penalty = diagnostics["per_penalty"]
+    all_pass = True
+    for p, name in enumerate(penalty_names):
+        block_rows = temporal_totals_by_penalty[p]
+        if len(block_rows) < 3:
+            raise ValueError("semantic acceptance requires at least three validation blocks.")
+        block_gains: List[float] = []
+        block_high_counts: List[int] = []
+        for block in block_rows:
+            high_count = int(block["high_count"])
+            base_sum = float(block["high_base_penalty"])
+            candidate_sum = float(block["high_candidate_penalty"])
+            block_high_counts.append(high_count)
+            block_gains.append((base_sum - candidate_sum) / max(base_sum, float(eps)))
+        row = per_penalty[name]
+        current = totals_by_penalty[p]
+        improved_fraction = float(current.get("high_improved_count", 0.0)) / max(
+            int(row["high_count"]), 1
+        )
+        relative_gain_quantiles = dict(
+            current.get("high_relative_gain_quantiles", {})
+        )
+        min_improved_fraction = float(
+            current.get("min_high_need_improved_fraction", 0.60)
+        )
+        row["high_need_improved_fraction"] = improved_fraction
+        row["min_high_need_improved_fraction"] = min_improved_fraction
+        row["high_need_relative_gain_quantiles"] = relative_gain_quantiles
+        matching_gain = float(row["matching_penalty_relative_gain"])
+        min_gain = float(min_matching_gain_by_name[name])
+        semantic_checks = {
+            "finite_matching_gain": bool(math.isfinite(matching_gain)),
+            "matching_penalty_material_gain": bool(matching_gain >= min_gain),
+            "high_correction_rms_gt_1e_8": bool(
+                float(row["high_correction_rms"]) > 1.0e-8
+            ),
+            "high_need_improved_fraction_ge_threshold": bool(
+                float(row.get("high_need_improved_fraction", 0.0))
+                >= min_improved_fraction
+            ),
+            "high_need_relative_gain_median_gt_0": bool(
+                float(row.get("high_need_relative_gain_quantiles", {}).get("0.5", float("-inf")))
+                > 0.0
+            ),
+            "all_temporal_blocks_have_high_units": bool(
+                all(count > 0 for count in block_high_counts)
+            ),
+            "all_temporal_block_matching_gains_gt_0": bool(
+                all(math.isfinite(gain) and gain > 0.0 for gain in block_gains)
+            ),
+        }
+        passed = all(semantic_checks.values())
+        row["semantic_only_checks"] = semantic_checks
+        row["semantic_only_pass"] = bool(passed)
+        row["pass"] = bool(passed)
+        row["material_matching_gain_threshold"] = min_gain
+        row["temporal_block_matching_relative_gain"] = block_gains
+        row["temporal_block_matching_gain_pct"] = [100.0 * value for value in block_gains]
+        row["temporal_block_high_count"] = block_high_counts
+        row["safety_diagnostics_are_non_blocking"] = True
+        all_pass = all_pass and passed
+    diagnostics["all_pass"] = bool(all_pass)
+    diagnostics["acceptance_mode"] = "semantic_only_high_need_materiality"
+    return diagnostics
+
+
 def _named_forecast_attribute_error(
     candidate_bch: torch.Tensor,
     target_bch: torch.Tensor,
@@ -4076,6 +4406,12 @@ def _named_forecast_attribute_error(
     """Direct future-attribute error used to train one named adapter."""
     if name == "level":
         return (candidate_bch.mean(dim=-1) - target_bch.mean(dim=-1)).pow(2)
+    if name == "trend":
+        if int(candidate_bch.shape[-1]) <= 1 or int(target_bch.shape[-1]) <= 1:
+            return torch.zeros_like(candidate_bch[..., 0])
+        candidate_trend = candidate_bch[..., -1] - candidate_bch[..., 0]
+        target_trend = target_bch[..., -1] - target_bch[..., 0]
+        return (candidate_trend - target_trend).pow(2)
     if name == "delta":
         cand_shape = candidate_bch - candidate_bch.mean(dim=-1, keepdim=True)
         target_shape = target_bch - target_bch.mean(dim=-1, keepdim=True)
@@ -4109,8 +4445,19 @@ def _pred_residual_candidate_supervision_loss(
     penalty_names: Optional[List[str]] = None,
     penalty_fns: Optional[Dict[str, callable]] = None,
     penalty_scale: Optional[torch.Tensor] = None,
+    penalty_need_threshold: Optional[torch.Tensor] = None,
+    need_patch_len: int = 0,
+    level_need_positive_weight: float = 1.0,
+    noop_weight: float = 1.0,
+    high_mse_relative_tolerance: float = 0.0,
+    low_mse_relative_tolerance: float = 1.0e-3,
+    low_high_rms_ratio_max: float = 0.25,
+    constraint_weight: float = 1.0,
+    constraint_eps: float = 1.0e-8,
     allowed_mask_kp: Optional[torch.Tensor] = None,
     only_allowed: bool = True,
+    return_per_penalty: bool = False,
+    return_components: bool = False,
     loss_kind: str = "mse",
     forecast_mse_weight: float = 1.0,
     min_abs_improvement: float = 0.0,
@@ -4128,7 +4475,7 @@ def _pred_residual_candidate_supervision_loss(
     train_stat_anchor_pc: Optional[torch.Tensor] = None,
     train_residual_anchor_phc: Optional[torch.Tensor] = None,
     learnable_output_anchor: Optional[ClusterwiseLearnableOutputAnchor] = None,
-) -> Optional[torch.Tensor]:
+) -> Optional[object]:
     if pred_out is None:
         return None
     base_eval_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
@@ -4152,7 +4499,136 @@ def _pred_residual_candidate_supervision_loss(
     if cand_bcpH is None or cand_bcpH.numel() == 0:
         return None
     loss_mode = str(loss_kind).lower()
-    if loss_mode in {"direct_attribute", "attribute_mse", "future_attribute"}:
+    level_controller_loss_modes = {
+        "level_residual_gate",
+        "level_residual_separate_gate",
+        "level_residual_high_need_separate_gate",
+    }
+    if loss_mode in level_controller_loss_modes:
+        separate_gate = loss_mode in {
+            "level_residual_separate_gate",
+            "level_residual_high_need_separate_gate",
+        }
+        high_need_amplitude = (
+            loss_mode == "level_residual_high_need_separate_gate"
+        )
+        required = {
+            "level_amplitude_bcq",
+            "level_need_logits_bcq",
+        }
+        if not separate_gate:
+            required.add("level_executed_correction_bcq")
+        missing = sorted(required - set(pred_out))
+        if missing:
+            raise ValueError(
+                f"{loss_mode} supervision requires LEVEL controller outputs: "
+                + ", ".join(missing)
+            )
+        if penalty_names is None or penalty_names.count("level") != 1:
+            raise ValueError(f"{loss_mode} requires exactly one named level branch.")
+        level_p = penalty_names.index("level")
+        patch_len = int(need_patch_len)
+        if patch_len != 12:
+            raise ValueError(f"{loss_mode} requires need_patch_len=12.")
+        if int(base_eval_bch.shape[-1]) % patch_len != 0:
+            raise ValueError(f"{loss_mode} patch length must divide the horizon.")
+        if penalty_scale is None or int(penalty_scale.numel()) != int(cand_bcpH.shape[2]):
+            raise ValueError(f"{loss_mode} requires one train-only scale per branch.")
+        if (
+            penalty_need_threshold is None
+            or int(penalty_need_threshold.numel()) != int(cand_bcpH.shape[2])
+        ):
+            raise ValueError(f"{loss_mode} requires one train-only q75 threshold per branch.")
+        if separate_gate and float(level_need_positive_weight) <= 0.0:
+            raise ValueError("level_residual_separate_gate requires positive need class weight.")
+        batch, channels, horizon = base_eval_bch.shape
+        patches = horizon // patch_len
+        amplitude_bcq = pred_out["level_amplitude_bcq"]
+        logits_bcq = pred_out["level_need_logits_bcq"]
+        expected_shape = (batch, channels, patches)
+        shape_values = [
+            ("level_amplitude_bcq", amplitude_bcq),
+            ("level_need_logits_bcq", logits_bcq),
+        ]
+        if not separate_gate:
+            shape_values.append(
+                (
+                    "level_executed_correction_bcq",
+                    pred_out["level_executed_correction_bcq"],
+                )
+            )
+        for name, value in shape_values:
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got {tuple(value.shape)}."
+                )
+        scale_level = penalty_scale[level_p].to(
+            device=base_eval_bch.device, dtype=base_eval_bch.dtype
+        ).clamp_min(1.0e-8)
+        threshold_level = penalty_need_threshold[level_p].to(
+            device=base_eval_bch.device, dtype=base_eval_bch.dtype
+        )
+        base_patch = base_eval_bch.reshape(batch, channels, patches, patch_len)
+        target_patch = y_bch.reshape(batch, channels, patches, patch_len)
+        residual_target_bcq = (target_patch - base_patch).mean(dim=-1).detach()
+        need_target_bcq = (
+            residual_target_bcq.square() / scale_level >= threshold_level
+        ).to(dtype=base_eval_bch.dtype).detach()
+        amplitude_error_bcq = (
+            amplitude_bcq - residual_target_bcq
+        ).square() / scale_level
+        if high_need_amplitude:
+            need_fraction = need_target_bcq.mean().detach()
+            amplitude_loss_bcq = (
+                amplitude_error_bcq
+                * need_target_bcq
+                / need_fraction.clamp_min(1.0e-12)
+            )
+        else:
+            amplitude_loss_bcq = amplitude_error_bcq
+        if separate_gate:
+            positive_weight = logits_bcq.new_tensor(float(level_need_positive_weight))
+            need_loss_bcq = F.binary_cross_entropy_with_logits(
+                logits_bcq,
+                need_target_bcq,
+                pos_weight=positive_weight,
+                reduction="none",
+            )
+            total_bc = amplitude_loss_bcq.mean(dim=-1) + need_loss_bcq.mean(dim=-1)
+            component_values = (
+                ("level_amplitude_loss", amplitude_loss_bcq),
+                ("level_need_balanced_bce", need_loss_bcq),
+            )
+        else:
+            need_loss_bcq = F.binary_cross_entropy_with_logits(
+                logits_bcq,
+                need_target_bcq,
+                reduction="none",
+            )
+            executed_bcq = pred_out["level_executed_correction_bcq"]
+            executed_loss_bcq = (
+                executed_bcq - need_target_bcq * residual_target_bcq
+            ).square() / scale_level
+            total_bc = (
+                amplitude_loss_bcq.mean(dim=-1)
+                + need_loss_bcq.mean(dim=-1)
+                + executed_loss_bcq.mean(dim=-1)
+            )
+            component_values = (
+                ("level_amplitude_loss", amplitude_loss_bcq),
+                ("level_need_bce", need_loss_bcq),
+                ("level_executed_loss", executed_loss_bcq),
+            )
+        err_bcp = total_bc.new_zeros((batch, channels, int(cand_bcpH.shape[2])))
+        err_bcp[:, :, level_p] = total_bc
+        objective_component_bcp = {}
+        for key, values_bcq in component_values:
+            values_bcp = total_bc.new_zeros(
+                (batch, channels, int(cand_bcpH.shape[2]))
+            )
+            values_bcp[:, :, level_p] = values_bcq.mean(dim=-1)
+            objective_component_bcp[key] = values_bcp
+    elif loss_mode in {"direct_attribute", "attribute_mse", "future_attribute"}:
         if penalty_names is None or len(penalty_names) != int(cand_bcpH.shape[2]):
             raise ValueError("direct_attribute candidate supervision requires one penalty name per branch.")
         per_penalty = []
@@ -4170,17 +4646,230 @@ def _pred_residual_candidate_supervision_loss(
         "shape",
         "own_penalty_mse",
         "mse_own_penalty",
+        "high_need_own_penalty",
+        "need_weighted_own_penalty_mse",
+        "acceptance_guarded_own_penalty",
     }:
         if penalty_names is None or penalty_fns is None or len(penalty_names) != int(cand_bcpH.shape[2]):
             raise ValueError("own_penalty candidate supervision requires one penalty name/function per branch.")
-        per_penalty = []
-        for p, name in enumerate(penalty_names):
-            pen_bc = penalty_fns[name](cand_bcpH[:, :, p, :], y_bch)
-            if penalty_scale is not None and penalty_scale.numel() > p:
-                scale_p = penalty_scale[p].to(device=pen_bc.device, dtype=pen_bc.dtype).clamp_min(1.0e-6)
-                pen_bc = pen_bc / scale_p
-            per_penalty.append(pen_bc)
-        err_bcp = torch.stack(per_penalty, dim=-1)
+        if loss_mode in {
+            "high_need_own_penalty",
+            "need_weighted_own_penalty_mse",
+            "acceptance_guarded_own_penalty",
+        }:
+            patch_len = int(need_patch_len)
+            if patch_len <= 0:
+                raise ValueError("need-weighted candidate supervision requires need_patch_len > 0.")
+            if penalty_scale is None or int(penalty_scale.numel()) != int(cand_bcpH.shape[2]):
+                raise ValueError("need-weighted candidate supervision requires one penalty scale per branch.")
+            if penalty_need_threshold is None or int(penalty_need_threshold.numel()) != int(cand_bcpH.shape[2]):
+                raise ValueError("need-weighted candidate supervision requires one need threshold per branch.")
+            per_penalty = []
+            objective_components: Optional[Dict[str, List[torch.Tensor]]]
+            if loss_mode == "high_need_own_penalty":
+                objective_components = {
+                    "high_semantic_contribution": [],
+                }
+            elif loss_mode == "need_weighted_own_penalty_mse":
+                objective_components = {
+                    "high_semantic_contribution": [],
+                    "high_forecast_mse_contribution": [],
+                    "low_noop_contribution": [],
+                }
+            else:
+                objective_components = {
+                    "high_semantic": [],
+                    "high_forecast_mse": [],
+                    "high_mse_violation": [],
+                    "low_mse_violation": [],
+                    "low_noop_violation": [],
+                    "base_guard_objective": [],
+                    "constraint_total": [],
+                }
+            for p, name in enumerate(penalty_names):
+                scale_p = penalty_scale[p].to(
+                    device=cand_bcpH.device,
+                    dtype=cand_bcpH.dtype,
+                ).clamp_min(1.0e-8)
+                threshold_p = penalty_need_threshold[p].to(
+                    device=cand_bcpH.device,
+                    dtype=cand_bcpH.dtype,
+                )
+                base_penalty_bcq = _patchwise_penalty_bcq(
+                    base_eval_bch,
+                    y_bch,
+                    penalty_fns[name],
+                    patch_len=patch_len,
+                )
+                candidate_penalty_bcq = _patchwise_penalty_bcq(
+                    cand_bcpH[:, :, p, :],
+                    y_bch,
+                    penalty_fns[name],
+                    patch_len=patch_len,
+                )
+                batch, channels, horizon = base_eval_bch.shape
+                patches = horizon // patch_len
+                target_patch = y_bch.reshape(batch, channels, patches, patch_len)
+                candidate_patch = cand_bcpH[:, :, p, :].reshape(
+                    batch, channels, patches, patch_len
+                )
+                base_patch = base_eval_bch.reshape(batch, channels, patches, patch_len)
+                candidate_mse_bcq = (candidate_patch - target_patch).square().mean(dim=-1)
+                correction_mse_bcq = (candidate_patch - base_patch).square().mean(dim=-1)
+                need_bcq = (
+                    (base_penalty_bcq / scale_p) >= threshold_p
+                ).to(dtype=candidate_mse_bcq.dtype).detach()
+                if loss_mode == "high_need_own_penalty":
+                    high_semantic_bcq = need_bcq * (
+                        candidate_penalty_bcq / scale_p
+                    )
+                    per_penalty.append(high_semantic_bcq.mean(dim=-1))
+                    objective_components["high_semantic_contribution"].append(
+                        high_semantic_bcq.mean(dim=-1)
+                    )
+                    continue
+                if loss_mode == "need_weighted_own_penalty_mse":
+                    high_semantic_bcq = need_bcq * (
+                        candidate_penalty_bcq / scale_p
+                    )
+                    high_forecast_mse_bcq = need_bcq * candidate_mse_bcq
+                    low_noop_bcq = (1.0 - need_bcq) * correction_mse_bcq
+                    loss_bcq = (
+                        high_semantic_bcq
+                        + float(forecast_mse_weight) * high_forecast_mse_bcq
+                        + float(noop_weight) * low_noop_bcq
+                    )
+                    per_penalty.append(loss_bcq.mean(dim=-1))
+                    objective_components["high_semantic_contribution"].append(
+                        high_semantic_bcq.mean(dim=-1)
+                    )
+                    objective_components[
+                        "high_forecast_mse_contribution"
+                    ].append(high_forecast_mse_bcq.mean(dim=-1))
+                    objective_components["low_noop_contribution"].append(
+                        low_noop_bcq.mean(dim=-1)
+                    )
+                    continue
+
+                eps = float(constraint_eps)
+                if eps <= 0.0:
+                    raise ValueError("acceptance-guarded constraint_eps must be positive.")
+                high_tol = float(high_mse_relative_tolerance)
+                low_tol = float(low_mse_relative_tolerance)
+                ratio_max = float(low_high_rms_ratio_max)
+                constraint = float(constraint_weight)
+                if high_tol < 0.0 or low_tol < 0.0:
+                    raise ValueError("acceptance-guarded MSE tolerances must be nonnegative.")
+                if ratio_max < 0.0 or constraint <= 0.0:
+                    raise ValueError(
+                        "acceptance-guarded ratio must be nonnegative and constraint_weight positive."
+                    )
+
+                low_bcq = 1.0 - need_bcq
+                high_count_bc = need_bcq.sum(dim=-1)
+                low_count_bc = low_bcq.sum(dim=-1)
+
+                def conditional_mean(values_bcq: torch.Tensor, mask_bcq: torch.Tensor) -> torch.Tensor:
+                    count_bc = mask_bcq.sum(dim=-1)
+                    mean_bc = (values_bcq * mask_bcq).sum(dim=-1) / count_bc.clamp_min(1.0)
+                    return torch.where(count_bc > 0.0, mean_bc, torch.zeros_like(mean_bc))
+
+                base_mse_bcq = (base_patch - target_patch).square().mean(dim=-1).detach()
+                high_allowed_bcq = base_mse_bcq * (1.0 + high_tol)
+                high_mse_violation_bcq = (
+                    (candidate_mse_bcq - high_allowed_bcq).clamp_min(0.0)
+                    / base_mse_bcq.clamp_min(eps)
+                )
+
+                high_correction_mse_bc = conditional_mean(correction_mse_bcq, need_bcq)
+                low_correction_mse_bc = conditional_mean(correction_mse_bcq, low_bcq)
+                low_base_mse_bc = conditional_mean(base_mse_bcq, low_bcq).detach()
+                low_candidate_mse_bc = conditional_mean(candidate_mse_bcq, low_bcq)
+                low_allowed_mse_bc = low_base_mse_bc * (1.0 + low_tol)
+                low_mse_violation_bc = (
+                    (low_candidate_mse_bc - low_allowed_mse_bc).clamp_min(0.0)
+                    / low_base_mse_bc.clamp_min(eps)
+                )
+                low_noop_excess_bc = (
+                    low_correction_mse_bc
+                    - (ratio_max * ratio_max) * high_correction_mse_bc.detach()
+                )
+                low_noop_violation_bc = (
+                    low_noop_excess_bc.clamp_min(0.0)
+                    / low_base_mse_bc.clamp_min(eps)
+                )
+                high_semantic_bc = conditional_mean(
+                    candidate_penalty_bcq / scale_p,
+                    need_bcq,
+                )
+                base_high_semantic_bc = conditional_mean(
+                    base_penalty_bcq.detach() / scale_p,
+                    need_bcq,
+                )
+                high_forecast_mse_bc = conditional_mean(
+                    candidate_mse_bcq / base_mse_bcq.clamp_min(eps),
+                    need_bcq,
+                )
+                base_high_forecast_bc = torch.where(
+                    high_count_bc > 0.0,
+                    torch.ones_like(high_forecast_mse_bc),
+                    torch.zeros_like(high_forecast_mse_bc),
+                )
+                high_mse_violation_bc = conditional_mean(
+                    high_mse_violation_bcq,
+                    need_bcq,
+                )
+                constraint_total_bc = (
+                    high_mse_violation_bc
+                    + low_mse_violation_bc
+                    + float(noop_weight) * low_noop_violation_bc
+                )
+                candidate_objective_bc = (
+                    high_semantic_bc
+                    + float(forecast_mse_weight) * high_forecast_mse_bc
+                )
+                base_guard_objective_bc = (
+                    base_high_semantic_bc
+                    + float(forecast_mse_weight) * base_high_forecast_bc
+                ).detach()
+                # The final non-tradeable switch is applied after channel-to-cluster
+                # reduction.  Until then keep the candidate objective, detached base
+                # guard, and constraints as separate tensors so no local semantic
+                # improvement can numerically pay for another unit's violation.
+                per_penalty.append(candidate_objective_bc)
+                objective_components["high_semantic"].append(high_semantic_bc)
+                objective_components["high_forecast_mse"].append(
+                    high_forecast_mse_bc
+                )
+                objective_components["high_mse_violation"].append(
+                    high_mse_violation_bc
+                )
+                objective_components["low_mse_violation"].append(
+                    low_mse_violation_bc
+                )
+                objective_components["low_noop_violation"].append(
+                    low_noop_violation_bc
+                )
+                objective_components["base_guard_objective"].append(
+                    base_guard_objective_bc
+                )
+                objective_components["constraint_total"].append(
+                    constraint_total_bc
+                )
+            err_bcp = torch.stack(per_penalty, dim=-1)
+            objective_component_bcp = {
+                key: torch.stack(values, dim=-1)
+                for key, values in objective_components.items()
+            }
+        else:
+            per_penalty = []
+            for p, name in enumerate(penalty_names):
+                pen_bc = penalty_fns[name](cand_bcpH[:, :, p, :], y_bch)
+                if penalty_scale is not None and penalty_scale.numel() > p:
+                    scale_p = penalty_scale[p].to(device=pen_bc.device, dtype=pen_bc.dtype).clamp_min(1.0e-6)
+                    pen_bc = pen_bc / scale_p
+                per_penalty.append(pen_bc)
+            err_bcp = torch.stack(per_penalty, dim=-1)
         if loss_mode in {"own_penalty_mse", "mse_own_penalty"}:
             forecast_mse_bcp = (
                 cand_bcpH - y_bch.unsqueeze(2)
@@ -4211,12 +4900,48 @@ def _pred_residual_candidate_supervision_loss(
     else:
         raise ValueError(
             "moe.pred_side_residual.candidate_supervision.loss must be mse, mae, own_penalty, "
-            "own_penalty_mse, "
+            "own_penalty_mse, high_need_own_penalty, need_weighted_own_penalty_mse, "
+            "acceptance_guarded_own_penalty, "
+            "level_residual_gate, level_residual_separate_gate, "
+            "level_residual_high_need_separate_gate, "
             "direct_attribute, "
             "gain_hinge_mse, or gain_hinge_mae "
             f"(got {loss_kind!r})."
         )
     err_bkp = scatter_mean_bcf_to_bkf(err_bcp, cluster_id_c, K)
+    component_bkp = None
+    if loss_mode in {
+        "level_residual_gate",
+        "level_residual_separate_gate",
+        "level_residual_high_need_separate_gate",
+        "high_need_own_penalty",
+        "need_weighted_own_penalty_mse",
+        "acceptance_guarded_own_penalty",
+    }:
+        component_bkp = {
+            key: scatter_mean_bcf_to_bkf(value, cluster_id_c, K)
+            for key, value in objective_component_bcp.items()
+        }
+    if loss_mode == "acceptance_guarded_own_penalty":
+        assert component_bkp is not None
+        constraint_active_p = (
+            component_bkp["constraint_total"]
+            .detach()
+            .amax(dim=(0, 1))
+            > 0.0
+        )
+        constraint_active_bkp = constraint_active_p.view(1, 1, -1).expand_as(
+            err_bkp
+        )
+        err_bkp = torch.where(
+            constraint_active_bkp,
+            component_bkp["base_guard_objective"].detach()
+            + float(constraint_weight) * component_bkp["constraint_total"],
+            err_bkp,
+        )
+        component_bkp["constraint_active"] = constraint_active_bkp.to(
+            dtype=err_bkp.dtype
+        )
     if bool(only_allowed) and allowed_mask_kp is not None and allowed_mask_kp.numel() > 0:
         allowed = allowed_mask_kp.to(device=err_bkp.device, dtype=err_bkp.dtype)
         if allowed.shape != err_bkp.shape[1:]:
@@ -4226,7 +4951,27 @@ def _pred_residual_candidate_supervision_loss(
             )
         empty = allowed.sum(dim=-1, keepdim=True) <= 0.0
         allowed = torch.where(empty, torch.ones_like(allowed), allowed)
-        return (err_bkp * allowed.unsqueeze(0)).sum(dim=-1) / allowed.sum(dim=-1).clamp_min(1.0).view(1, -1)
+        masked_bkp = err_bkp * allowed.unsqueeze(0)
+        if bool(return_per_penalty):
+            if bool(return_components):
+                assert component_bkp is not None
+                return {
+                    "loss_bkp": masked_bkp,
+                    "components_bkp": {
+                        key: value * allowed.unsqueeze(0)
+                        for key, value in component_bkp.items()
+                    },
+                }
+            return masked_bkp
+        return masked_bkp.sum(dim=-1) / allowed.sum(dim=-1).clamp_min(1.0).view(1, -1)
+    if bool(return_per_penalty):
+        if bool(return_components):
+            assert component_bkp is not None
+            return {
+                "loss_bkp": err_bkp,
+                "components_bkp": component_bkp,
+            }
+        return err_bkp
     return err_bkp.mean(dim=-1)
 
 
@@ -6388,6 +7133,13 @@ __all__ = [
     '_walk_forward_expert_reliability_rerank_metrics',
     '_patch_router_hierarchical_recall_loss_terms',
     '_patch_router_oracle_batch_stats',
+    '_patchwise_penalty_bcq',
+    '_level_oracle_patch_diagnostics',
+    '_prediction_fit_sufficient_statistics',
+    '_level_stage1_acceptance_candidate_patch',
+    '_validate_level_executed_candidate_patch',
+    '_semantic_bank_acceptance_metrics',
+    '_semantic_bank_semantic_only_acceptance_metrics',
     '_pred_residual_candidate_supervision_loss',
     '_pred_residual_intervention_supervision_loss',
     'PredResidualCandidateSelector',

@@ -7,6 +7,7 @@ def read_csv_time_series(
     csv_path: str,
     date_col: int = 0,
     dtype: torch.dtype = torch.float32,
+    nrows: int | None = None,
 ) -> Tuple[torch.Tensor, List[str]]:
     """
     要求：
@@ -19,7 +20,9 @@ def read_csv_time_series(
     - data: [T, C] tensor
     - channel_names: List[str], 长度 C
     """
-    df = pd.read_csv(csv_path, header=0)
+    if nrows is not None and nrows < 0:
+        raise ValueError("nrows must be nonnegative or None")
+    df = pd.read_csv(csv_path, header=0, nrows=nrows)
     cols = list(df.columns)
     value_cols = [c for i, c in enumerate(cols) if i != date_col]
 

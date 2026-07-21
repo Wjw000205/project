@@ -1,3 +1,4 @@
+import inspect
 from typing import Dict, List, Tuple, Optional
 import torch
 
@@ -300,7 +301,13 @@ def save_cluster_checkpoint(
 
 
 def load_cluster_checkpoint(path: str, device: torch.device) -> Dict[str, object]:
-    return torch.load(path, map_location=device)
+    load_kwargs = {"map_location": device}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        # Project checkpoints are trusted internal artifacts containing metadata
+        # and optional non-model state, so preserve the historical full-payload
+        # behavior while making the PyTorch default explicit.
+        load_kwargs["weights_only"] = False
+    return torch.load(path, **load_kwargs)
 
 
 def assign_channels_by_corr(

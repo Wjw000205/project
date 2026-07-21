@@ -8,6 +8,7 @@ import time
 import math
 import sys
 import builtins
+import hashlib
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
@@ -635,6 +636,13 @@ def main():
         loss_normalization_cfg = {"enable": bool(loss_normalization_cfg)}
     penalty_warmup_epochs = int(cfg["train"].get("penalty_warmup_epochs", 0))
     penalty_scale_floor = float(cfg["train"].get("penalty_scale_floor", 1.0e-3))
+    penalty_scale_source = str(
+        cfg["train"].get("penalty_scale_source", "persistence")
+    ).lower()
+    if penalty_scale_source not in {"persistence", "frozen_backbone_patch"}:
+        raise ValueError(
+            "train.penalty_scale_source must be persistence or frozen_backbone_patch."
+        )
 
     def compute_penalty_scale(loader: DataLoader, pred_len: int) -> torch.Tensor:
         if len(loader) == 0:
@@ -666,7 +674,22 @@ def main():
         scale = torch.where(cnt_pos > 0, mean_pos, mean_all)
         return scale.clamp_min(penalty_scale_floor)
 
-    penalty_scale = compute_penalty_scale(dl_tr_source, H)
+    penalty_scale = (
+        compute_penalty_scale(dl_tr_source, H)
+        if penalty_scale_source == "persistence"
+        else torch.full((P,), penalty_scale_floor, device=device)
+    )
+    penalty_need_threshold: Optional[torch.Tensor] = None
+    penalty_need_statistics_summary: Dict[str, object] = {
+        "source": str(penalty_scale_source),
+        "patch_len": 0,
+        "quantile": 0.75,
+        "scale": None,
+        "threshold": None,
+        "coverage": None,
+        "source_windows": 0,
+        "source_units": 0,
+    }
 
     _validate_strict_history_anchor_scope(
         cfg.get("moe", {}).get("history_anchor_expert", {}) or {},
@@ -831,6 +854,19 @@ def main():
     router_penalty_context_score = str(moe_cfg.get("router_penalty_context_score", "high_violation")).lower()
     pred_residual_cfg = moe_cfg.get("pred_side_residual", {}) or {}
     pred_residual_enable = bool(pred_residual_cfg.get("enable", False)) and moe_enable and P > 0
+    pred_residual_require_pure_backbone_base = bool(
+        pred_residual_cfg.get("require_pure_backbone_base", False)
+    ) and pred_residual_enable
+    pred_residual_semantic_bank_stage1 = bool(
+        pred_residual_cfg.get("semantic_bank_stage1", False)
+    ) and pred_residual_enable
+    pred_residual_semantic_output_head_scope = str(
+        pred_residual_cfg.get("semantic_output_head_scope", "shared")
+    ).strip().lower()
+    if pred_residual_semantic_output_head_scope not in {"shared", "per_cluster"}:
+        raise ValueError(
+            "moe.pred_side_residual.semantic_output_head_scope must be shared or per_cluster."
+        )
     position_daily_residual_expert_cfg = pred_residual_cfg.get(
         "position_daily_residual_expert", {}
     ) or {}
@@ -883,6 +919,12 @@ def main():
     ]
     named_output_projection_patch_len = int(
         named_output_projection_cfg.get("patch_len", 0) or 0
+    )
+    named_output_projection_mode = str(
+        named_output_projection_cfg.get("mode", "legacy_carrier")
+    )
+    named_output_projection_diff_amp_max = float(
+        named_output_projection_cfg.get("diff_amp_max", 1.0)
     )
     periodic_anchor_expert_cfg = pred_residual_cfg.get("periodic_anchor_expert", {}) or {}
     if not isinstance(periodic_anchor_expert_cfg, dict):
@@ -1359,8 +1401,186 @@ def main():
     pred_residual_candidate_supervision_loss = str(
         pred_residual_candidate_supervision_cfg.get("loss", "mse")
     ).lower()
+    pred_residual_semantic_level_controller_cfg = (
+        pred_residual_cfg.get("semantic_level_controller", {}) or {}
+    )
+    if not isinstance(pred_residual_semantic_level_controller_cfg, dict):
+        raise ValueError("moe.pred_side_residual.semantic_level_controller must be a mapping.")
+    pred_residual_semantic_level_amplitude_optimizer_cfg = (
+        pred_residual_semantic_level_controller_cfg.get("amplitude_optimizer", {})
+        or {}
+    )
+    if not isinstance(pred_residual_semantic_level_amplitude_optimizer_cfg, dict):
+        raise ValueError(
+            "moe.pred_side_residual.semantic_level_controller.amplitude_optimizer "
+            "must be a mapping."
+        )
+    pred_residual_semantic_level_amplitude_optimizer_name = str(
+        pred_residual_semantic_level_amplitude_optimizer_cfg.get("name", "sgd")
+    ).strip().lower()
+    pred_residual_semantic_level_amplitude_lr_raw = (
+        pred_residual_semantic_level_amplitude_optimizer_cfg.get("lr", None)
+    )
+    pred_residual_semantic_level_amplitude_weight_decay_raw = (
+        pred_residual_semantic_level_amplitude_optimizer_cfg.get(
+            "weight_decay", None
+        )
+    )
+    pred_residual_semantic_level_separate_need_gate = bool(
+        pred_residual_semantic_level_controller_cfg.get("separate_need_gate", False)
+    )
+    pred_residual_semantic_level_need_positive_weight = float(
+        pred_residual_candidate_supervision_cfg.get("level_need_positive_weight", 1.0)
+    )
+    pred_residual_semantic_level_acceptance_candidate_source = str(
+        pred_residual_candidate_supervision_cfg.get(
+            "level_acceptance_candidate",
+            "executed",
+        )
+    ).strip().lower()
+    if pred_residual_semantic_level_acceptance_candidate_source not in {
+        "executed",
+        "raw_amplitude",
+    }:
+        raise ValueError(
+            "adapter_attribute_supervision.level_acceptance_candidate must be "
+            "executed or raw_amplitude."
+        )
     pred_residual_candidate_supervision_forecast_mse_weight = float(
         pred_residual_candidate_supervision_cfg.get("forecast_mse_weight", 1.0)
+    )
+    pred_residual_candidate_supervision_need_patch_len = int(
+        pred_residual_candidate_supervision_cfg.get(
+            "need_patch_len",
+            named_output_projection_patch_len,
+        )
+        or 0
+    )
+    pred_residual_candidate_supervision_need_quantile = float(
+        pred_residual_candidate_supervision_cfg.get("need_quantile", 0.75)
+    )
+    pred_residual_candidate_supervision_noop_weight = float(
+        pred_residual_candidate_supervision_cfg.get("noop_weight", 1.0)
+    )
+    pred_residual_candidate_supervision_independent_optimization = bool(
+        pred_residual_candidate_supervision_cfg.get(
+            "independent_optimization",
+            False,
+        )
+    )
+    pred_residual_candidate_supervision_independent_optimizer = str(
+        pred_residual_candidate_supervision_cfg.get(
+            "independent_optimizer",
+            "sgd",
+        )
+    ).lower()
+    pred_residual_semantic_active_penalty = str(
+        pred_residual_candidate_supervision_cfg.get("active_penalty", "")
+    ).strip()
+    pred_residual_semantic_raw_gradient_accumulation_cfg = (
+        pred_residual_candidate_supervision_cfg.get(
+            "raw_gradient_accumulation", {}
+        )
+        or {}
+    )
+    if not isinstance(
+        pred_residual_semantic_raw_gradient_accumulation_cfg, dict
+    ):
+        raise ValueError(
+            "adapter_attribute_supervision.raw_gradient_accumulation must be a mapping."
+        )
+    pred_residual_semantic_raw_gradient_accumulation = bool(
+        pred_residual_semantic_raw_gradient_accumulation_cfg.get("enable", False)
+    )
+    pred_residual_semantic_raw_gradient_microbatches = int(
+        pred_residual_semantic_raw_gradient_accumulation_cfg.get(
+            "microbatches", 16
+        )
+    )
+    pred_residual_semantic_final_train_audit = bool(
+        pred_residual_candidate_supervision_cfg.get(
+            "final_train_semantic_audit", False
+        )
+    )
+    pred_residual_semantic_validation_blocks = int(
+        pred_residual_candidate_supervision_cfg.get("validation_blocks", 3)
+    )
+    pred_residual_semantic_min_improved_fraction = float(
+        pred_residual_candidate_supervision_cfg.get(
+            "min_high_need_improved_fraction", 0.60
+        )
+    )
+    pred_residual_semantic_min_gain_by_name = {
+        str(name): float(value)
+        for name, value in (
+            pred_residual_candidate_supervision_cfg.get(
+                "min_matching_gain_by_name",
+                {
+                    "level": 0.10,
+                    "trend": 0.10,
+                    "d2_match": 0.10,
+                    "diff_amp": 0.70,
+                },
+            )
+            or {}
+        ).items()
+    }
+    pred_residual_candidate_supervision_high_mse_relative_tolerance = float(
+        pred_residual_candidate_supervision_cfg.get(
+            "high_mse_relative_tolerance",
+            0.0,
+        )
+    )
+    pred_residual_candidate_supervision_low_mse_relative_tolerance = float(
+        pred_residual_candidate_supervision_cfg.get(
+            "low_mse_relative_tolerance",
+            1.0e-3,
+        )
+    )
+    pred_residual_candidate_supervision_low_high_rms_ratio_max = float(
+        pred_residual_candidate_supervision_cfg.get(
+            "low_high_rms_ratio_max",
+            0.25,
+        )
+    )
+    pred_residual_candidate_supervision_constraint_weight = float(
+        pred_residual_candidate_supervision_cfg.get(
+            "constraint_weight",
+            1.0,
+        )
+    )
+    pred_residual_candidate_supervision_constraint_eps = float(
+        pred_residual_candidate_supervision_cfg.get(
+            "constraint_eps",
+            1.0e-8,
+        )
+    )
+    if not 0.0 <= pred_residual_candidate_supervision_need_quantile <= 1.0:
+        raise ValueError("adapter_attribute_supervision.need_quantile must be in [0,1].")
+    if pred_residual_candidate_supervision_noop_weight < 0.0:
+        raise ValueError("adapter_attribute_supervision.noop_weight must be nonnegative.")
+    if (
+        pred_residual_candidate_supervision_high_mse_relative_tolerance < 0.0
+        or pred_residual_candidate_supervision_low_mse_relative_tolerance < 0.0
+        or pred_residual_candidate_supervision_low_high_rms_ratio_max < 0.0
+        or pred_residual_candidate_supervision_constraint_weight <= 0.0
+        or pred_residual_candidate_supervision_constraint_eps <= 0.0
+    ):
+        raise ValueError(
+            "adapter_attribute_supervision acceptance constraints require "
+            "nonnegative tolerances/ratio and positive weight/eps."
+        )
+    if pred_residual_semantic_validation_blocks < 3:
+        raise ValueError("semantic Stage-1 requires at least three validation blocks.")
+    if not 0.0 < pred_residual_semantic_min_improved_fraction <= 1.0:
+        raise ValueError(
+            "min_high_need_improved_fraction must be in (0,1]."
+        )
+    penalty_need_statistics_summary.update(
+        {
+            "patch_len": int(pred_residual_candidate_supervision_need_patch_len),
+            "quantile": float(pred_residual_candidate_supervision_need_quantile),
+        }
     )
     pred_residual_candidate_supervision_min_abs = float(
         pred_residual_candidate_supervision_cfg.get("min_abs_improvement", 0.0)
@@ -1821,12 +2041,15 @@ def main():
             phase_residual_candidate_names=phase_residual_candidate_names,
             phase_residual_candidate_scale=phase_residual_candidate_scale,
             shared_across_clusters=shared_moe_across_clusters,
+            semantic_output_head_scope=pred_residual_semantic_output_head_scope,
             patch_router_cfg=patch_router_cfg,
             named_output_projection_enable=named_output_projection_enable,
             named_output_projection_fixed_alpha=named_output_projection_fixed_alpha,
             named_output_projection_scale_by_name=named_output_projection_scale_by_name,
             named_output_projection_carrier_names=named_output_projection_carrier_names,
             named_output_projection_patch_len=named_output_projection_patch_len,
+            named_output_projection_mode=named_output_projection_mode,
+            named_output_projection_diff_amp_max=named_output_projection_diff_amp_max,
             periodic_anchor_expert_enable=periodic_anchor_expert_enable,
             periodic_anchor_expert_scale=periodic_anchor_expert_scale,
             position_daily_residual_expert_enable=position_daily_residual_expert_enable,
@@ -1837,6 +2060,7 @@ def main():
                 position_daily_residual_expert_cfg.get("daily_harmonics", 4)
             ),
             anchor_ridge_gate_cfg=anchor_ridge_gate_cfg,
+            semantic_level_controller_cfg=pred_residual_semantic_level_controller_cfg,
         ).to(device)
         if (
             pred_residual.patch_router is not None
@@ -1859,6 +2083,7 @@ def main():
             f"named_output_projection_fixed_alpha={bool(named_output_projection_fixed_alpha)}, "
             f"named_output_projection_carrier_names={named_output_projection_carrier_names}, "
             f"named_output_projection_patch_len={named_output_projection_patch_len}, "
+            f"named_output_projection_mode={named_output_projection_mode}, "
             f"periodic_anchor_expert={bool(periodic_anchor_expert_enable)}, "
             f"periodic_anchor_scale={float(periodic_anchor_expert_scale):.3f}, "
             f"position_daily_residual_expert={bool(position_daily_residual_expert_enable)}, "
@@ -1966,6 +2191,647 @@ def main():
             f"scale_temporal_basis_rank={learnable_output_anchor.scale_temporal_basis_rank}, "
             "zero_init_static_equivalent=True"
         )
+
+    if pred_residual_require_pure_backbone_base:
+        active_output_modifiers = []
+        if history_anchor_active:
+            active_output_modifiers.append("model.history_anchor")
+        if bool(calendar_residual_cfg.get("enable", False)):
+            active_output_modifiers.append("calendar_residual")
+        if bool(position_daily_residual_cfg.get("enable", False)):
+            active_output_modifiers.append("position_daily_residual_ridge")
+        if bool(model_train_stat_adapter_cfg.get("enable", False)):
+            active_output_modifiers.append("model.train_stat_adapter")
+        if bool(train_stat_anchor_cfg.get("enable", False)):
+            active_output_modifiers.append("moe.train_stat_anchor_expert")
+        if bool(train_residual_anchor_cfg.get("enable", False)):
+            active_output_modifiers.append("moe.train_residual_anchor_expert")
+        if learnable_output_anchor_enable:
+            active_output_modifiers.append("moe.learnable_output_anchor")
+        if periodic_anchor_expert_enable:
+            active_output_modifiers.append("pred_side_residual.periodic_anchor_expert")
+        if position_daily_residual_expert_enable:
+            active_output_modifiers.append("pred_side_residual.position_daily_residual_expert")
+        if anchor_ridge_gate_enable:
+            active_output_modifiers.append("pred_side_residual.anchor_ridge_gate")
+        if list(pred_residual_cfg.get("seasonal_anchor_names", []) or []):
+            active_output_modifiers.append("pred_side_residual.seasonal_anchor_names")
+        if phase_residual_candidate_enable:
+            active_output_modifiers.append("pred_side_residual.phase_residual_candidate")
+        if active_output_modifiers:
+            raise ValueError(
+                "require_pure_backbone_base=true forbids output modifiers: "
+                + ", ".join(active_output_modifiers)
+            )
+
+    if pred_residual_semantic_bank_stage1:
+        expected_penalties = ["level", "trend", "d2_match", "diff_amp"]
+        if not pred_residual_require_pure_backbone_base:
+            raise ValueError("semantic_bank_stage1 requires require_pure_backbone_base=true.")
+        if not shared_moe_across_clusters:
+            raise ValueError(
+                "semantic_bank_stage1 independent optimization requires shared_across_clusters=true."
+            )
+        if pred_residual_semantic_output_head_scope == "per_cluster":
+            forbidden_semantic_output_features = []
+            if bool(pred_residual_cfg.get("intervention_enable", False)):
+                forbidden_semantic_output_features.append("intervention_enable")
+            if bool(pred_residual_cfg.get("penalty_selector_enable", False)):
+                forbidden_semantic_output_features.append("penalty_selector_enable")
+            if bool(pred_residual_cfg.get("fusion_gate_enable", False)):
+                forbidden_semantic_output_features.append("fusion_gate_enable")
+            if bool((pred_residual_cfg.get("channel_expert_adapters", {}) or {}).get("enable", False)):
+                forbidden_semantic_output_features.append("channel_expert_adapters")
+            if forbidden_semantic_output_features:
+                raise ValueError(
+                    "semantic per-cluster Stage-1 producer forbids: "
+                    + ", ".join(forbidden_semantic_output_features)
+                )
+        if penalty_names != expected_penalties:
+            raise ValueError(
+                "semantic_bank_stage1 requires penalty order "
+                f"{expected_penalties}, got {penalty_names}."
+            )
+        if bool(patch_router_cfg.get("enable", False)):
+            raise ValueError("semantic_bank_stage1 requires patch_router.enable=false.")
+        if not (
+            named_output_projection_enable
+            and named_output_projection_fixed_alpha
+            and named_output_projection_mode == "semantic_residual"
+            and named_output_projection_patch_len == 12
+        ):
+            raise ValueError(
+                "semantic_bank_stage1 requires semantic_residual projection, fixed alpha, and patch_len=12."
+            )
+        effective_scales = [
+            float(named_output_projection_scale_by_name.get(name, 1.0))
+            for name in penalty_names
+        ]
+        if any(value != 1.0 for value in effective_scales):
+            raise ValueError("semantic_bank_stage1 requires all fixed projection scales to equal 1.0.")
+        semantic_level_controller_enable = bool(
+            pred_residual_semantic_level_controller_cfg.get("enable", False)
+        )
+        if semantic_level_controller_enable and pred_residual_semantic_active_penalty == "level":
+            if pred_residual_semantic_level_separate_need_gate:
+                required_level_loss = (
+                    "level_residual_high_need_separate_gate"
+                    if pred_residual_semantic_level_acceptance_candidate_source
+                    == "raw_amplitude"
+                    else "level_residual_separate_gate"
+                )
+            else:
+                required_level_loss = "level_residual_gate"
+                if (
+                    pred_residual_semantic_level_acceptance_candidate_source
+                    != "executed"
+                ):
+                    raise ValueError(
+                        "raw LEVEL acceptance requires separate_need_gate=true."
+                    )
+            if pred_residual_candidate_supervision_loss != required_level_loss:
+                raise ValueError(
+                    "semantic_bank_stage1 LEVEL controller mode requires "
+                    f"{required_level_loss} supervision."
+                )
+            if int(pred_residual_semantic_level_controller_cfg.get("patch_len", 12)) != 12:
+                raise ValueError("semantic_bank_stage1 LEVEL controller requires patch_len=12.")
+            if pred_residual_semantic_level_separate_need_gate:
+                if abs(pred_residual_semantic_level_need_positive_weight - 3.0) > 1.0e-12:
+                    raise ValueError(
+                        "separate LEVEL gate requires level_need_positive_weight=3.0 for q75."
+                    )
+                if not pred_residual_semantic_raw_gradient_accumulation:
+                    raise ValueError(
+                        "separate LEVEL gate requires raw-gradient accumulation."
+                    )
+                if pred_residual_semantic_level_amplitude_optimizer_name not in {
+                    "sgd",
+                    "adam",
+                }:
+                    raise ValueError(
+                        "separate LEVEL amplitude optimizer must be sgd or adam."
+                    )
+                if pred_residual_semantic_level_amplitude_optimizer_name == "adam":
+                    if (
+                        pred_residual_semantic_level_amplitude_lr_raw is None
+                        or abs(
+                            float(pred_residual_semantic_level_amplitude_lr_raw)
+                            - 1.0e-3
+                        )
+                        > 1.0e-12
+                    ):
+                        raise ValueError(
+                            "reviewed LEVEL amplitude Adam repair requires lr=0.001."
+                        )
+                    if (
+                        pred_residual_semantic_level_amplitude_weight_decay_raw
+                        is None
+                        or abs(
+                            float(
+                                pred_residual_semantic_level_amplitude_weight_decay_raw
+                            )
+                        )
+                        > 1.0e-12
+                    ):
+                        raise ValueError(
+                            "reviewed LEVEL amplitude Adam repair requires weight_decay=0."
+                        )
+            elif pred_residual_semantic_level_amplitude_optimizer_cfg:
+                raise ValueError(
+                    "LEVEL amplitude optimizer override requires separate_need_gate=true."
+                )
+        else:
+            if pred_residual_semantic_level_amplitude_optimizer_cfg:
+                raise ValueError(
+                    "LEVEL amplitude optimizer override requires the active disjoint "
+                    "LEVEL controller."
+                )
+            if pred_residual_candidate_supervision_loss in {
+                "level_residual_gate",
+                "level_residual_separate_gate",
+                "level_residual_high_need_separate_gate",
+            }:
+                raise ValueError(
+                    "LEVEL controller supervision requires an enabled controller and active_penalty=level."
+                )
+            if pred_residual_candidate_supervision_loss != "high_need_own_penalty":
+                raise ValueError(
+                    "legacy semantic_bank_stage1 staged repair requires high_need_own_penalty supervision."
+                )
+        if not pred_residual_candidate_supervision_independent_optimization:
+            raise ValueError(
+                "semantic_bank_stage1 requires independent_optimization=true."
+            )
+        expected_independent_optimizer = (
+            "mixed_level_adam_amplitude_sgd_need_gate"
+            if semantic_level_controller_enable
+            and pred_residual_semantic_active_penalty == "level"
+            and pred_residual_semantic_level_separate_need_gate
+            and pred_residual_semantic_level_amplitude_optimizer_name == "adam"
+            else "sgd"
+        )
+        if (
+            pred_residual_candidate_supervision_independent_optimizer
+            != expected_independent_optimizer
+        ):
+            raise ValueError(
+                "semantic_bank_stage1 independent_optimizer mismatch: expected "
+                f"{expected_independent_optimizer!r}."
+            )
+        if abs(pred_residual_candidate_supervision_weight - 1.0) > 1.0e-12:
+            raise ValueError(
+                "semantic_bank_stage1 requires adapter_attribute_supervision.weight=1."
+            )
+        if abs(pred_residual_candidate_supervision_forecast_mse_weight) > 1.0e-12:
+            raise ValueError(
+                "semantic_bank_stage1 semantic-only repair requires forecast_mse_weight=0."
+            )
+        if abs(pred_residual_candidate_supervision_noop_weight) > 1.0e-12:
+            raise ValueError("semantic_bank_stage1 semantic-only repair requires noop_weight=0.")
+        if pred_residual_candidate_supervision_high_mse_relative_tolerance != 0.0:
+            raise ValueError(
+                "semantic_bank_stage1 requires high_mse_relative_tolerance=0."
+            )
+        if abs(pred_residual_candidate_supervision_low_mse_relative_tolerance - 1.0e-3) > 1.0e-12:
+            raise ValueError(
+                "semantic_bank_stage1 requires low_mse_relative_tolerance=0.001."
+            )
+        if abs(pred_residual_candidate_supervision_low_high_rms_ratio_max - 0.25) > 1.0e-12:
+            raise ValueError(
+                "semantic_bank_stage1 requires low_high_rms_ratio_max=0.25."
+            )
+        if pred_residual_candidate_supervision_need_patch_len != 12:
+            raise ValueError("semantic_bank_stage1 requires need_patch_len=12.")
+        if abs(pred_residual_candidate_supervision_need_quantile - 0.75) > 1.0e-12:
+            raise ValueError("semantic_bank_stage1 requires need_quantile=0.75.")
+        if pred_residual_semantic_active_penalty not in expected_penalties:
+            raise ValueError(
+                "semantic_bank_stage1 requires one active_penalty from "
+                f"{expected_penalties}, got {pred_residual_semantic_active_penalty!r}."
+            )
+        if pred_residual_semantic_validation_blocks != 3:
+            raise ValueError("semantic_bank_stage1 requires validation_blocks=3.")
+        expected_min_gains = {
+            "level": 0.10,
+            "trend": 0.10,
+            "d2_match": 0.10,
+            "diff_amp": 0.70,
+        }
+        if pred_residual_semantic_min_gain_by_name != expected_min_gains:
+            raise ValueError(
+                "semantic_bank_stage1 materiality thresholds must equal "
+                f"{expected_min_gains}."
+            )
+        if abs(pred_residual_semantic_min_improved_fraction - 0.60) > 1.0e-12:
+            raise ValueError(
+                "semantic_bank_stage1 requires min_high_need_improved_fraction=0.60."
+            )
+        if pred_residual_candidate_supervision_only_allowed:
+            raise ValueError("semantic_bank_stage1 requires only_allowed=false.")
+        if pred_residual_candidate_supervision_include_intervention:
+            raise ValueError(
+                "semantic_bank_stage1 candidate loss must exclude intervention."
+            )
+        if pred_residual_candidate_supervision_include_selector:
+            raise ValueError(
+                "semantic_bank_stage1 candidate loss must exclude selector."
+            )
+        if pred_residual_candidate_supervision_include_patch_route:
+            raise ValueError("semantic_bank_stage1 candidate loss must exclude patch routing.")
+        if penalty_scale_source != "frozen_backbone_patch":
+            raise ValueError(
+                "semantic_bank_stage1 requires train.penalty_scale_source=frozen_backbone_patch."
+            )
+        if abs(float(cfg["train"].get("penalty_scale_floor", 1.0e-3)) - 1.0e-3) > 1.0e-12:
+            raise ValueError("semantic_bank_stage1 requires penalty_scale_floor=0.001.")
+        if str(memory_cfg.get("checkpoint_selection", "")).lower() != "semantic_per_expert":
+            raise ValueError(
+                "semantic_bank_stage1 requires memory.checkpoint_selection=semantic_per_expert."
+            )
+        if str((cfg["train"].get("lr_scheduler", {}) or {}).get("name", "none")).lower() not in {
+            "none",
+            "off",
+            "disabled",
+        }:
+            raise ValueError(
+                "semantic_bank_stage1 requires a loss-independent scheduler (name=none)."
+            )
+        if pred_residual_semantic_raw_gradient_accumulation:
+            if pred_residual_semantic_active_penalty != "level":
+                raise ValueError(
+                    "semantic raw-gradient accumulation is currently active-level only."
+                )
+            if pred_residual_semantic_raw_gradient_microbatches != 16:
+                raise ValueError(
+                    "semantic raw-gradient accumulation requires microbatches=16."
+                )
+    else:
+        if pred_residual_semantic_raw_gradient_accumulation:
+            raise ValueError(
+                "semantic raw-gradient accumulation requires semantic_bank_stage1=true."
+            )
+        if pred_residual_semantic_final_train_audit:
+            raise ValueError(
+                "final_train_semantic_audit requires semantic_bank_stage1=true."
+            )
+
+    semantic_bank_active_penalty_index = (
+        penalty_names.index(pred_residual_semantic_active_penalty)
+        if pred_residual_semantic_bank_stage1
+        else None
+    )
+
+    if (
+        pred_residual_enable
+        and pred_residual_semantic_output_head_scope == "per_cluster"
+        and not pred_residual_semantic_bank_stage1
+    ):
+        finetune_consumer_cfg = cfg.get("finetune", {}) or {}
+        _validate_semantic_frozen_consumer_lifecycle_flags(
+            freeze_adapter_bank=pred_residual_freeze_adapter_bank,
+            freeze_backbone=bool(
+                moe_cfg.get("freeze_backbone", cfg.get("train", {}).get("freeze_backbone", False))
+            ),
+            patch_router_enable=bool(patch_router_cfg.get("enable", False)),
+            finetune_enable=bool(finetune_consumer_cfg.get("enable", False)),
+            load_pred_residual=bool(finetune_consumer_cfg.get("load_pred_residual", False)),
+            load_gate=bool(finetune_consumer_cfg.get("load_gate", True)),
+            require_training_provenance=bool(
+                finetune_consumer_cfg.get("require_pred_residual_training_provenance", False)
+            ),
+        )
+        if bool((moe_cfg.get("dynamic_lambda", {}) or {}).get("enable", False)) or bool(
+            (moe_cfg.get("learnable_lambda", {}) or {}).get("enable", False)
+        ):
+            raise ValueError("Per-cluster frozen consumer forbids dynamic/learnable lambda parameters.")
+        if not pred_residual_require_pure_backbone_base:
+            raise ValueError("Per-cluster frozen consumer requires require_pure_backbone_base=true.")
+        if penalty_names != ["level", "trend", "d2_match", "diff_amp"]:
+            raise ValueError("Per-cluster frozen consumer requires the exact semantic penalty order.")
+        if not (
+            shared_moe_across_clusters
+            and named_output_projection_enable
+            and named_output_projection_fixed_alpha
+            and named_output_projection_mode == "semantic_residual"
+            and named_output_projection_patch_len == 12
+        ):
+            raise ValueError(
+                "Per-cluster frozen consumer requires the exact shared semantic p12 representation."
+            )
+        consumer_scales = [
+            float(named_output_projection_scale_by_name.get(name, 1.0))
+            for name in penalty_names
+        ]
+        if any(value != 1.0 for value in consumer_scales):
+            raise ValueError("Per-cluster frozen consumer requires fixed alpha scale 1.0 for every expert.")
+        _validate_semantic_frozen_consumer_paths({
+            "intervention_enable": bool(pred_residual_cfg.get("intervention_enable", False)),
+            "penalty_selector_enable": bool(pred_residual_cfg.get("penalty_selector_enable", False)),
+            "fusion_gate_enable": bool(pred_residual_cfg.get("fusion_gate_enable", False)),
+            "channel_expert_adapters": bool(
+                (pred_residual_cfg.get("channel_expert_adapters", {}) or {}).get("enable", False)
+            ),
+            "seasonal_anchor_names": bool(list(pred_residual_cfg.get("seasonal_anchor_names", []) or [])),
+            "phase_residual_candidate": bool(phase_residual_candidate_enable),
+            "periodic_anchor_expert": bool(periodic_anchor_expert_enable),
+            "position_daily_residual_expert": bool(position_daily_residual_expert_enable),
+            "anchor_ridge_gate": bool(anchor_ridge_gate_enable),
+        })
+
+    pred_residual_contract: Optional[Dict[str, object]] = None
+    pred_residual_training_provenance: Optional[Dict[str, object]] = None
+    if pred_residual_enable:
+        pred_residual_contract = {
+            # This contract contains inference representation only.  It is what a
+            # frozen-bank consumer must match and deliberately excludes the
+            # producer's optimizer/objective settings.
+            "version": (
+                5
+                if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                and pred_residual_semantic_level_separate_need_gate
+                else 4
+                if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                else (3 if named_output_projection_mode == "semantic_residual" else 1)
+            ),
+            "penalty_names": list(penalty_names),
+            "projection_mode": str(named_output_projection_mode),
+            "projection_patch_len": int(named_output_projection_patch_len),
+            "base_type": (
+                "pure_backbone"
+                if pred_residual_require_pure_backbone_base
+                else "configured_candidate_base"
+            ),
+            "fixed_alpha": bool(named_output_projection_fixed_alpha),
+            "scale_by_name": {
+                name: float(named_output_projection_scale_by_name.get(name, 1.0))
+                for name in penalty_names
+            },
+            "diff_amp_max": float(named_output_projection_diff_amp_max),
+            "semantic_output_head_scope": str(pred_residual_semantic_output_head_scope),
+            "semantic_encoder_param_clusters": int(pred_residual.param_K),
+            "semantic_output_param_clusters": int(pred_residual.output_param_K),
+            "semantic_parameter_ownership": (
+                "hybrid_level_local_controller_other_legacy_v1"
+                if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                and not pred_residual_semantic_level_separate_need_gate
+                else "hybrid_level_disjoint_local_gate_other_legacy_v2"
+                if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                else
+                "shared_encoder_per_cluster_output_v1"
+                if pred_residual_semantic_output_head_scope == "per_cluster"
+                else "legacy_shared_v1"
+            ),
+        }
+        if bool(pred_residual_semantic_level_controller_cfg.get("enable", False)):
+            pred_residual_contract.update({
+                "semantic_level_controller": {
+                    "enable": True,
+                    "patch_len": int(pred_residual_semantic_level_controller_cfg.get("patch_len", 12)),
+                    "hidden_dim": int(
+                        pred_residual_semantic_level_controller_cfg.get(
+                            "hidden_dim", pred_residual_cfg.get("corrector_hidden", 32)
+                        )
+                    ),
+                    "state_version": 1,
+                },
+                "body_type_by_penalty": {
+                    name: (
+                        "level_local_controller_v1"
+                        if name == "level"
+                        else (
+                            "shared_encoder_per_cluster_output_v1"
+                            if pred_residual_semantic_output_head_scope == "per_cluster"
+                            else "legacy_shared_v1"
+                        )
+                    )
+                    for name in penalty_names
+                },
+            })
+            if pred_residual_semantic_level_separate_need_gate:
+                pred_residual_contract["semantic_level_controller"].update({
+                    "separate_need_gate": True,
+                    "need_hidden_dim": int(
+                        pred_residual_semantic_level_controller_cfg.get(
+                            "need_hidden_dim",
+                            pred_residual_semantic_level_controller_cfg.get(
+                                "hidden_dim", pred_residual_cfg.get("corrector_hidden", 32)
+                            ),
+                        )
+                    ),
+                })
+        if pred_residual_semantic_output_head_scope == "per_cluster":
+            cluster_id_values = [
+                int(value) for value in cluster_id_c.detach().cpu().tolist()
+            ]
+            pred_residual_contract.update({
+                "cluster_count": int(K),
+                "cluster_id_c": cluster_id_values,
+                "cluster_map_sha256": _canonical_cluster_map_sha256(
+                    K, cluster_id_values
+                ),
+            })
+        if pred_residual_semantic_bank_stage1:
+            pred_residual_training_provenance = {
+                "version": (
+                    8
+                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                    and pred_residual_semantic_active_penalty == "level"
+                    and pred_residual_semantic_level_separate_need_gate
+                    and pred_residual_semantic_level_amplitude_optimizer_name == "adam"
+                    and pred_residual_semantic_level_acceptance_candidate_source
+                    == "raw_amplitude"
+                    else 7
+                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                    and pred_residual_semantic_active_penalty == "level"
+                    and pred_residual_semantic_level_separate_need_gate
+                    and pred_residual_semantic_level_amplitude_optimizer_name == "adam"
+                    else 6
+                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                    and pred_residual_semantic_active_penalty == "level"
+                    and pred_residual_semantic_level_separate_need_gate
+                    else 5
+                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                    and pred_residual_semantic_active_penalty == "level"
+                    else (4 if pred_residual_semantic_raw_gradient_accumulation else 3)
+                ),
+                "stage": "semantic_bank_stage1",
+                "candidate_loss": str(pred_residual_candidate_supervision_loss),
+                "candidate_supervision_weight": float(
+                    pred_residual_candidate_supervision_weight
+                ),
+                "independent_optimization": bool(
+                    pred_residual_candidate_supervision_independent_optimization
+                ),
+                "independent_optimizer": str(
+                    pred_residual_candidate_supervision_independent_optimizer
+                ),
+                "forecast_mse_weight": float(
+                    pred_residual_candidate_supervision_forecast_mse_weight
+                ),
+                "noop_weight": float(pred_residual_candidate_supervision_noop_weight),
+                "active_penalty": str(pred_residual_semantic_active_penalty),
+                "validation_blocks": int(pred_residual_semantic_validation_blocks),
+                "min_high_need_improved_fraction": float(
+                    pred_residual_semantic_min_improved_fraction
+                ),
+                "min_matching_gain_by_name": dict(
+                    pred_residual_semantic_min_gain_by_name
+                ),
+                "acceptance_mode": (
+                    "semantic_only_high_need_patch_with_local_gate"
+                    if pred_residual_semantic_level_separate_need_gate
+                    and pred_residual_semantic_active_penalty == "level"
+                    else "semantic_only_high_need_patch"
+                ),
+                "need_quantile": float(
+                    pred_residual_candidate_supervision_need_quantile
+                ),
+                "need_patch_len": int(
+                    pred_residual_candidate_supervision_need_patch_len
+                ),
+                "only_allowed": bool(
+                    pred_residual_candidate_supervision_only_allowed
+                ),
+                "include_intervention": bool(
+                    pred_residual_candidate_supervision_include_intervention
+                ),
+                "include_selector": bool(
+                    pred_residual_candidate_supervision_include_selector
+                ),
+                "include_patch_route": bool(
+                    pred_residual_candidate_supervision_include_patch_route
+                ),
+                "penalty_scale_source": str(penalty_scale_source),
+                "penalty_scale_floor": float(
+                    cfg["train"].get("penalty_scale_floor", 1.0e-3)
+                ),
+                "penalty_scale_rule": "positive_patch_mean_floored",
+                "threshold_source": "train_frozen_pure_backbone_patch_q75",
+                "threshold_interpolation": "linear",
+                "need_comparison": ">=",
+                "optimizer": (
+                    {
+                        "name": "disjoint_level_adam_amplitude_sgd_need_gate",
+                        "amplitude": {
+                            "name": "adam",
+                            "lr": float(
+                                pred_residual_semantic_level_amplitude_lr_raw
+                            ),
+                            "weight_decay": float(
+                                pred_residual_semantic_level_amplitude_weight_decay_raw
+                            ),
+                            "betas": [0.9, 0.999],
+                            "eps": 1.0e-8,
+                            "amsgrad": False,
+                        },
+                        "need_gate": {
+                            "name": "sgd",
+                            "lr": float(cfg["train"]["lr"]),
+                            "weight_decay": float(
+                                pred_residual_weight_decay
+                                if pred_residual_weight_decay is not None
+                                else cfg["train"]["weight_decay"]
+                            ),
+                            "momentum": 0.0,
+                            "dampening": 0.0,
+                            "nesterov": False,
+                        },
+                    }
+                    if pred_residual_semantic_level_separate_need_gate
+                    and pred_residual_semantic_level_amplitude_optimizer_name == "adam"
+                    else {
+                        "name": "sgd",
+                        "momentum": 0.0,
+                        "dampening": 0.0,
+                        "nesterov": False,
+                    }
+                ),
+                "scheduler": "none",
+                "checkpoint_selection": "semantic_per_expert",
+            }
+            if (
+                bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                and pred_residual_semantic_active_penalty == "level"
+            ):
+                if pred_residual_semantic_level_separate_need_gate:
+                    pred_residual_training_provenance.update({
+                        "level_loss_weights": {
+                            "amplitude": 1.0,
+                            "need_balanced_bce": 1.0,
+                            "executed": 0.0,
+                        },
+                        "level_need_positive_weight": float(
+                            pred_residual_semantic_level_need_positive_weight
+                        ),
+                        "level_optimizer_groups": ["amplitude", "need_gate"],
+                        "gradient_clip": "independent_per_level_group",
+                    })
+                    if (
+                        pred_residual_semantic_level_acceptance_candidate_source
+                        == "raw_amplitude"
+                    ):
+                        pred_residual_training_provenance.update(
+                            {
+                                "level_amplitude_population": (
+                                    "detached_q75_high_need_only"
+                                ),
+                                "level_acceptance_candidate": "raw_amplitude",
+                                "level_need_gate_acceptance_role": (
+                                    "diagnostic_only"
+                                ),
+                            }
+                        )
+                else:
+                    pred_residual_training_provenance["level_loss_weights"] = {
+                        "amplitude": 1.0,
+                        "need_bce": 1.0,
+                        "executed": 1.0,
+                    }
+            if pred_residual_semantic_raw_gradient_accumulation:
+                pred_residual_training_provenance["raw_gradient_accumulation"] = {
+                    "enabled": True,
+                    "microbatches": int(
+                        pred_residual_semantic_raw_gradient_microbatches
+                    ),
+                    "missing_gradient": "zero",
+                    "reduction": "mean_by_actual_count",
+                    "clip": (
+                        "once_after_mean_per_level_group"
+                        if pred_residual_semantic_level_separate_need_gate
+                        and pred_residual_semantic_active_penalty == "level"
+                        else "once_after_mean"
+                    ),
+                    "weight_decay": (
+                        "once_per_optimizer_step_per_level_group"
+                        if pred_residual_semantic_level_separate_need_gate
+                        and pred_residual_semantic_active_penalty == "level"
+                        else "once_per_optimizer_step"
+                    ),
+                    "tail": "actual_count",
+                }
+            _validate_semantic_bank_training_provenance(
+                pred_residual_training_provenance
+            )
+
+    def _assert_pure_candidate_base(
+        pred_out: Optional[Dict[str, torch.Tensor]],
+        backbone_prediction_bch: torch.Tensor,
+        *,
+        stage: str,
+    ) -> None:
+        if not pred_residual_require_pure_backbone_base or pred_out is None:
+            return
+        candidate_base = pred_out.get("candidate_base_bch")
+        if candidate_base is None or not torch.equal(candidate_base, backbone_prediction_bch):
+            max_abs = None
+            if candidate_base is not None and candidate_base.shape == backbone_prediction_bch.shape:
+                max_abs = float((candidate_base - backbone_prediction_bch).abs().max().detach().item())
+            raise RuntimeError(
+                "pure-backbone candidate base assertion failed: "
+                f"stage={stage}, max_abs={max_abs}."
+            )
+
     gate_balance_target_kp = None
     gate_prior_prob_kp = None
     gate_prior_enable = bool(gate_prior_cfg.get("enable", False)) and penalty_portrait_kp is not None and P > 0
@@ -2230,9 +3096,10 @@ def main():
         return torch.stack(rows, dim=0)
 
     finetune_summary = None
+    semantic_bank_loaded_accepted_rows: List[Dict[str, object]] = []
 
     def apply_finetune_warm_start():
-        nonlocal finetune_summary
+        nonlocal finetune_summary, semantic_bank_loaded_accepted_rows
         ft_cfg = cfg.get("finetune", {})
         if not bool(ft_cfg.get("enable", False)):
             return
@@ -2383,12 +3250,42 @@ def main():
                     gate.load_cluster_state(k, source_gate.get_cluster_state(src_k))
 
         if bool(ft_cfg.get("load_pred_residual", False)) and pred_residual is not None:
+            if pred_residual_semantic_output_head_scope == "per_cluster":
+                release_meta = meta.get("semantic_bank_independent_selection", {}) or {}
+                if pred_residual_semantic_bank_stage1:
+                    semantic_bank_loaded_accepted_rows = (
+                        _validate_semantic_partial_metadata(
+                            release_meta,
+                            penalty_names=penalty_names,
+                            next_active_penalty=pred_residual_semantic_active_penalty,
+                            source_state=ckpt["pred_residual_state"],
+                            source_contract=meta.get("pred_residual_contract") or {},
+                        )
+                    )
+                else:
+                    _validate_semantic_release_metadata(
+                        release_meta,
+                        penalty_names=penalty_names,
+                        source_state=ckpt["pred_residual_state"],
+                        source_contract=meta.get("pred_residual_contract") or {},
+                    )
             loaded_pred_residual_state = _load_finetune_pred_residual_state(
                 pred_residual=pred_residual,
                 checkpoint=ckpt,
                 source_penalty_names=source_penalty_names,
                 target_penalty_names=penalty_names,
                 strict=bool(ft_cfg.get("strict_pred_residual", True)),
+                source_contract=meta.get("pred_residual_contract"),
+                target_contract=pred_residual_contract,
+                source_training_provenance=meta.get(
+                    "pred_residual_training_provenance"
+                ),
+                require_training_provenance=bool(
+                    ft_cfg.get(
+                        "require_pred_residual_training_provenance",
+                        False,
+                    )
+                ),
             )
             if not loaded_pred_residual_state:
                 raise ValueError(f"Fine-tune checkpoint is missing pred_residual_state: {ckpt_path}")
@@ -2511,6 +3408,10 @@ def main():
             "partial_model_state": partial_model_state,
             "partial_model_load": partial_model_summary,
             "loaded_pred_residual": bool(loaded_pred_residual_state),
+            "loaded_accepted_penalties": [
+                str(row["penalty"])
+                for row in semantic_bank_loaded_accepted_rows
+            ],
         }
         print(f"Fine-tune warm start loaded from: {ckpt_path}")
         print(f"Fine-tune target->source cluster map: {finetune_summary['target_to_source_cluster']}")
@@ -2538,8 +3439,27 @@ def main():
             f"learnable_params={periodic_anchor_source_frozen_params}"
         )
     frozen_adapter_bank_params = 0
+    semantic_frozen_consumer_trainability: Dict[str, object] = {}
     if pred_residual_freeze_adapter_bank and pred_residual is not None:
-        frozen_adapter_bank_params = _freeze_module_params(pred_residual)
+        if pred_residual_semantic_output_head_scope == "per_cluster":
+            if not bool((finetune_summary or {}).get("loaded_pred_residual", False)):
+                raise RuntimeError(
+                    "Per-cluster frozen consumer must load the complete semantic bank before freezing."
+                )
+            frozen_consumer = _freeze_semantic_frozen_consumer(pred_residual)
+            semantic_frozen_consumer_trainability = dict(frozen_consumer)
+            frozen_adapter_bank_params = int(frozen_consumer["frozen_params"])
+            frozen_ids = set()
+            for p in range(P):
+                for param in pred_residual.get_penalty_body_params(p):
+                    if id(param) in frozen_ids:
+                        raise RuntimeError("Per-cluster semantic body freeze found duplicate ownership.")
+                    frozen_ids.add(id(param))
+            for p in range(P):
+                if any(param.requires_grad for param in pred_residual.get_penalty_body_params(p)):
+                    raise RuntimeError("Per-cluster semantic body was not completely frozen.")
+        else:
+            frozen_adapter_bank_params = _freeze_module_params(pred_residual)
         print(f"Prediction adapter bank frozen for gate training: params={frozen_adapter_bank_params}")
 
     freeze_backbone = bool(moe_cfg.get("freeze_backbone", cfg.get("train", {}).get("freeze_backbone", False)))
@@ -2557,6 +3477,144 @@ def main():
                 "Frozen backbone stays in eval mode during MoE training "
                 "so dropout cannot perturb gate utility targets."
             )
+
+    if penalty_scale_source == "frozen_backbone_patch":
+        if not (freeze_backbone and pred_residual_require_pure_backbone_base):
+            raise ValueError(
+                "frozen_backbone_patch penalty statistics require a frozen pure-backbone base."
+            )
+        patch_len = int(pred_residual_candidate_supervision_need_patch_len)
+        if patch_len <= 0 or H % patch_len != 0:
+            raise ValueError(
+                "frozen_backbone_patch penalty statistics require need_patch_len to divide pred_len."
+            )
+        was_training = model.training
+        model.eval()
+        values_by_penalty: List[List[torch.Tensor]] = [[] for _ in range(P)]
+        source_windows = 0
+        with torch.no_grad():
+            for x_stats, y_stats, _ in dl_tr_source:
+                x_stats = x_stats.to(device, non_blocking=True)
+                y_stats = y_stats.to(device, non_blocking=True)
+                y_base_stats = model(x_stats, cluster_id_c)
+                source_windows += int(x_stats.shape[0])
+                for p, name in enumerate(penalty_names):
+                    patch_values = _patchwise_penalty_bcq(
+                        y_base_stats,
+                        y_stats,
+                        penalty_fns[name],
+                        patch_len=patch_len,
+                    )
+                    values_by_penalty[p].append(
+                        patch_values.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+                    )
+        if was_training and not frozen_backbone_eval_mode:
+            model.train()
+        scale_values: List[float] = []
+        threshold_values: List[float] = []
+        coverage_values: List[float] = []
+        distribution_by_name: Dict[str, object] = {}
+        source_units = 0
+        quantile = float(pred_residual_candidate_supervision_need_quantile)
+        for p, name in enumerate(penalty_names):
+            if not values_by_penalty[p]:
+                raise RuntimeError("No train-only units were available for frozen-backbone penalty statistics.")
+            values = torch.cat(values_by_penalty[p], dim=0)
+            source_units = int(values.numel())
+            positive = values[values > 0.0]
+            if int(positive.numel()) > 0:
+                scale_value = max(float(positive.mean().item()), float(penalty_scale_floor))
+            else:
+                scale_value = float(penalty_scale_floor)
+            normalized = values / scale_value
+            threshold_value = float(
+                torch.quantile(
+                    normalized,
+                    quantile,
+                    interpolation="linear",
+                ).item()
+            )
+            coverage_value = float((normalized >= threshold_value).to(torch.float64).mean().item())
+            scale_values.append(scale_value)
+            threshold_values.append(threshold_value)
+            coverage_values.append(coverage_value)
+            distribution_by_name[name] = {
+                "count": int(values.numel()),
+                "positive_count": int(positive.numel()),
+                "raw_mean": float(values.mean().item()),
+                "raw_positive_mean": (
+                    float(positive.mean().item()) if int(positive.numel()) > 0 else None
+                ),
+                "normalized_quantiles": {
+                    str(q): float(
+                        torch.quantile(normalized, q, interpolation="linear").item()
+                    )
+                    for q in (0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0)
+                },
+            }
+        penalty_scale = torch.tensor(scale_values, device=device, dtype=torch.float32)
+        penalty_need_threshold = torch.tensor(
+            threshold_values,
+            device=device,
+            dtype=torch.float32,
+        )
+        penalty_need_statistics_summary.update(
+            {
+                "source": "train_only_frozen_pure_backbone",
+                "source_window_range": [0, int(len(dtr))],
+                "source_windows": int(source_windows),
+                "source_units": int(source_units),
+                "patch_len": int(patch_len),
+                "scale_rule": "float64 mean of positive exact patch penalties, floored",
+                "threshold_rule": "torch.quantile(normalized_defect, q, interpolation=linear)",
+                "scale": {
+                    name: float(scale_values[p]) for p, name in enumerate(penalty_names)
+                },
+                "threshold": {
+                    name: float(threshold_values[p]) for p, name in enumerate(penalty_names)
+                },
+                "coverage": {
+                    name: float(coverage_values[p]) for p, name in enumerate(penalty_names)
+                },
+                "distribution": distribution_by_name,
+                "test_read": False,
+            }
+        )
+        stats_path = os.path.join(out_dir, "semantic_bank_train_penalty_statistics.json")
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(penalty_need_statistics_summary, f, ensure_ascii=False, indent=2)
+        penalty_need_statistics_summary["artifact_path"] = stats_path
+        print(
+            "Frozen pure-backbone penalty statistics: "
+            f"scales={penalty_need_statistics_summary['scale']}, "
+            f"thresholds={penalty_need_statistics_summary['threshold']}"
+        )
+
+    semantic_bank_frozen_gate_params = 0
+    semantic_bank_frozen_nonbody_params = 0
+    semantic_bank_trainable_body_names: List[str] = []
+    semantic_bank_frozen_nonbody_names: List[str] = []
+    if pred_residual_semantic_bank_stage1:
+        if pred_residual is None:
+            raise RuntimeError("semantic_bank_stage1 requires a prediction residual module.")
+        semantic_bank_frozen_gate_params = _freeze_module_params(gate)
+        body_only = _configure_semantic_bank_body_only(
+            pred_residual,
+            active_penalty_index=semantic_bank_active_penalty_index,
+        )
+        semantic_bank_trainable_body_names = list(body_only["trainable"])
+        semantic_bank_frozen_nonbody_names = list(body_only["frozen"])
+        param_by_name = dict(pred_residual.named_parameters())
+        semantic_bank_frozen_nonbody_params = int(sum(
+            param_by_name[name].numel() for name in semantic_bank_frozen_nonbody_names
+        ))
+        print(
+            "Semantic bank body-only training: "
+            f"frozen_gate_params={semantic_bank_frozen_gate_params}, "
+            f"frozen_nonbody_params={semantic_bank_frozen_nonbody_params}, "
+            f"trainable={semantic_bank_trainable_body_names}, "
+            f"frozen={semantic_bank_frozen_nonbody_names}"
+        )
     patch_router_replaces_cluster_gate = bool(
         pred_residual is not None and getattr(pred_residual, "patch_router", None) is not None
     )
@@ -2566,6 +3624,20 @@ def main():
         print(
             "Input patch router replaces cluster gate for prediction residual routing: "
             f"frozen_gate_params={frozen_cluster_gate_for_patch_router}"
+        )
+    semantic_consumer_router_trainable_names: List[str] = []
+    if (
+        pred_residual is not None
+        and pred_residual_semantic_output_head_scope == "per_cluster"
+        and not pred_residual_semantic_bank_stage1
+    ):
+        semantic_consumer_router_trainable_names = _assert_semantic_patch_router_only_trainable(
+            model=model,
+            gate=gate,
+            pred_residual=pred_residual,
+            dynamic_lambda=dynamic_lambda,
+            learnable_lambda=learnable_lambda,
+            learnable_output_anchor=learnable_output_anchor,
         )
     patch_router_pairwise_frozen_other_params = 0
     patch_router_pairwise_frozen_reference: Dict[str, torch.Tensor] = {}
@@ -2673,6 +3745,76 @@ def main():
             ),
         }
 
+    semantic_bank_params_by_penalty: List[List[nn.Parameter]] = []
+    semantic_bank_param_names_by_penalty: List[List[str]] = []
+    semantic_level_disjoint_params_by_group: Dict[str, List[nn.Parameter]] = {}
+    semantic_level_disjoint_names_by_group: Dict[str, List[str]] = {}
+    if pred_residual_semantic_bank_stage1:
+        if pred_residual is None:
+            raise RuntimeError("semantic bank independent optimization requires pred_residual.")
+        name_by_id = {
+            id(param): name for name, param in pred_residual.named_parameters()
+        }
+        seen_semantic_param_ids = set()
+        for p, name in enumerate(penalty_names):
+            params_p = [
+                param
+                for param in pred_residual.get_penalty_body_params(p)
+                if param.requires_grad
+            ]
+            is_active_penalty = p == semantic_bank_active_penalty_index
+            if is_active_penalty and not params_p:
+                raise RuntimeError(f"semantic expert {name} has no trainable body parameters.")
+            if not is_active_penalty and params_p:
+                raise RuntimeError(
+                    f"inactive semantic expert {name} unexpectedly has trainable parameters."
+                )
+            ids_p = {id(param) for param in params_p}
+            overlap = seen_semantic_param_ids.intersection(ids_p)
+            if overlap:
+                raise RuntimeError(
+                    f"semantic expert {name} shares optimizer parameters with another penalty."
+                )
+            seen_semantic_param_ids.update(ids_p)
+            semantic_bank_params_by_penalty.append(params_p)
+            semantic_bank_param_names_by_penalty.append(
+                [name_by_id[id(param)] for param in params_p]
+            )
+        all_trainable_ids = {
+            id(param) for param in pred_residual.parameters() if param.requires_grad
+        }
+        if seen_semantic_param_ids != all_trainable_ids:
+            raise RuntimeError(
+                "semantic bank optimizer ownership does not exactly cover all trainable bodies."
+            )
+        if pred_residual_semantic_level_separate_need_gate:
+            if pred_residual_semantic_active_penalty != "level":
+                raise RuntimeError("disjoint LEVEL gate optimization is level-only.")
+            amplitude_params = list(pred_residual.get_level_amplitude_params())
+            need_gate_params = list(pred_residual.get_level_need_gate_params())
+            amplitude_ids = {id(param) for param in amplitude_params}
+            need_gate_ids = {id(param) for param in need_gate_params}
+            if not amplitude_params or not need_gate_params or amplitude_ids & need_gate_ids:
+                raise RuntimeError("LEVEL amplitude and need-gate parameter groups must be nonempty/disjoint.")
+            active_ids = {
+                id(param)
+                for param in semantic_bank_params_by_penalty[
+                    int(semantic_bank_active_penalty_index)
+                ]
+            }
+            if amplitude_ids | need_gate_ids != active_ids:
+                raise RuntimeError(
+                    "LEVEL disjoint optimizer groups must exactly cover the active body."
+                )
+            semantic_level_disjoint_params_by_group = {
+                "amplitude": amplitude_params,
+                "need_gate": need_gate_params,
+            }
+            semantic_level_disjoint_names_by_group = {
+                group: [name_by_id[id(param)] for param in params]
+                for group, params in semantic_level_disjoint_params_by_group.items()
+            }
+
     cluster_params = []
     cluster_param_groups = []
     stage2_trainable_param_counts = []
@@ -2690,9 +3832,26 @@ def main():
             and (not patch_router_replaces_cluster_gate)
             and not (bilevel_enable and bilevel_optimize_gate)
         ):
-            gate_params_k.extend(_gate_cluster_params(gate, k))
-        if pred_residual is not None and (not learnable_output_anchor_anchor_only):
-            pred_residual_params_k.extend(pred_residual.get_cluster_params(k))
+            gate_params_k.extend(
+                param for param in _gate_cluster_params(gate, k) if param.requires_grad
+            )
+        if (
+            pred_residual is not None
+            and (not learnable_output_anchor_anchor_only)
+            and not pred_residual_semantic_bank_stage1
+        ):
+            pred_residual_params_k.extend(
+                param for param in pred_residual.get_cluster_params(k) if param.requires_grad
+            )
+        pred_residual_count_k = int(sum(param.numel() for param in pred_residual_params_k))
+        if pred_residual_semantic_bank_stage1 and k == 0:
+            pred_residual_count_k = int(
+                sum(
+                    param.numel()
+                    for params_p in semantic_bank_params_by_penalty
+                    for param in params_p
+                )
+            )
         if dynamic_lambda is not None and (not bilevel_enable) and (not learnable_output_anchor_anchor_only):
             dynamic_lambda_params_k.extend(dynamic_lambda.get_cluster_params(k))
         if learnable_lambda is not None and (not bilevel_enable) and (not learnable_output_anchor_anchor_only):
@@ -2704,7 +3863,7 @@ def main():
                 "cluster_id": int(k),
                 "backbone": int(sum(param.numel() for param in base_params_k)),
                 "gate": int(sum(param.numel() for param in gate_params_k)),
-                "pred_residual": int(sum(param.numel() for param in pred_residual_params_k)),
+                "pred_residual": pred_residual_count_k,
                 "dynamic_lambda": int(sum(param.numel() for param in dynamic_lambda_params_k)),
                 "learnable_lambda": int(sum(param.numel() for param in learnable_lambda_params_k)),
                 "learnable_output_anchor": int(sum(param.numel() for param in learnable_anchor_params_k)),
@@ -2752,6 +3911,127 @@ def main():
         )
         for param_groups_k in cluster_param_groups
     ]
+    semantic_bank_optimizers_p: List[Optional[torch.optim.Optimizer]] = []
+    semantic_bank_optimizer_identity_p: List[str] = []
+    semantic_level_need_gate_optimizer: Optional[torch.optim.Optimizer] = None
+    if pred_residual_semantic_bank_stage1:
+        residual_wd = pred_residual_weight_decay
+        if residual_wd is None:
+            residual_wd = (
+                moe_weight_decay
+                if moe_weight_decay is not None
+                else float(cfg["train"]["weight_decay"])
+            )
+        semantic_level_amplitude_lr = float(
+            pred_residual_semantic_level_amplitude_lr_raw
+            if pred_residual_semantic_level_amplitude_lr_raw is not None
+            else cfg["train"]["lr"]
+        )
+        semantic_level_amplitude_weight_decay = float(
+            pred_residual_semantic_level_amplitude_weight_decay_raw
+            if pred_residual_semantic_level_amplitude_weight_decay_raw is not None
+            else residual_wd
+        )
+        for p, name in enumerate(penalty_names):
+            if p != semantic_bank_active_penalty_index:
+                semantic_bank_optimizers_p.append(None)
+                semantic_bank_optimizer_identity_p.append("frozen_inactive")
+                continue
+            optimizer_params = (
+                semantic_level_disjoint_params_by_group["amplitude"]
+                if pred_residual_semantic_level_separate_need_gate
+                else semantic_bank_params_by_penalty[p]
+            )
+            if pred_residual_semantic_level_separate_need_gate:
+                level_optimizers = _make_semantic_level_disjoint_optimizers(
+                    optimizer_params,
+                    semantic_level_disjoint_params_by_group["need_gate"],
+                    amplitude_optimizer_name=(
+                        pred_residual_semantic_level_amplitude_optimizer_name
+                    ),
+                    amplitude_lr=semantic_level_amplitude_lr,
+                    amplitude_weight_decay=(
+                        semantic_level_amplitude_weight_decay
+                    ),
+                    need_gate_lr=float(cfg["train"]["lr"]),
+                    need_gate_weight_decay=float(residual_wd),
+                )
+                optimizer_p = level_optimizers["amplitude"]
+                semantic_level_need_gate_optimizer = level_optimizers["need_gate"]
+            else:
+                optimizer_p = torch.optim.SGD(
+                    [
+                        {
+                            "params": optimizer_params,
+                            "weight_decay": float(residual_wd),
+                        }
+                    ],
+                    lr=float(cfg["train"]["lr"]),
+                    momentum=0.0,
+                    dampening=0.0,
+                    nesterov=False,
+                )
+                for group in optimizer_p.param_groups:
+                    group.setdefault("initial_lr", float(group["lr"]))
+            semantic_bank_optimizers_p.append(optimizer_p)
+            identity_fields = [name, *semantic_bank_param_names_by_penalty[p]]
+            if pred_residual_semantic_level_separate_need_gate:
+                identity_fields.extend([
+                    "disjoint_groups=amplitude,need_gate",
+                    *(
+                        "amplitude:" + param_name
+                        for param_name in semantic_level_disjoint_names_by_group["amplitude"]
+                    ),
+                    *(
+                        "need_gate:" + param_name
+                        for param_name in semantic_level_disjoint_names_by_group["need_gate"]
+                    ),
+                    "gradient_clip=independent_per_group",
+                ])
+                identity_fields.extend(
+                    _semantic_level_optimizer_identity_fields(
+                        amplitude_optimizer_name=(
+                            pred_residual_semantic_level_amplitude_optimizer_name
+                        ),
+                        amplitude_lr=semantic_level_amplitude_lr,
+                        amplitude_weight_decay=(
+                            semantic_level_amplitude_weight_decay
+                        ),
+                        need_gate_lr=float(cfg["train"]["lr"]),
+                        need_gate_weight_decay=float(residual_wd),
+                    )
+                )
+            if pred_residual_semantic_raw_gradient_accumulation:
+                identity_fields.extend(
+                    [
+                        "raw_gradient_accumulation=mean_then_clip",
+                        "microbatches="
+                        + str(pred_residual_semantic_raw_gradient_microbatches),
+                        "tail=actual_count",
+                    ]
+                )
+            identity_payload = "|".join(identity_fields).encode("utf-8")
+            semantic_bank_optimizer_identity_p.append(
+                hashlib.sha256(identity_payload).hexdigest()
+            )
+        if pred_residual_semantic_raw_gradient_accumulation:
+            print(
+                "Semantic level optimizer: mode="
+                + (
+                    "disjoint_amplitude_need_gate_mean_then_clip"
+                    if pred_residual_semantic_level_separate_need_gate
+                    else "raw_gradient_mean_then_clip"
+                )
+                + ", "
+                f"target_microbatches={pred_residual_semantic_raw_gradient_microbatches}, "
+                "missing_gradient=zero, tail=actual_count, "
+                f"amplitude_optimizer={pred_residual_semantic_level_amplitude_optimizer_name}, "
+                f"amplitude_lr={semantic_level_amplitude_lr:.8g}, "
+                f"amplitude_weight_decay={semantic_level_amplitude_weight_decay:.8g}, "
+                f"need_gate_optimizer=sgd, need_gate_lr={float(cfg['train']['lr']):.8g}, "
+                f"need_gate_weight_decay={float(residual_wd):.8g}, "
+                "weight_decay=once_per_step"
+            )
     for opt_k in optimizers:
         if opt_k is None:
             continue
@@ -2763,6 +4043,11 @@ def main():
         sched_cfg.get("warmup_start_factor", cfg["train"].get("lr_warmup_start_factor", 0.1))
     )
     sched_name = str(sched_cfg.get("name", "none")).lower()
+    if pred_residual_semantic_bank_stage1 and sched_name not in {"none", "off", "disabled"}:
+        raise ValueError(
+            "semantic_bank_stage1 independent optimization requires a deterministic "
+            "loss-independent scheduler (name=none)."
+        )
     if sched_name in {"plateau", "reduce", "reduce_on_plateau"}:
         schedulers = [
             (
@@ -3238,6 +4523,23 @@ def main():
             "candidate_supervision_forecast_mse_weight": float(
                 pred_residual_candidate_supervision_forecast_mse_weight
             ),
+            "candidate_supervision_need_patch_len": int(
+                pred_residual_candidate_supervision_need_patch_len
+            ),
+            "candidate_supervision_need_quantile": float(
+                pred_residual_candidate_supervision_need_quantile
+            ),
+            "candidate_supervision_noop_weight": float(
+                pred_residual_candidate_supervision_noop_weight
+            ),
+            "need_weighted_penalty_statistics": dict(penalty_need_statistics_summary),
+            "require_pure_backbone_base": bool(pred_residual_require_pure_backbone_base),
+            "semantic_bank_stage1": bool(pred_residual_semantic_bank_stage1),
+            "semantic_bank_frozen_gate_params": int(semantic_bank_frozen_gate_params),
+            "semantic_bank_frozen_nonbody_params": int(semantic_bank_frozen_nonbody_params),
+            "semantic_bank_trainable_body_names": list(semantic_bank_trainable_body_names),
+            "semantic_bank_frozen_nonbody_names": list(semantic_bank_frozen_nonbody_names),
+            "semantic_output_head_scope": str(pred_residual_semantic_output_head_scope),
             "candidate_supervision_min_abs_improvement": float(pred_residual_candidate_supervision_min_abs),
             "candidate_supervision_min_rel_improvement": float(pred_residual_candidate_supervision_min_rel),
             "candidate_supervision_only_allowed": bool(pred_residual_candidate_supervision_only_allowed),
@@ -3252,11 +4554,21 @@ def main():
                 else False
             ),
             "frozen_adapter_bank_params": int(frozen_adapter_bank_params),
+            "semantic_frozen_consumer_trainability": dict(
+                semantic_frozen_consumer_trainability
+            ),
+            "semantic_consumer_router_trainable_names": list(
+                semantic_consumer_router_trainable_names
+            ),
             "named_output_projection_enable": bool(named_output_projection_enable),
             "named_output_projection_fixed_alpha": bool(named_output_projection_fixed_alpha),
             "named_output_projection_scale_by_name": dict(named_output_projection_scale_by_name),
             "named_output_projection_carrier_names": list(named_output_projection_carrier_names),
             "named_output_projection_patch_len": int(named_output_projection_patch_len),
+            "named_output_projection_mode": str(named_output_projection_mode),
+            "named_output_projection_diff_amp_max": float(
+                named_output_projection_diff_amp_max
+            ),
             "periodic_anchor_expert": {
                 "enable": bool(periodic_anchor_expert_enable),
                 "role": "reserved_always_on" if periodic_anchor_expert_enable else None,
@@ -3780,6 +5092,7 @@ def main():
                 query_start_abs_b=query_start_abs_b,
                 fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
+            _assert_pure_candidate_base(pred_out, y_base, stage="residual_summary")
             y_final = pred_out["y_final"]
             terms = _pred_residual_loss_terms(
                 pred_out=pred_out,
@@ -4200,6 +5513,796 @@ def main():
         return cfg_summary
 
     @torch.no_grad()
+    def collect_semantic_bank_candidate_audit(
+        loader: DataLoader,
+        *,
+        eval_start: int,
+        split_name: str,
+        split_window_count: int,
+        include_level_oracle_diagnostic: bool = False,
+    ) -> Dict[str, object]:
+        split = str(split_name).strip().lower()
+        if split not in {"train", "val"}:
+            raise ValueError("semantic bank candidate audit split must be train or val.")
+        window_count = int(split_window_count)
+        audit: Dict[str, object] = {
+            "enabled": bool(pred_residual_semantic_bank_stage1),
+            "split": split,
+            "patch_len": int(pred_residual_candidate_supervision_need_patch_len),
+            "test_read": False,
+        }
+        if not pred_residual_semantic_bank_stage1:
+            return audit
+        if window_count <= 0:
+            raise ValueError("semantic bank candidate audit split_window_count must be positive.")
+        loader_window_count = int(len(loader.dataset))
+        if loader_window_count != window_count:
+            raise ValueError(
+                "semantic bank candidate audit split_window_count must match "
+                f"the loader dataset: {window_count} != {loader_window_count}."
+            )
+        audit.update(
+            {
+                "split_window_count": window_count,
+                "training_mutation": False,
+                "selection_effect": False,
+            }
+        )
+        if pred_residual_semantic_level_acceptance_candidate_source != "executed":
+            audit["level_acceptance_candidate"] = str(
+                pred_residual_semantic_level_acceptance_candidate_source
+            )
+        if pred_residual is None or penalty_need_threshold is None or len(loader) == 0:
+            audit.update({"all_pass": False, "reason": "missing_model_threshold_or_loader"})
+            return audit
+        patch_len = int(pred_residual_candidate_supervision_need_patch_len)
+        totals = [
+            {
+                "high_count": 0.0,
+                "low_count": 0.0,
+                "high_base_penalty": 0.0,
+                "high_candidate_penalty": 0.0,
+                "high_base_mse": 0.0,
+                "high_candidate_mse": 0.0,
+                "low_base_mse": 0.0,
+                "low_candidate_mse": 0.0,
+                "high_correction_sq_sum": 0.0,
+                "low_correction_sq_sum": 0.0,
+                "high_correction_numel": 0.0,
+                "low_correction_numel": 0.0,
+                "high_improved_count": 0.0,
+                "high_relative_gain_parts": [],
+                "min_high_need_improved_fraction": float(
+                    pred_residual_semantic_min_improved_fraction
+                ),
+            }
+            for _ in range(P)
+        ]
+        temporal_totals = [
+            [
+                {
+                    "high_count": 0.0,
+                    "high_base_penalty": 0.0,
+                    "high_candidate_penalty": 0.0,
+                }
+                for _ in range(pred_residual_semantic_validation_blocks)
+            ]
+            for _ in range(P)
+        ]
+        level_oracle_parts: Optional[Dict[str, object]] = None
+        level_penalty_index: Optional[int] = None
+        if bool(include_level_oracle_diagnostic):
+            if "level" not in penalty_names:
+                raise ValueError("LEVEL oracle diagnostic requires a level penalty.")
+            level_penalty_index = int(penalty_names.index("level"))
+            level_oracle_parts = {
+                "base_penalty": [],
+                "normalized_base_penalty": [],
+                "oracle_correction": [],
+                "raw_amplitude": [],
+                "raw_signed_ratio": [],
+                "raw_absolute_ratio": [],
+                "adapter_correction": [],
+                "signed_ratio": [],
+                "absolute_ratio": [],
+                "adapter_semantic_gain": [],
+                "oracle_gain_base_mse_ratio": [],
+                "sign_agreement_count": 0,
+                "raw_sign_agreement_count": 0,
+                "ratio_valid_count": 0,
+                "need_tp": 0,
+                "need_fp": 0,
+                "need_tn": 0,
+                "need_fn": 0,
+                "need_probability": [],
+                "count": 0,
+                "base_penalty_consistency_error_max": 0.0,
+                "oracle_penalty_sum": 0.0,
+                "oracle_penalty_max": 0.0,
+                "oracle_mse_gain_identity_error_sum": 0.0,
+                "oracle_mse_gain_identity_error_max": 0.0,
+                "exemplar_base_penalty": float("-inf"),
+                "exemplar": None,
+                "acceptance_candidate_source": str(
+                    pred_residual_semantic_level_acceptance_candidate_source
+                ),
+            }
+        model.eval()
+        pred_residual.eval()
+        for x_audit, y_audit, idx_audit in loader:
+            x_audit = x_audit.to(device, non_blocking=True)
+            y_audit = y_audit.to(device, non_blocking=True)
+            query_start = int(eval_start) + idx_audit.to(
+                device=device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+            relative_window_index = idx_audit.to(device=device, dtype=torch.long)
+            block_index_b = _semantic_bank_temporal_block_indices(
+                relative_window_index,
+                split_window_count=window_count,
+                block_count=pred_residual_semantic_validation_blocks,
+            )
+            y_base = _eval_path_base_prediction(x_audit, query_start)
+            route = torch.ones(
+                int(x_audit.shape[0]),
+                K,
+                P,
+                device=device,
+                dtype=y_base.dtype,
+            )
+            pred_out = pred_residual(
+                x_audit,
+                y_base,
+                cluster_id_c,
+                route,
+                skip_bk=None,
+                query_start_abs_b=query_start,
+                fixed_expert_delta_bch=None,
+            )
+            _assert_pure_candidate_base(pred_out, y_base, stage="semantic_bank_audit")
+            candidates = _pred_residual_candidate_predictions(
+                y_base,
+                pred_out,
+                include_intervention=False,
+                include_selector=False,
+                include_patch_route=False,
+            )
+            if candidates is None:
+                raise RuntimeError("semantic bank audit could not construct candidate predictions.")
+            batch, channels, horizon = y_base.shape
+            patches = horizon // patch_len
+            base_patch = y_base.reshape(batch, channels, patches, patch_len)
+            target_patch = y_audit.reshape(batch, channels, patches, patch_len)
+            base_mse = (base_patch - target_patch).square().mean(dim=-1)
+            for p, name in enumerate(penalty_names):
+                candidate = candidates[:, :, p, :]
+                candidate_patch = candidate.reshape(batch, channels, patches, patch_len)
+                executed_candidate_patch = candidate_patch
+                candidate_mse = (candidate_patch - target_patch).square().mean(dim=-1)
+                correction_sq = (candidate_patch - base_patch).square()
+                base_penalty = _patchwise_penalty_bcq(
+                    y_base,
+                    y_audit,
+                    penalty_fns[name],
+                    patch_len=patch_len,
+                )
+                candidate_penalty = _patchwise_penalty_bcq(
+                    candidate,
+                    y_audit,
+                    penalty_fns[name],
+                    patch_len=patch_len,
+                )
+                if (
+                    name == "level"
+                    and bool(
+                        pred_residual_semantic_level_controller_cfg.get(
+                            "enable",
+                            False,
+                        )
+                    )
+                ):
+                    if "level_amplitude_bcq" not in pred_out:
+                        raise RuntimeError(
+                            "LEVEL Stage-1 acceptance is missing level_amplitude_bcq."
+                        )
+                    if "level_executed_correction_bcq" not in pred_out:
+                        raise RuntimeError(
+                            "LEVEL Stage-1 acceptance is missing "
+                            "level_executed_correction_bcq."
+                        )
+                    raw_acceptance_amplitude = pred_out["level_amplitude_bcq"]
+                    executed_acceptance_correction = pred_out[
+                        "level_executed_correction_bcq"
+                    ]
+                    _validate_level_executed_candidate_patch(
+                        base_patch=base_patch,
+                        executed_candidate_patch=executed_candidate_patch,
+                        executed_correction_bcq=executed_acceptance_correction,
+                    )
+                    acceptance_candidate_patch = _level_stage1_acceptance_candidate_patch(
+                        base_patch=base_patch,
+                        executed_candidate_patch=executed_candidate_patch,
+                        raw_amplitude_bcq=raw_acceptance_amplitude,
+                        source=(
+                            pred_residual_semantic_level_acceptance_candidate_source
+                        ),
+                    )
+                    if (
+                        pred_residual_semantic_level_acceptance_candidate_source
+                        == "raw_amplitude"
+                    ):
+                        candidate_patch = acceptance_candidate_patch
+                        candidate = candidate_patch.reshape(batch, channels, horizon)
+                        candidate_mse = (
+                            candidate_patch - target_patch
+                        ).square().mean(dim=-1)
+                        correction_sq = (candidate_patch - base_patch).square()
+                        candidate_penalty = _patchwise_penalty_bcq(
+                            candidate,
+                            y_audit,
+                            penalty_fns[name],
+                            patch_len=patch_len,
+                        )
+                need = (
+                    base_penalty / penalty_scale[p].to(base_penalty)
+                    >= penalty_need_threshold[p].to(base_penalty)
+                )
+                low = ~need
+                if (
+                    level_oracle_parts is not None
+                    and level_penalty_index is not None
+                    and p == level_penalty_index
+                ):
+                    required_controller_outputs = {
+                        "level_amplitude_bcq",
+                        "level_need_probability_bcq",
+                        "level_need_hard_bcq",
+                        "level_executed_correction_bcq",
+                    }
+                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False)):
+                        missing_controller = sorted(
+                            required_controller_outputs - set(pred_out)
+                        )
+                        if missing_controller:
+                            raise RuntimeError(
+                                "LEVEL audit is missing controller outputs: "
+                                + ", ".join(missing_controller)
+                            )
+                        raw_amplitude_all = pred_out["level_amplitude_bcq"]
+                        need_probability_all = pred_out["level_need_probability_bcq"]
+                        need_hard_all = pred_out["level_need_hard_bcq"].to(dtype=torch.bool)
+                        executed_all = executed_acceptance_correction
+                        level_oracle_parts["need_probability"].append(
+                            need_probability_all.detach().cpu().reshape(-1)
+                        )
+                        level_oracle_parts["need_tp"] += int((need_hard_all & need).sum().item())
+                        level_oracle_parts["need_fp"] += int((need_hard_all & ~need).sum().item())
+                        level_oracle_parts["need_tn"] += int((~need_hard_all & ~need).sum().item())
+                        level_oracle_parts["need_fn"] += int((~need_hard_all & need).sum().item())
+                    else:
+                        raw_amplitude_all = (
+                            candidate_patch.mean(dim=-1) - base_patch.mean(dim=-1)
+                        )
+                        executed_all = raw_amplitude_all
+                    level_diag = _level_oracle_patch_diagnostics(
+                        base_patch,
+                        target_patch,
+                        candidate_patch,
+                    )
+                    high_count_level = int(need.sum().item())
+                    if high_count_level > 0:
+                        oracle_correction = level_diag["oracle_correction"][need]
+                        raw_amplitude = raw_amplitude_all[need]
+                        adapter_correction = level_diag["adapter_correction"][need]
+                        level_base_penalty = level_diag["base_penalty"][need]
+                        level_candidate_penalty = level_diag["candidate_penalty"][need]
+                        level_base_mse = level_diag["base_mse"][need]
+                        level_oracle_mse = level_diag["oracle_mse"][need]
+                        ratio_valid = oracle_correction.abs() > 1.0e-12
+                        signed_ratio = adapter_correction[ratio_valid] / oracle_correction[ratio_valid]
+                        absolute_ratio = adapter_correction[ratio_valid].abs() / oracle_correction[ratio_valid].abs()
+                        raw_signed_ratio = raw_amplitude[ratio_valid] / oracle_correction[ratio_valid]
+                        raw_absolute_ratio = raw_amplitude[ratio_valid].abs() / oracle_correction[ratio_valid].abs()
+                        semantic_gain = (
+                            level_base_penalty - level_candidate_penalty
+                        ) / level_base_penalty.clamp_min(1.0e-12)
+                        oracle_mse_gain = level_base_mse - level_oracle_mse
+                        oracle_gain_base_mse_ratio = (
+                            oracle_mse_gain / level_base_mse.clamp_min(1.0e-12)
+                        )
+                        tensor_parts = {
+                            "base_penalty": level_base_penalty,
+                            "normalized_base_penalty": (
+                                level_base_penalty / penalty_scale[p].to(level_base_penalty)
+                            ),
+                            "oracle_correction": oracle_correction,
+                            "raw_amplitude": raw_amplitude,
+                            "raw_signed_ratio": raw_signed_ratio,
+                            "raw_absolute_ratio": raw_absolute_ratio,
+                            "adapter_correction": adapter_correction,
+                            "signed_ratio": signed_ratio,
+                            "absolute_ratio": absolute_ratio,
+                            "adapter_semantic_gain": semantic_gain,
+                            "oracle_gain_base_mse_ratio": oracle_gain_base_mse_ratio,
+                        }
+                        for key, values in tensor_parts.items():
+                            level_oracle_parts[key].append(values.detach().cpu())
+                        level_oracle_parts["sign_agreement_count"] += int(
+                            ((adapter_correction[ratio_valid] * oracle_correction[ratio_valid]) > 0.0).sum().item()
+                        )
+                        level_oracle_parts["raw_sign_agreement_count"] += int(
+                            ((raw_amplitude[ratio_valid] * oracle_correction[ratio_valid]) > 0.0).sum().item()
+                        )
+                        level_oracle_parts["ratio_valid_count"] += int(ratio_valid.sum().item())
+                        level_oracle_parts["count"] += high_count_level
+                        consistency_error = (
+                            level_diag["base_penalty"] - base_penalty
+                        ).abs()[need]
+                        level_oracle_parts["base_penalty_consistency_error_max"] = max(
+                            float(level_oracle_parts["base_penalty_consistency_error_max"]),
+                            float(consistency_error.max().item()),
+                        )
+                        oracle_penalty_high = level_diag["oracle_penalty"][need]
+                        level_oracle_parts["oracle_penalty_sum"] += float(
+                            oracle_penalty_high.sum().item()
+                        )
+                        level_oracle_parts["oracle_penalty_max"] = max(
+                            float(level_oracle_parts["oracle_penalty_max"]),
+                            float(oracle_penalty_high.max().item()),
+                        )
+                        identity_error = level_diag[
+                            "oracle_mse_gain_identity_error"
+                        ][need]
+                        level_oracle_parts[
+                            "oracle_mse_gain_identity_error_sum"
+                        ] += float(identity_error.sum().item())
+                        level_oracle_parts[
+                            "oracle_mse_gain_identity_error_max"
+                        ] = max(
+                            float(
+                                level_oracle_parts[
+                                    "oracle_mse_gain_identity_error_max"
+                                ]
+                            ),
+                            float(identity_error.max().item()),
+                        )
+
+                        masked_base_penalty = base_penalty.masked_fill(
+                            ~need,
+                            float("-inf"),
+                        )
+                        batch_max = float(masked_base_penalty.max().item())
+                        if batch_max > float(
+                            level_oracle_parts["exemplar_base_penalty"]
+                        ):
+                            flat_index = int(masked_base_penalty.reshape(-1).argmax().item())
+                            exemplar_patch = flat_index % patches
+                            flat_index //= patches
+                            exemplar_channel = flat_index % channels
+                            exemplar_batch = flat_index // channels
+                            relative_window = int(idx_audit[exemplar_batch].item())
+                            oracle_patch = level_diag["oracle_patch"]
+                            level_oracle_parts["exemplar_base_penalty"] = batch_max
+                            level_oracle_parts["exemplar"] = {
+                                "split": split,
+                                "relative_window": relative_window,
+                                "absolute_query_start": int(eval_start) + relative_window,
+                                "channel_index": int(exemplar_channel),
+                                "channel_name": str(channel_names[exemplar_channel]),
+                                "patch_index": int(exemplar_patch),
+                                "horizon_start": int(exemplar_patch * patch_len),
+                                "horizon_end_exclusive": int(
+                                    (exemplar_patch + 1) * patch_len
+                                ),
+                                "base_mean": float(
+                                    level_diag["base_mean"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "target_mean": float(
+                                    level_diag["target_mean"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "candidate_mean": float(
+                                    level_diag["candidate_mean"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "adapter_correction": float(
+                                    level_diag["adapter_correction"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "raw_amplitude": float(
+                                    raw_amplitude_all[
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "need_probability": (
+                                    float(need_probability_all[
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item())
+                                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                                    else None
+                                ),
+                                "need_hard": (
+                                    bool(need_hard_all[
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item())
+                                    if bool(pred_residual_semantic_level_controller_cfg.get("enable", False))
+                                    else True
+                                ),
+                                "executed_correction": float(
+                                    executed_all[
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "oracle_correction": float(
+                                    level_diag["oracle_correction"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "base_penalty": float(
+                                    level_diag["base_penalty"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "candidate_penalty": float(
+                                    level_diag["candidate_penalty"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "oracle_penalty": float(
+                                    level_diag["oracle_penalty"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "base_mse": float(
+                                    level_diag["base_mse"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "candidate_mse": float(
+                                    level_diag["candidate_mse"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "oracle_mse": float(
+                                    level_diag["oracle_mse"][
+                                        exemplar_batch,
+                                        exemplar_channel,
+                                        exemplar_patch,
+                                    ].item()
+                                ),
+                                "base_patch": base_patch[
+                                    exemplar_batch,
+                                    exemplar_channel,
+                                    exemplar_patch,
+                                ].detach().cpu().tolist(),
+                                "target_patch": target_patch[
+                                    exemplar_batch,
+                                    exemplar_channel,
+                                    exemplar_patch,
+                                ].detach().cpu().tolist(),
+                                "candidate_patch": candidate_patch[
+                                    exemplar_batch,
+                                    exemplar_channel,
+                                    exemplar_patch,
+                                ].detach().cpu().tolist(),
+                                "oracle_patch": oracle_patch[
+                                    exemplar_batch,
+                                    exemplar_channel,
+                                    exemplar_patch,
+                                ].detach().cpu().tolist(),
+                            }
+                current = totals[p]
+                high_count = int(need.sum().item())
+                low_count = int(low.sum().item())
+                current["high_count"] += float(high_count)
+                current["low_count"] += float(low_count)
+                current["high_base_penalty"] += float(base_penalty[need].sum().item())
+                current["high_candidate_penalty"] += float(candidate_penalty[need].sum().item())
+                current["high_base_mse"] += float(base_mse[need].sum().item())
+                current["high_candidate_mse"] += float(candidate_mse[need].sum().item())
+                current["low_base_mse"] += float(base_mse[low].sum().item())
+                current["low_candidate_mse"] += float(candidate_mse[low].sum().item())
+                current["high_correction_sq_sum"] += float(
+                    correction_sq[need.unsqueeze(-1).expand_as(correction_sq)].sum().item()
+                )
+                current["low_correction_sq_sum"] += float(
+                    correction_sq[low.unsqueeze(-1).expand_as(correction_sq)].sum().item()
+                )
+                current["high_correction_numel"] += float(high_count * patch_len)
+                current["low_correction_numel"] += float(low_count * patch_len)
+                high_relative_gain = (
+                    (base_penalty - candidate_penalty)
+                    / base_penalty.clamp_min(1.0e-8)
+                )
+                current["high_improved_count"] += float(
+                    ((candidate_penalty < base_penalty) & need).sum().item()
+                )
+                current["high_relative_gain_parts"].append(
+                    high_relative_gain[need].detach().cpu()
+                )
+                for block_index in range(pred_residual_semantic_validation_blocks):
+                    block_mask = need & (
+                        block_index_b.view(batch, 1, 1) == block_index
+                    )
+                    block_row = temporal_totals[p][block_index]
+                    block_row["high_count"] += float(block_mask.sum().item())
+                    block_row["high_base_penalty"] += float(
+                        base_penalty[block_mask].sum().item()
+                    )
+                    block_row["high_candidate_penalty"] += float(
+                        candidate_penalty[block_mask].sum().item()
+                    )
+
+        for current in totals:
+            parts = current.pop("high_relative_gain_parts")
+            values = (
+                torch.cat(parts, dim=0).to(dtype=torch.float64)
+                if parts
+                else torch.empty(0, dtype=torch.float64)
+            )
+            current["high_relative_gain_quantiles"] = {
+                str(q): (
+                    float(torch.quantile(values, q).item())
+                    if int(values.numel()) > 0
+                    else float("nan")
+                )
+                for q in (0.1, 0.25, 0.5, 0.75, 0.9)
+            }
+        acceptance = _semantic_bank_semantic_only_acceptance_metrics(
+            totals_by_penalty=totals,
+            temporal_totals_by_penalty=temporal_totals,
+            penalty_names=penalty_names,
+            min_matching_gain_by_name=pred_residual_semantic_min_gain_by_name,
+            eps=1.0e-8,
+        )
+        audit.update(
+            {
+                "scale": {
+                    name: float(penalty_scale[p].detach().cpu().item())
+                    for p, name in enumerate(penalty_names)
+                },
+                "threshold": {
+                    name: float(penalty_need_threshold[p].detach().cpu().item())
+                    for p, name in enumerate(penalty_names)
+                },
+                **acceptance,
+            }
+        )
+        if level_oracle_parts is not None:
+            quantile_levels = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+
+            def diagnostic_values(key: str) -> torch.Tensor:
+                parts = level_oracle_parts[key]
+                return (
+                    torch.cat(parts, dim=0).to(dtype=torch.float64)
+                    if parts
+                    else torch.empty(0, dtype=torch.float64)
+                )
+
+            def diagnostic_quantiles(values: torch.Tensor) -> Dict[str, float]:
+                return {
+                    str(q): (
+                        float(torch.quantile(values, q).item())
+                        if int(values.numel()) > 0
+                        else float("nan")
+                    )
+                    for q in quantile_levels
+                }
+
+            base_penalty_values = diagnostic_values("base_penalty")
+            normalized_base_penalty_values = diagnostic_values(
+                "normalized_base_penalty"
+            )
+            oracle_correction_values = diagnostic_values("oracle_correction")
+            raw_amplitude_values = diagnostic_values("raw_amplitude")
+            adapter_correction_values = diagnostic_values("adapter_correction")
+
+            def prediction_fit(
+                prediction: torch.Tensor,
+                target: torch.Tensor,
+            ) -> Tuple[float, float, Dict[str, object]]:
+                if int(target.numel()) == 0 or prediction.shape != target.shape:
+                    return float("nan"), float("nan"), {
+                        "count": 0,
+                        "prediction_sum": 0.0,
+                        "prediction_squared_sum": 0.0,
+                        "target_sum": 0.0,
+                        "target_squared_sum": 0.0,
+                        "prediction_target_cross_sum": 0.0,
+                        "squared_error_sum": 0.0,
+                    }
+                sufficient = _prediction_fit_sufficient_statistics(
+                    prediction,
+                    target,
+                )
+                count = int(sufficient["count"])
+                prediction_centered_ss = max(
+                    float(sufficient["prediction_squared_sum"])
+                    - float(sufficient["prediction_sum"]) ** 2 / max(count, 1),
+                    0.0,
+                )
+                target_centered_ss = max(
+                    float(sufficient["target_squared_sum"])
+                    - float(sufficient["target_sum"]) ** 2 / max(count, 1),
+                    0.0,
+                )
+                centered_cross = (
+                    float(sufficient["prediction_target_cross_sum"])
+                    - float(sufficient["prediction_sum"])
+                    * float(sufficient["target_sum"])
+                    / max(count, 1)
+                )
+                correlation_denom = math.sqrt(
+                    prediction_centered_ss * target_centered_ss
+                )
+                pearson = (
+                    float(centered_cross / correlation_denom)
+                    if correlation_denom > 0.0
+                    else float("nan")
+                )
+                r2_zero = (
+                    1.0
+                    - float(sufficient["squared_error_sum"])
+                    / max(float(sufficient["target_squared_sum"]), 1.0e-12)
+                )
+                return pearson, r2_zero, sufficient
+
+            raw_oracle_pearson, raw_r2_vs_zero, raw_fit_sufficient = prediction_fit(
+                raw_amplitude_values,
+                oracle_correction_values,
+            )
+            adapter_oracle_pearson, adapter_r2_vs_zero, _ = prediction_fit(
+                adapter_correction_values,
+                oracle_correction_values,
+            )
+            base_penalty_sum = float(base_penalty_values.sum().item())
+            count_level = int(level_oracle_parts["count"])
+            need_tp = int(level_oracle_parts["need_tp"])
+            need_fp = int(level_oracle_parts["need_fp"])
+            need_tn = int(level_oracle_parts["need_tn"])
+            need_fn = int(level_oracle_parts["need_fn"])
+            need_total = need_tp + need_fp + need_tn + need_fn
+            audit["level_oracle_diagnostic"] = {
+                "enabled": True,
+                "target_usage": "final_audit_only",
+                "non_selecting": True,
+                "test_read": False,
+                **(
+                    {
+                        "acceptance_candidate_source": str(
+                            level_oracle_parts["acceptance_candidate_source"]
+                        )
+                    }
+                    if str(level_oracle_parts["acceptance_candidate_source"])
+                    != "executed"
+                    else {}
+                ),
+                "high_need_count": count_level,
+                "base_penalty_quantiles": diagnostic_quantiles(
+                    base_penalty_values
+                ),
+                "normalized_base_penalty_quantiles": diagnostic_quantiles(
+                    normalized_base_penalty_values
+                ),
+                "oracle_correction_quantiles": diagnostic_quantiles(
+                    oracle_correction_values
+                ),
+                "raw_amplitude_quantiles": diagnostic_quantiles(
+                    raw_amplitude_values
+                ),
+                "raw_signed_oracle_ratio_quantiles": diagnostic_quantiles(
+                    diagnostic_values("raw_signed_ratio")
+                ),
+                "raw_absolute_oracle_ratio_quantiles": diagnostic_quantiles(
+                    diagnostic_values("raw_absolute_ratio")
+                ),
+                "adapter_correction_quantiles": diagnostic_quantiles(
+                    adapter_correction_values
+                ),
+                "signed_adapter_oracle_ratio_quantiles": diagnostic_quantiles(
+                    diagnostic_values("signed_ratio")
+                ),
+                "absolute_adapter_oracle_ratio_quantiles": diagnostic_quantiles(
+                    diagnostic_values("absolute_ratio")
+                ),
+                "adapter_semantic_gain_quantiles": diagnostic_quantiles(
+                    diagnostic_values("adapter_semantic_gain")
+                ),
+                "oracle_gain_base_mse_ratio_quantiles": diagnostic_quantiles(
+                    diagnostic_values("oracle_gain_base_mse_ratio")
+                ),
+                "adapter_oracle_sign_agreement_fraction": (
+                    float(level_oracle_parts["sign_agreement_count"])
+                    / max(int(level_oracle_parts["ratio_valid_count"]), 1)
+                ),
+                "ratio_valid_count": int(level_oracle_parts["ratio_valid_count"]),
+                "raw_amplitude_oracle_pearson": raw_oracle_pearson,
+                "raw_amplitude_r2_vs_zero_correction": raw_r2_vs_zero,
+                "raw_amplitude_fit_sufficient_statistics": raw_fit_sufficient,
+                "raw_amplitude_oracle_sign_agreement_fraction": (
+                    float(level_oracle_parts["raw_sign_agreement_count"])
+                    / max(int(level_oracle_parts["ratio_valid_count"]), 1)
+                ),
+                "adapter_oracle_pearson": adapter_oracle_pearson,
+                "adapter_r2_vs_zero_correction": adapter_r2_vs_zero,
+                "need_gate": {
+                    "tp": need_tp,
+                    "fp": need_fp,
+                    "tn": need_tn,
+                    "fn": need_fn,
+                    "recall": float(need_tp) / max(need_tp + need_fn, 1),
+                    "precision": float(need_tp) / max(need_tp + need_fp, 1),
+                    "false_positive_rate": float(need_fp) / max(need_fp + need_tn, 1),
+                    "predicted_adoption_rate": float(need_tp + need_fp) / max(need_total, 1),
+                    "probability_quantiles": diagnostic_quantiles(
+                        diagnostic_values("need_probability")
+                    ),
+                },
+                "oracle_matching_penalty_gain": (
+                    1.0
+                    - float(level_oracle_parts["oracle_penalty_sum"])
+                    / max(base_penalty_sum, 1.0e-12)
+                ),
+                "base_penalty_consistency_error_max": float(
+                    level_oracle_parts[
+                        "base_penalty_consistency_error_max"
+                    ]
+                ),
+                "oracle_penalty_max": float(
+                    level_oracle_parts["oracle_penalty_max"]
+                ),
+                "oracle_mse_gain_identity_error_mean": (
+                    float(
+                        level_oracle_parts[
+                            "oracle_mse_gain_identity_error_sum"
+                        ]
+                    )
+                    / max(count_level, 1)
+                ),
+                "oracle_mse_gain_identity_error_max": float(
+                    level_oracle_parts[
+                        "oracle_mse_gain_identity_error_max"
+                    ]
+                ),
+                "strongest_need_exemplar": level_oracle_parts["exemplar"],
+            }
+        return audit
+
+    @torch.no_grad()
     def collect_patch_risk_calibration_tensors(
         loader: DataLoader,
         *,
@@ -4305,6 +6408,7 @@ def main():
                 query_start_abs_b=query_start_abs_b,
                 fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
+            _assert_pure_candidate_base(pred_out, y_base, stage="calibration_summary")
             selected_score_bcq = pred_out.get("patch_selected_risk_score_bcq")
             selected_penalty_bcq = pred_out.get("patch_selected_penalty_index_bcq")
             candidate_score_bcqp = pred_out.get(
@@ -4697,6 +6801,7 @@ def main():
                 query_start_abs_b=idx,
                 fixed_expert_delta_bch=fixed_expert_delta_bch,
             )
+            _assert_pure_candidate_base(pred_out, yhat_base, stage="compute_batch_terms")
             yhat_residual_raw = pred_out["y_final"]
             yhat = yhat_residual_raw
         else:
@@ -4799,6 +6904,25 @@ def main():
                 penalty_names=penalty_names,
                 penalty_fns=penalty_fns,
                 penalty_scale=penalty_scale,
+                penalty_need_threshold=penalty_need_threshold,
+                need_patch_len=pred_residual_candidate_supervision_need_patch_len,
+                level_need_positive_weight=(
+                    pred_residual_semantic_level_need_positive_weight
+                ),
+                noop_weight=pred_residual_candidate_supervision_noop_weight,
+                high_mse_relative_tolerance=(
+                    pred_residual_candidate_supervision_high_mse_relative_tolerance
+                ),
+                low_mse_relative_tolerance=(
+                    pred_residual_candidate_supervision_low_mse_relative_tolerance
+                ),
+                low_high_rms_ratio_max=(
+                    pred_residual_candidate_supervision_low_high_rms_ratio_max
+                ),
+                constraint_weight=(
+                    pred_residual_candidate_supervision_constraint_weight
+                ),
+                constraint_eps=pred_residual_candidate_supervision_constraint_eps,
                 allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                 only_allowed=pred_residual_candidate_supervision_only_allowed,
                 loss_kind=pred_residual_candidate_supervision_loss,
@@ -5439,6 +7563,14 @@ def main():
     stage2_route_audit_history: List[Dict[str, object]] = []
     overfit_diagnostic_history: List[Dict[str, object]] = []
     overfit_diagnostic_metric_epochs: List[int] = []
+    semantic_bank_independent_history: List[Dict[str, object]] = []
+    semantic_bank_best_by_penalty: List[Dict[str, object]] = (
+        _new_semantic_bank_best_candidates(penalty_names)
+    )
+    for loaded_row in semantic_bank_loaded_accepted_rows:
+        loaded_name = str(loaded_row["penalty"])
+        loaded_index = penalty_names.index(loaded_name)
+        semantic_bank_best_by_penalty[loaded_index] = loaded_row
     if overfit_diagnostic_range is not None:
         configured_metric_epochs = overfit_diagnostic_cfg.get(
             "metric_epochs",
@@ -5594,6 +7726,66 @@ def main():
 
     for ep in range(1, epochs + 1):
         t_ep0 = time.perf_counter()
+        semantic_loss_sum_p = torch.zeros(P, dtype=torch.float64)
+        semantic_grad_raw_sum_p = torch.zeros(P, dtype=torch.float64)
+        semantic_grad_clipped_sum_p = torch.zeros(P, dtype=torch.float64)
+        semantic_update_sum_p = torch.zeros(P, dtype=torch.float64)
+        semantic_component_names = (
+            (
+                "level_amplitude_loss",
+                "level_need_balanced_bce",
+            )
+            if pred_residual_candidate_supervision_loss
+            in {
+                "level_residual_separate_gate",
+                "level_residual_high_need_separate_gate",
+            }
+            else
+            (
+                "level_amplitude_loss",
+                "level_need_bce",
+                "level_executed_loss",
+            )
+            if pred_residual_candidate_supervision_loss == "level_residual_gate"
+            else
+            ("high_semantic_contribution",)
+            if pred_residual_candidate_supervision_loss
+            == "high_need_own_penalty"
+            else
+            (
+                "high_semantic_contribution",
+                "high_forecast_mse_contribution",
+                "low_noop_contribution",
+            )
+            if pred_residual_candidate_supervision_loss
+            == "need_weighted_own_penalty_mse"
+            else (
+                "high_semantic",
+                "high_forecast_mse",
+                "high_mse_violation",
+                "low_mse_violation",
+                "low_noop_violation",
+                "base_guard_objective",
+                "constraint_total",
+                "constraint_active",
+            )
+        )
+        semantic_component_sum_by_name_p = {
+            key: torch.zeros(P, dtype=torch.float64)
+            for key in semantic_component_names
+        }
+        semantic_step_count = 0
+        semantic_batch_count = 0
+        semantic_raw_gradient_pending_count = 0
+        semantic_raw_gradient_group_counts: List[int] = []
+        semantic_level_disjoint_metric_sums = {
+            group: {
+                "raw_gradient_l2": 0.0,
+                "clipped_gradient_l2": 0.0,
+                "parameter_update_l2": 0.0,
+            }
+            for group in semantic_level_disjoint_params_by_group
+        }
         if (
             patch_router_freeze_experts_after_warmup
             and not patch_router_expert_freeze_applied
@@ -5838,6 +8030,7 @@ def main():
                     query_start_abs_b=idx,
                     fixed_expert_delta_bch=fixed_expert_delta_bch,
                 )
+                _assert_pure_candidate_base(pred_out, yhat_base, stage="train_epoch")
                 yhat_residual_raw = pred_out["y_final"]
                 yhat = yhat_residual_raw
             else:
@@ -5937,8 +8130,10 @@ def main():
                     intervention_weight=pred_residual_intervention_weight,
                 )
                 candidate_supervision_loss_bk = None
+                candidate_supervision_loss_bkp = None
+                candidate_supervision_components_bkp = None
                 if pred_residual_candidate_supervision_weight > 0.0:
-                    candidate_supervision_loss_bk = _pred_residual_candidate_supervision_loss(
+                    candidate_supervision_raw = _pred_residual_candidate_supervision_loss(
                         y_base_bch=yhat_base,
                         pred_out=pred_out,
                         y_bch=y,
@@ -5947,8 +8142,32 @@ def main():
                         penalty_names=penalty_names,
                         penalty_fns=penalty_fns,
                         penalty_scale=penalty_scale,
+                        penalty_need_threshold=penalty_need_threshold,
+                        need_patch_len=pred_residual_candidate_supervision_need_patch_len,
+                        level_need_positive_weight=(
+                            pred_residual_semantic_level_need_positive_weight
+                        ),
+                        noop_weight=pred_residual_candidate_supervision_noop_weight,
+                        high_mse_relative_tolerance=(
+                            pred_residual_candidate_supervision_high_mse_relative_tolerance
+                        ),
+                        low_mse_relative_tolerance=(
+                            pred_residual_candidate_supervision_low_mse_relative_tolerance
+                        ),
+                        low_high_rms_ratio_max=(
+                            pred_residual_candidate_supervision_low_high_rms_ratio_max
+                        ),
+                        constraint_weight=(
+                            pred_residual_candidate_supervision_constraint_weight
+                        ),
+                        constraint_eps=pred_residual_candidate_supervision_constraint_eps,
                         allowed_mask_kp=cluster_penalty_allowed_mask_kp,
                         only_allowed=pred_residual_candidate_supervision_only_allowed,
+                        return_per_penalty=bool(
+                            pred_residual_semantic_bank_stage1
+                            and pred_residual_candidate_supervision_independent_optimization
+                        ),
+                        return_components=bool(pred_residual_semantic_bank_stage1),
                         loss_kind=pred_residual_candidate_supervision_loss,
                         forecast_mse_weight=(
                             pred_residual_candidate_supervision_forecast_mse_weight
@@ -5969,6 +8188,35 @@ def main():
                         train_residual_anchor_phc=train_residual_anchor_phc,
                         learnable_output_anchor=learnable_output_anchor,
                     )
+                    if candidate_supervision_raw is not None:
+                        if pred_residual_semantic_bank_stage1:
+                            if not isinstance(candidate_supervision_raw, dict):
+                                raise RuntimeError(
+                                    "semantic bank independent loss must expose loss/components."
+                                )
+                            candidate_supervision_loss_bkp = candidate_supervision_raw.get(
+                                "loss_bkp"
+                            )
+                            candidate_supervision_components_bkp = candidate_supervision_raw.get(
+                                "components_bkp"
+                            )
+                            if (
+                                not isinstance(candidate_supervision_loss_bkp, torch.Tensor)
+                                or candidate_supervision_loss_bkp.ndim != 3
+                                or not isinstance(candidate_supervision_components_bkp, dict)
+                            ):
+                                raise RuntimeError(
+                                    "semantic bank independent loss must expose [B,K,P] tensors."
+                                )
+                            candidate_supervision_loss_bk = candidate_supervision_loss_bkp[
+                                :, :, int(semantic_bank_active_penalty_index)
+                            ]
+                        else:
+                            if candidate_supervision_raw.ndim != 2:
+                                raise RuntimeError(
+                                    "legacy candidate supervision must expose [B,K]."
+                                )
+                            candidate_supervision_loss_bk = candidate_supervision_raw
                 intervention_supervision_loss_bk = None
                 if pred_residual_intervention_supervision_weight > 0.0:
                     intervention_supervision_loss_bk = _pred_residual_intervention_supervision_loss(
@@ -6149,6 +8397,11 @@ def main():
                         cluster_id_c=cluster_id_c,
                         K=K,
                         mae_weight=patch_router_mixture_mae_weight,
+                        allowed_penalty_mask_cp=(
+                            pred_residual.channel_penalty_allowed_mask_cp
+                            if pred_residual is not None
+                            else None
+                        ),
                     )
                     patch_mixture_component_bk = (
                         patch_router_mixture_mse_weight * patch_mixture_loss_bk
@@ -6702,20 +8955,191 @@ def main():
                 )
                 stage2_objective_overlap_batches.append(overlap_summary)
 
-            for opt_k in optimizers:
-                if opt_k is None:
-                    continue
-                opt_k.zero_grad(set_to_none=True)
-            loss.backward()
-
-            if grad_clip > 0:
-                for k, params_k in enumerate(cluster_params):
-                    if (
-                        len(params_k) == 0
-                        or not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters)
+            semantic_loss_p: List[torch.Tensor] = []
+            if pred_residual_semantic_bank_stage1:
+                if candidate_supervision_loss_bkp is None:
+                    raise RuntimeError(
+                        "semantic bank independent optimization requires per-expert loss exposure."
+                    )
+                if not isinstance(candidate_supervision_components_bkp, dict):
+                    raise RuntimeError(
+                        "semantic bank independent optimization requires per-expert components."
+                    )
+                if (
+                    not pred_residual_semantic_raw_gradient_accumulation
+                    or semantic_raw_gradient_pending_count == 0
+                ):
+                    for optimizer_p in semantic_bank_optimizers_p:
+                        if optimizer_p is not None:
+                            optimizer_p.zero_grad(set_to_none=True)
+                    if semantic_level_need_gate_optimizer is not None:
+                        semantic_level_need_gate_optimizer.zero_grad(set_to_none=True)
+                active_p = int(semantic_bank_active_penalty_index)
+                for p in [active_p]:
+                    loss_p = (
+                        float(pred_residual_candidate_supervision_weight)
+                        * reduce_cluster_metric(
+                            candidate_supervision_loss_bkp[:, :, p],
+                            cluster_weight_k,
+                        ).mean()
+                    )
+                    semantic_loss_p.append(loss_p)
+                    for component_name, component_bkp in (
+                        candidate_supervision_components_bkp.items()
                     ):
+                        component_value = reduce_cluster_metric(
+                            component_bkp[:, :, p],
+                            cluster_weight_k,
+                        ).mean()
+                        semantic_component_sum_by_name_p[component_name][p] += float(
+                            component_value.detach().item()
+                        )
+                    loss_p.backward()
+                # This mean is reporting-only.  It never participates in backward,
+                # clipping, optimizer state, scheduling, or checkpoint selection.
+                loss = semantic_loss_p[0].detach()
+                for p, params_p in enumerate(semantic_bank_params_by_penalty):
+                    if p != active_p:
+                        if any(param.grad is not None for param in pred_residual.get_penalty_body_params(p)):
+                            raise RuntimeError(
+                                f"inactive semantic expert {penalty_names[p]} received a gradient."
+                            )
+                semantic_loss_sum_p[active_p] += float(
+                    semantic_loss_p[0].detach().item()
+                )
+                semantic_batch_count += 1
+                if pred_residual_semantic_raw_gradient_accumulation:
+                    if any(param.grad is not None for param in model.parameters()):
+                        raise RuntimeError(
+                            "semantic raw-gradient accumulation reached the backbone."
+                        )
+                    if any(param.grad is not None for param in gate.parameters()):
+                        raise RuntimeError(
+                            "semantic raw-gradient accumulation reached the frozen gate."
+                        )
+                    semantic_raw_gradient_pending_count += 1
+                    if (
+                        semantic_raw_gradient_pending_count
+                        > pred_residual_semantic_raw_gradient_microbatches
+                    ):
+                        raise RuntimeError(
+                            "semantic raw-gradient accumulation exceeded its target count."
+                        )
+                    flush_accumulated = (
+                        _semantic_bank_should_flush_raw_gradient_accumulation(
+                            pending_count=semantic_raw_gradient_pending_count,
+                            target_microbatches=(
+                                pred_residual_semantic_raw_gradient_microbatches
+                            ),
+                            completed_batches=n_batches + 1,
+                            total_batches=steps_per_epoch,
+                        )
+                    )
+                    if flush_accumulated:
+                        optimizer_p = semantic_bank_optimizers_p[active_p]
+                        if optimizer_p is None:
+                            raise RuntimeError(
+                                "active semantic expert is missing its optimizer."
+                            )
+                        if pred_residual_semantic_level_separate_need_gate:
+                            if semantic_level_need_gate_optimizer is None:
+                                raise RuntimeError("LEVEL need-gate optimizer is missing.")
+                            step_metrics = _semantic_bank_finalize_disjoint_gradient_step(
+                                {
+                                    "amplitude": optimizer_p,
+                                    "need_gate": semantic_level_need_gate_optimizer,
+                                },
+                                semantic_level_disjoint_params_by_group,
+                                raw_gradient_accumulation=True,
+                                accumulation_count=semantic_raw_gradient_pending_count,
+                                grad_clip=grad_clip,
+                            )
+                        else:
+                            step_metrics = _semantic_bank_finalize_gradient_step(
+                                optimizer_p,
+                                semantic_bank_params_by_penalty[active_p],
+                                raw_gradient_accumulation=True,
+                                accumulation_count=(
+                                    semantic_raw_gradient_pending_count
+                                ),
+                                grad_clip=grad_clip,
+                            )
+                        semantic_grad_raw_sum_p[active_p] += float(
+                            step_metrics["raw_gradient_l2"]
+                        )
+                        semantic_grad_clipped_sum_p[active_p] += float(
+                            step_metrics["clipped_gradient_l2"]
+                        )
+                        semantic_update_sum_p[active_p] += float(
+                            step_metrics["parameter_update_l2"]
+                        )
+                        for group, row in step_metrics.get("groups", {}).items():
+                            for metric in semantic_level_disjoint_metric_sums[group]:
+                                semantic_level_disjoint_metric_sums[group][metric] += float(
+                                    row[metric]
+                                )
+                        semantic_raw_gradient_group_counts.append(
+                            int(step_metrics["accumulation_count"])
+                        )
+                        semantic_step_count += 1
+                        semantic_raw_gradient_pending_count = 0
+                else:
+                    optimizer_p = semantic_bank_optimizers_p[active_p]
+                    if optimizer_p is None:
+                        raise RuntimeError(
+                            "active semantic expert is missing its optimizer."
+                        )
+                    if pred_residual_semantic_level_separate_need_gate:
+                        if semantic_level_need_gate_optimizer is None:
+                            raise RuntimeError("LEVEL need-gate optimizer is missing.")
+                        step_metrics = _semantic_bank_finalize_disjoint_gradient_step(
+                            {
+                                "amplitude": optimizer_p,
+                                "need_gate": semantic_level_need_gate_optimizer,
+                            },
+                            semantic_level_disjoint_params_by_group,
+                            grad_clip=grad_clip,
+                            raw_gradient_accumulation=False,
+                            accumulation_count=1,
+                        )
+                    else:
+                        step_metrics = _semantic_bank_finalize_gradient_step(
+                            optimizer_p,
+                            semantic_bank_params_by_penalty[active_p],
+                            grad_clip=grad_clip,
+                            raw_gradient_accumulation=False,
+                            accumulation_count=1,
+                        )
+                    semantic_grad_raw_sum_p[active_p] += float(
+                        step_metrics["raw_gradient_l2"]
+                    )
+                    semantic_grad_clipped_sum_p[active_p] += float(
+                        step_metrics["clipped_gradient_l2"]
+                    )
+                    semantic_update_sum_p[active_p] += float(
+                        step_metrics["parameter_update_l2"]
+                    )
+                    for group, row in step_metrics.get("groups", {}).items():
+                        for metric in semantic_level_disjoint_metric_sums[group]:
+                            semantic_level_disjoint_metric_sums[group][metric] += float(
+                                row[metric]
+                            )
+                    semantic_step_count += 1
+            else:
+                for opt_k in optimizers:
+                    if opt_k is None:
                         continue
-                    torch.nn.utils.clip_grad_norm_(params_k, grad_clip)
+                    opt_k.zero_grad(set_to_none=True)
+                loss.backward()
+
+                if grad_clip > 0:
+                    for k, params_k in enumerate(cluster_params):
+                        if (
+                            len(params_k) == 0
+                            or not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters)
+                        ):
+                            continue
+                        torch.nn.utils.clip_grad_norm_(params_k, grad_clip)
 
             model.mask_cluster_grads(stopped)
             if moe_enable:
@@ -6726,7 +9150,7 @@ def main():
                     freeze_after_epoch=pred_residual_freeze_gate_after_epoch,
                     stopped=stopped,
                 )
-            if pred_residual is not None:
+            if pred_residual is not None and not pred_residual_semantic_bank_stage1:
                 pred_residual.mask_cluster_grads(stopped)
             if dynamic_lambda is not None:
                 dynamic_lambda.mask_cluster_grads(stopped)
@@ -6748,12 +9172,13 @@ def main():
                         learnable_output_anchor.parameters()
                     )
                 stage2_grad_norm_batches += 1
-            for k, opt_k in enumerate(optimizers):
-                if opt_k is None:
-                    continue
-                if not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters):
-                    continue
-                opt_k.step()
+            if not pred_residual_semantic_bank_stage1:
+                for k, opt_k in enumerate(optimizers):
+                    if opt_k is None:
+                        continue
+                    if not _optimizer_slot_active(stopped, k, shared_moe=shared_moe_across_clusters):
+                        continue
+                    opt_k.step()
 
             running += float(loss.item())
             n_batches += 1
@@ -6767,6 +9192,13 @@ def main():
                     ),
                 )
 
+        if (
+            pred_residual_semantic_raw_gradient_accumulation
+            and semantic_raw_gradient_pending_count != 0
+        ):
+            raise RuntimeError(
+                "semantic raw-gradient tail was not flushed at epoch end."
+            )
         assert_pairwise_frozen_parameters_unchanged(f"epoch_{ep}_post_optimizer")
         outer_loss_epoch = None
         if bilevel_enable:
@@ -6819,6 +9251,132 @@ def main():
             pred_residual=pred_residual,
             eval_start=epoch_eval_start,
         )
+        semantic_epoch_audit = None
+        if pred_residual_semantic_bank_stage1:
+            semantic_epoch_audit = collect_semantic_bank_candidate_audit(
+                dl_va,
+                eval_start=val_eval_start,
+                split_name="val",
+                split_window_count=len(dva),
+            )
+            if pred_residual is None:
+                raise RuntimeError("semantic bank audit requires pred_residual.")
+            per_penalty_audit = semantic_epoch_audit.get("per_penalty", {})
+            epoch_record = {
+                "epoch": int(ep),
+                "reporting_mean_only": True,
+                "active_penalty": pred_residual_semantic_active_penalty,
+                "raw_gradient_accumulation": {
+                    "enabled": bool(
+                        pred_residual_semantic_raw_gradient_accumulation
+                    ),
+                    "mode": (
+                        "disjoint_level_groups_mean_then_independent_clip"
+                        if pred_residual_semantic_raw_gradient_accumulation
+                        and pred_residual_semantic_level_separate_need_gate
+                        else "raw_gradient_mean_then_clip"
+                        if pred_residual_semantic_raw_gradient_accumulation
+                        else "legacy_per_batch_clip_step"
+                    ),
+                    "target_microbatches": int(
+                        pred_residual_semantic_raw_gradient_microbatches
+                    ),
+                    "microbatch_count": int(semantic_batch_count),
+                    "optimizer_step_count": int(semantic_step_count),
+                    "group_counts": list(semantic_raw_gradient_group_counts),
+                    "tail_microbatches": (
+                        int(semantic_raw_gradient_group_counts[-1])
+                        if semantic_raw_gradient_group_counts
+                        and semantic_raw_gradient_group_counts[-1]
+                        < pred_residual_semantic_raw_gradient_microbatches
+                        else 0
+                    ),
+                },
+                "per_penalty": {},
+            }
+            batch_denom = max(int(semantic_batch_count), 1)
+            step_denom = max(int(semantic_step_count), 1)
+            for p, name in enumerate(penalty_names):
+                row = dict(per_penalty_audit.get(name, {}))
+                is_active = p == semantic_bank_active_penalty_index
+                runtime_checks = {
+                    "active_body_only": bool(is_active),
+                    "raw_gradient_l2_gt_0": bool(
+                        is_active and float(semantic_grad_raw_sum_p[p].item()) > 0.0
+                    ),
+                    "clipped_gradient_l2_gt_0": bool(
+                        is_active and float(semantic_grad_clipped_sum_p[p].item()) > 0.0
+                    ),
+                    "parameter_update_l2_gt_0": bool(
+                        is_active and float(semantic_update_sum_p[p].item()) > 0.0
+                    ),
+                }
+                row["runtime_gradient_checks"] = runtime_checks
+                if is_active:
+                    row["pass"] = bool(row.get("pass", False)) and all(
+                        runtime_checks.values()
+                    )
+                    row["semantic_only_pass"] = bool(row["pass"])
+                    selected = _update_semantic_bank_best_candidate(
+                        semantic_bank_best_by_penalty,
+                        penalty_index=p,
+                        penalty_name=name,
+                        epoch=ep,
+                        acceptance=row,
+                        body_state=pred_residual.get_penalty_body_state(p),
+                    )
+                    if selected:
+                        semantic_bank_best_by_penalty[p][
+                            "training_provenance"
+                        ] = dict(pred_residual_training_provenance or {})
+                        semantic_bank_best_by_penalty[p][
+                            "optimizer_state_identity"
+                        ] = semantic_bank_optimizer_identity_p[p]
+                else:
+                    row["pass"] = False
+                    row["semantic_only_pass"] = False
+                    row["inactive_not_eligible_for_acceptance"] = True
+                    selected = False
+                epoch_record["per_penalty"][name] = {
+                    "active": bool(is_active),
+                    "objective": float(semantic_loss_sum_p[p].item()) / batch_denom,
+                    "components": {
+                        component_name: float(component_sum_p[p].item()) / batch_denom
+                        for component_name, component_sum_p in (
+                            semantic_component_sum_by_name_p.items()
+                        )
+                    },
+                    "raw_gradient_l2": float(semantic_grad_raw_sum_p[p].item()) / step_denom,
+                    "clipped_gradient_l2": float(semantic_grad_clipped_sum_p[p].item()) / step_denom,
+                    "parameter_update_l2": float(semantic_update_sum_p[p].item()) / step_denom,
+                    "optimizer_state_identity": semantic_bank_optimizer_identity_p[p],
+                    "checkpoint_candidate_selected": selected,
+                    "acceptance": row,
+                }
+                if is_active and semantic_level_disjoint_metric_sums:
+                    epoch_record["per_penalty"][name]["optimizer_groups"] = {
+                        group: {
+                            metric: float(value) / step_denom
+                            for metric, value in metrics.items()
+                        }
+                        for group, metrics in semantic_level_disjoint_metric_sums.items()
+                    }
+            semantic_bank_independent_history.append(epoch_record)
+            if pred_residual_semantic_raw_gradient_accumulation:
+                active_row = epoch_record["per_penalty"][
+                    pred_residual_semantic_active_penalty
+                ]
+                print(
+                    "Semantic level optimizer audit: "
+                    "mode="
+                    + str(epoch_record["raw_gradient_accumulation"]["mode"])
+                    + ", "
+                    f"groups={semantic_raw_gradient_group_counts}, "
+                    f"raw_norm={float(active_row['raw_gradient_l2']):.9g}, "
+                    f"clipped_norm={float(active_row['clipped_gradient_l2']):.9g}, "
+                    f"update={float(active_row['parameter_update_l2']):.9g}, "
+                    f"optimizer_groups={active_row.get('optimizer_groups', {})}"
+                )
         train_loss_k = train_loss_sum_k / max(train_cnt, 1)
         train_mse_k = train_mse_sum_k / max(train_cnt, 1)
         train_mae_k = train_mae_sum_k / max(train_cnt, 1)
@@ -6851,7 +9409,10 @@ def main():
         update_swa_averagers(ep)
 
         monitor_k = _select_monitor_k(train_loss_k, train_mse_k, train_mae_k, val_loss_k, val_mse_k, val_mae_k)
-        selection_active = ep >= selection_start_epoch
+        selection_active = (
+            ep >= selection_start_epoch
+            and not pred_residual_semantic_bank_stage1
+        )
         if shared_moe_across_clusters and selection_active:
             shared_monitor = float(reduce_cluster_metric(monitor_k, cluster_weight_k).item())
             shared_dual_safe = True
@@ -7203,9 +9764,91 @@ def main():
         print(f"Saved MSE curves to: {loss_dir}")
 
     checkpoint_selection = str(memory_cfg.get("checkpoint_selection", "best")).lower()
-    if checkpoint_selection not in {"best", "last"}:
-        raise ValueError("memory.checkpoint_selection must be 'best' or 'last'.")
-    if checkpoint_selection == "best":
+    if checkpoint_selection not in {"best", "last", "semantic_per_expert"}:
+        raise ValueError(
+            "memory.checkpoint_selection must be best, last, or semantic_per_expert."
+        )
+    semantic_bank_release_ready = False
+    semantic_bank_stage_complete = False
+    semantic_bank_accepted_penalties: List[str] = []
+    if pred_residual_semantic_bank_stage1:
+        if checkpoint_selection != "semantic_per_expert":
+            raise ValueError(
+                "semantic_bank_stage1 requires checkpoint_selection=semantic_per_expert."
+            )
+        if pred_residual is None:
+            raise RuntimeError("semantic bank checkpoint selection requires pred_residual.")
+        semantic_bank_release_ready = _semantic_bank_release_ready(
+            semantic_bank_best_by_penalty,
+            penalty_names,
+        )
+        semantic_bank_accepted_penalties = [
+            str(item["penalty"])
+            for item in semantic_bank_best_by_penalty
+            if isinstance(item.get("state"), dict)
+            and bool((item.get("acceptance") or {}).get("pass", False))
+        ]
+        active_item = semantic_bank_best_by_penalty[
+            int(semantic_bank_active_penalty_index)
+        ]
+        semantic_bank_stage_complete = bool(
+            isinstance(active_item.get("state"), dict)
+            and bool((active_item.get("acceptance") or {}).get("pass", False))
+        )
+        if semantic_bank_release_ready:
+            for p, item in enumerate(semantic_bank_best_by_penalty):
+                actual_body_hash = _semantic_penalty_body_state_sha256(item["state"])
+                if item.get("body_sha256") != actual_body_hash:
+                    raise RuntimeError(
+                        "Semantic bank selected body hash mismatch before assembly: "
+                        f"penalty={penalty_names[p]}, metadata={item.get('body_sha256')}, "
+                        f"actual={actual_body_hash}"
+                    )
+            pred_residual.load_penalty_body_states([
+                item["state"] for item in semantic_bank_best_by_penalty
+            ])
+            for p, item in enumerate(semantic_bank_best_by_penalty):
+                assembled_hash = _semantic_penalty_body_state_sha256(
+                    pred_residual.get_penalty_body_state(p)
+                )
+                if assembled_hash != item["body_sha256"]:
+                    raise RuntimeError(
+                        "Semantic bank assembled body hash mismatch: "
+                        f"penalty={penalty_names[p]}, selected={item['body_sha256']}, "
+                        f"assembled={assembled_hash}"
+                    )
+            print(
+                "Semantic bank assembled from independently accepted expert checkpoints: "
+                + ", ".join(
+                    f"{item['penalty']}@epoch{item['epoch']}"
+                    for item in semantic_bank_best_by_penalty
+                )
+            )
+        elif semantic_bank_stage_complete:
+            pred_residual.load_penalty_body_state(
+                int(semantic_bank_active_penalty_index),
+                active_item["state"],
+            )
+            assembled_hash = _semantic_penalty_body_state_sha256(
+                pred_residual.get_penalty_body_state(
+                    int(semantic_bank_active_penalty_index)
+                )
+            )
+            if assembled_hash != active_item["body_sha256"]:
+                raise RuntimeError(
+                    "Semantic partial checkpoint active-body hash mismatch: "
+                    f"penalty={pred_residual_semantic_active_penalty}."
+                )
+            print(
+                "Semantic staged checkpoint accepted active expert: "
+                f"{pred_residual_semantic_active_penalty}@epoch{active_item['epoch']}"
+            )
+        else:
+            print(
+                "Semantic bank release blocked: at least one expert has no independently "
+                "accepted checkpoint candidate."
+            )
+    elif checkpoint_selection == "best":
         load_best_all()
     else:
         print("Checkpoint selection uses the final epoch state (adapter-bank training mode).")
@@ -7886,8 +10529,24 @@ def main():
     best_checkpoint_dynamic_lambda_state = None
     best_checkpoint_learnable_lambda_state = None
     best_checkpoint_learnable_output_anchor_state = None
-    if bool(memory_cfg.get("save_checkpoint", False)):
+    semantic_bank_checkpoint_ready = bool(
+        semantic_bank_release_ready or semantic_bank_stage_complete
+    )
+    if bool(memory_cfg.get("save_checkpoint", False)) and (
+        not pred_residual_semantic_bank_stage1 or semantic_bank_checkpoint_ready
+    ):
         ckpt_path = str(memory_cfg.get("checkpoint_path", os.path.join(out_dir, "best_checkpoint.pt")))
+        checkpoint_pred_residual_contract = (
+            None if pred_residual_contract is None else dict(pred_residual_contract)
+        )
+        if (
+            checkpoint_pred_residual_contract is not None
+            and pred_residual is not None
+            and pred_residual_semantic_output_head_scope == "per_cluster"
+        ):
+            checkpoint_pred_residual_contract["semantic_body_sha256"] = (
+                _semantic_body_state_sha256(pred_residual.state_dict())
+            )
         meta = {
             "K": K,
             "input_len": L,
@@ -7900,9 +10559,59 @@ def main():
             "gate_feature_mode": str(gate_feature_mode),
             "gate_feature_names": _gate_feature_names_for_mode(gate_feature_mode),
             "penalty_names": list(penalty_names),
+            "pred_residual_contract": checkpoint_pred_residual_contract,
+            "pred_residual_training_provenance": pred_residual_training_provenance,
+            "penalty_need_statistics": dict(penalty_need_statistics_summary),
             "best_epoch": best_epoch.detach().cpu(),
             "shared_moe_across_clusters": bool(shared_moe_across_clusters),
             "shared_moe_best_epoch": int(shared_moe_best_epoch),
+            "semantic_bank_independent_selection": (
+                {
+                    "release_ready": bool(semantic_bank_release_ready),
+                    "stage_complete": bool(semantic_bank_stage_complete),
+                    "active_penalty": str(pred_residual_semantic_active_penalty),
+                    "accepted_penalties": list(semantic_bank_accepted_penalties),
+                    "body_sha256_by_penalty": [
+                        (
+                            str(item["body_sha256"])
+                            if item.get("body_sha256") is not None
+                            else None
+                        )
+                        for item in semantic_bank_best_by_penalty
+                    ],
+                    "per_penalty": [
+                        {
+                            "penalty": str(item["penalty"]),
+                            "epoch": item["epoch"],
+                            "matching_penalty_relative_gain": (
+                                float(item["matching_penalty_relative_gain"])
+                                if math.isfinite(float(item["matching_penalty_relative_gain"]))
+                                else None
+                            ),
+                            "accepted": bool(
+                                isinstance(item.get("state"), dict)
+                                and bool((item.get("acceptance") or {}).get("pass", False))
+                            ),
+                            "acceptance": item["acceptance"],
+                            "optimizer_state_identity": str(
+                                item.get(
+                                    "optimizer_state_identity",
+                                    semantic_bank_optimizer_identity_p[p],
+                                )
+                            ),
+                            "training_provenance": item.get("training_provenance"),
+                            "body_sha256": (
+                                str(item["body_sha256"])
+                                if item.get("body_sha256") is not None
+                                else None
+                            ),
+                        }
+                        for p, item in enumerate(semantic_bank_best_by_penalty)
+                    ],
+                }
+                if pred_residual_semantic_bank_stage1
+                else None
+            ),
         }
         best_checkpoint_path = ckpt_path
         best_checkpoint_meta = meta
@@ -7925,6 +10634,11 @@ def main():
             learnable_output_anchor_state=best_checkpoint_learnable_output_anchor_state,
         )
         print(f"Saved best checkpoint to: {ckpt_path}")
+    elif bool(memory_cfg.get("save_checkpoint", False)) and pred_residual_semantic_bank_stage1:
+        print(
+            "Semantic staged checkpoint was not saved because the active expert "
+            "did not pass semantic-only acceptance."
+        )
     if cluster_penalty_late_allowed_mask_kp is not None:
         cluster_penalty_allowed_mask_kp = cluster_penalty_late_allowed_mask_kp
         gate.set_penalty_allowed_mask(cluster_penalty_allowed_mask_kp)
@@ -7954,6 +10668,126 @@ def main():
     lambda_stats_csv_path = os.path.join(out_dir, "cluster_lambda_stats.csv")
     print_dynamic_lambda_summary(summary_name, lambda_stats, csv_path=lambda_stats_csv_path)
     moe_residual_summary = collect_pred_residual_summary(summary_loader, eval_start=summary_eval_start)
+    semantic_bank_candidate_audit = collect_semantic_bank_candidate_audit(
+        summary_loader,
+        eval_start=summary_eval_start,
+        split_name=summary_name,
+        split_window_count=(len(dva) if summary_name == "val" else len(dtr)),
+        include_level_oracle_diagnostic=bool(
+            pred_residual_semantic_final_train_audit
+        ),
+    )
+    if pred_residual_semantic_bank_stage1:
+        semantic_audit_path = os.path.join(out_dir, "semantic_bank_candidate_audit.json")
+        with open(semantic_audit_path, "w", encoding="utf-8") as f:
+            json.dump(semantic_bank_candidate_audit, f, ensure_ascii=False, indent=2)
+        semantic_bank_candidate_audit["artifact_path"] = semantic_audit_path
+        moe_residual_summary["semantic_bank_candidate_audit"] = semantic_bank_candidate_audit
+        semantic_bank_final_train_audit = None
+        if pred_residual_semantic_final_train_audit:
+            semantic_bank_final_train_audit = collect_semantic_bank_candidate_audit(
+                dl_tr_source,
+                eval_start=0,
+                split_name="train",
+                split_window_count=len(dtr),
+                include_level_oracle_diagnostic=True,
+            )
+            train_semantic_audit_path = os.path.join(
+                out_dir,
+                "semantic_bank_final_train_candidate_audit.json",
+            )
+            with open(train_semantic_audit_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    semantic_bank_final_train_audit,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            semantic_bank_final_train_audit[
+                "artifact_path"
+            ] = train_semantic_audit_path
+            moe_residual_summary[
+                "semantic_bank_final_train_candidate_audit"
+            ] = semantic_bank_final_train_audit
+        moe_residual_summary["semantic_bank_independent_optimization"] = {
+            "enabled": True,
+            "reporting_mean_only": True,
+            "release_ready": bool(semantic_bank_release_ready),
+            "stage_complete": bool(semantic_bank_stage_complete),
+            "active_penalty": str(pred_residual_semantic_active_penalty),
+            "accepted_penalties": list(semantic_bank_accepted_penalties),
+            "optimizer": (
+                "independent_level_adam_amplitude_sgd_need_gate"
+                if pred_residual_semantic_level_separate_need_gate
+                and pred_residual_semantic_level_amplitude_optimizer_name == "adam"
+                else "independent_sgd_per_penalty_and_disjoint_level_gate"
+                if pred_residual_semantic_level_separate_need_gate
+                else "independent_sgd_per_penalty"
+            ),
+            "gradient_clip": (
+                "raw_gradient_mean_then_independent_level_group_clip_once"
+                if pred_residual_semantic_raw_gradient_accumulation
+                and pred_residual_semantic_level_separate_need_gate
+                else "raw_gradient_mean_then_branch_clip_once"
+                if pred_residual_semantic_raw_gradient_accumulation
+                else "branch_only"
+            ),
+            "raw_gradient_accumulation": (
+                dict(
+                    (pred_residual_training_provenance or {}).get(
+                        "raw_gradient_accumulation", {}
+                    )
+                )
+                if pred_residual_semantic_raw_gradient_accumulation
+                else {"enabled": False}
+            ),
+            "checkpoint_selection": "semantic_per_expert",
+            "final_train_semantic_audit": {
+                "enabled": bool(pred_residual_semantic_final_train_audit),
+                "non_selecting": True,
+                "test_read": False,
+                "artifact_path": (
+                    semantic_bank_final_train_audit.get("artifact_path")
+                    if semantic_bank_final_train_audit is not None
+                    else None
+                ),
+            },
+            "history": semantic_bank_independent_history,
+            "selected": [
+                {
+                    "penalty": str(item["penalty"]),
+                    "epoch": item["epoch"],
+                    "matching_penalty_relative_gain": (
+                        float(item["matching_penalty_relative_gain"])
+                        if math.isfinite(float(item["matching_penalty_relative_gain"]))
+                        else None
+                    ),
+                    "acceptance": item["acceptance"],
+                    "optimizer_state_identity": str(
+                        item.get(
+                            "optimizer_state_identity",
+                            semantic_bank_optimizer_identity_p[p],
+                        )
+                    ),
+                    "training_provenance": item.get("training_provenance"),
+                    "body_sha256": (
+                        str(item["body_sha256"])
+                        if item.get("body_sha256") is not None
+                        else None
+                    ),
+                    "accepted": bool(
+                        isinstance(item.get("state"), dict)
+                        and bool((item.get("acceptance") or {}).get("pass", False))
+                    ),
+                }
+                for p, item in enumerate(semantic_bank_best_by_penalty)
+            ],
+        }
+        print(
+            "Semantic bank candidate audit: "
+            f"all_pass={bool(semantic_bank_candidate_audit.get('all_pass', False))}, "
+            f"artifact={semantic_audit_path}"
+        )
     if (
         patch_router_train_oracle_diagnostic
         and pred_residual is not None
@@ -11334,9 +14168,26 @@ def main():
             json.dump(stage2_route_audit_summary, f, ensure_ascii=False, indent=2)
         stage2_route_audit_summary["artifact_path"] = route_audit_path
 
+    checkpoint_sha256 = None
+    if best_checkpoint_path is not None and os.path.exists(best_checkpoint_path):
+        digest = hashlib.sha256()
+        with open(best_checkpoint_path, "rb") as checkpoint_file:
+            for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        checkpoint_sha256 = digest.hexdigest()
+
     summary = {
         "config_path": args.config,
         "out_dir": out_dir,
+        "checkpoint": {
+            "path": best_checkpoint_path,
+            "sha256": checkpoint_sha256,
+            "pred_residual_contract": (
+                best_checkpoint_meta.get("pred_residual_contract")
+                if isinstance(best_checkpoint_meta, dict)
+                else pred_residual_contract
+            ),
+        },
         "penalty_names": list(penalty_names),
         "best_epoch": [int(v) for v in best_epoch.detach().cpu().tolist()],
         "windowing": {

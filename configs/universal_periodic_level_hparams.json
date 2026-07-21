@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "architecture": {
+    "feature_builder": "period_level_features",
+    "feature_width": 601,
+    "magnitude_model": "UniversalPeriodicLevelMagnitudeAdapter",
+    "sign_estimator": "HistGradientBoostingClassifier",
+    "sign_head_count": 1,
+    "sign_weight_formula": "globally_q95_clipped_squared_level_coordinate"
+  },
+  "training_contract": {
+    "environment_normalization": "disabled",
+    "rejected_branch": "v25-v28 environment alpha",
+    "rejection_reason": "alpha1 produced only a negligible MSE/MAE tradeoff and did not repair local Level direction failures",
+    "selection_split": "TRAIN only",
+    "validation_role": "frozen overfit guard only",
+    "test_role": "reporting only"
+  },
+  "datasets": {
+    "ETTm1": {
+      "H96": {
+        "deployment_status": "preserve accepted universal Level; alpha branch rejected",
+        "execution_scale": 0.125,
+        "sign_checkpoint": ".pt_ettm1_h96_universal_period_sign_val_v2/period_sign.joblib"
+      }
+    },
+    "Electricity": {
+      "H96": {
+        "deployment_status": "preserve accepted universal Level; alpha branch rejected",
+        "execution_scale": 0.0625,
+        "selection_artifact": "outputs/electricity_periodic_adapters_20260718/H96/universal_period_level_train_v1/result.json",
+        "sign_checkpoint": "outputs/electricity_periodic_adapters_20260718/H96/universal_period_level_train_v1/period_sign.joblib"
+      }
+    }
+  }
+}

@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -2178,6 +2178,202 @@ class ChannelPatchPenaltyRouter(nn.Module):
             self.expert_risk_adopt_threshold_by_penalty.copy_(threshold)
 
 
+class SemanticLevelPatchController(nn.Module):
+    """Causal, horizon-independent LEVEL correction and adoption controller.
+
+    The controller is local to the LEVEL expert.  It predicts one signed scalar
+    correction and one adoption logit for every future patch, using history,
+    the frozen-base patch and deterministic patch position only.  Target values
+    never enter this forward path.
+    """
+
+    STATE_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        input_len: int,
+        patch_len: int = 12,
+        hidden_dim: int = 32,
+        separate_need_gate: bool = False,
+        need_hidden_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.input_len = int(input_len)
+        self.patch_len = int(patch_len)
+        self.hidden_dim = int(hidden_dim)
+        self.separate_need_gate = bool(separate_need_gate)
+        self.need_hidden_dim = int(need_hidden_dim or hidden_dim)
+        if self.input_len <= 0 or self.patch_len <= 0 or self.hidden_dim <= 0:
+            raise ValueError("LEVEL controller dimensions must be positive.")
+        if self.need_hidden_dim <= 0:
+            raise ValueError("LEVEL need gate hidden_dim must be positive.")
+
+        # Full normalized history plus four H-independent summaries.
+        self.history_encoder = nn.Linear(self.input_len + 4, self.hidden_dim)
+        # A fixed p12 base shape, five summaries, and one normalized position.
+        self.patch_encoder = nn.Linear(self.patch_len + 6, self.hidden_dim)
+        self.joint_encoder = nn.Linear(2 * self.hidden_dim, self.hidden_dim)
+        self.amplitude_head = nn.Linear(self.hidden_dim, 1)
+        self.need_head = nn.Linear(self.hidden_dim, 1)
+        self.separate_need_gate_mlp = (
+            nn.Sequential(
+                nn.Linear(self.hidden_dim + 2, self.need_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.need_hidden_dim, 1),
+            )
+            if self.separate_need_gate
+            else None
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for layer in (self.history_encoder, self.patch_encoder, self.joint_encoder):
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        # Epoch zero is an exact no-correction state while both heads receive
+        # gradients from their explicit supervised objectives.
+        nn.init.zeros_(self.amplitude_head.weight)
+        nn.init.zeros_(self.amplitude_head.bias)
+        nn.init.zeros_(self.need_head.weight)
+        nn.init.zeros_(self.need_head.bias)
+        if self.separate_need_gate_mlp is not None:
+            first = self.separate_need_gate_mlp[0]
+            last = self.separate_need_gate_mlp[2]
+            assert isinstance(first, nn.Linear) and isinstance(last, nn.Linear)
+            nn.init.xavier_uniform_(first.weight)
+            nn.init.zeros_(first.bias)
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def amplitude_parameters(self) -> List[nn.Parameter]:
+        modules = (
+            self.history_encoder,
+            self.patch_encoder,
+            self.joint_encoder,
+            self.amplitude_head,
+        )
+        return [parameter for module in modules for parameter in module.parameters()]
+
+    def need_gate_parameters(self) -> List[nn.Parameter]:
+        module: nn.Module = (
+            self.separate_need_gate_mlp
+            if self.separate_need_gate_mlp is not None
+            else self.need_head
+        )
+        return list(module.parameters())
+
+    def forward(self, x_bcl: torch.Tensor, base_bch: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if x_bcl.ndim != 3 or base_bch.ndim != 3:
+            raise ValueError("LEVEL controller expects x=[B,C,L] and base=[B,C,H].")
+        if tuple(x_bcl.shape[:2]) != tuple(base_bch.shape[:2]):
+            raise ValueError("LEVEL controller history/base batch-channel shapes must match.")
+        if int(x_bcl.shape[-1]) != self.input_len:
+            raise ValueError(
+                f"LEVEL controller expected input_len={self.input_len}, got {int(x_bcl.shape[-1])}."
+            )
+        horizon = int(base_bch.shape[-1])
+        if horizon <= 0 or horizon % self.patch_len != 0:
+            raise ValueError(
+                f"LEVEL controller requires H divisible by patch_len={self.patch_len}, got H={horizon}."
+            )
+        batch, channels, _ = x_bcl.shape
+        patches = horizon // self.patch_len
+        eps = 1.0e-6
+
+        hist_mean = x_bcl.mean(dim=-1, keepdim=True)
+        hist_std = x_bcl.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
+        last = x_bcl[..., -1:]
+        hist_norm = (x_bcl - last) / hist_std
+        if self.input_len > 1:
+            hist_delta = (x_bcl[..., -1:] - x_bcl[..., -2:-1]) / hist_std
+            time_l = torch.linspace(
+                -1.0, 1.0, self.input_len, device=x_bcl.device, dtype=x_bcl.dtype
+            )
+            time_l = time_l - time_l.mean()
+            hist_slope = (
+                ((x_bcl - hist_mean) * time_l.view(1, 1, -1)).sum(dim=-1, keepdim=True)
+                / time_l.square().sum().clamp_min(eps)
+                / hist_std
+            )
+        else:
+            hist_delta = torch.zeros_like(last)
+            hist_slope = torch.zeros_like(last)
+        hist_features = torch.cat(
+            [
+                hist_norm,
+                (hist_mean - last) / hist_std,
+                hist_std.log(),
+                hist_delta,
+                hist_slope,
+            ],
+            dim=-1,
+        )
+        hist_hidden = F.gelu(self.history_encoder(hist_features))
+
+        base_patch = base_bch.reshape(batch, channels, patches, self.patch_len)
+        base_norm = (base_patch - last.unsqueeze(2)) / hist_std.unsqueeze(2)
+        base_mean = base_norm.mean(dim=-1, keepdim=True)
+        base_std = base_norm.std(dim=-1, keepdim=True, unbiased=False)
+        base_start = base_norm[..., :1]
+        base_end = base_norm[..., -1:]
+        base_slope = base_end - base_start
+        if patches == 1:
+            position = torch.zeros(1, device=x_bcl.device, dtype=x_bcl.dtype)
+        else:
+            position = torch.linspace(-1.0, 1.0, patches, device=x_bcl.device, dtype=x_bcl.dtype)
+        position_bcq1 = position.view(1, 1, patches, 1).expand(batch, channels, -1, -1)
+        patch_features = torch.cat(
+            [base_norm, base_mean, base_std, base_start, base_end, base_slope, position_bcq1],
+            dim=-1,
+        )
+        patch_hidden = F.gelu(self.patch_encoder(patch_features))
+        hist_expanded = hist_hidden.unsqueeze(2).expand(-1, -1, patches, -1)
+        joint = F.gelu(self.joint_encoder(torch.cat([hist_expanded, patch_hidden], dim=-1)))
+
+        amplitude_norm_bcq = self.amplitude_head(joint).squeeze(-1)
+        amplitude_bcq = amplitude_norm_bcq * hist_std
+        if self.separate_need_gate_mlp is not None:
+            # The gate is trained jointly in time but owns a disjoint parameter
+            # graph.  Adapter-derived features are values only: BCE must never
+            # update or globally clip the amplitude encoder/head.
+            detached_amplitude = amplitude_norm_bcq.detach().unsqueeze(-1)
+            need_features = torch.cat(
+                [joint.detach(), detached_amplitude, detached_amplitude.abs()],
+                dim=-1,
+            )
+            need_logits_bcq = self.separate_need_gate_mlp(need_features).squeeze(-1)
+        else:
+            need_logits_bcq = self.need_head(joint).squeeze(-1)
+        need_probability_bcq = torch.sigmoid(need_logits_bcq)
+        need_hard_bcq = (
+            (need_logits_bcq > 0.0)
+            if self.separate_need_gate_mlp is not None
+            else (need_logits_bcq >= 0.0)
+        ).to(dtype=base_bch.dtype)
+        if self.training:
+            need_execute_bcq = (
+                need_hard_bcq.detach()
+                - need_probability_bcq.detach()
+                + need_probability_bcq
+            )
+        else:
+            need_execute_bcq = need_hard_bcq
+        executed_bcq = need_execute_bcq * amplitude_bcq
+        residual_bch = executed_bcq.unsqueeze(-1).expand(-1, -1, -1, self.patch_len).reshape(
+            batch, channels, horizon
+        )
+        return {
+            "level_amplitude_bcq": amplitude_bcq,
+            "level_need_logits_bcq": need_logits_bcq,
+            "level_need_probability_bcq": need_probability_bcq,
+            "level_need_hard_bcq": need_hard_bcq,
+            "level_need_execute_bcq": need_execute_bcq,
+            "level_executed_correction_bcq": executed_bcq,
+            "level_residual_bch": residual_bch,
+        }
+
+
 class ClusterwisePredResidualMoE(nn.Module):
     """
     Cluster-wise, penalty-keyed residual experts for prediction-side MoE.
@@ -2227,17 +2423,35 @@ class ClusterwisePredResidualMoE(nn.Module):
         named_output_projection_scale_by_name: Optional[Dict[str, float]] = None,
         named_output_projection_carrier_names: Optional[List[str]] = None,
         named_output_projection_patch_len: Optional[int] = None,
+        named_output_projection_mode: str = "legacy_carrier",
+        named_output_projection_diff_amp_max: float = 1.0,
         periodic_anchor_expert_enable: bool = False,
         periodic_anchor_expert_scale: float = 1.0,
         position_daily_residual_expert_enable: bool = False,
         position_daily_residual_period: int = 96,
         position_daily_residual_harmonics: int = 4,
         anchor_ridge_gate_cfg: Optional[Dict[str, Any]] = None,
+        semantic_output_head_scope: str = "shared",
+        semantic_level_controller_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.K = int(num_clusters)
         self.shared_across_clusters = bool(shared_across_clusters)
         self.param_K = 1 if self.shared_across_clusters else self.K
+        self.semantic_output_head_scope = str(semantic_output_head_scope).strip().lower()
+        if self.semantic_output_head_scope not in {"shared", "per_cluster"}:
+            raise ValueError(
+                "semantic_output_head_scope must be shared or per_cluster, got "
+                f"{semantic_output_head_scope!r}."
+            )
+        if self.semantic_output_head_scope == "per_cluster" and not self.shared_across_clusters:
+            raise ValueError(
+                "semantic_output_head_scope=per_cluster requires shared_across_clusters=true "
+                "so only W2/b2 ownership changes."
+            )
+        self.output_param_K = (
+            self.K if self.semantic_output_head_scope == "per_cluster" else self.param_K
+        )
         self.P = int(num_penalties)
         self.L = int(input_len)
         self.H = int(pred_len)
@@ -2311,6 +2525,24 @@ class ClusterwisePredResidualMoE(nn.Module):
         self.residual_clip = float(max(0.0, residual_clip))
         self.named_output_projection_enable = bool(named_output_projection_enable)
         self.named_output_projection_fixed_alpha = bool(named_output_projection_fixed_alpha)
+        self.named_output_projection_mode = str(
+            named_output_projection_mode or "legacy_carrier"
+        ).lower()
+        if self.named_output_projection_mode not in {
+            "legacy_carrier",
+            "semantic_residual",
+        }:
+            raise ValueError(
+                "named_output_projection.mode must be legacy_carrier or "
+                "semantic_residual."
+            )
+        self.named_output_projection_diff_amp_max = float(
+            named_output_projection_diff_amp_max
+        )
+        if self.named_output_projection_diff_amp_max <= 0.0:
+            raise ValueError(
+                "named_output_projection.diff_amp_max must be positive."
+            )
         self.named_output_projection_carrier_names = frozenset(
             str(name) for name in (named_output_projection_carrier_names or [])
         )
@@ -2325,6 +2557,17 @@ class ClusterwisePredResidualMoE(nn.Module):
         ):
             raise ValueError(
                 "named_output_projection.patch_len must divide pred_len exactly."
+            )
+        if (
+            self.named_output_projection_enable
+            and self.named_output_projection_mode == "semantic_residual"
+            and self.patch_router is not None
+            and self.named_output_projection_patch_len > 0
+            and self.named_output_projection_patch_len != self.patch_router.patch_len
+        ):
+            raise ValueError(
+                "semantic_residual named projection requires patch_len to match "
+                "patch_router.patch_len."
             )
         self.periodic_anchor_expert_enable = bool(periodic_anchor_expert_enable)
         self.periodic_anchor_expert_scale = float(periodic_anchor_expert_scale)
@@ -2401,6 +2644,38 @@ class ClusterwisePredResidualMoE(nn.Module):
             if len(names) != self.P:
                 raise ValueError(f"penalty_names must have {self.P} entries, got {len(names)}")
         self.penalty_names = names
+        semantic_level_controller_cfg = semantic_level_controller_cfg or {}
+        self.semantic_level_controller_enable = bool(
+            semantic_level_controller_cfg.get("enable", False)
+        )
+        self.semantic_level_controller_patch_len = int(
+            semantic_level_controller_cfg.get("patch_len", 12)
+        )
+        if self.semantic_level_controller_enable:
+            if self.penalty_names.count("level") != 1:
+                raise ValueError("semantic LEVEL controller requires exactly one 'level' penalty.")
+            if self.semantic_level_controller_patch_len != 12:
+                raise ValueError("semantic LEVEL controller v1 requires patch_len=12.")
+            if self.H % self.semantic_level_controller_patch_len != 0:
+                raise ValueError("semantic LEVEL controller patch_len must divide pred_len.")
+            self.semantic_level_controller = SemanticLevelPatchController(
+                input_len=self.L,
+                patch_len=self.semantic_level_controller_patch_len,
+                hidden_dim=int(semantic_level_controller_cfg.get("hidden_dim", self.hidden_dim)),
+                separate_need_gate=bool(
+                    semantic_level_controller_cfg.get("separate_need_gate", False)
+                ),
+                need_hidden_dim=int(
+                    semantic_level_controller_cfg.get(
+                        "need_hidden_dim",
+                        semantic_level_controller_cfg.get("hidden_dim", self.hidden_dim),
+                    )
+                ),
+            )
+            self.semantic_level_penalty_index = self.penalty_names.index("level")
+        else:
+            self.semantic_level_controller = None
+            self.semantic_level_penalty_index = -1
         projection_scale_by_name = named_output_projection_scale_by_name or {}
         projection_scale_p = torch.tensor(
             [float(projection_scale_by_name.get(name, 1.0)) for name in self.penalty_names],
@@ -2487,6 +2762,7 @@ class ClusterwisePredResidualMoE(nn.Module):
         # penalty experts physically separate makes gradient isolation and
         # diagnostics unambiguous.
         num_experts = self.param_K * self.P
+        num_output_experts = self.output_param_K * self.P
         self.W1 = nn.ParameterList(
             [nn.Parameter(torch.empty(self.input_dim, self.hidden_dim)) for _ in range(num_experts)]
         )
@@ -2494,10 +2770,10 @@ class ClusterwisePredResidualMoE(nn.Module):
             [nn.Parameter(torch.zeros(self.hidden_dim)) for _ in range(num_experts)]
         )
         self.W2 = nn.ParameterList(
-            [nn.Parameter(torch.empty(self.hidden_dim, self.H)) for _ in range(num_experts)]
+            [nn.Parameter(torch.empty(self.hidden_dim, self.H)) for _ in range(num_output_experts)]
         )
         self.b2 = nn.ParameterList(
-            [nn.Parameter(torch.zeros(self.H)) for _ in range(num_experts)]
+            [nn.Parameter(torch.zeros(self.H)) for _ in range(num_output_experts)]
         )
         self.log_alpha = nn.ParameterList(
             [nn.Parameter(torch.tensor(float(init_alpha))) for _ in range(num_experts)]
@@ -2577,6 +2853,10 @@ class ClusterwisePredResidualMoE(nn.Module):
     def _idx(self, k: int, p: int) -> int:
         return self._param_cluster(k) * self.P + int(p)
 
+    def _output_idx(self, k: int, p: int) -> int:
+        output_k = int(k) if self.semantic_output_head_scope == "per_cluster" else self._param_cluster(k)
+        return output_k * self.P + int(p)
+
     def _param_cluster(self, k: int) -> int:
         return 0 if self.shared_across_clusters else int(k)
 
@@ -2585,6 +2865,13 @@ class ClusterwisePredResidualMoE(nn.Module):
         if self.shared_across_clusters and self.K != 1:
             return stacked.expand(self.K, self.P, *stacked.shape[2:])
         return stacked
+
+    def _stack_output_params(self, params: nn.ParameterList) -> torch.Tensor:
+        if self.semantic_output_head_scope == "shared":
+            return self._stack_expert_params(params)
+        return torch.stack(list(params), dim=0).reshape(
+            self.output_param_K, self.P, *params[0].shape
+        )
 
     def _stack_cluster_params(self, params: nn.ParameterList) -> torch.Tensor:
         stacked = torch.stack(list(params), dim=0)
@@ -3023,6 +3310,9 @@ class ClusterwisePredResidualMoE(nn.Module):
         name: str,
     ) -> torch.Tensor:
         """Map a free residual onto the correction space named by ``name``."""
+        if self.named_output_projection_mode == "semantic_residual":
+            return self._project_semantic_residual_segment(raw_bch, name)
+
         if name == "level":
             projected = raw_bch.mean(dim=-1, keepdim=True).expand_as(raw_bch)
         elif name == "delta":
@@ -3050,6 +3340,76 @@ class ClusterwisePredResidualMoE(nn.Module):
         if self.residual_clip > 0.0:
             max_abs = projected.abs().amax(dim=-1, keepdim=True)
             scale = torch.clamp(float(self.residual_clip) / max_abs.clamp_min(1.0e-12), max=1.0)
+            projected = projected * scale
+        return projected
+
+    def _project_semantic_residual_segment(
+        self,
+        raw_bch: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        """Project an expert's own residual into a distinct semantic subspace.
+
+        Unlike the legacy carrier projection, this mode never needs structure to
+        already be present in the frozen base forecast.  The bounded diff-amplitude
+        is parameterized by the magnitude of the expert's raw output, so its
+        amplitude remains learnable without adding a second prediction head.
+        """
+        if name == "level":
+            projected = raw_bch.mean(dim=-1, keepdim=True).expand_as(raw_bch)
+        elif name == "trend":
+            centered = raw_bch - raw_bch.mean(dim=-1, keepdim=True)
+            if int(raw_bch.shape[-1]) <= 1:
+                projected = centered
+            else:
+                trend_h = torch.linspace(
+                    -1.0,
+                    1.0,
+                    int(raw_bch.shape[-1]),
+                    device=raw_bch.device,
+                    dtype=raw_bch.dtype,
+                )
+                trend_h = trend_h - trend_h.mean()
+                denom = trend_h.pow(2).sum().clamp_min(1.0e-12)
+                coef = (
+                    (centered * trend_h.view(1, 1, -1)).sum(
+                        dim=-1, keepdim=True
+                    )
+                    / denom
+                )
+                projected = coef * trend_h.view(1, 1, -1)
+        elif name == "delta":
+            projected = raw_bch - raw_bch.mean(dim=-1, keepdim=True)
+        elif name == "d2_match":
+            projected = self._remove_affine_component(raw_bch)
+        elif name in {"diff_amp", "amp", "amp_under"}:
+            # Diff-amplitude is the volatility of first differences, not their
+            # mean/trend.  Remove the affine subspace so this branch cannot
+            # duplicate the dedicated trend expert, then parameterize amplitude
+            # with the same sample std(diff) statistic as penalty_diff_amp.
+            shape = self._remove_affine_component(raw_bch)
+            if int(raw_bch.shape[-1]) <= 1:
+                projected = shape
+            else:
+                diff_std = shape.diff(dim=-1).std(
+                    dim=-1,
+                    keepdim=True,
+                    unbiased=True,
+                )
+                safe_std = diff_std.square().add(1.0e-12).sqrt()
+                unit_shape = shape / safe_std
+                max_amp = self.named_output_projection_diff_amp_max
+                learned_amp = max_amp * torch.tanh(safe_std / max_amp)
+                projected = learned_amp * unit_shape
+        else:
+            projected = raw_bch
+
+        if self.residual_clip > 0.0:
+            max_abs = projected.abs().amax(dim=-1, keepdim=True)
+            scale = torch.clamp(
+                float(self.residual_clip) / max_abs.clamp_min(1.0e-12),
+                max=1.0,
+            )
             projected = projected * scale
         return projected
 
@@ -3192,8 +3552,8 @@ class ClusterwisePredResidualMoE(nn.Module):
 
         W1_kpdm = self._stack_expert_params(self.W1)
         b1_kpm = self._stack_expert_params(self.b1)
-        W2_kpmh = self._stack_expert_params(self.W2)
-        b2_kph = self._stack_expert_params(self.b2)
+        W2_kpmh = self._stack_output_params(self.W2)
+        b2_kph = self._stack_output_params(self.b2)
         Wg_kpm = self._stack_expert_params(self.W_gate)
         bg_kp = self._stack_expert_params(self.b_gate)
         W1 = W1_kpdm.index_select(0, cluster_id_c)  # [C,P,D,M]
@@ -3264,6 +3624,17 @@ class ClusterwisePredResidualMoE(nn.Module):
             clip = float(self.residual_clip)
             residuals = clip * torch.tanh(residuals / clip)
         residuals = self._project_named_residuals(residuals, candidate_base_bch)
+        semantic_level_controller_out: Optional[Dict[str, torch.Tensor]] = None
+        if self.semantic_level_controller is not None:
+            semantic_level_controller_out = self.semantic_level_controller(
+                x_bcl,
+                candidate_base_bch,
+            )
+            level_p = int(self.semantic_level_penalty_index)
+            residuals = residuals.clone()
+            residuals[:, :, level_p, :] = semantic_level_controller_out[
+                "level_residual_bch"
+            ]
 
         alpha_cp = self.alpha_values().index_select(0, cluster_id_c)  # [C,P]
         if self.channel_expert_enable:
@@ -3463,6 +3834,8 @@ class ClusterwisePredResidualMoE(nn.Module):
             if compositional_periodic_active:
                 result["selected_base_bch"] = selected_base_bch
                 result["periodic_expert_route_bch"] = periodic_expert_route_bch
+        if semantic_level_controller_out is not None:
+            result.update(semantic_level_controller_out)
         return result
 
     def alpha_values(self) -> torch.Tensor:
@@ -3474,6 +3847,31 @@ class ClusterwisePredResidualMoE(nn.Module):
         return alpha
 
     def get_cluster_params(self, k: int) -> List[nn.Parameter]:
+        if self.semantic_output_head_scope == "per_cluster":
+            cluster = int(k)
+            if cluster < 0 or cluster >= self.K:
+                raise IndexError(f"cluster index must be in [0,{self.K}), got {cluster}")
+            params: List[nn.Parameter] = []
+            for p in range(self.P):
+                if cluster == 0:
+                    encoder_idx = self._idx(0, p)
+                    params.extend([
+                        self.W1[encoder_idx],
+                        self.b1[encoder_idx],
+                        self.log_alpha[encoder_idx],
+                        self.W_gate[encoder_idx],
+                        self.b_gate[encoder_idx],
+                    ])
+                output_idx = self._output_idx(cluster, p)
+                params.extend([self.W2[output_idx], self.b2[output_idx]])
+            if cluster == 0:
+                if self.penalty_selector_enable:
+                    params.extend([self.W_selector[0], self.b_selector[0]])
+                if self.fusion_gate_enable:
+                    params.extend([self.W_fusion[0], self.b_fusion[0]])
+                if self.patch_router is not None:
+                    params.extend(list(self.patch_router.parameters()))
+            return params
         if self.shared_across_clusters and int(k) != 0:
             return []
         params: List[nn.Parameter] = []
@@ -3515,7 +3913,237 @@ class ClusterwisePredResidualMoE(nn.Module):
                     ])
         return params
 
+    def get_penalty_body_params(self, penalty_index: int) -> List[nn.Parameter]:
+        """Return the physically isolated prediction body for one named expert."""
+        p = int(penalty_index)
+        if p < 0 or p >= self.P:
+            raise IndexError(f"penalty_index must be in [0,{self.P}), got {p}")
+        if self.semantic_level_controller is not None and p == self.semantic_level_penalty_index:
+            if self.semantic_level_controller.separate_need_gate:
+                return [
+                    *self.semantic_level_controller.amplitude_parameters(),
+                    *self.semantic_level_controller.need_gate_parameters(),
+                ]
+            return list(self.semantic_level_controller.parameters())
+        params: List[nn.Parameter] = []
+        for param_k in range(self.param_K):
+            idx = param_k * self.P + p
+            params.extend([self.W1[idx], self.b1[idx]])
+        for output_k in range(self.output_param_K):
+            idx = output_k * self.P + p
+            params.extend([self.W2[idx], self.b2[idx]])
+        return params
+
+    def get_level_amplitude_params(self) -> List[nn.Parameter]:
+        if self.semantic_level_controller is None:
+            raise RuntimeError("LEVEL amplitude parameters require an enabled controller.")
+        return self.semantic_level_controller.amplitude_parameters()
+
+    def get_level_need_gate_params(self) -> List[nn.Parameter]:
+        if self.semantic_level_controller is None:
+            raise RuntimeError("LEVEL need-gate parameters require an enabled controller.")
+        if not self.semantic_level_controller.separate_need_gate:
+            raise RuntimeError("LEVEL disjoint need-gate parameters require separate_need_gate=true.")
+        return self.semantic_level_controller.need_gate_parameters()
+
+    def get_penalty_body_state(self, penalty_index: int) -> Dict[str, torch.Tensor]:
+        """Clone one expert body without including any other penalty parameters."""
+        p = int(penalty_index)
+        if p < 0 or p >= self.P:
+            raise IndexError(f"penalty_index must be in [0,{self.P}), got {p}")
+        if self.semantic_level_controller is not None and p == self.semantic_level_penalty_index:
+            state = {
+                "penalty_index": torch.tensor(p, dtype=torch.long),
+                "controller_state_version": torch.tensor(
+                    SemanticLevelPatchController.STATE_VERSION, dtype=torch.long
+                ),
+                "controller_patch_len": torch.tensor(
+                    self.semantic_level_controller_patch_len, dtype=torch.long
+                ),
+            }
+            state.update(
+                {
+                    f"controller.{name}": value.detach().cpu().clone()
+                    for name, value in self.semantic_level_controller.state_dict().items()
+                }
+            )
+            return state
+        return {
+            "penalty_index": torch.tensor(p, dtype=torch.long),
+            "W1": torch.stack(
+                [self.W1[param_k * self.P + p].detach().cpu().clone() for param_k in range(self.param_K)],
+                dim=0,
+            ),
+            "b1": torch.stack(
+                [self.b1[param_k * self.P + p].detach().cpu().clone() for param_k in range(self.param_K)],
+                dim=0,
+            ),
+            "W2": torch.stack(
+                [self.W2[output_k * self.P + p].detach().cpu().clone() for output_k in range(self.output_param_K)],
+                dim=0,
+            ),
+            "b2": torch.stack(
+                [self.b2[output_k * self.P + p].detach().cpu().clone() for output_k in range(self.output_param_K)],
+                dim=0,
+            ),
+        }
+
+    def _validated_penalty_body_copies(
+        self,
+        penalty_index: int,
+        state: Dict[str, torch.Tensor],
+    ) -> List[Tuple[nn.Parameter, torch.Tensor]]:
+        """Validate a complete body state without mutating the module."""
+        p = int(penalty_index)
+        if p < 0 or p >= self.P:
+            raise IndexError(f"penalty_index must be in [0,{self.P}), got {p}")
+        if self.semantic_level_controller is not None and p == self.semantic_level_penalty_index:
+            expected_state = self.semantic_level_controller.state_dict()
+            expected_keys = {
+                "penalty_index",
+                "controller_state_version",
+                "controller_patch_len",
+                *(f"controller.{name}" for name in expected_state),
+            }
+            actual_keys = set(state)
+            if actual_keys != expected_keys:
+                raise ValueError(
+                    "LEVEL controller body state key mismatch: "
+                    f"missing={sorted(expected_keys - actual_keys)}, "
+                    f"unexpected={sorted(actual_keys - expected_keys)}"
+                )
+            if int(torch.as_tensor(state["penalty_index"]).item()) != p:
+                raise ValueError("LEVEL controller penalty index mismatch.")
+            if int(torch.as_tensor(state["controller_state_version"]).item()) != int(
+                SemanticLevelPatchController.STATE_VERSION
+            ):
+                raise ValueError("LEVEL controller state version mismatch.")
+            if int(torch.as_tensor(state["controller_patch_len"]).item()) != int(
+                self.semantic_level_controller_patch_len
+            ):
+                raise ValueError("LEVEL controller patch length mismatch.")
+            parameter_by_name = dict(self.semantic_level_controller.named_parameters())
+            copies: List[Tuple[nn.Parameter, torch.Tensor]] = []
+            for name, parameter in parameter_by_name.items():
+                source = torch.as_tensor(state[f"controller.{name}"])
+                if tuple(source.shape) != tuple(parameter.shape) or source.dtype != parameter.dtype:
+                    raise ValueError(
+                        f"LEVEL controller body tensor mismatch for {name}: "
+                        f"expected {tuple(parameter.shape)}/{parameter.dtype}, "
+                        f"got {tuple(source.shape)}/{source.dtype}."
+                    )
+                copies.append((parameter, source))
+            return copies
+        expected_keys = {"penalty_index", "W1", "b1", "W2", "b2"}
+        actual_keys = set(state.keys())
+        if actual_keys != expected_keys:
+            raise ValueError(
+                "penalty body state key mismatch: "
+                f"missing={sorted(expected_keys - actual_keys)}, "
+                f"unexpected={sorted(actual_keys - expected_keys)}"
+            )
+        state_index = int(torch.as_tensor(state["penalty_index"]).item())
+        if state_index != p:
+            raise ValueError(
+                f"penalty body state index mismatch: expected {p}, got {state_index}"
+            )
+        copies: List[Tuple[nn.Parameter, torch.Tensor]] = []
+        for name, params, leading_size in (
+            ("W1", self.W1, self.param_K),
+            ("b1", self.b1, self.param_K),
+            ("W2", self.W2, self.output_param_K),
+            ("b2", self.b2, self.output_param_K),
+        ):
+            value = torch.as_tensor(state[name])
+            expected_shape = (leading_size, *params[p].shape)
+            if tuple(value.shape) != tuple(expected_shape):
+                raise ValueError(
+                    f"penalty body state {name} expected shape {tuple(expected_shape)}, "
+                    f"got {tuple(value.shape)}"
+                )
+            for owner_k in range(leading_size):
+                param = params[owner_k * self.P + p]
+                source = value[owner_k]
+                if source.dtype != param.dtype:
+                    raise ValueError(
+                        f"penalty body state {name} dtype mismatch: "
+                        f"expected {param.dtype}, got {source.dtype}"
+                    )
+                copies.append((param, source))
+        return copies
+
+    def load_penalty_body_state(
+        self,
+        penalty_index: int,
+        state: Dict[str, torch.Tensor],
+    ) -> None:
+        """Restore exactly one expert body and leave all other experts unchanged."""
+        copies = self._validated_penalty_body_copies(penalty_index, state)
+        with torch.no_grad():
+            for param, source in copies:
+                param.copy_(source.to(device=param.device))
+
+    def load_penalty_body_states(
+        self,
+        states: List[Dict[str, torch.Tensor]],
+    ) -> None:
+        """Atomically validate and restore the complete ordered penalty bank."""
+        if len(states) != self.P:
+            raise ValueError(
+                f"semantic bank requires exactly {self.P} penalty body states, got {len(states)}"
+            )
+        all_copies: List[Tuple[nn.Parameter, torch.Tensor]] = []
+        seen_ids = set()
+        for p, state in enumerate(states):
+            copies = self._validated_penalty_body_copies(p, state)
+            for param, source in copies:
+                if id(param) in seen_ids:
+                    raise RuntimeError("semantic bank body assembly contains duplicate parameters")
+                seen_ids.add(id(param))
+                all_copies.append((param, source))
+        expected_ids = {
+            id(param)
+            for p in range(self.P)
+            for param in self.get_penalty_body_params(p)
+        }
+        if seen_ids != expected_ids:
+            raise RuntimeError("semantic bank body assembly does not exactly cover the body")
+        with torch.no_grad():
+            for param, source in all_copies:
+                param.copy_(source.to(device=param.device))
+
     def mask_cluster_grads(self, stopped_k: torch.Tensor):
+        if self.semantic_output_head_scope == "per_cluster":
+            stopped = stopped_k.detach().to(dtype=torch.bool).reshape(-1)
+            if int(stopped.numel()) != self.K:
+                raise ValueError(
+                    f"stopped_k must contain {self.K} cluster flags, got {int(stopped.numel())}"
+                )
+            for k in range(self.K):
+                if not bool(stopped[k].item()):
+                    continue
+                for p in range(self.P):
+                    for param in (
+                        self.W2[self._output_idx(k, p)],
+                        self.b2[self._output_idx(k, p)],
+                    ):
+                        if param.grad is not None:
+                            param.grad.zero_()
+            if bool(stopped.all().item()):
+                output_ids = {
+                    id(self.W2[self._output_idx(k, p)])
+                    for k in range(self.K)
+                    for p in range(self.P)
+                }
+                output_ids.update(
+                    id(self.b2[self._output_idx(k, p)])
+                    for k in range(self.K)
+                    for p in range(self.P)
+                )
+                for param in self.get_cluster_params(0):
+                    if id(param) not in output_ids and param.grad is not None:
+                        param.grad.zero_()
+            return
         if self.shared_across_clusters:
             if not bool(stopped_k.detach().to(dtype=torch.bool).all().item()):
                 return
@@ -3530,6 +4158,38 @@ class ClusterwisePredResidualMoE(nn.Module):
                 break
 
     def get_cluster_state(self, k: int) -> Dict[str, torch.Tensor]:
+        if self.semantic_output_head_scope == "per_cluster":
+            cluster = int(k)
+            if cluster < 0 or cluster >= self.K:
+                raise IndexError(f"cluster index must be in [0,{self.K}), got {cluster}")
+            state: Dict[str, torch.Tensor] = {
+                "W2": torch.stack(
+                    [self.W2[self._output_idx(cluster, p)].detach().cpu() for p in range(self.P)],
+                    dim=0,
+                ),
+                "b2": torch.stack(
+                    [self.b2[self._output_idx(cluster, p)].detach().cpu() for p in range(self.P)],
+                    dim=0,
+                ),
+            }
+            if cluster == 0:
+                state.update({
+                    "W1": torch.stack([self.W1[self._idx(0, p)].detach().cpu() for p in range(self.P)], dim=0),
+                    "b1": torch.stack([self.b1[self._idx(0, p)].detach().cpu() for p in range(self.P)], dim=0),
+                    "log_alpha": torch.stack([self.log_alpha[self._idx(0, p)].detach().cpu() for p in range(self.P)], dim=0),
+                    "W_gate": torch.stack([self.W_gate[self._idx(0, p)].detach().cpu() for p in range(self.P)], dim=0),
+                    "b_gate": torch.stack([self.b_gate[self._idx(0, p)].detach().cpu() for p in range(self.P)], dim=0),
+                })
+                if self.penalty_selector_enable:
+                    state["W_selector"] = self.W_selector[0].detach().cpu()
+                    state["b_selector"] = self.b_selector[0].detach().cpu()
+                if self.fusion_gate_enable:
+                    state["W_fusion"] = self.W_fusion[0].detach().cpu()
+                    state["b_fusion"] = self.b_fusion[0].detach().cpu()
+                if self.patch_router is not None:
+                    for name, param in self.patch_router.named_parameters():
+                        state[f"patch_router.{name}"] = param.detach().cpu().clone()
+            return state
         state = {
             "W1": torch.stack([self.W1[self._idx(k, p)].detach().cpu() for p in range(self.P)], dim=0),
             "b1": torch.stack([self.b1[self._idx(k, p)].detach().cpu() for p in range(self.P)], dim=0),
@@ -3595,6 +4255,72 @@ class ClusterwisePredResidualMoE(nn.Module):
         return state
 
     def load_cluster_state(self, k: int, state: Dict[str, torch.Tensor]):
+        if self.semantic_output_head_scope == "per_cluster":
+            cluster = int(k)
+            if cluster < 0 or cluster >= self.K:
+                raise IndexError(f"cluster index must be in [0,{self.K}), got {cluster}")
+            expected = set(self.get_cluster_state(cluster).keys())
+            actual = set(state.keys())
+            if actual != expected:
+                raise ValueError(
+                    f"cluster {cluster} state key mismatch: "
+                    f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
+                )
+            copies: List[Tuple[nn.Parameter, torch.Tensor]] = []
+            families: List[Tuple[str, nn.ParameterList, bool]] = [
+                ("W2", self.W2, True),
+                ("b2", self.b2, True),
+            ]
+            if cluster == 0:
+                families.extend([
+                    ("W1", self.W1, False),
+                    ("b1", self.b1, False),
+                    ("log_alpha", self.log_alpha, False),
+                    ("W_gate", self.W_gate, False),
+                    ("b_gate", self.b_gate, False),
+                ])
+            for name, params, output_family in families:
+                value = torch.as_tensor(state[name])
+                first_param = params[self._output_idx(cluster, 0) if output_family else self._idx(0, 0)]
+                expected_shape = (self.P, *first_param.shape)
+                if tuple(value.shape) != expected_shape or value.dtype != first_param.dtype:
+                    raise ValueError(
+                        f"cluster {cluster} state {name} expected {expected_shape}/{first_param.dtype}, "
+                        f"got {tuple(value.shape)}/{value.dtype}"
+                    )
+                for p in range(self.P):
+                    idx = self._output_idx(cluster, p) if output_family else self._idx(0, p)
+                    copies.append((params[idx], value[p]))
+            if cluster == 0:
+                for name, params in (
+                    ("W_selector", self.W_selector),
+                    ("b_selector", self.b_selector),
+                    ("W_fusion", self.W_fusion),
+                    ("b_fusion", self.b_fusion),
+                ):
+                    if name not in state:
+                        continue
+                    param = params[0]
+                    value = torch.as_tensor(state[name])
+                    if tuple(value.shape) != tuple(param.shape) or value.dtype != param.dtype:
+                        raise ValueError(
+                            f"cluster 0 state {name} expected {tuple(param.shape)}/{param.dtype}, "
+                            f"got {tuple(value.shape)}/{value.dtype}"
+                        )
+                    copies.append((param, value))
+                if self.patch_router is not None:
+                    for name, param in self.patch_router.named_parameters():
+                        value = torch.as_tensor(state[f"patch_router.{name}"])
+                        if tuple(value.shape) != tuple(param.shape) or value.dtype != param.dtype:
+                            raise ValueError(
+                                f"cluster 0 state patch_router.{name} expected "
+                                f"{tuple(param.shape)}/{param.dtype}, got {tuple(value.shape)}/{value.dtype}"
+                            )
+                        copies.append((param, value))
+            with torch.no_grad():
+                for param, source in copies:
+                    param.copy_(source.to(device=param.device))
+            return
         for p in range(self.P):
             idx = self._idx(k, p)
             device = self.W1[idx].device

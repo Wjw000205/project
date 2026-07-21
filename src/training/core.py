@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import hashlib
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -1342,6 +1343,852 @@ def _make_cluster_optimizer_param_groups(
     return groups
 
 
+def _validate_semantic_bank_training_provenance(
+    provenance: Optional[Dict[str, object]],
+) -> bool:
+    """Validate the immutable Stage-1 producer recipe independently of inference shape."""
+    if provenance is None:
+        raise ValueError(
+            "Semantic bank checkpoint is missing pred_residual_training_provenance."
+        )
+    common: Dict[str, object] = {
+        "stage": "semantic_bank_stage1",
+        "candidate_supervision_weight": 1.0,
+        "independent_optimization": True,
+        "independent_optimizer": "sgd",
+        "need_quantile": 0.75,
+        "need_patch_len": 12,
+        "only_allowed": False,
+        "include_intervention": False,
+        "include_selector": False,
+        "include_patch_route": False,
+        "penalty_scale_source": "frozen_backbone_patch",
+        "penalty_scale_floor": 1.0e-3,
+        "penalty_scale_rule": "positive_patch_mean_floored",
+        "threshold_source": "train_frozen_pure_backbone_patch_q75",
+        "threshold_interpolation": "linear",
+        "need_comparison": ">=",
+        "optimizer": {
+            "name": "sgd",
+            "momentum": 0.0,
+            "dampening": 0.0,
+            "nesterov": False,
+        },
+        "scheduler": "none",
+        "checkpoint_selection": "semantic_per_expert",
+    }
+    recipes: Dict[int, Dict[str, object]] = {
+        1: {
+            "version": 1,
+            "candidate_loss": "acceptance_guarded_own_penalty",
+            "high_mse_relative_tolerance": 0.0,
+            "low_mse_relative_tolerance": 1.0e-3,
+            "low_high_rms_ratio_max": 0.25,
+            "forecast_mse_weight": 1.0,
+            "noop_weight": 1.0,
+            "constraint_weight": 1.0,
+            "constraint_eps": 1.0e-8,
+        },
+        2: {
+            "version": 2,
+            "candidate_loss": "need_weighted_own_penalty_mse",
+            "high_mse_relative_tolerance": 0.0,
+            "low_mse_relative_tolerance": 1.0e-3,
+            "low_high_rms_ratio_max": 0.25,
+            "forecast_mse_weight": 1.0,
+            "noop_weight": 1.0,
+        },
+        3: {
+            "version": 3,
+            "candidate_loss": "high_need_own_penalty",
+            "forecast_mse_weight": 0.0,
+            "noop_weight": 0.0,
+            "active_penalty": provenance.get("active_penalty"),
+            "validation_blocks": 3,
+            "min_high_need_improved_fraction": 0.60,
+            "min_matching_gain_by_name": {
+                "level": 0.10,
+                "trend": 0.10,
+                "d2_match": 0.10,
+                "diff_amp": 0.70,
+            },
+            "acceptance_mode": "semantic_only_high_need_patch",
+        },
+        4: {
+            "version": 4,
+            "candidate_loss": "high_need_own_penalty",
+            "forecast_mse_weight": 0.0,
+            "noop_weight": 0.0,
+            "active_penalty": provenance.get("active_penalty"),
+            "validation_blocks": 3,
+            "min_high_need_improved_fraction": 0.60,
+            "min_matching_gain_by_name": {
+                "level": 0.10,
+                "trend": 0.10,
+                "d2_match": 0.10,
+                "diff_amp": 0.70,
+            },
+            "acceptance_mode": "semantic_only_high_need_patch",
+            "raw_gradient_accumulation": {
+                "enabled": True,
+                "microbatches": 16,
+                "missing_gradient": "zero",
+                "reduction": "mean_by_actual_count",
+                "clip": "once_after_mean",
+                "weight_decay": "once_per_optimizer_step",
+                "tail": "actual_count",
+            },
+        },
+        5: {
+            "version": 5,
+            "candidate_loss": "level_residual_gate",
+            "forecast_mse_weight": 0.0,
+            "noop_weight": 0.0,
+            "active_penalty": "level",
+            "validation_blocks": 3,
+            "min_high_need_improved_fraction": 0.60,
+            "min_matching_gain_by_name": {
+                "level": 0.10,
+                "trend": 0.10,
+                "d2_match": 0.10,
+                "diff_amp": 0.70,
+            },
+            "acceptance_mode": "semantic_only_high_need_patch",
+            "level_loss_weights": {
+                "amplitude": 1.0,
+                "need_bce": 1.0,
+                "executed": 1.0,
+            },
+            "raw_gradient_accumulation": {
+                "enabled": True,
+                "microbatches": 16,
+                "missing_gradient": "zero",
+                "reduction": "mean_by_actual_count",
+                "clip": "once_after_mean",
+                "weight_decay": "once_per_optimizer_step",
+                "tail": "actual_count",
+            },
+        },
+        6: {
+            "version": 6,
+            "candidate_loss": "level_residual_separate_gate",
+            "forecast_mse_weight": 0.0,
+            "noop_weight": 0.0,
+            "active_penalty": "level",
+            "validation_blocks": 3,
+            "min_high_need_improved_fraction": 0.60,
+            "min_matching_gain_by_name": {
+                "level": 0.10,
+                "trend": 0.10,
+                "d2_match": 0.10,
+                "diff_amp": 0.70,
+            },
+            "acceptance_mode": "semantic_only_high_need_patch_with_local_gate",
+            "level_loss_weights": {
+                "amplitude": 1.0,
+                "need_balanced_bce": 1.0,
+                "executed": 0.0,
+            },
+            "level_need_positive_weight": 3.0,
+            "level_optimizer_groups": ["amplitude", "need_gate"],
+            "gradient_clip": "independent_per_level_group",
+            "raw_gradient_accumulation": {
+                "enabled": True,
+                "microbatches": 16,
+                "missing_gradient": "zero",
+                "reduction": "mean_by_actual_count",
+                "clip": "once_after_mean_per_level_group",
+                "weight_decay": "once_per_optimizer_step_per_level_group",
+                "tail": "actual_count",
+            },
+        },
+        7: {
+            "version": 7,
+            "independent_optimizer": "mixed_level_adam_amplitude_sgd_need_gate",
+            "candidate_loss": "level_residual_separate_gate",
+            "forecast_mse_weight": 0.0,
+            "noop_weight": 0.0,
+            "active_penalty": "level",
+            "validation_blocks": 3,
+            "min_high_need_improved_fraction": 0.60,
+            "min_matching_gain_by_name": {
+                "level": 0.10,
+                "trend": 0.10,
+                "d2_match": 0.10,
+                "diff_amp": 0.70,
+            },
+            "acceptance_mode": "semantic_only_high_need_patch_with_local_gate",
+            "level_loss_weights": {
+                "amplitude": 1.0,
+                "need_balanced_bce": 1.0,
+                "executed": 0.0,
+            },
+            "level_need_positive_weight": 3.0,
+            "level_optimizer_groups": ["amplitude", "need_gate"],
+            "gradient_clip": "independent_per_level_group",
+            "optimizer": {
+                "name": "disjoint_level_adam_amplitude_sgd_need_gate",
+                "amplitude": {
+                    "name": "adam",
+                    "lr": 1.0e-3,
+                    "weight_decay": 0.0,
+                    "betas": [0.9, 0.999],
+                    "eps": 1.0e-8,
+                    "amsgrad": False,
+                },
+                "need_gate": {
+                    "name": "sgd",
+                    "lr": 3.0e-4,
+                    "weight_decay": 1.0e-3,
+                    "momentum": 0.0,
+                    "dampening": 0.0,
+                    "nesterov": False,
+                },
+            },
+            "raw_gradient_accumulation": {
+                "enabled": True,
+                "microbatches": 16,
+                "missing_gradient": "zero",
+                "reduction": "mean_by_actual_count",
+                "clip": "once_after_mean_per_level_group",
+                "weight_decay": "once_per_optimizer_step_per_level_group",
+                "tail": "actual_count",
+            },
+        },
+    }
+    recipes[8] = {
+        **recipes[7],
+        "version": 8,
+        "candidate_loss": "level_residual_high_need_separate_gate",
+        "level_amplitude_population": "detached_q75_high_need_only",
+        "level_acceptance_candidate": "raw_amplitude",
+        "level_need_gate_acceptance_role": "diagnostic_only",
+    }
+    version = provenance.get("version")
+    if version not in recipes:
+        raise ValueError(
+            "Semantic bank training provenance mismatch: "
+            f"unsupported version={version!r}."
+        )
+    if int(version) in {3, 4, 5, 6, 7, 8} and provenance.get("active_penalty") not in {
+        "level", "trend", "d2_match", "diff_amp"
+    }:
+        raise ValueError(
+            "Semantic staged provenance requires a valid active_penalty."
+        )
+    if int(version) in {4, 5, 6, 7, 8} and provenance.get("active_penalty") != "level":
+        raise ValueError(
+            "Semantic raw-gradient accumulation provenance is currently level-only."
+        )
+    expected = {**common, **recipes[int(version)]}
+    missing = [field for field in expected if field not in provenance]
+    unexpected = [field for field in provenance if field not in expected]
+    mismatches = {
+        field: {"actual": provenance.get(field), "expected": value}
+        for field, value in expected.items()
+        if field in provenance and provenance.get(field) != value
+    }
+    if missing or unexpected or mismatches:
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if unexpected:
+            details.append(f"unexpected={unexpected}")
+        if mismatches:
+            details.append(f"mismatches={mismatches}")
+        raise ValueError(
+            "Semantic bank training provenance mismatch: " + "; ".join(details)
+        )
+    return True
+
+
+_SEMANTIC_BODY_PREFIXES = (
+    "W1.",
+    "b1.",
+    "W2.",
+    "b2.",
+    "semantic_level_controller.",
+)
+
+
+def _semantic_body_state_sha256(state: Dict[str, torch.Tensor]) -> str:
+    """Hash the exact ordered semantic-body tensor schema and bytes."""
+    digest = hashlib.sha256()
+    keys = sorted(
+        str(name) for name in state if str(name).startswith(_SEMANTIC_BODY_PREFIXES)
+    )
+    if not keys:
+        raise ValueError("semantic body state contains no W1/b1/W2/b2 tensors")
+    for name in keys:
+        value = torch.as_tensor(state[name]).detach().cpu().contiguous()
+        header = (
+            f"name={name}\n"
+            f"dtype={value.dtype}\n"
+            f"shape={','.join(str(int(dim)) for dim in value.shape)}\n"
+            f"numel={int(value.numel())}\n"
+        ).encode("ascii")
+        digest.update(header)
+        digest.update(value.numpy().tobytes(order="C"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _semantic_penalty_body_state_sha256(state: Dict[str, torch.Tensor]) -> str:
+    """Hash one complete named expert body, including its ordered ownership schema."""
+    expected = {"penalty_index", "W1", "b1", "W2", "b2"}
+    actual = set(state.keys())
+    controller_required = {
+        "penalty_index",
+        "controller_state_version",
+        "controller_patch_len",
+    }
+    if actual == expected:
+        ordered_names = ("penalty_index", "W1", "b1", "W2", "b2")
+    elif controller_required.issubset(actual) and all(
+        name in controller_required or name.startswith("controller.") for name in actual
+    ) and any(name.startswith("controller.") for name in actual):
+        ordered_names = (
+            "penalty_index",
+            "controller_state_version",
+            "controller_patch_len",
+            *sorted(name for name in actual if name.startswith("controller.")),
+        )
+    else:
+        raise ValueError(
+            "semantic penalty body hash requires an exact legacy or LEVEL-controller schema: "
+            f"keys={sorted(actual)}"
+        )
+    digest = hashlib.sha256()
+    for name in ordered_names:
+        value = torch.as_tensor(state[name]).detach().cpu().contiguous()
+        digest.update(
+            (
+                f"name={name}\n"
+                f"dtype={value.dtype}\n"
+                f"shape={','.join(str(int(dim)) for dim in value.shape)}\n"
+                f"numel={int(value.numel())}\n"
+            ).encode("ascii")
+        )
+        digest.update(value.numpy().tobytes(order="C"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _semantic_penalty_body_state_from_state_dict(
+    state: Dict[str, torch.Tensor],
+    *,
+    penalty_index: int,
+    num_penalties: int,
+    encoder_param_clusters: int,
+    output_param_clusters: int,
+    body_type: str = "legacy_shared_v1",
+    controller_patch_len: int = 12,
+    controller_state_version: int = 1,
+) -> Dict[str, torch.Tensor]:
+    p = int(penalty_index)
+    P = int(num_penalties)
+    if p < 0 or p >= P:
+        raise IndexError(f"penalty_index must be in [0,{P}), got {p}")
+    if str(body_type) == "level_local_controller_v1":
+        prefix = "semantic_level_controller."
+        controller_keys = sorted(name for name in state if str(name).startswith(prefix))
+        if not controller_keys:
+            raise ValueError("semantic checkpoint is missing LEVEL controller tensors.")
+        body = {
+            "penalty_index": torch.tensor(p, dtype=torch.long),
+            "controller_state_version": torch.tensor(
+                int(controller_state_version), dtype=torch.long
+            ),
+            "controller_patch_len": torch.tensor(int(controller_patch_len), dtype=torch.long),
+        }
+        body.update(
+            {
+                f"controller.{name[len(prefix):]}": torch.as_tensor(state[name]).detach().cpu().clone()
+                for name in controller_keys
+            }
+        )
+        return body
+
+    def stacked(family: str, count: int) -> torch.Tensor:
+        keys = [f"{family}.{owner_k * P + p}" for owner_k in range(int(count))]
+        missing = [name for name in keys if name not in state]
+        if missing:
+            raise ValueError(
+                f"semantic checkpoint is missing {family} keys for penalty {p}: {missing}"
+            )
+        return torch.stack(
+            [torch.as_tensor(state[name]).detach().cpu().clone() for name in keys],
+            dim=0,
+        )
+
+    return {
+        "penalty_index": torch.tensor(p, dtype=torch.long),
+        "W1": stacked("W1", encoder_param_clusters),
+        "b1": stacked("b1", encoder_param_clusters),
+        "W2": stacked("W2", output_param_clusters),
+        "b2": stacked("b2", output_param_clusters),
+    }
+
+
+def _validate_semantic_release_metadata(
+    release: object,
+    *,
+    penalty_names: List[str],
+    source_state: Dict[str, torch.Tensor],
+    source_contract: Dict[str, object],
+) -> List[str]:
+    if not isinstance(release, dict) or not bool(release.get("release_ready", False)):
+        raise ValueError("Per-cluster frozen consumer requires release_ready=true metadata.")
+    rows = release.get("per_penalty")
+    if not isinstance(rows, list) or len(rows) != len(penalty_names):
+        raise ValueError(
+            "Semantic release metadata requires one ordered row per penalty."
+        )
+    stored_hashes = release.get("body_sha256_by_penalty")
+    if not isinstance(stored_hashes, list) or len(stored_hashes) != len(penalty_names):
+        raise ValueError("Semantic release metadata is missing ordered per-penalty body hashes.")
+    encoder_count = int(source_contract.get("semantic_encoder_param_clusters", 0))
+    output_count = int(source_contract.get("semantic_output_param_clusters", 0))
+    body_type_by_penalty = source_contract.get("body_type_by_penalty", {}) or {}
+    controller_contract = source_contract.get("semantic_level_controller", {}) or {}
+    computed_hashes: List[str] = []
+    for p, name in enumerate(penalty_names):
+        row = rows[p]
+        if not isinstance(row, dict) or row.get("penalty") != name:
+            raise ValueError(
+                f"Semantic release penalty order mismatch at {p}: expected {name!r}."
+            )
+        if not bool((row.get("acceptance") or {}).get("pass", False)):
+            raise ValueError(f"Semantic release penalty {name} is not independently accepted.")
+        body_state = _semantic_penalty_body_state_from_state_dict(
+            source_state,
+            penalty_index=p,
+            num_penalties=len(penalty_names),
+            encoder_param_clusters=encoder_count,
+            output_param_clusters=output_count,
+            body_type=str(body_type_by_penalty.get(name, "legacy_shared_v1")),
+            controller_patch_len=int(controller_contract.get("patch_len", 12)),
+            controller_state_version=int(controller_contract.get("state_version", 1)),
+        )
+        body_hash = _semantic_penalty_body_state_sha256(body_state)
+        if row.get("body_sha256") != body_hash or stored_hashes[p] != body_hash:
+            raise ValueError(
+                f"Semantic release body hash mismatch for {name}: "
+                f"row={row.get('body_sha256')}, ordered={stored_hashes[p]}, actual={body_hash}"
+            )
+        computed_hashes.append(body_hash)
+    return computed_hashes
+
+
+def _validate_semantic_partial_metadata(
+    release: object,
+    *,
+    penalty_names: List[str],
+    next_active_penalty: str,
+    source_state: Dict[str, torch.Tensor],
+    source_contract: Dict[str, object],
+) -> List[Dict[str, object]]:
+    """Validate an ordered accepted prefix for the next staged Stage-1 run."""
+    if next_active_penalty not in penalty_names:
+        raise ValueError(f"Unknown staged active penalty {next_active_penalty!r}.")
+    next_index = penalty_names.index(next_active_penalty)
+    expected_accepted = penalty_names[:next_index]
+    if not isinstance(release, dict):
+        raise ValueError("Semantic staged checkpoint is missing selection metadata.")
+    if bool(release.get("release_ready", False)):
+        raise ValueError("A partial Stage-1 resume must not claim release_ready=true.")
+    if not bool(release.get("stage_complete", False)):
+        raise ValueError("Semantic staged checkpoint requires stage_complete=true.")
+    if list(release.get("accepted_penalties", [])) != expected_accepted:
+        raise ValueError(
+            "Semantic staged checkpoint accepted prefix mismatch: "
+            f"expected={expected_accepted}, actual={release.get('accepted_penalties')}."
+        )
+    rows = release.get("per_penalty")
+    hashes = release.get("body_sha256_by_penalty")
+    if not isinstance(rows, list) or len(rows) != len(penalty_names):
+        raise ValueError("Semantic staged checkpoint requires one ordered row per penalty.")
+    if not isinstance(hashes, list) or len(hashes) != len(penalty_names):
+        raise ValueError("Semantic staged checkpoint requires ordered body hashes.")
+    encoder_count = int(source_contract.get("semantic_encoder_param_clusters", 0))
+    output_count = int(source_contract.get("semantic_output_param_clusters", 0))
+    body_type_by_penalty = source_contract.get("body_type_by_penalty", {}) or {}
+    controller_contract = source_contract.get("semantic_level_controller", {}) or {}
+    accepted_rows: List[Dict[str, object]] = []
+    for p, name in enumerate(penalty_names):
+        row = rows[p]
+        if not isinstance(row, dict) or row.get("penalty") != name:
+            raise ValueError(f"Semantic staged penalty order mismatch at index {p}.")
+        should_be_accepted = p < next_index
+        if bool(row.get("accepted", False)) != should_be_accepted:
+            raise ValueError(
+                f"Semantic staged accepted flag mismatch for {name}."
+            )
+        if not should_be_accepted:
+            if hashes[p] is not None or row.get("body_sha256") is not None:
+                raise ValueError(
+                    f"Unaccepted staged penalty {name} must not carry an accepted-body hash."
+                )
+            continue
+        if not bool((row.get("acceptance") or {}).get("pass", False)):
+            raise ValueError(f"Accepted staged penalty {name} has no PASS evidence.")
+        body_provenance = row.get("training_provenance")
+        _validate_semantic_bank_training_provenance(body_provenance)
+        if not isinstance(body_provenance, dict) or body_provenance.get(
+            "active_penalty"
+        ) != name:
+            raise ValueError(
+                f"Accepted staged penalty {name} has mismatched body provenance."
+            )
+        body_state = _semantic_penalty_body_state_from_state_dict(
+            source_state,
+            penalty_index=p,
+            num_penalties=len(penalty_names),
+            encoder_param_clusters=encoder_count,
+            output_param_clusters=output_count,
+            body_type=str(body_type_by_penalty.get(name, "legacy_shared_v1")),
+            controller_patch_len=int(controller_contract.get("patch_len", 12)),
+            controller_state_version=int(controller_contract.get("state_version", 1)),
+        )
+        body_hash = _semantic_penalty_body_state_sha256(body_state)
+        if hashes[p] != body_hash or row.get("body_sha256") != body_hash:
+            raise ValueError(f"Semantic staged body hash mismatch for {name}.")
+        accepted_rows.append(
+            {
+                "penalty": name,
+                "epoch": row.get("epoch"),
+                "matching_penalty_relative_gain": float(
+                    row.get("matching_penalty_relative_gain")
+                ),
+                "state": body_state,
+                "body_sha256": body_hash,
+                "acceptance": dict(row["acceptance"]),
+                "training_provenance": dict(body_provenance),
+                "optimizer_state_identity": str(
+                    row.get("optimizer_state_identity", "")
+                ),
+            }
+        )
+    return accepted_rows
+
+
+def _configure_semantic_bank_body_only(
+    pred_residual: ClusterwisePredResidualMoE,
+    *,
+    active_penalty_index: Optional[int] = None,
+) -> Dict[str, List[str]]:
+    body_prefixes = _SEMANTIC_BODY_PREFIXES
+    active_ids = None
+    if active_penalty_index is not None:
+        active_ids = {
+            id(param)
+            for param in pred_residual.get_penalty_body_params(
+                int(active_penalty_index)
+            )
+        }
+    trainable: List[str] = []
+    frozen: List[str] = []
+    for name, param in pred_residual.named_parameters():
+        is_body = name.startswith(body_prefixes)
+        is_active_body = bool(
+            id(param) in active_ids
+            if active_ids is not None
+            else is_body
+        )
+        param.requires_grad_(is_active_body)
+        if not is_active_body:
+            param.grad = None
+            frozen.append(name)
+        else:
+            trainable.append(name)
+    expected_ids = {
+        id(param)
+        for p in (
+            range(pred_residual.P)
+            if active_penalty_index is None
+            else [int(active_penalty_index)]
+        )
+        for param in pred_residual.get_penalty_body_params(p)
+    }
+    actual_ids = {
+        id(param) for param in pred_residual.parameters() if param.requires_grad
+    }
+    if actual_ids != expected_ids:
+        raise RuntimeError("semantic Stage-1 body-only trainability does not match ownership")
+    return {"trainable": trainable, "frozen": frozen}
+
+
+def _validate_semantic_frozen_consumer_paths(paths: Dict[str, bool]) -> None:
+    forbidden = sorted(name for name, enabled in paths.items() if bool(enabled))
+    if forbidden:
+        raise ValueError(
+            "Per-cluster frozen consumer permits only the exact bank plus a new patch_router; "
+            "forbidden paths: " + ", ".join(forbidden)
+        )
+
+
+def _validate_semantic_frozen_consumer_lifecycle_flags(
+    *,
+    freeze_adapter_bank: bool,
+    freeze_backbone: bool,
+    patch_router_enable: bool,
+    finetune_enable: bool,
+    load_pred_residual: bool,
+    load_gate: bool,
+    require_training_provenance: bool,
+) -> None:
+    required = {
+        "freeze_adapter_bank": freeze_adapter_bank,
+        "freeze_backbone": freeze_backbone,
+        "patch_router_enable": patch_router_enable,
+        "finetune_enable": finetune_enable,
+        "load_pred_residual": load_pred_residual,
+        "require_training_provenance": require_training_provenance,
+    }
+    missing = sorted(name for name, enabled in required.items() if not bool(enabled))
+    if missing or bool(load_gate):
+        raise ValueError(
+            "Per-cluster frozen consumer lifecycle mismatch: "
+            f"missing_required={missing}, load_gate={bool(load_gate)}"
+        )
+
+
+def _freeze_semantic_frozen_consumer(
+    pred_residual: ClusterwisePredResidualMoE,
+) -> Dict[str, object]:
+    frozen_count = _freeze_module_params_except_prefixes(
+        pred_residual,
+        ("patch_router.",),
+    )
+    body_ids = {
+        id(param)
+        for p in range(pred_residual.P)
+        for param in pred_residual.get_penalty_body_params(p)
+    }
+    named = list(pred_residual.named_parameters())
+    body_trainable = [name for name, param in named if id(param) in body_ids and param.requires_grad]
+    nonrouter_trainable = [
+        name for name, param in named
+        if not name.startswith("patch_router.") and param.requires_grad
+    ]
+    router_frozen = [
+        name for name, param in named
+        if name.startswith("patch_router.") and not param.requires_grad
+    ]
+    if body_trainable or nonrouter_trainable or router_frozen:
+        raise RuntimeError(
+            "Per-cluster frozen consumer trainability mismatch: "
+            f"body_trainable={body_trainable}, nonrouter_trainable={nonrouter_trainable}, "
+            f"router_frozen={router_frozen}"
+        )
+    return {
+        "frozen_params": int(frozen_count),
+        "frozen_names": [
+            name for name, param in named if not param.requires_grad
+        ],
+        "trainable_router_names": [
+            name for name, param in named if param.requires_grad
+        ],
+    }
+
+
+def _assert_semantic_patch_router_only_trainable(
+    *,
+    model: nn.Module,
+    gate: nn.Module,
+    pred_residual: ClusterwisePredResidualMoE,
+    dynamic_lambda: Optional[nn.Module] = None,
+    learnable_lambda: Optional[nn.Module] = None,
+    learnable_output_anchor: Optional[nn.Module] = None,
+) -> List[str]:
+    unexpected: List[str] = []
+    for prefix, module in (
+        ("model", model),
+        ("gate", gate),
+        ("dynamic_lambda", dynamic_lambda),
+        ("learnable_lambda", learnable_lambda),
+        ("learnable_output_anchor", learnable_output_anchor),
+    ):
+        if module is None:
+            continue
+        unexpected.extend(
+            f"{prefix}.{name}" for name, param in module.named_parameters() if param.requires_grad
+        )
+    router_names: List[str] = []
+    for name, param in pred_residual.named_parameters():
+        if not param.requires_grad:
+            continue
+        if not name.startswith("patch_router."):
+            unexpected.append(f"pred_residual.{name}")
+        else:
+            router_names.append(f"pred_residual.{name}")
+    if unexpected or not router_names:
+        raise RuntimeError(
+            "Per-cluster frozen consumer must have only target-new patch_router trainable: "
+            f"unexpected={unexpected}, router_names={router_names}"
+        )
+    return router_names
+
+
+def _canonical_cluster_map_sha256(K: int, cluster_id_c: Iterable[int]) -> str:
+    cluster_count = int(K)
+    values = [int(value) for value in cluster_id_c]
+    if cluster_count <= 0 or not values:
+        raise ValueError("canonical cluster map requires positive K and a nonempty channel map")
+    if any(value < 0 or value >= cluster_count for value in values):
+        raise ValueError(
+            f"canonical cluster map values must be in [0,{cluster_count}), got {values}"
+        )
+    payload = (
+        f"K={cluster_count}\ncluster_id_c="
+        + ",".join(str(value) for value in values)
+        + "\n"
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _normalized_pred_residual_contract(
+    source_contract: Dict[str, object],
+    target_contract: Dict[str, object],
+) -> Dict[str, object]:
+    """Normalize only a legacy semantic contract to the shared representation."""
+    normalized = dict(source_contract)
+    if "semantic_output_head_scope" in normalized:
+        return normalized
+    if target_contract.get("semantic_output_head_scope", "shared") != "shared":
+        raise ValueError(
+            "Legacy pred_residual contracts can normalize only to shared output heads."
+        )
+    normalized.update({
+        "version": target_contract.get("version"),
+        "semantic_output_head_scope": "shared",
+        "semantic_encoder_param_clusters": target_contract.get(
+            "semantic_encoder_param_clusters", 1
+        ),
+        "semantic_output_param_clusters": target_contract.get(
+            "semantic_output_param_clusters", 1
+        ),
+        "semantic_parameter_ownership": "legacy_shared_v1",
+    })
+    return normalized
+
+
+def _validate_exact_semantic_body_state(
+    source_state: Dict[str, torch.Tensor],
+    target_state: Dict[str, torch.Tensor],
+) -> None:
+    source_keys = {
+        str(name) for name in source_state if str(name).startswith(_SEMANTIC_BODY_PREFIXES)
+    }
+    target_keys = {
+        str(name) for name in target_state if str(name).startswith(_SEMANTIC_BODY_PREFIXES)
+    }
+    if source_keys != target_keys:
+        raise ValueError(
+            "Semantic body key mismatch: "
+            f"missing={sorted(target_keys - source_keys)}, "
+            f"unexpected={sorted(source_keys - target_keys)}"
+        )
+    for name in sorted(target_keys):
+        source = torch.as_tensor(source_state[name])
+        target = torch.as_tensor(target_state[name])
+        if tuple(source.shape) != tuple(target.shape) or source.dtype != target.dtype:
+            raise ValueError(
+                f"Semantic body tensor mismatch for {name}: "
+                f"source={tuple(source.shape)}/{source.dtype}, "
+                f"target={tuple(target.shape)}/{target.dtype}"
+            )
+
+
+def _new_semantic_bank_best_candidates(
+    penalty_names: List[str],
+) -> List[Dict[str, object]]:
+    return [
+        {
+            "penalty": str(name),
+            "epoch": None,
+            "matching_penalty_relative_gain": float("-inf"),
+            "state": None,
+            "body_sha256": None,
+            "acceptance": None,
+        }
+        for name in penalty_names
+    ]
+
+
+def _update_semantic_bank_best_candidate(
+    best_by_penalty: List[Dict[str, object]],
+    *,
+    penalty_index: int,
+    penalty_name: str,
+    epoch: int,
+    acceptance: Dict[str, object],
+    body_state: Dict[str, torch.Tensor],
+) -> bool:
+    """Retain one body only when that same expert independently passes."""
+    p = int(penalty_index)
+    if p < 0 or p >= len(best_by_penalty):
+        raise IndexError(f"penalty_index {p} is outside candidate bank")
+    current = best_by_penalty[p]
+    if str(current.get("penalty")) != str(penalty_name):
+        raise ValueError(
+            "semantic bank candidate penalty mismatch: "
+            f"slot={current.get('penalty')!r}, submitted={penalty_name!r}"
+        )
+    passed = bool(acceptance.get("pass", False))
+    gain = float(acceptance.get("matching_penalty_relative_gain", float("-inf")))
+    selected = bool(
+        passed
+        and math.isfinite(gain)
+        and gain > float(current.get("matching_penalty_relative_gain", float("-inf")))
+    )
+    if selected:
+        best_by_penalty[p] = {
+            "penalty": str(penalty_name),
+            "epoch": int(epoch),
+            "matching_penalty_relative_gain": gain,
+            "state": {
+                key: value.detach().cpu().clone()
+                for key, value in body_state.items()
+            },
+            "body_sha256": _semantic_penalty_body_state_sha256(body_state),
+            "acceptance": dict(acceptance),
+        }
+    return selected
+
+
+def _semantic_bank_release_ready(
+    best_by_penalty: List[Dict[str, object]],
+    penalty_names: List[str],
+) -> bool:
+    if len(best_by_penalty) != len(penalty_names) or not penalty_names:
+        return False
+    for p, (item, expected_name) in enumerate(zip(best_by_penalty, penalty_names)):
+        if item.get("penalty") != expected_name:
+            return False
+        state = item.get("state")
+        if not isinstance(state, dict):
+            return False
+        if not bool((item.get("acceptance") or {}).get("pass", False)):
+            return False
+        if item.get("body_sha256") != _semantic_penalty_body_state_sha256(state):
+            return False
+        if int(torch.as_tensor(state.get("penalty_index", -1)).item()) != p:
+            return False
+    return True
+
+
+def _semantic_bank_checkpoint_save_allowed(
+    *,
+    save_requested: bool,
+    semantic_bank_stage1: bool,
+    release_ready: bool,
+) -> bool:
+    return bool(save_requested) and (
+        not bool(semantic_bank_stage1) or bool(release_ready)
+    )
+
+
 def _load_finetune_pred_residual_state(
     *,
     pred_residual: Optional[ClusterwisePredResidualMoE],
@@ -1349,6 +2196,10 @@ def _load_finetune_pred_residual_state(
     source_penalty_names: List[str],
     target_penalty_names: List[str],
     strict: bool = True,
+    source_contract: Optional[Dict[str, object]] = None,
+    target_contract: Optional[Dict[str, object]] = None,
+    source_training_provenance: Optional[Dict[str, object]] = None,
+    require_training_provenance: bool = False,
 ) -> bool:
     if pred_residual is None or "pred_residual_state" not in checkpoint:
         return False
@@ -1357,11 +2208,124 @@ def _load_finetune_pred_residual_state(
             "Fine-tune pred_residual loading requires identical penalty_names: "
             f"source={list(source_penalty_names)}, target={list(target_penalty_names)}"
         )
+    if target_contract is not None:
+        if source_contract is None:
+            raise ValueError(
+                "Fine-tune pred_residual loading requires checkpoint pred_residual_contract metadata."
+            )
+        target_has_output_scope = "semantic_output_head_scope" in target_contract
+        normalized_source_contract = (
+            _normalized_pred_residual_contract(source_contract, target_contract)
+            if target_has_output_scope
+            else dict(source_contract)
+        )
+        contract_fields = (
+            "version",
+            "penalty_names",
+            "projection_mode",
+            "projection_patch_len",
+            "base_type",
+            "fixed_alpha",
+            "scale_by_name",
+            "diff_amp_max",
+        )
+        if target_has_output_scope:
+            contract_fields = (
+                *contract_fields,
+                "semantic_output_head_scope",
+                "semantic_encoder_param_clusters",
+                "semantic_output_param_clusters",
+                "semantic_parameter_ownership",
+            )
+        if "semantic_level_controller" in target_contract:
+            contract_fields = (
+                *contract_fields,
+                "semantic_level_controller",
+                "body_type_by_penalty",
+            )
+        if target_contract.get("semantic_output_head_scope") == "per_cluster":
+            contract_fields = (*contract_fields, "cluster_count", "cluster_id_c", "cluster_map_sha256")
+            for label, contract in (
+                ("source", normalized_source_contract),
+                ("target", target_contract),
+            ):
+                canonical_hash = _canonical_cluster_map_sha256(
+                    int(contract.get("cluster_count", 0)),
+                    contract.get("cluster_id_c", []),
+                )
+                if contract.get("cluster_map_sha256") != canonical_hash:
+                    raise ValueError(
+                        f"{label} pred_residual contract has a noncanonical cluster_map_sha256."
+                    )
+        mismatches = {
+            field: {
+                "source": normalized_source_contract.get(field),
+                "target": target_contract.get(field),
+            }
+            for field in contract_fields
+            if normalized_source_contract.get(field) != target_contract.get(field)
+        }
+        if mismatches:
+            raise ValueError(
+                "Fine-tune pred_residual contract mismatch: "
+                + ", ".join(
+                    f"{field}=source:{values['source']!r}/target:{values['target']!r}"
+                    for field, values in mismatches.items()
+                )
+            )
+    if bool(require_training_provenance) or source_training_provenance is not None:
+        _validate_semantic_bank_training_provenance(source_training_provenance)
     source_state = checkpoint["pred_residual_state"]
+    target_state = pred_residual.state_dict()
+    per_cluster_semantic_body = bool(
+        target_contract is not None
+        and target_contract.get("semantic_output_head_scope") == "per_cluster"
+    )
+    if per_cluster_semantic_body:
+        source_router_keys = sorted(
+            name for name in source_state if str(name).startswith("patch_router.")
+        )
+        if source_router_keys:
+            raise ValueError(
+                "Per-cluster frozen consumer requires a target-new patch_router; "
+                f"source checkpoint contains router keys: {source_router_keys}"
+            )
+        _validate_exact_semantic_body_state(source_state, target_state)
+        expected_body_hash = source_contract.get("semantic_body_sha256") if source_contract else None
+        if not isinstance(expected_body_hash, str) or len(expected_body_hash) != 64:
+            raise ValueError(
+                "Per-cluster semantic bank checkpoint is missing semantic_body_sha256."
+            )
+        actual_body_hash = _semantic_body_state_sha256(source_state)
+        if actual_body_hash != expected_body_hash:
+            raise ValueError(
+                "Per-cluster semantic body hash mismatch: "
+                f"metadata={expected_body_hash}, actual={actual_body_hash}"
+            )
     if bool(strict):
+        if per_cluster_semantic_body:
+            source_keys = set(source_state.keys())
+            target_keys = set(target_state.keys())
+            if source_keys != target_keys:
+                raise ValueError(
+                    "Strict per-cluster consumer requires an exact full state key set: "
+                    f"missing={sorted(target_keys - source_keys)}, "
+                    f"unexpected={sorted(source_keys - target_keys)}"
+                )
+            for name in sorted(target_keys):
+                source_value = torch.as_tensor(source_state[name])
+                target_value = torch.as_tensor(target_state[name])
+                if (
+                    tuple(source_value.shape) != tuple(target_value.shape)
+                    or source_value.dtype != target_value.dtype
+                ):
+                    raise ValueError(
+                        f"Strict per-cluster state mismatch for {name}: "
+                        f"source={tuple(source_value.shape)}/{source_value.dtype}, "
+                        f"target={tuple(target_value.shape)}/{target_value.dtype}"
+                    )
         pred_residual.load_state_dict(source_state, strict=True)
         return True
-    target_state = pred_residual.state_dict()
     compatible_state = {}
     incompatible_keys = []
     for name, value in source_state.items():
@@ -1370,6 +2334,21 @@ def _load_finetune_pred_residual_state(
             incompatible_keys.append(str(name))
             continue
         compatible_state[name] = value
+    if per_cluster_semantic_body:
+        unexpected_source = sorted(set(source_state.keys()) - set(target_state.keys()))
+        missing_target = sorted(set(target_state.keys()) - set(source_state.keys()))
+        forbidden_unexpected = [
+            name for name in unexpected_source if not str(name).startswith("patch_router.")
+        ]
+        forbidden_missing = [
+            name for name in missing_target if not str(name).startswith("patch_router.")
+        ]
+        if forbidden_unexpected or forbidden_missing or incompatible_keys:
+            raise ValueError(
+                "Non-strict per-cluster consumer permits only explicit patch_router nonbody keys: "
+                f"missing={forbidden_missing}, unexpected={forbidden_unexpected}, "
+                f"incompatible={incompatible_keys}"
+            )
     if not compatible_state:
         return False
     pred_residual.load_state_dict(compatible_state, strict=False)
@@ -2387,6 +3366,329 @@ def _parameter_grad_l2_norm(params: Iterable[nn.Parameter]) -> float:
     return float(total ** 0.5)
 
 
+def _semantic_bank_finalize_raw_gradient_accumulation(
+    optimizer: torch.optim.Optimizer,
+    params: Iterable[nn.Parameter],
+    *,
+    accumulation_count: int,
+    grad_clip: float,
+) -> Dict[str, float | int]:
+    """Mean accumulated raw grads, clip once, apply WD/SGD once, then clear grads."""
+    params_list = list(params)
+    count = int(accumulation_count)
+    if count <= 0:
+        raise ValueError("semantic raw-gradient accumulation_count must be positive.")
+    optimizer_params = [
+        param for group in optimizer.param_groups for param in group["params"]
+    ]
+    if [id(param) for param in optimizer_params] != [id(param) for param in params_list]:
+        raise ValueError(
+            "semantic raw-gradient optimizer ownership must exactly match active params."
+        )
+    present = [param for param in params_list if param.grad is not None]
+    if not present:
+        raise RuntimeError("semantic raw-gradient accumulation produced no gradients.")
+    for param in present:
+        param.grad.div_(float(count))
+    raw_norm = _parameter_grad_l2_norm(params_list)
+    if float(grad_clip) > 0.0:
+        torch.nn.utils.clip_grad_norm_(params_list, float(grad_clip))
+    clipped_norm = _parameter_grad_l2_norm(params_list)
+    snapshots = [param.detach().clone() for param in params_list]
+    optimizer.step()
+    update_sq = 0.0
+    for before_param, after_param in zip(snapshots, params_list):
+        update_sq += float(
+            (after_param.detach() - before_param).double().square().sum().item()
+        )
+    optimizer.zero_grad(set_to_none=True)
+    return {
+        "accumulation_count": count,
+        "raw_gradient_l2": float(raw_norm),
+        "clipped_gradient_l2": float(clipped_norm),
+        "parameter_update_l2": math.sqrt(update_sq),
+    }
+
+
+def _semantic_bank_should_flush_raw_gradient_accumulation(
+    *,
+    pending_count: int,
+    target_microbatches: int,
+    completed_batches: int,
+    total_batches: int,
+) -> bool:
+    """Return the production flush decision for a full group or epoch tail."""
+    pending = int(pending_count)
+    target = int(target_microbatches)
+    completed = int(completed_batches)
+    total = int(total_batches)
+    if target <= 0 or total <= 0:
+        raise ValueError("semantic accumulation target and total_batches must be positive.")
+    if pending <= 0 or pending > target:
+        raise ValueError("semantic accumulation pending_count must be in [1,target].")
+    if completed <= 0 or completed > total:
+        raise ValueError("semantic accumulation completed_batches must be in [1,total].")
+    return bool(pending == target or completed == total)
+
+
+def _semantic_bank_temporal_block_indices(
+    relative_window_index: torch.Tensor,
+    *,
+    split_window_count: int,
+    block_count: int,
+) -> torch.Tensor:
+    """Assign split-relative windows to fixed contiguous semantic-audit blocks."""
+    windows = int(split_window_count)
+    blocks = int(block_count)
+    if windows <= 0:
+        raise ValueError("semantic audit split_window_count must be positive.")
+    if blocks <= 0:
+        raise ValueError("semantic audit block_count must be positive.")
+    if relative_window_index.dtype != torch.long:
+        raise ValueError("semantic audit relative_window_index must use torch.long.")
+    if bool((relative_window_index < 0).any().item()):
+        raise ValueError("semantic audit relative_window_index must be nonnegative.")
+    return torch.div(
+        relative_window_index * blocks,
+        windows,
+        rounding_mode="floor",
+    ).clamp_max(blocks - 1)
+
+
+def _make_semantic_level_disjoint_optimizers(
+    amplitude_params: Iterable[nn.Parameter],
+    need_gate_params: Iterable[nn.Parameter],
+    *,
+    amplitude_optimizer_name: str,
+    amplitude_lr: float,
+    amplitude_weight_decay: float,
+    need_gate_lr: float,
+    need_gate_weight_decay: float,
+) -> Dict[str, torch.optim.Optimizer]:
+    """Build independently owned LEVEL amplitude and need-gate optimizers.
+
+    The need gate deliberately retains the legacy zero-momentum SGD rule.  The
+    amplitude rule is explicit so an optimizer repair cannot silently affect the
+    gate or any other named expert.
+    """
+
+    amplitude = list(amplitude_params)
+    need_gate = list(need_gate_params)
+    if not amplitude or not need_gate:
+        raise ValueError("LEVEL disjoint optimizer groups must be non-empty.")
+    amplitude_ids = [id(parameter) for parameter in amplitude]
+    need_gate_ids = [id(parameter) for parameter in need_gate]
+    if len(amplitude_ids) != len(set(amplitude_ids)) or len(need_gate_ids) != len(
+        set(need_gate_ids)
+    ):
+        raise ValueError("LEVEL disjoint optimizer groups contain duplicate parameters.")
+    if set(amplitude_ids).intersection(need_gate_ids):
+        raise ValueError("LEVEL amplitude and need-gate optimizer groups overlap.")
+
+    name = str(amplitude_optimizer_name).strip().lower()
+    lr = float(amplitude_lr)
+    weight_decay = float(amplitude_weight_decay)
+    gate_lr = float(need_gate_lr)
+    gate_weight_decay = float(need_gate_weight_decay)
+    if lr <= 0.0 or gate_lr <= 0.0:
+        raise ValueError("LEVEL optimizer learning rates must be positive.")
+    if weight_decay < 0.0 or gate_weight_decay < 0.0:
+        raise ValueError("LEVEL optimizer weight decay must be non-negative.")
+
+    if name == "adam":
+        amplitude_optimizer: torch.optim.Optimizer = torch.optim.Adam(
+            [{"params": amplitude, "weight_decay": weight_decay}],
+            lr=lr,
+            betas=(0.9, 0.999),
+            eps=1.0e-8,
+            amsgrad=False,
+        )
+    elif name == "sgd":
+        amplitude_optimizer = torch.optim.SGD(
+            [{"params": amplitude, "weight_decay": weight_decay}],
+            lr=lr,
+            momentum=0.0,
+            dampening=0.0,
+            nesterov=False,
+        )
+    else:
+        raise ValueError(
+            "LEVEL amplitude optimizer must be one of {'sgd','adam'}, "
+            f"got {amplitude_optimizer_name!r}."
+        )
+
+    need_gate_optimizer = torch.optim.SGD(
+        [{"params": need_gate, "weight_decay": gate_weight_decay}],
+        lr=gate_lr,
+        momentum=0.0,
+        dampening=0.0,
+        nesterov=False,
+    )
+    for optimizer in (amplitude_optimizer, need_gate_optimizer):
+        for group in optimizer.param_groups:
+            group.setdefault("initial_lr", float(group["lr"]))
+    return {
+        "amplitude": amplitude_optimizer,
+        "need_gate": need_gate_optimizer,
+    }
+
+
+def _semantic_level_optimizer_identity_fields(
+    *,
+    amplitude_optimizer_name: str,
+    amplitude_lr: float,
+    amplitude_weight_decay: float,
+    need_gate_lr: float,
+    need_gate_weight_decay: float,
+) -> List[str]:
+    """Return versioned identity fields without changing the legacy SGD hash.
+
+    Version-6 checkpoints predate an amplitude-specific override, so inherited
+    SGD contributes no new fields. Version 7 binds every behavior-affecting
+    constant of the reviewed Adam-amplitude/SGD-gate rule.
+    """
+
+    name = str(amplitude_optimizer_name).strip().lower()
+    if name == "sgd":
+        if float(amplitude_lr) != float(need_gate_lr):
+            raise ValueError(
+                "Legacy LEVEL SGD identity requires amplitude lr to equal "
+                "the inherited need-gate/train lr."
+            )
+        if float(amplitude_weight_decay) != float(need_gate_weight_decay):
+            raise ValueError(
+                "Legacy LEVEL SGD identity requires amplitude weight decay to "
+                "equal the inherited need-gate/residual weight decay."
+            )
+        return []
+    if name != "adam":
+        raise ValueError(
+            "LEVEL optimizer identity supports only inherited sgd or reviewed adam."
+        )
+    return [
+        "amplitude_optimizer=adam",
+        "amplitude_lr=" + repr(float(amplitude_lr)),
+        "amplitude_weight_decay=" + repr(float(amplitude_weight_decay)),
+        "amplitude_betas=(0.9,0.999)",
+        "amplitude_eps=1e-08",
+        "amplitude_amsgrad=false",
+        "need_gate_optimizer=sgd",
+        "need_gate_lr=" + repr(float(need_gate_lr)),
+        "need_gate_weight_decay=" + repr(float(need_gate_weight_decay)),
+        "need_gate_momentum=0.0",
+        "need_gate_dampening=0.0",
+        "need_gate_nesterov=false",
+    ]
+
+
+def _semantic_bank_finalize_gradient_step(
+    optimizer: torch.optim.Optimizer,
+    params: Iterable[nn.Parameter],
+    *,
+    grad_clip: float,
+    raw_gradient_accumulation: bool,
+    accumulation_count: int,
+) -> Dict[str, float | int]:
+    """Production dispatch for legacy per-batch or raw-mean semantic SGD."""
+    params_list = list(params)
+    if raw_gradient_accumulation:
+        return _semantic_bank_finalize_raw_gradient_accumulation(
+            optimizer,
+            params_list,
+            accumulation_count=int(accumulation_count),
+            grad_clip=float(grad_clip),
+        )
+    if int(accumulation_count) != 1:
+        raise ValueError("legacy semantic gradient step requires accumulation_count=1.")
+    snapshots = [param.detach().clone() for param in params_list]
+    raw_norm = _parameter_grad_l2_norm(params_list)
+    if float(grad_clip) > 0.0:
+        torch.nn.utils.clip_grad_norm_(params_list, float(grad_clip))
+    clipped_norm = _parameter_grad_l2_norm(params_list)
+    optimizer.step()
+    update_sq = 0.0
+    for before_param, after_param in zip(snapshots, params_list):
+        update_sq += float(
+            (after_param.detach() - before_param).double().square().sum().item()
+        )
+    return {
+        "accumulation_count": 1,
+        "raw_gradient_l2": float(raw_norm),
+        "clipped_gradient_l2": float(clipped_norm),
+        "parameter_update_l2": math.sqrt(update_sq),
+    }
+
+
+def _semantic_bank_finalize_disjoint_gradient_step(
+    optimizers_by_group: Dict[str, torch.optim.Optimizer],
+    params_by_group: Dict[str, Iterable[nn.Parameter]],
+    *,
+    grad_clip: float,
+    raw_gradient_accumulation: bool,
+    accumulation_count: int,
+) -> Dict[str, object]:
+    """Finalize disjoint LEVEL adapter/gate groups without cross-group clipping."""
+
+    if set(optimizers_by_group) != set(params_by_group) or len(params_by_group) < 2:
+        raise ValueError(
+            "semantic disjoint gradient step requires matching optimizer/parameter groups."
+        )
+    materialized = {
+        name: list(params_by_group[name]) for name in sorted(params_by_group)
+    }
+    seen: Dict[int, str] = {}
+    for name, params in materialized.items():
+        if not params:
+            raise ValueError(f"semantic disjoint parameter group {name!r} is empty.")
+        for parameter in params:
+            previous = seen.get(id(parameter))
+            if previous is not None:
+                raise ValueError(
+                    "semantic disjoint parameter groups overlap: "
+                    f"{previous!r} and {name!r}."
+                )
+            seen[id(parameter)] = name
+        optimizer_params = [
+            parameter
+            for optimizer_group in optimizers_by_group[name].param_groups
+            for parameter in optimizer_group["params"]
+        ]
+        optimizer_ids = [id(parameter) for parameter in optimizer_params]
+        parameter_ids = [id(parameter) for parameter in params]
+        if len(optimizer_ids) != len(set(optimizer_ids)):
+            raise ValueError(
+                f"semantic disjoint optimizer group {name!r} contains duplicate parameters."
+            )
+        if set(optimizer_ids) != set(parameter_ids):
+            raise ValueError(
+                f"semantic disjoint optimizer group {name!r} does not exactly match "
+                "its declared parameter group."
+            )
+
+    group_metrics: Dict[str, Dict[str, float | int]] = {}
+    for name, params in materialized.items():
+        group_metrics[name] = _semantic_bank_finalize_gradient_step(
+            optimizers_by_group[name],
+            params,
+            grad_clip=float(grad_clip),
+            raw_gradient_accumulation=bool(raw_gradient_accumulation),
+            accumulation_count=int(accumulation_count),
+        )
+    return {
+        "accumulation_count": int(accumulation_count),
+        "raw_gradient_l2": math.sqrt(
+            sum(float(row["raw_gradient_l2"]) ** 2 for row in group_metrics.values())
+        ),
+        "clipped_gradient_l2": math.sqrt(
+            sum(float(row["clipped_gradient_l2"]) ** 2 for row in group_metrics.values())
+        ),
+        "parameter_update_l2": math.sqrt(
+            sum(float(row["parameter_update_l2"]) ** 2 for row in group_metrics.values())
+        ),
+        "groups": group_metrics,
+    }
+
+
 def extract_gate_features(x_bcl: torch.Tensor) -> torch.Tensor:
     """
     Extract lightweight but shape-aware per-channel descriptors for gate routing.
@@ -2394,7 +3696,7 @@ def extract_gate_features(x_bcl: torch.Tensor) -> torch.Tensor:
     """
     B, C, L = x_bcl.shape
     mean = x_bcl.mean(dim=-1)
-    std = x_bcl.std(dim=-1)
+    std = x_bcl.std(dim=-1) if L > 1 else torch.zeros_like(mean)
     eps = 1.0e-6
 
     last_centered = x_bcl[..., -1] - mean
@@ -3244,7 +4546,25 @@ __all__ = [
     '_training_cluster_weight',
     '_should_update_swa',
     '_make_cluster_optimizer_param_groups',
+    '_validate_semantic_bank_training_provenance',
+    '_semantic_body_state_sha256',
+    '_semantic_penalty_body_state_sha256',
+    '_semantic_penalty_body_state_from_state_dict',
+    '_validate_semantic_release_metadata',
+    '_configure_semantic_bank_body_only',
+    '_validate_semantic_frozen_consumer_paths',
+    '_validate_semantic_frozen_consumer_lifecycle_flags',
+    '_freeze_semantic_frozen_consumer',
+    '_assert_semantic_patch_router_only_trainable',
+    '_canonical_cluster_map_sha256',
+    '_new_semantic_bank_best_candidates',
+    '_update_semantic_bank_best_candidate',
+    '_semantic_bank_release_ready',
+    '_validate_semantic_partial_metadata',
+    '_semantic_bank_checkpoint_save_allowed',
     '_load_finetune_pred_residual_state',
+    '_make_semantic_level_disjoint_optimizers',
+    '_semantic_level_optimizer_identity_fields',
     '_cluster_penalty_mask_to_channel_mask',
     '_gate_cluster_params',
     '_mask_gate_grads_after_epoch',
@@ -3275,6 +4595,11 @@ __all__ = [
     '_route_precision_constrained_recall_loss_from_probs',
     '_route_ce_class_weight_from_labels',
     '_parameter_grad_l2_norm',
+    '_semantic_bank_finalize_raw_gradient_accumulation',
+    '_semantic_bank_should_flush_raw_gradient_accumulation',
+    '_semantic_bank_temporal_block_indices',
+    '_semantic_bank_finalize_gradient_step',
+    '_semantic_bank_finalize_disjoint_gradient_step',
     'extract_gate_features',
     '_extract_base_forecast_gate_features',
     '_build_gate_routing_features',

@@ -1,0 +1,172 @@
+{
+  "dataset": "ETTm1",
+  "updated": "2026-07-18",
+  "policy": "two_separate_architecture_locked_families_finalized",
+  "paper_method_status": "report_v5_and_v117_as_separate_rows_never_mix_horizon_cells",
+  "test_may_select_or_modify_parameters": false,
+  "post_test_tuning": false,
+  "final_comparison": {
+    "result": ".pt_ettm1_locked_v5_vs_v117_final_test_v195/result.json",
+    "result_sha256": "fabc46352d85bee2ace0cfbf2c3b5b8c0e09d00d6747155f274a90c1b8e6b98b",
+    "verdict": "locked_v5_wins_mse_and_mae_at_all_four_horizons"
+  },
+  "families": {
+    "locked_v5": {
+      "architecture": {
+        "routing_unit": "origin x channel x p12",
+        "feature_width": 471,
+        "actions": [
+          "skip",
+          "level",
+          "amp",
+          "trend",
+          "level_amp",
+          "level_trend",
+          "amp_trend",
+          "level_amp_trend"
+        ],
+        "model": "seven HistGradientBoostingRegressor raw-MSE-margin heads",
+        "fitted_head_count": 7,
+        "continuous_strength": false,
+        "horizon_master_scale": null,
+        "identical_across_horizons": true
+      },
+      "mean_test_gain_pct": {
+        "mse": 5.669884697138627,
+        "mae": 2.1308728423043743
+      },
+      "frozen_h96_penalty_ablation": {
+        "result": ".pt_ettm1_h96_locked_v5_penalty_ablation_v198/result.json",
+        "result_sha256": "e4f75d9c4f978e024c02a6329019468aee8d648154e913c3fa4a2e8c77125e18",
+        "parameter_namespaces_disjoint": true,
+        "gate_contains_expert_parameters": false,
+        "target_component_gain_pct": {
+          "level": 8.311620657454677,
+          "amp": 8.459128269382212,
+          "trend": 5.293142227101375
+        },
+        "limitation": "Trend is aggregate-positive but negative in TEST Q4 and several channels; TEST diagnosis cannot tune the policy"
+      },
+      "horizons": {
+        "96": {
+          "deployment": "active_gate",
+          "selected_iteration": 96,
+          "fallback_action": "level_amp_trend",
+          "gate": ".pt_stage1_level_amp_trend_gate_val_earlystop_v5/gate.joblib",
+          "gate_sha256": "2b19c62206771b32d083e4ecca5869046db38fd0206befe2b7d4c3c59eb66f74",
+          "test_result": ".pt_ettm1_h96_locked_v5_final_test_v195/result.json",
+          "test_result_sha256": "aed07f8a40761cf2aad637c1a473f460619e570406669f940d03ecee6f25b2e2",
+          "base_mse": 0.3176293430010006,
+          "test_mse": 0.29126286919945454,
+          "mse_gain_pct": 8.301019531896012,
+          "base_mae": 0.35338582439427185,
+          "test_mae": 0.3407761210485131,
+          "mae_gain_pct": 3.568253867390591
+        },
+        "192": {
+          "deployment": "active_gate",
+          "selected_iteration": 8,
+          "fallback_action": "level_amp",
+          "gate": ".pt_ettm1_h192_locked_v5_gate_train_v185/gate.joblib",
+          "test_result": ".pt_ettm1_h192_locked_v5_final_test_v195/result.json",
+          "test_result_sha256": "aa97e53a049848e99c741ff6a195544186279efa9b10cdecdd3d451832241773",
+          "base_mse": 0.3508397592957474,
+          "test_mse": 0.3326903179222639,
+          "mse_gain_pct": 5.173142693381019,
+          "base_mae": 0.371520302286435,
+          "test_mae": 0.3640651416567651,
+          "mae_gain_pct": 2.006663050118349
+        },
+        "336": {
+          "deployment": "train_val_frozen_fallback",
+          "selected_iteration": 24,
+          "fallback_action": "level_amp",
+          "gate": ".pt_ettm1_h336_locked_v5_gate_train_v190/gate.joblib",
+          "test_result": ".pt_ettm1_h336_locked_v5_final_test_v195/result.json",
+          "test_result_sha256": "d5461881aa2807f6bc8d1b7a5d77ddd329b09e5f43021ce9410f4afd2b507c6c",
+          "base_mse": 0.3810397377374888,
+          "test_mse": 0.3637554380608854,
+          "mse_gain_pct": 4.536088487576886,
+          "base_mae": 0.3923380202695773,
+          "test_mae": 0.3855056602284119,
+          "mae_gain_pct": 1.741447345957166
+        },
+        "720": {
+          "deployment": "train_val_frozen_fallback",
+          "selected_iteration": 120,
+          "fallback_action": "level_amp_trend",
+          "gate": ".pt_ettm1_h720_locked_v5_gate_train_v190/gate.joblib",
+          "test_result": ".pt_ettm1_h720_locked_v5_final_test_v195/result.json",
+          "test_result_sha256": "9c0596b5a87f8305eccfbb5b608c7783718ed2ab2c9011f15d442cc74fdb062c",
+          "base_mse": 0.4515019970916945,
+          "test_mse": 0.43042006817994194,
+          "mse_gain_pct": 4.669288075700594,
+          "base_mae": 0.43372811080068224,
+          "test_mae": 0.4284924612099438,
+          "mae_gain_pct": 1.2071271057513921
+        }
+      }
+    },
+    "locked_v117": {
+      "architecture": {
+        "model": "MaturedPriorTrendBlockVetoGate",
+        "input_lanes": 27,
+        "trainable_parameter_count": 6156,
+        "canonical_actions": ["skip", "level", "amp", "level_amp"],
+        "deletion_masks": 4,
+        "trend": "exact_noop",
+        "incomplete_tail": "exact_noop",
+        "identical_across_horizons": true
+      },
+      "test_result": ".pt_ettm1_v117_arch_all_horizon_final_test_v195/result.json",
+      "test_result_sha256": "6f97b58da618ac2f44587a6acb12297b4d4f0befe5dc2b6f5f0bb60e3fed4cc9",
+      "mean_test_gain_pct": {
+        "mse": 3.1372005465872483,
+        "mae": 1.2877539507813687
+      },
+      "horizons": {
+        "96": {
+          "deployment": "v180_active_gate",
+          "base_mse": 0.31762934305436086,
+          "test_mse": 0.30434183702440337,
+          "mse_gain_pct": 4.18333706268548,
+          "base_mae": 0.3533858244103178,
+          "test_mae": 0.3455365747391697,
+          "mae_gain_pct": 2.2211557818556655
+        },
+        "192": {
+          "deployment": "immutable_v117_active_gate",
+          "base_mse": 0.3508397592957474,
+          "test_mse": 0.33451157413798666,
+          "mse_gain_pct": 4.654029289763756,
+          "base_mae": 0.371520302286435,
+          "test_mae": 0.3642531889053878,
+          "mae_gain_pct": 1.956047445139184
+        },
+        "336": {
+          "deployment": "v158_v159_p12_prior_all_keep",
+          "base_mse": 0.3810397377400795,
+          "test_mse": 0.3745743029257779,
+          "mse_gain_pct": 1.6967875457419777,
+          "base_mae": 0.3923380202702029,
+          "test_mae": 0.39070530557907623,
+          "mae_gain_pct": 0.41615000503959354
+        },
+        "720": {
+          "deployment": "v180_active_gate",
+          "base_mse": 0.4515019970916945,
+          "test_mse": 0.44240581983628846,
+          "mse_gain_pct": 2.01464828815778,
+          "base_mae": 0.43372811080068224,
+          "test_mae": 0.4313093714664466,
+          "mae_gain_pct": 0.5576625710910315
+        }
+      }
+    }
+  },
+  "historical_mixed_endpoints": {
+    "status": "diagnostic_only_not_a_valid_single_paper_method",
+    "reason": "H96 v5 and H192/H336/H720 continuous soft Gates have different feature/action/model contracts",
+    "do_not_restore_as_one_cross_horizon_row": true
+  }
+}
